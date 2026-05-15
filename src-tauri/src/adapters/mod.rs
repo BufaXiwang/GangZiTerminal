@@ -1,0 +1,9 @@
+//! Adapters 层——Tauri / 前端协议边界。
+//!
+//! 把 domain / infrastructure 暴露给前端 invoke / event 通道。
+//! 内部用 domain 类型，输出转 frontend-friendly JSON（DTO）。
+
+pub mod account_commands;
+pub mod market_commands;
+pub mod proxy_commands;
+pub mod quotes_commands;

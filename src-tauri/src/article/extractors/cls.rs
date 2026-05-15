@@ -1,0 +1,30 @@
+use crate::article::extractors::{extract_from_selectors, matches_any};
+use crate::article::model::{ArticleExtractor, ExtractContext, ExtractedArticle};
+use scraper::Html;
+
+pub struct ClsExtractor;
+
+impl ArticleExtractor for ClsExtractor {
+    fn name(&self) -> &'static str {
+        "cls"
+    }
+
+    fn matches(&self, context: &ExtractContext<'_>) -> bool {
+        matches_any(context, &["cls.cn", "财联社"])
+    }
+
+    fn extract(&self, document: &Html, _context: &ExtractContext<'_>) -> ExtractedArticle {
+        extract_from_selectors(
+            document,
+            self.name(),
+            &[
+                ".detail-content",
+                ".article-content",
+                ".telegraph-content",
+                ".content",
+                "[class*='detail']",
+                "article",
+            ],
+        )
+    }
+}

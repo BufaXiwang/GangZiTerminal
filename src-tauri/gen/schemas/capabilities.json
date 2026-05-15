@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capabilities granted to the main window: core defaults for IPC + event listen, plus opener for external links.","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}
