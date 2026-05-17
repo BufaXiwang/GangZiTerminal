@@ -12,8 +12,7 @@
 //!
 //! 这层 helper 是 chat pipeline 唯一从 DB 反序列化历史的入口。
 
-use crate::agent::types::{Block, Message, Role};
-use crate::db;
+use crate::domain::agent::types::{Block, Message, Role};
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
@@ -123,7 +122,8 @@ pub fn read_recent_chat_thread(
     exclude_id: Option<&str>,
 ) -> (Vec<Message>, Option<String>) {
     // read_all_chat_messages 按 created_at desc——最新在前；无条数截断。
-    let raw = db::read_all_chat_messages(app, None).unwrap_or_default();
+    let raw = crate::infrastructure::agent::repository::read_all_chat_messages(app, None)
+        .unwrap_or_default();
 
     // 排除调用方指定的 id（一般是本轮刚写入的 user message）
     let filtered: Vec<&Value> = raw
@@ -215,7 +215,7 @@ pub fn build_compact_boundary_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::types::ToolResultContent;
+    use crate::domain::agent::types::ToolResultContent;
     use serde_json::json;
 
     #[test]

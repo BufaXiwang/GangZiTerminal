@@ -1,23 +1,16 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { ExternalLink, ImagePlus, Loader2, PinOff, Pin, Search, Send, Sparkles, Wrench, X } from "lucide-react";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { ImagePlus, Loader2, Search, Send, Sparkles, Wrench, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAgentEventStream } from "../hooks/useAgentEventStream";
 import { formatDate } from "../lib/format";
-import type {
-  ArticleContent,
-  ChatMessage,
-  InvestorMemoryUpdate,
-  NewsItem,
-  StreamingRunState,
-} from "../types";
+import type { ChatMessage, InvestorMemoryUpdate, StreamingRunState } from "../types";
 
 const acceptedImageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const maxImagesPerMessage = 4;
 const maxImageBytes = 8 * 1024 * 1024;
 
 type Props = {
-  fetchArticle: (item: NewsItem) => Promise<ArticleContent | null>;
   hasMoreMessages: boolean;
   isChatting: boolean;
   loadMoreMessages: () => void;
@@ -27,7 +20,6 @@ type Props = {
 };
 
 export function ChatPage({
-  fetchArticle,
   hasMoreMessages,
   isChatting,
   loadMoreMessages,
@@ -37,53 +29,25 @@ export function ChatPage({
 }: Props) {
   const [draft, setDraft] = useState("");
   const [searchInput, setSearchInput] = useState("");
-  const [openMessageId, setOpenMessageId] = useState<string | null>(null);
-  const [railTab, setRailTab] = useState<"briefings" | "reviews">("briefings");
   const messageListRef = useRef<HTMLDivElement>(null);
   // 用户粘进/拖进来的图，base64 data URL。submit 时一并落盘 + 走 Block::Image 喂给 agent。
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 实时 agent run 状态——按 run_id 索引；agent loop 每条 TextDelta / ToolStart /
-  // ToolEnd 都进这里。只展示 pipeline=chat 的 run；briefing / review 在右侧分页里。
+  // ToolEnd 都进这里。只展示 pipeline=chat 的 run。
   const [streamingRuns, setStreamingRuns] = useState<Record<string, StreamingRunState>>({});
   useAgentEventStream({ enabled: true, setStreamingRuns });
   const activeChatRun = useMemo(() => {
     const runs = Object.values(streamingRuns).filter((r) => r.pipeline === "chat");
-    // 一般同时只会有一条；多条的话取最后一条
     return runs[runs.length - 1] ?? null;
   }, [streamingRuns]);
 
-  // Timeline 中间：用户对话 + Agent chat 回复 + highlight + 系统消息
-  // briefing 和 review 都搬到右侧分页里——避免对话流被 Agent 自产消息淹没
+  // Timeline：用户对话 + Agent chat 回复 + highlight 类消息。
+  // briefing / review 已彻底下线（DB CHECK 不再允许这些 kind）。
   const timelineMessages = useMemo(
-    () =>
-      messages
-        .filter((message) => message.kind !== "briefing" && message.kind !== "review")
-        .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)),
+    () => [...messages].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)),
     [messages],
-  );
-
-  const briefings = useMemo(
-    () =>
-      messages
-        .filter((message) => message.kind === "briefing")
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
-    [messages],
-  );
-
-  const reviews = useMemo(
-    () =>
-      messages
-        .filter((message) => message.kind === "review")
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
-    [messages],
-  );
-
-  const openMessage = useMemo(
-    () =>
-      [...briefings, ...reviews].find((message) => message.id === openMessageId) ?? null,
-    [briefings, reviews, openMessageId],
   );
 
   function submit() {
@@ -172,7 +136,7 @@ export function ChatPage({
       <div className="section-head">
         <div>
           <h2>Agent 对话</h2>
-          <p className="muted">中间是对话流；主 Agent 自主发布的简报和复盘在右侧分页，点击查看详情。</p>
+          <p className="muted">和 Agent 实时对话。决策、开仓、调止损都在对话流里完成。</p>
         </div>
         <div className="chat-search-wrap">
           <Search size={14} />
@@ -195,7 +159,7 @@ export function ChatPage({
             {timelineMessages.length === 0 ? (
               <div className="chat-welcome">
                 <strong>对话流为空</strong>
-                <p>简报在右侧列表里。你可以直接提问，复盘消息也会出现在这里。</p>
+                <p>直接提问。Agent 看到机会会主动开仓 / 调止损，过程会用自然语言汇报。</p>
               </div>
             ) : (
               timelineMessages.map((message) => (
@@ -211,7 +175,6 @@ export function ChatPage({
                         Agent 划重点
                       </span>
                     )}
-                    {message.kind === "review" && <span className="kind-badge review">复盘</span>}
                     <time>{formatDate(message.createdAt)}</time>
                   </header>
                   {message.contentMd && (
@@ -298,26 +261,7 @@ export function ChatPage({
           </div>
         </div>
 
-        <SideRail
-          briefings={briefings}
-          reviews={reviews}
-          tab={railTab}
-          onTab={setRailTab}
-          onOpen={(id) => setOpenMessageId(id)}
-          activeId={openMessageId}
-        />
       </div>
-
-      {openMessage && openMessage.kind === "briefing" && (
-        <BriefingModal
-          briefing={openMessage}
-          fetchArticle={fetchArticle}
-          onClose={() => setOpenMessageId(null)}
-        />
-      )}
-      {openMessage && openMessage.kind === "review" && (
-        <ReviewModal review={openMessage} onClose={() => setOpenMessageId(null)} />
-      )}
     </section>
   );
 }
@@ -426,530 +370,6 @@ function briefInput(input: unknown): string {
   return out.length > 32 ? out.slice(0, 32) + "…" : out;
 }
 
-// ---------- Side rail（右侧分页：简报 / 复盘） ----------
-
-function SideRail({
-  briefings,
-  reviews,
-  tab,
-  onTab,
-  onOpen,
-  activeId,
-}: {
-  briefings: ChatMessage[];
-  reviews: ChatMessage[];
-  tab: "briefings" | "reviews";
-  onTab: (next: "briefings" | "reviews") => void;
-  onOpen: (id: string) => void;
-  activeId: string | null;
-}) {
-  const [autoFollow, setAutoFollow] = useState(true);
-  const listRef = useRef<HTMLDivElement>(null);
-  const lastTopIdRef = useRef<string | null>(null);
-
-  const list = tab === "briefings" ? briefings : reviews;
-
-  // 当前分页 list 第 0 位 id 变化（新到达） → 滚到顶
-  useEffect(() => {
-    const topId = list[0]?.id ?? null;
-    if (topId && topId !== lastTopIdRef.current && lastTopIdRef.current !== null && autoFollow) {
-      listRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-    }
-    lastTopIdRef.current = topId;
-  }, [list, autoFollow]);
-
-  // 切分页时重置滚动 + 跟随的"上一项 id" 锚点
-  useEffect(() => {
-    listRef.current?.scrollTo({ top: 0 });
-    lastTopIdRef.current = null;
-  }, [tab]);
-
-  return (
-    <aside className="news-rail briefing-rail">
-      <div className="news-rail-head side-rail-head">
-        <div className="side-rail-tabs" role="tablist">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "briefings"}
-            className={`side-rail-tab${tab === "briefings" ? " active" : ""}`}
-            onClick={() => onTab("briefings")}
-          >
-            简报
-            <span className="side-rail-count">{briefings.length}</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "reviews"}
-            className={`side-rail-tab${tab === "reviews" ? " active" : ""}`}
-            onClick={() => onTab("reviews")}
-          >
-            复盘
-            <span className="side-rail-count">{reviews.length}</span>
-          </button>
-        </div>
-        <button
-          type="button"
-          className={`briefing-follow${autoFollow ? " active" : ""}`}
-          onClick={() => setAutoFollow((v) => !v)}
-          title={autoFollow ? "新条目到达时自动滚到顶" : "已关闭自动跟随"}
-        >
-          {autoFollow ? <Pin size={12} /> : <PinOff size={12} />}
-          <span>{autoFollow ? "跟随" : "不跟随"}</span>
-        </button>
-      </div>
-      <div className="news-rail-list briefing-list" ref={listRef}>
-        {list.length === 0 ? (
-          <p className="muted briefing-empty">
-            {tab === "briefings"
-              ? "主 Agent 还没发布简报。等待 buffer 满或定时触发。"
-              : "尚无复盘。已开仓的交易假设到期后会自动复盘。"}
-          </p>
-        ) : (
-          list.map((message) =>
-            tab === "briefings" ? (
-              <BriefingRow
-                key={message.id}
-                briefing={message}
-                active={activeId === message.id}
-                onOpen={onOpen}
-              />
-            ) : (
-              <ReviewRow
-                key={message.id}
-                review={message}
-                active={activeId === message.id}
-                onOpen={onOpen}
-              />
-            ),
-          )
-        )}
-      </div>
-    </aside>
-  );
-}
-
-function BriefingRow({
-  briefing,
-  active,
-  onOpen,
-}: {
-  briefing: ChatMessage;
-  active: boolean;
-  onOpen: (id: string) => void;
-}) {
-  const coveredCount = briefing.sourceNewsIds?.length ?? 0;
-  const tradeCount = briefing.contentJson?.briefing?.tradeCalls?.length ?? 0;
-  const headline = briefingTitle(briefing);
-  return (
-    <button
-      type="button"
-      className={`briefing-row${active ? " active" : ""}`}
-      onClick={() => onOpen(briefing.id)}
-    >
-      <time>{formatDate(briefing.createdAt)}</time>
-      <strong>{headline}</strong>
-      <span className="briefing-row-meta">
-        覆盖 {coveredCount} 条资讯
-        {tradeCount > 0 ? ` · ${tradeCount} 个交易假设` : ""}
-      </span>
-    </button>
-  );
-}
-
-function ReviewRow({
-  review,
-  active,
-  onOpen,
-}: {
-  review: ChatMessage;
-  active: boolean;
-  onOpen: (id: string) => void;
-}) {
-  const r = review.contentJson?.review;
-  // 标题来源：从 contentMd 抽第一行的 "复盘｜<原假设标题>" 后缀；否则给个回退
-  const headline = (() => {
-    const firstLine = review.contentMd.split("\n", 1)[0] ?? "";
-    const stripped = firstLine.replace(/^[*#\s]*复盘[｜|]/, "").replace(/[*\s]+$/, "");
-    return (stripped || "复盘记录").slice(0, 28);
-  })();
-  return (
-    <button
-      type="button"
-      className={`briefing-row${active ? " active" : ""}`}
-      onClick={() => onOpen(review.id)}
-    >
-      <time>{formatDate(review.createdAt)}</time>
-      <strong>{headline}</strong>
-      <span className="briefing-row-meta">
-        {r?.thesisStatus
-          ? `状态：${reviewStatusLabel(r.thesisStatus)}`
-          : "已复盘"}
-        {typeof r?.confidence === "number" ? ` · 置信 ${(r.confidence * 100).toFixed(0)}%` : ""}
-      </span>
-    </button>
-  );
-}
-
-function reviewStatusLabel(status: string): string {
-  switch (status) {
-    case "validated":
-      return "✅ 验证";
-    case "invalidated":
-      return "❌ 证伪";
-    case "watching":
-      return "👀 观察";
-    case "inconclusive":
-      return "❓ 证据不足";
-    default:
-      return status;
-  }
-}
-
-function briefingTitle(briefing: ChatMessage): string {
-  const data = briefing.contentJson?.briefing;
-  // 1) Agent 在 JSON 里给的 headline（新版本）
-  if (data?.headline && data.headline.trim().length > 0) {
-    return data.headline.slice(0, 24);
-  }
-  // 2) 第一个 signal 主题
-  if (data?.signals?.[0]?.theme) return data.signals[0].theme.slice(0, 24);
-  // 3) 第一个 trade call 标的
-  if (data?.tradeCalls?.[0]?.name) return data.tradeCalls[0].name.slice(0, 24);
-  // 4) 旧 briefing 没有结构化字段：直接给个通用标题，不再去 markdown 里碰运气
-  return "Agent 简报";
-}
-
-// ---------- Briefing modal ----------
-
-function BriefingModal({
-  briefing,
-  fetchArticle,
-  onClose,
-}: {
-  briefing: ChatMessage;
-  fetchArticle: (item: NewsItem) => Promise<ArticleContent | null>;
-  onClose: () => void;
-}) {
-  const [selectedNewsId, setSelectedNewsId] = useState<string | null>(null);
-  const [article, setArticle] = useState<ArticleContent | null>(null);
-  const [loadingArticle, setLoadingArticle] = useState(false);
-  const [coveredNews, setCoveredNews] = useState<NewsItem[]>([]);
-  const [loadingNews, setLoadingNews] = useState(false);
-  const [newsError, setNewsError] = useState<string | null>(null);
-
-  // 按 sourceNewsIds 直接从 DB 查——避免依赖 items state（它只缓存最近 300 条，旧 briefing 的资讯查不到）
-  useEffect(() => {
-    const ids = briefing.sourceNewsIds ?? [];
-    if (ids.length === 0) {
-      setCoveredNews([]);
-      setNewsError(null);
-      return;
-    }
-    setLoadingNews(true);
-    setNewsError(null);
-    let cancelled = false;
-    // SQLite 默认参数上限 999；按 500 一批分块以兜底超大 briefing
-    const chunks: string[][] = [];
-    for (let i = 0; i < ids.length; i += 500) {
-      chunks.push(ids.slice(i, i + 500));
-    }
-    Promise.all(
-      chunks.map((chunk) => invoke<NewsItem[]>("get_news_items_by_ids", { ids: chunk })),
-    )
-      .then((batches) => {
-        if (cancelled) return;
-        setCoveredNews(batches.flat());
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setCoveredNews([]);
-        setNewsError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingNews(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [briefing.sourceNewsIds]);
-
-  const selectedNews = useMemo(
-    () => coveredNews.find((item) => item.id === selectedNewsId) ?? null,
-    [coveredNews, selectedNewsId],
-  );
-
-  // Esc 关闭
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  // 选中资讯后取正文
-  useEffect(() => {
-    if (!selectedNews) {
-      setArticle(null);
-      return;
-    }
-    setLoadingArticle(true);
-    let cancelled = false;
-    fetchArticle(selectedNews)
-      .then((result) => {
-        if (!cancelled) setArticle(result);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingArticle(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [selectedNews, fetchArticle]);
-
-  return createPortal(
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="briefing-modal" onClick={(event) => event.stopPropagation()}>
-        <header className="briefing-modal-head">
-          <div>
-            <strong>简报详情</strong>
-            <time>{formatDate(briefing.createdAt)}</time>
-          </div>
-          <button className="modal-close" type="button" onClick={onClose} aria-label="关闭">
-            <X size={16} />
-          </button>
-        </header>
-        <div className="briefing-modal-body">
-          <div className="briefing-modal-content">
-            <MarkdownText content={briefing.contentMd} />
-            <MemoryChips message={briefing} />
-          </div>
-          <aside className="briefing-modal-side">
-            {selectedNews ? (
-              <NewsDetailView
-                news={selectedNews}
-                article={article}
-                loading={loadingArticle}
-                onBack={() => setSelectedNewsId(null)}
-              />
-            ) : (
-              <NewsListView
-                covered={coveredNews}
-                loading={loadingNews}
-                error={newsError}
-                onSelect={(id) => setSelectedNewsId(id)}
-              />
-            )}
-          </aside>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-// ---------- Review modal ----------
-
-function ReviewModal({
-  review,
-  onClose,
-}: {
-  review: ChatMessage;
-  onClose: () => void;
-}) {
-  // Esc 关闭
-  useEffect(() => {
-    function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") onClose();
-    }
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const r = review.contentJson?.review;
-  return createPortal(
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="briefing-modal review-modal" onClick={(event) => event.stopPropagation()}>
-        <header className="briefing-modal-head">
-          <div>
-            <strong>复盘详情</strong>
-            <time>{formatDate(review.createdAt)}</time>
-          </div>
-          <button className="modal-close" type="button" onClick={onClose} aria-label="关闭">
-            <X size={16} />
-          </button>
-        </header>
-        <div className="briefing-modal-body review-modal-body">
-          <div className="briefing-modal-content">
-            {r && (
-              <div className="review-modal-meta">
-                <span className={`review-status-pill review-status-${r.thesisStatus}`}>
-                  {reviewStatusLabel(r.thesisStatus)}
-                </span>
-                {typeof r.confidence === "number" && (
-                  <span className="review-confidence">置信 {(r.confidence * 100).toFixed(0)}%</span>
-                )}
-                {r.nextReviewAt && (
-                  <span className="review-next">下次复盘：{formatDate(r.nextReviewAt)}</span>
-                )}
-              </div>
-            )}
-            <MarkdownText content={review.contentMd} />
-            {r?.evidence && r.evidence.length > 0 && (
-              <ReviewSection title="证据" items={r.evidence} />
-            )}
-            {r?.priceAction && r.priceAction.length > 0 && (
-              <ReviewSection title="价格行为" items={r.priceAction} />
-            )}
-            {r?.newsFollowUp && r.newsFollowUp.length > 0 && (
-              <ReviewSection title="后续消息面" items={r.newsFollowUp} />
-            )}
-            {r?.checklistReview && r.checklistReview.length > 0 && (
-              <ReviewSection title="验证清单复查" items={r.checklistReview} />
-            )}
-            {r?.mistakes && r.mistakes.length > 0 && (
-              <ReviewSection title="偏差识别" items={r.mistakes} />
-            )}
-            {r?.nextActions && r.nextActions.length > 0 && (
-              <ReviewSection title="后续动作" items={r.nextActions} />
-            )}
-            {r?.learningUpdate && (
-              <div className="review-section">
-                <strong>学习沉淀</strong>
-                <p>{r.learningUpdate}</p>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>,
-    document.body,
-  );
-}
-
-function ReviewSection({ title, items }: { title: string; items: string[] }) {
-  return (
-    <div className="review-section">
-      <strong>{title}</strong>
-      <ul>
-        {items.map((item, index) => (
-          <li key={index}>{item}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-function NewsListView({
-  covered,
-  loading,
-  error,
-  onSelect,
-}: {
-  covered: NewsItem[];
-  loading: boolean;
-  error: string | null;
-  onSelect: (id: string) => void;
-}) {
-  return (
-    <>
-      <div className="modal-side-head">
-        <strong>本简报覆盖的资讯</strong>
-        <span>{loading ? "加载中…" : error ? "加载失败" : `${covered.length} 条`}</span>
-      </div>
-      <div className="modal-side-list">
-        {loading ? (
-          <div className="modal-news-loading">
-            <Loader2 className="spin" size={14} /> 正在拉取资讯…
-          </div>
-        ) : error ? (
-          <p className="muted">资讯加载失败：{error}</p>
-        ) : covered.length === 0 ? (
-          <p className="muted">该简报没有挂载资讯（可能是 Agent 总结性发布）。</p>
-        ) : (
-          covered.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className="modal-news-row"
-              onClick={() => onSelect(item.id)}
-            >
-              <div className="modal-news-meta">
-                <span>{cleanSourceLabel(item.source)}</span>
-                <time>{formatDate(item.published)}</time>
-              </div>
-              <strong>{item.title}</strong>
-              {item.summary && <p>{item.summary.slice(0, 120)}</p>}
-            </button>
-          ))
-        )}
-      </div>
-    </>
-  );
-}
-
-function NewsDetailView({
-  news,
-  article,
-  loading,
-  onBack,
-}: {
-  news: NewsItem;
-  article: ArticleContent | null;
-  loading: boolean;
-  onBack: () => void;
-}) {
-  const body = article?.paragraphs.filter(Boolean).join("\n") ?? news.summary ?? "";
-  return (
-    <>
-      <div className="modal-side-head">
-        <button className="modal-back" type="button" onClick={onBack}>
-          ← 返回列表
-        </button>
-        {news.link && (
-          <button
-            type="button"
-            className="modal-external"
-            onClick={() => void invoke("open_external_url", { url: news.link! }).catch(() => undefined)}
-            title="在浏览器打开原文"
-          >
-            <ExternalLink size={13} />
-          </button>
-        )}
-      </div>
-      <div className="modal-news-detail">
-        <h4>{news.title}</h4>
-        <div className="modal-news-detail-meta">
-          <span>{cleanSourceLabel(news.source)}</span>
-          {news.published && <time>{formatDate(news.published)}</time>}
-        </div>
-        {loading ? (
-          <div className="modal-news-loading">
-            <Loader2 className="spin" size={14} /> 正在抓取原文…
-          </div>
-        ) : body ? (
-          <p>{body}</p>
-        ) : (
-          <p className="muted">未能抓取到正文，可点右上角图标在浏览器打开。</p>
-        )}
-      </div>
-    </>
-  );
-}
-
-function cleanSourceLabel(source: string) {
-  return source.replace(/^RSS\s*备用[：:]\s*/, "").trim() || source;
-}
-
-// ---------- 消息内的图片附件 ----------
-//
-// chat_message.contentJson.images 存的是后端落盘后的绝对路径（在 app_data_dir/chat-images/）。
-// 用 Tauri 的 convertFileSrc 把绝对路径转成 webview 能加载的 asset:// URL；
-// CSP 已经允许 img-src 'self' asset: ...，tauri.conf.json assetProtocol.scope 限制只能读 chat-images/。
-//
-// 点缩略图打开 lightbox 看大图——chat 流里图都是缩略，原图在 modal 里看。
 
 function MessageImages({ images }: { images?: string[] }) {
   const [openIdx, setOpenIdx] = useState<number | null>(null);

@@ -14,6 +14,7 @@ pub mod cache;
 pub mod core_indexes;
 pub mod eastmoney;
 pub mod realtime;
+pub mod repository;
 pub mod scanner;
 pub mod snapshot;
 pub mod tdx;

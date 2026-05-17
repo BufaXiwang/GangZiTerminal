@@ -14,7 +14,6 @@
 //! commission / stamp_tax 用规则函数估算（不知道当时实际收的多少，按 0.025%/0.1% 算）。
 //! 这是合理近似——legacy 数据本来就没记费用，估算让 cash 派生数字稳定。
 
-use crate::db;
 use crate::domain::account::rules::{commission, stamp_tax};
 use crate::domain::account::types::{
     CloseReason, EventSource, PositionEvent, PositionEventKind, PositionId,
@@ -30,7 +29,7 @@ use super::repository::{occurred_at_to_rfc3339, parse_rfc3339};
 /// 失败仅日志告警，不抛出——migration 失败也不应该阻塞启动。
 pub fn migrate_legacy_positions(app: &AppHandle) -> Result<usize, String> {
     // 1. 读 positions
-    let raw_positions = db::list_simulated_positions(app.clone())?;
+    let raw_positions = crate::infrastructure::account::repository::list_simulated_positions(app.clone())?;
     if raw_positions.is_empty() {
         return Ok(0);
     }
@@ -43,7 +42,7 @@ pub fn migrate_legacy_positions(app: &AppHandle) -> Result<usize, String> {
     }
 
     // 2. 读 events 并按 position_id 聚合
-    let raw_events = db::list_position_events_batch(app.clone(), position_ids.clone())?;
+    let raw_events = crate::infrastructure::account::repository::list_position_events_batch(app.clone(), position_ids.clone())?;
     let mut positions_with_events: HashSet<String> = HashSet::new();
     for e in &raw_events {
         if let Some(pid) = e.get("positionId").and_then(|v| v.as_str()) {
@@ -222,5 +221,5 @@ fn write_event(app: &AppHandle, event: &PositionEvent) -> Result<(), String> {
         "payload": payload,
         "agentNoteMd": event.agent_note_md,
     });
-    db::append_position_event(app.clone(), v).map(|_| ())
+    crate::infrastructure::account::repository::append_position_event(app.clone(), v).map(|_| ())
 }

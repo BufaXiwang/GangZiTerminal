@@ -10,25 +10,22 @@ import type { NewsItem } from "../types";
  * 数据生命周期完全由后端 Tokio scheduler 驱动（news_refresh_loop）：
  * - 启动 2s 后首次拉取
  * - 之后按 refreshInterval 周期性拉取
- * - 每次拉完 emit `news-refreshed { fetchedCount, pendingCount }`
+ * - 每次拉完 emit `news-refreshed { fetchedCount, failedCount }`
  *
  * 前端只剩两件事：
- * 1. 监听事件后调 list_news_items + count_pending_news 把 UI state 同步上
+ * 1. 监听事件后调 list_news_items 把 UI state 同步上
  * 2. 用户点"刷新资讯"时 invoke run_news_refresh
  */
 export function useNewsRefresh() {
   const [items, setItems] = useState<NewsItem[]>([]);
-  const [pendingNewsCount, setPendingNewsCount] = useState(0);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
 
   const reloadFromDb = useCallback(async () => {
-    const [refreshed, pending] = await Promise.all([
-      invoke<NewsItem[]>("list_news_items", { limit: 300 }).catch(() => []),
-      invoke<number>("count_pending_news").catch(() => 0),
-    ]);
+    const refreshed = await invoke<NewsItem[]>("list_news_items", { limit: 300 }).catch(
+      () => [] as NewsItem[],
+    );
     setItems(refreshed);
-    setPendingNewsCount(pending);
     setLastUpdated(new Date().toISOString());
   }, []);
 
@@ -66,8 +63,6 @@ export function useNewsRefresh() {
   return {
     items,
     setItems,
-    pendingNewsCount,
-    setPendingNewsCount,
     isRefreshing,
     lastUpdated,
     refreshFeeds,

@@ -13,7 +13,7 @@ use crate::domain::shared::{Lots, StockCode, TradeDate, Yuan};
 use serde_json::json;
 use tauri::AppHandle;
 
-/// 一条基金档案——映射 db::FundRow。
+/// 一条基金档案——映射 crate::infrastructure::quotes::repository::FundRow。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FundBasic {
     pub ts_code: String,

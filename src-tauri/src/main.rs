@@ -1,22 +1,7 @@
 mod adapters; // Tauri commands 边界
-mod agent;
-mod agent_io;
-mod article;
-mod chat_attachments;
-mod db;
-mod domain; // 新 DDD 层（Phase 1+ 起逐步填充）
-mod infrastructure; // 新 I/O 适配层
-mod learning;
-mod logging;
-mod memory;
-mod models;
-mod news;
-mod pipeline;
-mod prompt;
-mod risk;
-mod scheduler;
-mod security;
-mod trade;
+mod domain; // DDD domain 层（types + 业务规则）
+mod infrastructure; // I/O 适配 + cross-cutting infra
+mod pipeline; // application 用例编排 + 顶级 chat / scheduler 等
 
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
@@ -25,9 +10,6 @@ fn open_external_url(url: String) -> Result<(), String> {
     }
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|err| err.to_string())
 }
-
-// 旧的 codex MCP 注册逻辑已删除——现在 agent 直连 Anthropic-compatible provider。
-// 旧 mcp-status/session-id KV 由 db::migrate 清理，前端不再读取。
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -38,7 +20,7 @@ pub fn run() {
             // 初始化结构化日志——写到 app data dir 下 gangzi-terminal.log，按天滚。
             // 在 recover/spawn_all 之前调用，让那些动作就能落到日志里。
             // _guard 保留为静态生命周期，否则日志线程立刻 drop 写不出去。
-            let log_guard = logging::init(&handle);
+            let log_guard = infrastructure::logging::init(&handle);
             std::mem::forget(log_guard); // 进程结束才清，简单粗暴
 
             // 代理池：从 KV 恢复用户在 Settings 配的 proxy list
@@ -52,17 +34,8 @@ pub fn run() {
                 tracing::warn!(error = %e, "legacy positions migration 失败（跳过，不阻塞启动）");
             }
 
-            // 把上次 briefing 中途崩溃留下的 processing 资讯放回 pending
-            match db::recover_stale_processing_news(&handle) {
-                Ok(count) if count > 0 => {
-                    tracing::info!(count, "recovered stale 'processing' news on startup");
-                }
-                Ok(_) => {}
-                Err(err) => tracing::warn!(error = %err, "recover_stale_processing_news 失败"),
-            }
-            // Tokio 任务：4 个 scheduler loop（briefing 扫描 / review 扫描 /
-            // 行情自动刷新 / 资讯自动刷新）。前端的 useEffect 计时器全部移除。
-            scheduler::spawn_all(app.handle().clone());
+            // Tokio 任务：scheduler 启动后台 loop（news / market / account / kline warm）
+            pipeline::scheduler::spawn_all(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。
@@ -71,15 +44,12 @@ pub fn run() {
         // 把这些从 IPC 拿掉之后，"后端 pipeline 是唯一业务写入口"就从约定变成边界。
         .invoke_handler(tauri::generate_handler![
             // 应用初始化 / 用户 UI 设置
-            db::initialize_database,
-            db::load_app_state,
-            db::save_app_state,
+            adapters::app_state_commands::initialize_database,
+            adapters::app_state_commands::load_app_state,
+            adapters::app_state_commands::save_app_state,
             // 流水线触发（用户点击 / 计划任务）
-            pipeline::briefing::run_briefing_now,
-            pipeline::review::run_review_now,
             pipeline::chat::send_chat_message_now,
-            pipeline::refresh::run_news_refresh,
-            // run_quote_refresh 已删——前端读取 MARKET_SNAPSHOT，刷新由 scheduler 驱动
+            adapters::news_commands::run_news_refresh,
             // 模拟账户 IPC（adapters/account_commands.rs）
             adapters::account_commands::get_account_snapshot,
             adapters::account_commands::list_positions,
@@ -91,16 +61,14 @@ pub fn run() {
             adapters::account_commands::get_default_watchlist,
             adapters::account_commands::reset_simulation_account,
             // 只读 list/get/count——前端 refetch 时用
-            db::count_pending_news,
-            db::get_news_items_by_ids,
-            db::list_chat_messages,
-            db::list_news_items,
-            db::list_analysis_records,
-            db::list_simulated_positions,
-            db::list_position_events_batch,
-            db::search_chat_messages,
+            infrastructure::news::repository::get_news_items_by_ids,
+            infrastructure::agent::repository::list_chat_messages,
+            infrastructure::news::repository::list_news_items,
+            infrastructure::account::repository::list_simulated_positions,
+            infrastructure::account::repository::list_position_events_batch,
+            infrastructure::agent::repository::search_chat_messages,
             // UI 直接渲染的辅助命令
-            article::fetch_article_content, // hover 看资讯原文
+            adapters::news_commands::fetch_article_content, // hover 看资讯原文
             adapters::quotes_commands::fetch_a_share_klines, // 日/周/月 K（TuShare）
             adapters::quotes_commands::fetch_a_share_minutes, // 分时（EM trends2）
             adapters::quotes_commands::fetch_minute_klines, // 分钟 K（1/5/15/30/60m, EM klines）
@@ -126,10 +94,12 @@ pub fn run() {
             // TuShare 能力探测（dev / 一次性）
             infrastructure::quotes::tushare::probe::probe_tushare_capabilities,
             open_external_url, // 打开浏览器
+            // 数据源配置（SettingsPage → 数据源）
+            pipeline::stocks::save_tushare_token,
             // Agent provider 配置（SettingsPage → AI 配置）
-            agent::config::get_agent_config,
-            agent::config::set_agent_config,
-            agent::config::verify_provider_model,
+            adapters::agent_commands::get_agent_config,
+            adapters::agent_commands::set_agent_config,
+            adapters::agent_commands::verify_provider_model,
             // 实时报价代理池 + 三源健康度（SettingsPage → 网络 tab）
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,

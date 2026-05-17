@@ -4,6 +4,9 @@
 //! 内部用 domain 类型，输出转 frontend-friendly JSON（DTO）。
 
 pub mod account_commands;
+pub mod agent_commands;
+pub mod app_state_commands;
 pub mod market_commands;
+pub mod news_commands;
 pub mod proxy_commands;
 pub mod quotes_commands;

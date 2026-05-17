@@ -13,7 +13,6 @@
 //! 与 `market_quote_loop`（active_set，15s）并行运行——
 //! universe 给"全市场新鲜度"兜底，active_set 给"我关心的票"高频。
 
-use crate::db;
 use crate::domain::quotes::StockQuote;
 use crate::domain::shared::{Lots, OccurredAt, StockCode, Yuan};
 use crate::infrastructure::quotes::realtime::dispatch;
@@ -214,7 +213,7 @@ fn map_tdx_quotes(
 // ============================================================================
 
 fn list_stock_ts_codes(app: &AppHandle) -> Vec<String> {
-    db::list_stocks(app)
+    crate::infrastructure::quotes::repository::list_stocks(app)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|r| {
@@ -230,7 +229,7 @@ fn list_stock_ts_codes(app: &AppHandle) -> Vec<String> {
 }
 
 fn list_index_ts_codes(app: &AppHandle) -> Vec<String> {
-    db::list_indexes(app)
+    crate::infrastructure::quotes::repository::list_indexes(app)
         .unwrap_or_default()
         .into_iter()
         .map(|r| r.ts_code)
@@ -238,7 +237,7 @@ fn list_index_ts_codes(app: &AppHandle) -> Vec<String> {
 }
 
 fn list_fund_ts_codes(app: &AppHandle) -> Vec<String> {
-    db::list_listed_funds(app)
+    crate::infrastructure::quotes::repository::list_listed_funds(app)
         .unwrap_or_default()
         .into_iter()
         .map(|r| r.ts_code)

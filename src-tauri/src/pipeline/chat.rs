@@ -12,17 +12,15 @@
 //! Memory 更新由 agent 通过 update_memory / remove_memory 工具自己写——
 //! pipeline 不再 parse JSON。
 
-use crate::agent::config::{build_provider_for_channel, read_agent_config, ProviderKind};
-use crate::agent::observer;
-use crate::agent::tools::{build_chat_registry, ToolContext};
-use crate::agent::types::{
+use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config, ProviderKind};
+use crate::pipeline::agent::observer;
+use crate::infrastructure::agent::tools::{build_chat_registry, ToolContext};
+use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
     ServerSideTool, StopReason, SystemBlock, ToolDef,
 };
-use crate::agent::{run_agent, SummarizeOptions};
-use crate::db;
+use crate::pipeline::agent::{run_agent, SummarizeOptions};
 use crate::infrastructure::account::watchlist;
-use crate::learning::build_learning_profile;
 use crate::pipeline::history::{
     build_assistant_content_json, build_compact_boundary_row, build_user_content_json,
     read_recent_chat_thread,
@@ -30,9 +28,8 @@ use crate::pipeline::history::{
 use crate::pipeline::{
     collect_relevant_codes, emit_status, fetch_market_overview, fetch_quotes_with_visibility,
     new_id, now_iso, read_investor_memory, read_position_events_for_open, read_positions,
-    read_recent_briefings, read_recent_records, SIMULATION_INITIAL_CASH,
 };
-use crate::prompt::{
+use crate::pipeline::agent::prompt::{
     build_chat_dynamic_context, build_chat_system_context, ChatDynamicContextInput,
     ChatSystemContextInput, AGENT_IDENTITY, CHAT_SYSTEM_INSTRUCTIONS,
 };
@@ -87,7 +84,7 @@ pub async fn send_chat_message_now(
     let image_paths = if image_data_urls.is_empty() {
         Vec::new()
     } else {
-        crate::chat_attachments::save_data_urls(&app, &image_data_urls)
+        crate::pipeline::chat_attachments::save_data_urls(&app, &image_data_urls)
     };
 
     // 1. 构造本轮 user message 的结构化 blocks（文本 + 可选图片），并落库。
@@ -124,7 +121,7 @@ pub async fn send_chat_message_now(
         "sourceNewsIds": null,
         "sourceRecordId": null,
     });
-    db::append_chat_message(app.clone(), user_msg).map_err(|e| format!("写 user 消息失败：{e}"))?;
+    crate::infrastructure::agent::repository::append_chat_message(app.clone(), user_msg).map_err(|e| format!("写 user 消息失败：{e}"))?;
 
     // 2. 读上下文。
     //    - history（结构化）：DB 里最近的真实对话，若有 compact_boundary 会优先吃边界后的全部
@@ -138,7 +135,6 @@ pub async fn send_chat_message_now(
     // exclude 掉本轮刚刚写入的 user_message_id，否则当前提问会在 messages 里出现两次。
     let (history_messages, boundary_summary) =
         read_recent_chat_thread(&app, Some(&user_message_id));
-    let recent_briefings = read_recent_briefings(&app, 3);
     let memory = read_investor_memory(&app);
     let positions = read_positions(&app).unwrap_or_default();
     let position_events = read_position_events_for_open(&app, &positions);
@@ -146,14 +142,10 @@ pub async fn send_chat_message_now(
     let codes = collect_relevant_codes(&watchlist, &positions);
     let quotes_status = fetch_quotes_with_visibility(&app, "chat", codes).await;
     let quotes_availability = quotes_status.to_prompt_section();
-    let quotes = &quotes_status.quotes;
     let market = fetch_market_overview(&app).await;
-    let records = read_recent_records(&app, 50).unwrap_or_default();
-    let learning = build_learning_profile(&records, &positions, quotes, SIMULATION_INITIAL_CASH);
 
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
-        recent_briefings: &recent_briefings,
         market_overview: market.as_ref(),
         simulated_positions: &positions,
         position_events: &position_events,
@@ -161,7 +153,6 @@ pub async fn send_chat_message_now(
     });
     let static_system_context = build_chat_system_context(&ChatSystemContextInput {
         investor_memory: Some(&memory),
-        learning_profile: Some(&learning),
     });
 
     // messages 拼装顺序（旧 → 新）：
@@ -391,7 +382,7 @@ pub async fn send_chat_message_now(
                 "contentJson": null,
                 "sourceTaskId": null, "sourceNewsIds": null, "sourceRecordId": null,
             });
-            let _ = db::append_chat_message(app.clone(), sys);
+            let _ = crate::infrastructure::agent::repository::append_chat_message(app.clone(), sys);
             return Err(err_msg);
         }
     };
@@ -452,7 +443,7 @@ pub async fn send_chat_message_now(
         "sourceNewsIds": null,
         "sourceRecordId": null,
     });
-    db::append_chat_message(app.clone(), assistant_msg)
+    crate::infrastructure::agent::repository::append_chat_message(app.clone(), assistant_msg)
         .map_err(|e| format!("写 assistant 消息失败：{e}"))?;
 
     // 若本 run 触发过 Summarize tier 且摘要成功，落一行 compact_boundary——
@@ -480,7 +471,7 @@ pub async fn send_chat_message_now(
                 map.insert("sourceNewsIds".into(), Value::Null);
                 map.insert("sourceRecordId".into(), Value::Null);
             }
-            if let Err(e) = db::append_chat_message(app.clone(), row) {
+            if let Err(e) = crate::infrastructure::agent::repository::append_chat_message(app.clone(), row) {
                 tracing::warn!(error = %e, "落 compact_boundary 行失败——下次 chat 加载会回到 N 条 history");
             }
         }

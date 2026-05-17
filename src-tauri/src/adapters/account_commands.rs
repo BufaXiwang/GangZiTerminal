@@ -71,7 +71,7 @@ pub fn list_watchlist() -> Vec<String> {
 /// 带元信息的自选股——前端"历史行情"列表展示用。
 #[tauri::command]
 pub fn list_watchlist_with_info(app: AppHandle) -> Vec<WatchlistEntry> {
-    let stock_map: HashMap<String, (String, String)> = crate::db::list_stocks(&app)
+    let stock_map: HashMap<String, (String, String)> = crate::infrastructure::quotes::repository::list_stocks(&app)
         .unwrap_or_default()
         .into_iter()
         .filter_map(|row| {

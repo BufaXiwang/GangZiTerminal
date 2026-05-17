@@ -8,4 +8,10 @@
 //! 不被 domain 层 use——通过 trait / function call 注入。
 
 pub mod account;
+pub mod agent;
+pub mod app_state;
+pub mod db;
+pub mod logging;
+pub mod news;
 pub mod quotes;
+pub mod security;

@@ -46,7 +46,7 @@ fn collect_warm_targets(app: &AppHandle) -> Vec<String> {
     let mut targets = Vec::with_capacity(codes.len());
     let mut unresolved = 0usize;
     for code in codes {
-        match crate::db::resolve_stock_ts_code(app, &code) {
+        match crate::infrastructure::quotes::repository::resolve_stock_ts_code(app, &code) {
             Some(ts) => targets.push(ts),
             None => unresolved += 1,
         }

@@ -7,9 +7,9 @@
 //! - f15 高 / f16 低 / f17 开 / f18 昨收
 //! - f124 行情时间戳（秒级，× 1000 转毫秒）
 //!
-//! 五档（f19-f40 / f29-f30 / f191-f192）已删——
-//! 实战 EM 对长 URL + 含五档请求触发 Empty reply 频率明显高于精简字段，
-//! 五档需求由 account 模块（持仓平仓）或前端详情视图按需 lazy 拉。
+//! 不带五档（f19-f40 / f29-f30 / f191-f192）——EM 对长 URL + 含五档请求触发
+//! Empty reply 频率明显高于精简字段；五档需求由 account 模块（持仓平仓）或
+//! 前端详情视图按需 lazy 拉。
 
 use super::client::{fetch_text, fetch_text_with, parse_em_response};
 use crate::domain::quotes::{QuotesError, StockQuote};

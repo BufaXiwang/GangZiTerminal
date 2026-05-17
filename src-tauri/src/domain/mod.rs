@@ -11,5 +11,7 @@
 //! domain 之外实现，通过 trait 在 domain 内定义契约。
 
 pub mod account;
+pub mod agent;
+pub mod news;
 pub mod quotes;
 pub mod shared;

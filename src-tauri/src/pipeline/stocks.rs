@@ -9,7 +9,7 @@
 //! - 每天 08:30 北京时间 → 盘前预热拉一次（覆盖前一晚的新股 / 改名 / 摘牌）。
 //! - 失败仅日志告警，不影响其它流水线。
 
-use crate::db::{self, StockRow};
+use crate::infrastructure::quotes::repository::StockRow;
 use crate::domain::shared::StockCode;
 use crate::infrastructure::quotes::eastmoney::realtime as em_realtime;
 use crate::infrastructure::quotes::tushare::stock as ts_stock;
@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter};
 
 /// 全市场股票档案的查询结果——code / name / sector / market。
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // agent 工具 Step B 用 name/sector/market 做 prompt 展示与缓存键
 pub struct StockRef {
     pub code: String,
     pub name: String,
@@ -56,7 +57,7 @@ pub async fn refresh_now(app: &AppHandle) -> Result<usize, String> {
             market: s.market,
         })
         .collect();
-    db::upsert_stocks(app.clone(), rows)
+    crate::infrastructure::quotes::repository::upsert_stocks(app.clone(), rows)
 }
 
 /// 拉指数档案（SSE / SZSE / CSI 合并）写入 `indexes` 表。
@@ -67,9 +68,9 @@ pub async fn refresh_indexes(app: &AppHandle) -> Result<usize, String> {
     let payload = crate::infrastructure::quotes::tushare::index::fetch_all_common_indexes(app)
         .await
         .map_err(|e| e.to_string())?;
-    let rows: Vec<db::IndexRow> = payload
+    let rows: Vec<crate::infrastructure::quotes::repository::IndexRow> = payload
         .into_iter()
-        .map(|b| db::IndexRow {
+        .map(|b| crate::infrastructure::quotes::repository::IndexRow {
             ts_code: b.ts_code,
             code: b.code,
             name: b.name,
@@ -78,7 +79,7 @@ pub async fn refresh_indexes(app: &AppHandle) -> Result<usize, String> {
             category: b.category,
         })
         .collect();
-    db::upsert_indexes(app.clone(), rows)
+    crate::infrastructure::quotes::repository::upsert_indexes(app.clone(), rows)
 }
 
 /// 拉场内基金档案（ETF / LOF / 封基）写入 `funds` 表。
@@ -86,9 +87,9 @@ pub async fn refresh_funds(app: &AppHandle) -> Result<usize, String> {
     let payload = crate::infrastructure::quotes::tushare::fund::fetch_listed_funds(app)
         .await
         .map_err(|e| e.to_string())?;
-    let rows: Vec<db::FundRow> = payload
+    let rows: Vec<crate::infrastructure::quotes::repository::FundRow> = payload
         .into_iter()
-        .map(|b| db::FundRow {
+        .map(|b| crate::infrastructure::quotes::repository::FundRow {
             ts_code: b.ts_code,
             code: b.code,
             name: b.name,
@@ -99,7 +100,7 @@ pub async fn refresh_funds(app: &AppHandle) -> Result<usize, String> {
             status: b.status,
         })
         .collect();
-    db::upsert_funds(app.clone(), rows)
+    crate::infrastructure::quotes::repository::upsert_funds(app.clone(), rows)
 }
 
 /// 全市场档案三件套刷新——stocks + indexes + funds。
@@ -150,6 +151,39 @@ pub async fn refresh_universe(app: &AppHandle) -> (usize, usize, usize) {
     (stocks, indexes, funds)
 }
 
+/// 保存 TuShare token + 立刻拉一次全市场档案。
+///
+/// 走这条命令而不是通用的 `save_app_state` 是因为：scheduler 里的几个 loop
+/// 只在 backend 启动后短窗口内做冷启动检查（stocks_refresh_loop 启动+3s、
+/// tushare_probe_once 启动+20s）。用户在 Settings 里填完 token 时这些窗口早
+/// 过了，下一次刷新要等北京 08:30——所以需要在保存 token 的当下主动 spawn
+/// 一次 refresh_universe，让 stocks/indexes/funds 三表立刻填上。
+///
+/// 同时删 probe-done flag，让下次 backend 重启时能重新跑一遍 TuShare 能力探测
+/// （旧 flag 是用旧 token 跑的，结果不可信）。
+#[tauri::command]
+pub async fn save_tushare_token(app: AppHandle, token: String) -> Result<(), String> {
+    let trimmed = token.trim().to_string();
+    crate::infrastructure::app_state::save_app_state_value(
+        &app,
+        "gangzi-terminal.tushare-token", // 与 infrastructure/quotes/tushare/client.rs KEY_TUSHARE_TOKEN 一致
+        &serde_json::Value::String(trimmed.clone()),
+    )?;
+    // 老 probe 结果用的是旧 token —— 删 flag 让下次 backend 启动时重新探测
+    crate::infrastructure::app_state::delete_app_state_value(&app, "gangzi-terminal.tushare-probe-done")?;
+
+    // token 为空（用户清空）→ 不 spawn refresh，避免对空 token 跑 68 个失败请求
+    if !trimmed.is_empty() {
+        let app_for_spawn = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tracing::info!("token 已更新，立刻拉一次全市场档案");
+            let (s, i, f) = refresh_universe(&app_for_spawn).await;
+            tracing::info!(stocks = s, indexes = i, funds = f, "token 更新后档案刷新完成");
+        });
+    }
+    Ok(())
+}
+
 /// 个股交易所前缀推断：6 沪市、4/8/92 北交所、其它深市。
 /// 个股语义——000001 = 平安银行 (sz)，不是上证指数。
 fn market_prefix(code: &str) -> &'static str {
@@ -180,13 +214,13 @@ pub async fn resolve_stock(app: &AppHandle, identifier: &str) -> Result<StockRef
     }
     // 6 位纯数字 → 先查本地档案，未命中时回退到实时报价探测
     if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
-        if let Some(row) = db::find_stock_by_code(app, trimmed)? {
+        if let Some(row) = crate::infrastructure::quotes::repository::find_stock_by_code(app, trimmed)? {
             return Ok(row.into());
         }
         return resolve_by_quote_probe(trimmed).await;
     }
     // 名字模糊（仍需本地 stocks 表——名字→代码的反向映射 ulist.np 给不了）
-    let matches = db::find_stocks_by_name(app, trimmed, 6)?;
+    let matches = crate::infrastructure::quotes::repository::find_stocks_by_name(app, trimmed, 6)?;
     if matches.is_empty() {
         return Err(format!(
             "找不到与 '{identifier}' 匹配的 A 股股票（请用 6 位代码或更完整的名字；本地清单可能未刷新）"

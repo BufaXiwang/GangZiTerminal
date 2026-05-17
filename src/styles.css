@@ -2840,18 +2840,35 @@ a {
 }
 
 .today-stock-row {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 72px 68px;
+  grid-template-columns: 6px minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
-  padding: 8px 10px;
+  padding: 6px 10px 6px 0;
   width: 100%;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   text-align: left;
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+/* 左侧涨跌色条——row 通过 tone-up/down/flat class 控制颜色。
+   3px 实心，纵贯 row，扫表时人眼一眼能分出涨跌的分布。 */
+.today-stock-bar {
+  width: 3px;
+  align-self: stretch;
+  margin: 4px 0;
+  border-radius: 2px;
+  background: transparent;
+}
+.today-stock-row.tone-up .today-stock-bar {
+  background: var(--chart-up);
+}
+.today-stock-row.tone-down .today-stock-bar {
+  background: var(--chart-down);
 }
 
 .today-stock-row:hover {
@@ -2865,18 +2882,28 @@ a {
 
 .today-stock-name {
   display: grid;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 
 .today-stock-name strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   color: var(--fg-strong);
-  font-size: 13.5px;
+  font-size: 14px;
   font-weight: 600;
   letter-spacing: -0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 已加入自选的小星标（filled，brand 色） */
+.today-stock-watch {
+  flex-shrink: 0;
+  color: var(--brand-strong, #c46c2f);
+  fill: currentColor;
 }
 
 /* 类别 badge——"指" / "基" 显示在 code 后面，区分指数/基金/股票 */
@@ -2919,28 +2946,47 @@ a {
 
 .today-stock-name small {
   color: var(--fg-faint);
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
+/* 价格 + 涨跌额/% 双行右对齐：上行价格、下行涨跌额 + % 并排 */
 .today-stock-price {
-  display: contents;
+  display: grid;
+  gap: 2px;
+  justify-items: end;
+  text-align: right;
+  min-width: 140px;
 }
 
-.today-stock-price span {
-  justify-self: end;
+.today-stock-price .price {
   color: var(--fg-strong);
-  font-size: 14.5px;
+  font-size: 15px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.today-stock-price .change-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
   font-variant-numeric: tabular-nums;
 }
 
 .today-stock-price em {
-  justify-self: end;
-  font-size: 12.5px;
+  font-size: 12px;
   font-style: normal;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+
+.today-stock-price em.change-abs {
+  font-size: 11.5px;
+  font-weight: 500;
+  opacity: 0.85;
 }
 
 .today-stock-price em.up {
@@ -2949,6 +2995,10 @@ a {
 
 .today-stock-price em.down {
   color: var(--chart-down);
+}
+
+.today-stock-price em.flat {
+  color: var(--fg-faint);
 }
 
 .today-stock-remove {
@@ -2971,6 +3021,48 @@ a {
 
 .today-stock-row:hover .today-stock-remove:hover {
   color: var(--chart-up);
+}
+
+/* 右键浮层菜单——加入/移除自选。固定定位、跟随鼠标，document click/ESC 关闭。 */
+.today-row-menu {
+  position: fixed;
+  z-index: 200;
+  min-width: 180px;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid var(--border, #e1d8c9);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(60, 40, 20, 0.12), 0 2px 4px rgba(60, 40, 20, 0.08);
+  font-size: 13px;
+}
+
+.today-row-menu button {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-strong);
+  text-align: left;
+  cursor: pointer;
+  transition: background 100ms ease;
+}
+
+.today-row-menu button:hover {
+  background: var(--bg-hover);
+}
+
+.today-row-menu button small {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  color: var(--fg-faint);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
 }
 
 .today-main {
@@ -4420,6 +4512,70 @@ a {
   font-size: 13px;
 }
 
+/* 持仓卡片右上角的浮动盈亏区——red/green 跟随中式涨跌色 */
+.sim-position-pnl {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sim-position-pnl strong {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.sim-position-pnl em {
+  font-style: normal;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.sim-position-pnl.tone-up,
+.sim-position-pnl.tone-up strong,
+.sim-position-pnl.tone-up em,
+.sim-position-grid strong.tone-up {
+  color: var(--chart-up);
+}
+
+.sim-position-pnl.tone-down,
+.sim-position-pnl.tone-down strong,
+.sim-position-pnl.tone-down em,
+.sim-position-grid strong.tone-down {
+  color: var(--chart-down);
+}
+
+.sim-position-pnl.tone-flat,
+.sim-position-pnl.tone-flat strong,
+.sim-position-pnl.tone-flat em,
+.sim-position-grid strong.tone-flat {
+  color: var(--fg-faint);
+}
+
+/* 卡片底部买一/卖一行——盘口快照 */
+.sim-position-orderbook {
+  display: flex;
+  gap: 16px;
+  padding-top: 6px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--border-soft);
+  font-size: 12px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.sim-position-orderbook span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.sim-position-orderbook strong {
+  font-weight: 600;
+}
+
 .sim-source strong {
   color: #17252a;
 }
@@ -5094,4 +5250,454 @@ a {
     opacity: 1;
     transform: translateY(-3px);
   }
+}
+
+/* =========================================================================
+   NewsPage — 资讯时间线（左侧 spine + dots，单列电报风格）
+   ========================================================================= */
+
+.news-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.news-update-sep {
+  color: var(--fg-faint);
+}
+
+/* 顶部 filter bar：横向日期时间线 + 来源 chips */
+.news-filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0 14px;
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 8px;
+}
+
+/* ===== 横向日期时间线 ===== */
+
+.news-date-timeline {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  flex: 1;
+}
+
+/* 横向滚动容器——日期多于视口时可左右滑动 */
+.news-date-axis {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  gap: 0;
+  padding: 8px 4px 4px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scroll-behavior: smooth;
+  scroll-snap-type: x proximity;
+  /* 左淡出 / 右淡出蒙版，提示用户可以滚动 */
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 24px,
+    #000 calc(100% - 24px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 24px,
+    #000 calc(100% - 24px),
+    transparent 100%
+  );
+}
+
+.news-date-axis::-webkit-scrollbar {
+  height: 4px;
+}
+
+.news-date-axis::-webkit-scrollbar-thumb {
+  background: var(--border-soft);
+  border-radius: 2px;
+}
+
+/* 横线贯穿所有 tick——dot 浮在线上 */
+.news-date-axis::before {
+  content: "";
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  top: 16px;
+  height: 1px;
+  background: var(--border-soft);
+  opacity: 0.7;
+}
+
+.news-date-tick {
+  position: relative;
+  display: flex;
+  flex: 1 0 44px;
+  min-width: 44px;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: color 120ms ease;
+  z-index: 1;
+  scroll-snap-align: start;
+}
+
+.news-date-tick:hover {
+  color: var(--fg-strong);
+}
+
+.news-date-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-default);
+  border: 2px solid var(--bg-card);
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.news-date-tick:hover .news-date-dot {
+  background: var(--fg-muted);
+  transform: scale(1.2);
+}
+
+/* 有数据的日期 dot 更深一档 */
+.news-date-tick:not(.empty) .news-date-dot {
+  background: var(--fg-muted);
+}
+
+.news-date-tick.empty .news-date-dot {
+  background: var(--border-default);
+  opacity: 0.5;
+}
+
+.news-date-tick.empty {
+  color: var(--fg-faint);
+}
+
+/* 选中态：dot 变 brand 色 + 放大 */
+.news-date-tick.active .news-date-dot {
+  background: var(--brand-strong);
+  transform: scale(1.4);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+
+.news-date-tick.active {
+  color: var(--brand-strong);
+}
+
+.news-date-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.news-date-tick.active .news-date-label {
+  color: var(--brand-strong);
+}
+
+.news-date-count {
+  font-size: 10.5px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.news-date-tick.active .news-date-count {
+  color: var(--brand-strong);
+  font-weight: 600;
+}
+
+.news-date-tick.empty .news-date-count {
+  opacity: 0.45;
+}
+
+.news-filter-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding-top: 4px;
+}
+
+.news-filter-label {
+  margin-right: 6px;
+  color: var(--fg-faint);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+/* slim chip：低饱和、扁、不抢眼 */
+.news-filter-bar .chip.slim {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.news-filter-bar .chip.slim:hover {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+
+.news-filter-bar .chip.slim.active {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  font-weight: 600;
+}
+
+.news-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 60px 20px;
+  color: var(--fg-faint);
+}
+
+.news-empty p {
+  margin: 0;
+  font-size: 13px;
+}
+
+/* ===== 时间线主体 ===== */
+
+.news-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.news-timeline-group {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 整组左侧的纵向 spine——比之前更浅更细 */
+.news-timeline-group::before {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 22px;
+  bottom: 6px;
+  width: 1px;
+  background: var(--border-soft);
+  opacity: 0.65;
+}
+
+.news-timeline-date {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 0 10px 0;
+  position: relative;
+}
+
+.news-timeline-date-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--brand-strong);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+
+.news-timeline-date strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  letter-spacing: 0.04em;
+}
+
+.news-timeline-date-count {
+  font-size: 11px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 单条新闻行：grid 左侧 rail（含 dot）+ 右侧内容 */
+.news-timeline-row {
+  display: grid;
+  grid-template-columns: 20px 1fr;
+  gap: 14px;
+  padding: 0 0 12px 0;
+  position: relative;
+}
+
+.news-timeline-rail {
+  display: flex;
+  justify-content: center;
+  padding-top: 7px;
+  position: relative;
+  z-index: 1;
+}
+
+.news-timeline-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--border-default);
+  transition: background 120ms ease, transform 120ms ease;
+}
+
+.news-timeline-row:hover .news-timeline-dot {
+  background: var(--brand-strong);
+  transform: scale(1.4);
+}
+
+.news-timeline-row.expanded .news-timeline-dot {
+  background: var(--brand-strong);
+  transform: scale(1.4);
+}
+
+.news-timeline-content {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.news-timeline-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 2px;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+}
+
+.news-timeline-meta time {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--fg-muted);
+}
+
+/* 来源标识——纯文字，不带背景，分隔靠 · 符号 */
+.news-source-chip {
+  position: relative;
+  padding-left: 10px;
+  color: var(--fg-faint);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.news-source-chip::before {
+  content: "·";
+  position: absolute;
+  left: 2px;
+  color: var(--fg-faint);
+}
+
+.news-external {
+  display: inline-flex;
+  color: var(--fg-faint);
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.news-timeline-row:hover .news-external {
+  opacity: 1;
+}
+
+.news-external:hover {
+  color: var(--brand-strong);
+}
+
+.news-timeline-title-btn {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: var(--fg-strong);
+}
+
+.news-timeline-title-btn strong {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  color: var(--fg-strong);
+  transition: color 120ms ease;
+}
+
+.news-timeline-title-btn:hover strong {
+  color: var(--brand-strong);
+}
+
+.news-timeline-summary {
+  margin: 4px 0 0 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--fg-muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 展开后的正文 */
+.news-timeline-article {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--bg-hover, #faf5ed);
+  border-left: 2px solid var(--brand-strong, #B85332);
+}
+
+.news-timeline-article p {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--fg-strong);
+}
+
+.news-timeline-article p:last-child {
+  margin-bottom: 0;
+}
+
+.news-article-status {
+  font-size: 12px;
+  color: var(--fg-faint);
+  font-style: italic;
+}
+
+.news-article-status.error {
+  color: var(--chart-down);
+  font-style: normal;
+}
+
+.news-article-status a {
+  color: var(--brand-strong);
+  text-decoration: underline;
 }

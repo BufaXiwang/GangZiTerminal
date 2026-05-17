@@ -6,7 +6,6 @@
 //! Token 从 `app_state[KEY_TUSHARE_TOKEN]` 读——用户在 Settings UI 配。
 //! 缺 token → `QuotesError::MissingToken`。
 
-use crate::db;
 use crate::domain::quotes::QuotesError;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -41,7 +40,7 @@ fn http_client() -> Result<&'static reqwest::Client, QuotesError> {
 // ============================================================================
 
 pub(crate) fn read_token(app: &AppHandle) -> Option<String> {
-    db::load_app_state_value(app, KEY_TUSHARE_TOKEN)
+    crate::infrastructure::app_state::load_app_state_value(app, KEY_TUSHARE_TOKEN)
         .ok()
         .flatten()
         .and_then(|v| v.as_str().map(|s| s.trim().to_string()))

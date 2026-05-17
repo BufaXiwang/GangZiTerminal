@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)] // newtype 提供完整 ctor / accessor 套件；Step B agent 工具按需用
+
 //! Domain `shared`——跨 bounded context 复用的 newtype 与 value object。
 //!
 //! 这里的类型是**纯 domain**——无 I/O、无 Tauri、无外部 crate（除 serde / chrono / thiserror）。

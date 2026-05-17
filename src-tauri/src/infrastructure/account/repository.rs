@@ -1,22 +1,24 @@
 //! Position + PositionEvent 的 SQLite 读写。
 //!
-//! 关键职责：**domain 富类型 ↔ DB 扁平行**的投射层。
-//!
-//! - 读：DB row → `domain::Position`
-//! - 写：`domain::Position` → DB row
-//!
-//! 第一版 DB schema 不动（避免 migration 风险）；后续 phase 再考虑清理冗余字段。
+//! 两层关注点：
+//! - **Raw JSON layer**（文件末尾）：`list_simulated_positions` / `commit_account_positions` /
+//!   `append_position_event` / `list_position_events_batch` —— Tauri IPC 直读形态。
+//! - **Domain layer**（PositionRepo struct）：domain 富类型 ↔ DB 扁平行的投射层。
+//!   PositionRepo 内部调 raw-JSON layer 完成 DB IO。
 
-use crate::db;
+use crate::infrastructure::db::{
+    json_string, list_json_payloads, migrate, now, open_database, required_json_string,
+};
 use crate::domain::account::errors::AccountError;
 use crate::domain::account::types::{
     CloseReason, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
     PositionSignalKind, PositionStatus,
 };
 use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
+use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,7 +85,7 @@ impl PositionRepo {
 
     /// 读所有 positions（open + closed）。
     pub fn list_all(&self) -> Result<Vec<Position>, AccountError> {
-        let raw = db::list_simulated_positions(self.app.clone()).map_err(AccountError::Io)?;
+        let raw = list_simulated_positions(self.app.clone()).map_err(AccountError::Io)?;
         let mut out = Vec::with_capacity(raw.len());
         for v in raw {
             let db_position: DbPosition = serde_json::from_value(v)
@@ -114,14 +116,14 @@ impl PositionRepo {
         positions: &[Position],
     ) -> Result<(), AccountError> {
         let rows = positions_to_db_rows(positions)?;
-        db::commit_account_positions(self.app.clone(), Some(event_to_db_json(event)), rows, false)
+        commit_account_positions(self.app.clone(), Some(event_to_db_json(event)), rows, false)
             .map_err(AccountError::Io)?;
         Ok(())
     }
 
     /// 清空账户状态 + 事件链。用于 reset 重新训练。
     pub fn clear_all(&self) -> Result<(), AccountError> {
-        db::commit_account_positions(self.app.clone(), None, Vec::new(), true)
+        commit_account_positions(self.app.clone(), None, Vec::new(), true)
             .map_err(AccountError::Io)?;
         Ok(())
     }
@@ -159,7 +161,7 @@ impl PositionRepo {
             return Ok(Vec::new());
         }
         let id_strings: Vec<String> = ids.iter().map(|id| id.as_str().to_string()).collect();
-        let raw = db::list_position_events_batch(self.app.clone(), id_strings)
+        let raw = list_position_events_batch(self.app.clone(), id_strings)
             .map_err(AccountError::Io)?;
         let mut out = Vec::with_capacity(raw.len());
         for v in raw {
@@ -689,3 +691,194 @@ mod tests {
         assert_eq!(parse_close_reason(""), CloseReason::Manual);
     }
 }
+
+// ============================================================================
+// Raw JSON layer——simulated_positions + position_events 表的 fn body
+// （Tauri IPC 直读形态；PositionRepo 内部也调这层）
+// ============================================================================
+
+#[tauri::command]
+pub fn list_simulated_positions(app: AppHandle) -> Result<Vec<Value>, String> {
+    let connection = open_database(&app)?;
+    migrate(&connection)?;
+    list_json_payloads(
+        &connection,
+        "select payload_json from simulated_positions order by created_at desc limit ?1",
+        1000,
+        "读取模拟持仓失败",
+    )
+}
+
+/// Account 写事务：可选 append 一条 position_event，并整列替换 positions。
+///
+/// `AccountService` 的写路径必须保持 event/state 原子性：不能出现 event 已写但
+/// positions 没更新，或 positions 更新但 event 缺失。reset 场景传 `clear_events=true`
+/// 清空事件链并替换为空 positions，让账户从干净初始状态重练。
+pub fn commit_account_positions(
+    app: AppHandle,
+    event: Option<Value>,
+    positions: Vec<Value>,
+    clear_events: bool,
+) -> Result<(), String> {
+    let mut connection = open_database(&app)?;
+    migrate(&connection)?;
+    let tx = connection
+        .transaction()
+        .map_err(|err| format!("提交账户事务失败：{err}"))?;
+
+    if clear_events {
+        tx.execute("delete from position_events", [])
+            .map_err(|err| format!("清空持仓事件失败：{err}"))?;
+    }
+
+    if let Some(event) = event {
+        insert_position_event_tx(&tx, &event)?;
+    }
+
+    replace_simulated_positions_tx(&tx, positions)?;
+
+    tx.commit()
+        .map_err(|err| format!("提交账户事务失败：{err}"))?;
+    Ok(())
+}
+
+fn replace_simulated_positions_tx(
+    tx: &Transaction<'_>,
+    positions: Vec<Value>,
+) -> Result<(), String> {
+    tx.execute("delete from simulated_positions", [])
+        .map_err(|err| format!("清理模拟持仓失败：{err}"))?;
+
+    let now = now();
+    for position in positions {
+        let id = required_json_string(&position, "/id", "模拟持仓缺少 id")?;
+        let code = required_json_string(&position, "/code", "模拟持仓缺少 code")?;
+        let source_analysis_id = required_json_string(
+            &position,
+            "/sourceAnalysisId",
+            "模拟持仓缺少 sourceAnalysisId",
+        )?;
+        let status = required_json_string(&position, "/status", "模拟持仓缺少 status")?;
+        let created_at = json_string(&position, "/entryAt").unwrap_or_else(|| now.clone());
+        let updated_at = json_string(&position, "/exitAt").unwrap_or_else(|| now.clone());
+        tx.execute(
+            "insert into simulated_positions
+                (id, code, source_analysis_id, status, payload_json, created_at, updated_at)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                code,
+                source_analysis_id,
+                status,
+                position.to_string(),
+                created_at,
+                updated_at
+            ],
+        )
+        .map_err(|err| format!("写入模拟持仓失败：{err}"))?;
+    }
+    Ok(())
+}
+
+fn insert_position_event_tx(tx: &Transaction<'_>, event: &Value) -> Result<(), String> {
+    let id = required_json_string(event, "/id", "持仓事件缺少 id")?;
+    let position_id = required_json_string(event, "/positionId", "持仓事件缺少 positionId")?;
+    let event_kind = required_json_string(event, "/eventKind", "持仓事件缺少 eventKind")?;
+    let occurred_at = json_string(event, "/occurredAt").unwrap_or_else(now);
+    let source_kind = json_string(event, "/sourceKind");
+    let source_ref = json_string(event, "/sourceRef");
+    let agent_note = json_string(event, "/agentNoteMd");
+
+    tx.execute(
+        "insert into position_events
+            (id, position_id, event_kind, occurred_at, source_kind, source_ref,
+             payload_json, agent_note_md, created_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            position_id,
+            event_kind,
+            occurred_at,
+            source_kind,
+            source_ref,
+            event.to_string(),
+            agent_note,
+            now()
+        ],
+    )
+    .map_err(|err| format!("写入持仓事件失败：{err}"))?;
+    Ok(())
+}
+
+
+/// 持仓事件（append-only 审计流）：opened / reviewed / adjusted / trimmed / added /
+/// stop_triggered / invalidated / closed。事件不能被修改或删除，是 Agent 复盘时
+/// 看到"这个仓位是怎么走过来的"的唯一可信来源。
+pub fn append_position_event(app: AppHandle, event: Value) -> Result<Value, String> {
+    let connection = open_database(&app)?;
+    migrate(&connection)?;
+    let id = required_json_string(&event, "/id", "持仓事件缺少 id")?;
+    let position_id = required_json_string(&event, "/positionId", "持仓事件缺少 positionId")?;
+    let event_kind = required_json_string(&event, "/eventKind", "持仓事件缺少 eventKind")?;
+    let occurred_at = json_string(&event, "/occurredAt").unwrap_or_else(now);
+    let source_kind = json_string(&event, "/sourceKind");
+    let source_ref = json_string(&event, "/sourceRef");
+    let agent_note = json_string(&event, "/agentNoteMd");
+
+    connection
+        .execute(
+            "insert into position_events
+                (id, position_id, event_kind, occurred_at, source_kind, source_ref,
+                 payload_json, agent_note_md, created_at)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                position_id,
+                event_kind,
+                occurred_at,
+                source_kind,
+                source_ref,
+                event.to_string(),
+                agent_note,
+                now()
+            ],
+        )
+        .map_err(|err| format!("写入持仓事件失败：{err}"))?;
+    Ok(event)
+}
+
+/// 一次拉多个持仓的事件，按 occurred_at 升序。前端在内存里按 positionId 分组。
+#[tauri::command]
+pub fn list_position_events_batch(
+    app: AppHandle,
+    position_ids: Vec<String>,
+) -> Result<Vec<Value>, String> {
+    if position_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let connection = open_database(&app)?;
+    migrate(&connection)?;
+    let placeholders = (0..position_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "select payload_json from position_events
+         where position_id in ({placeholders})
+         order by occurred_at asc
+         limit 2000"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|err| format!("读取批量持仓事件失败：{err}"))?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(position_ids.iter()), |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| format!("读取批量持仓事件失败：{err}"))?
+        .filter_map(|raw| raw.ok())
+        .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+        .collect();
+    Ok(rows)
+}
+

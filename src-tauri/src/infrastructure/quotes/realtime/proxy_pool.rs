@@ -186,7 +186,7 @@ pub fn pool() -> &'static ProxyPool {
 pub const KEY_PROXY_LIST: &str = "gangzi-terminal.realtime-proxies";
 
 pub fn hydrate(app: &tauri::AppHandle) {
-    if let Ok(Some(val)) = crate::db::load_app_state_value(app, KEY_PROXY_LIST) {
+    if let Ok(Some(val)) = crate::infrastructure::app_state::load_app_state_value(app, KEY_PROXY_LIST) {
         if let Some(arr) = val.as_array() {
             let urls: Vec<String> = arr
                 .iter()
@@ -204,7 +204,7 @@ pub fn persist(app: &tauri::AppHandle, urls: &[String]) -> Result<(), String> {
             .map(|s| serde_json::Value::String(s.clone()))
             .collect(),
     );
-    crate::db::save_app_state_value(app, KEY_PROXY_LIST, &val)
+    crate::infrastructure::app_state::save_app_state_value(app, KEY_PROXY_LIST, &val)
 }
 
 #[cfg(test)]

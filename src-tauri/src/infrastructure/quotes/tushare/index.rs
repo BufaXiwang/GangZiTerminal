@@ -15,7 +15,7 @@ use tauri::AppHandle;
 // index_basic——指数档案（大盘/行业/主题/风格）
 // ============================================================================
 
-/// 一条指数档案——和 db::IndexRow 一一对应，但放 domain 层避免循环依赖。
+/// 一条指数档案——和 crate::infrastructure::quotes::repository::IndexRow 一一对应，但放 domain 层避免循环依赖。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexBasic {
     pub ts_code: String,

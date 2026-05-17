@@ -15,7 +15,6 @@
 //! - 写操作流程：**校验规则 → 同事务 append event + 更新 positions → emit 事件**
 //!   事务内部事件先于状态，符合 spec § 1 "持久化先 event 后 state"
 
-use crate::db;
 use crate::domain::account::cash::reduce_events_to_cash_delta;
 use crate::domain::account::errors::{AccountError, RuleError};
 use crate::domain::account::rules::{
@@ -512,7 +511,7 @@ impl AccountService {
 
     /// 拿单股 quote——优先 MARKET_SNAPSHOT，缺则 lazy ensure 一次（走 dispatch 多源 fallback）。
     async fn fetch_quote(&self, code: &str) -> Result<StockQuote, AccountError> {
-        let ts_code = db::resolve_stock_ts_code(&self.app, code)
+        let ts_code = crate::infrastructure::quotes::repository::resolve_stock_ts_code(&self.app, code)
             .ok_or_else(|| AccountError::Io(format!("stocks 档案找不到 {code}")))?;
         if let Some(q) = market_snapshot::get(&ts_code) {
             return Ok(q);

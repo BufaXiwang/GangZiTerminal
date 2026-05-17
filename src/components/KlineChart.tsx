@@ -87,7 +87,7 @@ const DEFAULT_SUB = new Set(["VOL", "MACD"]);
 // ===== 画线工具 ============================================================
 // klinecharts v10 内置 overlay 类型。
 // 用户从下拉菜单选一个 → chart.createOverlay({ name }) → 鼠标在图上点击放置。
-// **不持久化**：切标的 / 切周期时 chart 重建，画的线丢失（Phase 2 再加 DB 持久化）。
+// **不持久化**：切标的 / 切周期时 chart 重建，画的线丢失。
 type DrawingTool = { id: string; label: string };
 
 const DRAWING_TOOLS: DrawingTool[] = [
@@ -143,8 +143,50 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
   const [subIndicators, setSubIndicators] = useState<Set<string>>(DEFAULT_SUB);
   const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false);
   const [drawingMenuOpen, setDrawingMenuOpen] = useState(false);
+  // chart 重建次数——onChartReady 触发时递增；让"画线 load/save"effect 在每次 chart
+  // 重建后重新跑。chart 实例本身在 ref 里，不能放 effect deps。
+  const [chartReadyTick, setChartReadyTick] = useState(0);
   const panelRef = useRef<HTMLElement | null>(null);
   const chartHandleRef = useRef<KChart | null>(null);
+
+  // 画线持久化——按 (tsCode, period) 一份。切标的 / 切周期时：
+  // 1. cleanup：dump 当前用户画的 overlay 写 app_state
+  // 2. setup：load 上次存的 overlay 重新 createOverlay
+  // 分时（minute）不支持画线，跳过。
+  useEffect(() => {
+    if (period === "minute") return;
+    const key = `gangzi-terminal.kline-drawings:${tsCode}:${period}`;
+    const allowedNames = new Set(DRAWING_TOOLS.map((t) => t.id));
+
+    void invoke<unknown>("load_app_state", { key }).then((stored) => {
+      const chart = chartHandleRef.current;
+      if (!chart || !Array.isArray(stored)) return;
+      for (const overlay of stored as Array<{ name?: string; points?: unknown }>) {
+        if (!overlay?.name || !allowedNames.has(overlay.name)) continue;
+        try {
+          (chart as unknown as { createOverlay: (o: unknown) => void }).createOverlay(overlay);
+        } catch {
+          // 单个 overlay 反序列化失败不阻塞其它
+        }
+      }
+    });
+
+    return () => {
+      const chart = chartHandleRef.current;
+      if (!chart) return;
+      try {
+        const getOverlays = (chart as unknown as { getOverlays?: () => unknown[] }).getOverlays;
+        if (typeof getOverlays !== "function") return;
+        const overlays = getOverlays.call(chart) ?? [];
+        const userOverlays = (overlays as Array<{ name?: string; points?: unknown }>)
+          .filter((o) => o?.name && allowedNames.has(o.name))
+          .map((o) => ({ name: o.name, points: o.points }));
+        void invoke("save_app_state", { key, value: userOverlays });
+      } catch {
+        // chart 已 dispose 等异常 —— 静默
+      }
+    };
+  }, [tsCode, period, chartReadyTick]);
 
   // 切换标的时重置数据
   useEffect(() => {
@@ -296,6 +338,11 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
     // klinecharts v10：不带参数 = 移除全部用户画的 overlay（不动 indicator）
     chart.removeOverlay();
     setDrawingMenuOpen(false);
+    // 同步清空 KV，避免下次切回时 restore 出来
+    if (period !== "minute") {
+      const key = `gangzi-terminal.kline-drawings:${tsCode}:${period}`;
+      void invoke("save_app_state", { key, value: [] });
+    }
   }
 
   const isMinuteView = period === "minute";
@@ -445,6 +492,8 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
           subIndicators={subIndicators}
           onChartReady={(chart) => {
             chartHandleRef.current = chart;
+            // 触发画线 load/save effect 重跑
+            setChartReadyTick((t) => t + 1);
           }}
         />
       )}
@@ -637,6 +686,11 @@ function minuteKlineToBar(p: MinuteKlinePoint): ChartBar {
 }
 
 function chartStyles() {
+  // 中式红涨绿跌——主图 candle + 子图 indicator 共用一套映射，避免量柱颜色与
+  // K 线方向相反（klinecharts v10 默认 indicator.ohlc/bars 是绿涨红跌的西方
+  // 习惯，不 override 就会出现"红 K 配绿量柱"的错位）。
+  const upAlpha = "rgba(185, 52, 45, 0.7)"; // #b9342d
+  const downAlpha = "rgba(22, 130, 90, 0.7)"; // #16825a
   return {
     candle: {
       bar: {
@@ -647,6 +701,20 @@ function chartStyles() {
         upWickColor: "#b9342d",
         downWickColor: "#16825a",
       },
+    },
+    indicator: {
+      ohlc: { upColor: upAlpha, downColor: downAlpha, noChangeColor: "#9aa3aa" },
+      bars: [
+        {
+          style: "fill" as const,
+          borderStyle: "solid" as const,
+          borderSize: 1,
+          borderDashedValue: [2, 2],
+          upColor: upAlpha,
+          downColor: downAlpha,
+          noChangeColor: "#9aa3aa",
+        },
+      ],
     },
     grid: {
       horizontal: { color: "#eadfd1", style: "dashed" as const, dashedValue: [2, 2] },

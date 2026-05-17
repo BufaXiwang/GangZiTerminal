@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)] // 完整 account 规则与类型；agent 写工具（open/close/scale/adjust）Step B 连通
+
 //! Domain `account`——模拟账户 Bounded Context。
 //!
 //! 定位：**模拟交易终端的训练场**。提供类真实账户的开仓 / 平仓 / 加减仓 / 调止损能力，

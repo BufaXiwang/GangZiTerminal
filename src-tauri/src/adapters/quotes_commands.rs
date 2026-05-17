@@ -350,7 +350,7 @@ pub async fn fetch_a_share_quotes(
     // 1. 6 位 code → ts_code（走 stocks 表 lookup，权威 market）
     let ts_codes: Vec<String> = codes
         .iter()
-        .filter_map(|c| crate::db::resolve_stock_ts_code(&app, c))
+        .filter_map(|c| crate::infrastructure::quotes::repository::resolve_stock_ts_code(&app, c))
         .collect();
 
     // 2. 读 MARKET_SNAPSHOT；缺失的同步 ensure 一次（走 dispatch 多源 fallback）
@@ -517,7 +517,7 @@ pub async fn fetch_stock_profile(
     code: String,
 ) -> Result<StockProfile, String> {
     let code = StockCode::new(code).map_err(|e| e.to_string())?;
-    let row = crate::db::find_stock_by_code(&app, code.as_str())?
+    let row = crate::infrastructure::quotes::repository::find_stock_by_code(&app, code.as_str())?
         .ok_or_else(|| format!("stocks 档案未找到 {}", code.as_str()))?;
     let fundamentals = ts_stock::fetch_daily_basic(&app, &code)
         .await

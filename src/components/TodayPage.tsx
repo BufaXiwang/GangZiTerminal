@@ -1,8 +1,9 @@
-import { Search } from "lucide-react";
+import { Search, Star, StarOff } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { KlineChart } from "./KlineChart";
 import { useMarketInstruments } from "../hooks/useMarketInstruments";
 import { useMarketQuotes } from "../hooks/useMarketQuotes";
+import { useWatchlist } from "../hooks/useWatchlist";
 import type { InstrumentCategory, MarketInstrument, MarketQuote } from "../types";
 
 type Category = InstrumentCategory;
@@ -28,17 +29,33 @@ const SORT_TABS: Array<[SortKey, string]> = [
 
 // 列表只渲染屏幕内 + 缓冲——全市场 7000+ 不能一次性 DOM。
 // 简单 fixed-row virtualization：行高固定 42px。
-const ROW_HEIGHT = 42;
+const ROW_HEIGHT = 56;
 const OVERSCAN = 6;
+
+type RowMenu = {
+  x: number;
+  y: number;
+  code: string;
+  name: string;
+  inWatchlist: boolean;
+};
 
 export function TodayPage() {
   const { instruments, loading: instrumentsLoading } = useMarketInstruments();
   const { quoteMap, lastRefreshed } = useMarketQuotes();
+  const { entries: watchlistEntries, add: addWatchlist, remove: removeWatchlist } = useWatchlist();
 
   const [selectedTsCode, setSelectedTsCode] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [category, setCategory] = useState<Category>("stock");
   const [sortKey, setSortKey] = useState<SortKey>("change");
+  const [rowMenu, setRowMenu] = useState<RowMenu | null>(null);
+
+  // 自选股 code 集合（用于 row indicator + 菜单状态判断）
+  const watchedCodes = useMemo(
+    () => new Set(watchlistEntries.map((e) => e.code)),
+    [watchlistEntries],
+  );
 
   // 列表 derive：分类 → 过滤 → 排序。默认股票按涨跌幅从高到低。
   const filteredRows = useMemo(() => {
@@ -90,6 +107,31 @@ export function TodayPage() {
       : false;
     if (!stillVisible) setSelectedTsCode(filteredRows[0]?.tsCode ?? null);
   }, [filteredRows, selectedTsCode]);
+
+  // 右键菜单关闭——只在以下情况关：
+  // 1. 左键 mousedown 在菜单**外部**（含点 row、点空白、点其它 UI）
+  // 2. ESC
+  // 右键 (button=2) 不关——让 row 的 onContextMenu 自然覆盖到新 row。
+  // 用 mousedown 而非 click 是为了避免 React root delegation 在 stopPropagation
+  // 之后 native click 仍冒泡到 document 把菜单关掉。
+  useEffect(() => {
+    if (!rowMenu) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button === 2) return;
+      const target = e.target as Element | null;
+      if (target && target.closest(".today-row-menu")) return;
+      setRowMenu(null);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setRowMenu(null);
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [rowMenu]);
 
   // 虚拟列表 scroll 状态
   const [scrollTop, setScrollTop] = useState(0);
@@ -185,7 +227,18 @@ export function TodayPage() {
                     inst={inst}
                     quote={quoteMap.get(inst.tsCode) ?? null}
                     active={selectedTsCode === inst.tsCode}
+                    inWatchlist={watchedCodes.has(inst.code)}
                     onSelect={() => setSelectedTsCode(inst.tsCode)}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setRowMenu({
+                        x: e.clientX,
+                        y: e.clientY,
+                        code: inst.code,
+                        name: inst.name || inst.code,
+                        inWatchlist: watchedCodes.has(inst.code),
+                      });
+                    }}
                   />
                 ))}
                 <div style={{ height: padBottom }} />
@@ -220,6 +273,41 @@ export function TodayPage() {
           )}
         </div>
       </div>
+
+      {rowMenu && (
+        <div
+          className="today-row-menu"
+          style={{ top: rowMenu.y, left: rowMenu.x }}
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+          role="menu"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              if (rowMenu.inWatchlist) {
+                void removeWatchlist(rowMenu.code);
+              } else {
+                void addWatchlist(rowMenu.code);
+              }
+              setRowMenu(null);
+            }}
+          >
+            {rowMenu.inWatchlist ? (
+              <>
+                <StarOff size={14} />
+                <span>从自选移除</span>
+              </>
+            ) : (
+              <>
+                <Star size={14} />
+                <span>加入自选</span>
+              </>
+            )}
+            <small>{rowMenu.name}</small>
+          </button>
+        </div>
+      )}
     </section>
   );
 }
@@ -330,22 +418,39 @@ function Row({
   inst,
   quote,
   active,
+  inWatchlist,
   onSelect,
+  onContextMenu,
 }: {
   inst: MarketInstrument;
   quote: MarketQuote | null;
   active: boolean;
+  inWatchlist: boolean;
   onSelect: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
 }) {
+  const tone = quoteTone(quote?.changePercent ?? null);
   return (
     <button
       type="button"
-      className={active ? "today-stock-row active" : "today-stock-row"}
+      className={`today-stock-row tone-${tone}${active ? " active" : ""}`}
       onClick={onSelect}
+      onContextMenu={onContextMenu}
       style={{ height: ROW_HEIGHT - 4 }}
     >
+      <span className="today-stock-bar" aria-hidden="true" />
       <div className="today-stock-name">
-        <strong>{inst.name || inst.code}</strong>
+        <strong>
+          {inst.name || inst.code}
+          {inWatchlist && (
+            <Star
+              size={11}
+              strokeWidth={2.5}
+              className="today-stock-watch"
+              aria-label="已加入自选"
+            />
+          )}
+        </strong>
         <small>
           {inst.code}
           {inst.category !== "stock" && (
@@ -356,10 +461,15 @@ function Row({
         </small>
       </div>
       <div className="today-stock-price">
-        <span>{formatPrice(quote?.price ?? null)}</span>
-        <em className={quoteTone(quote?.changePercent ?? null)}>
-          {formatPercent(quote?.changePercent ?? null)}
-        </em>
+        <span className="price">{formatPrice(quote?.price ?? null)}</span>
+        <div className="change-row">
+          <em className={`change-abs ${tone}`}>
+            {formatChange(quote?.change ?? null)}
+          </em>
+          <em className={`change-pct ${tone}`}>
+            {formatPercent(quote?.changePercent ?? null)}
+          </em>
+        </div>
       </div>
     </button>
   );
@@ -446,6 +556,15 @@ function formatPercent(value: number | null): string {
   if (!isFiniteNumber(value)) return "—";
   const sign = value > 0 ? "+" : "";
   return `${sign}${value.toFixed(2)}%`;
+}
+
+/// 涨跌额——带符号、最多 2 位小数（高价位股不至于占太宽）。
+function formatChange(value: number | null): string {
+  if (!isFiniteNumber(value)) return "—";
+  const abs = Math.abs(value);
+  const digits = abs < 10 ? 3 : 2;
+  const sign = value > 0 ? "+" : value < 0 ? "" : "";
+  return `${sign}${value.toFixed(digits)}`;
 }
 
 function quoteTone(value: number | null): "up" | "down" | "flat" {

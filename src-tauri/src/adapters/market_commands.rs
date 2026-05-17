@@ -6,7 +6,6 @@
 //! 全市场实时行情通过 event `market-quotes-refreshed` 推送（在 pipeline 里 emit），
 //! 这里 IPC 只做"静态列表"和"手动触发"。
 
-use crate::db;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -29,7 +28,7 @@ pub async fn list_market_instruments(
     let mut all: Vec<MarketInstrumentDto> = Vec::with_capacity(7000);
 
     // stocks
-    if let Ok(rows) = db::list_stocks(&app) {
+    if let Ok(rows) = crate::infrastructure::quotes::repository::list_stocks(&app) {
         for r in rows {
             let suffix = match r.market.as_str() {
                 "sh" => "SH",
@@ -48,7 +47,7 @@ pub async fn list_market_instruments(
     }
 
     // indexes
-    if let Ok(rows) = db::list_indexes(&app) {
+    if let Ok(rows) = crate::infrastructure::quotes::repository::list_indexes(&app) {
         for r in rows {
             all.push(MarketInstrumentDto {
                 ts_code: r.ts_code,
@@ -67,7 +66,7 @@ pub async fn list_market_instruments(
     }
 
     // funds (仅场内 ETF/LOF)
-    if let Ok(rows) = db::list_listed_funds(&app) {
+    if let Ok(rows) = crate::infrastructure::quotes::repository::list_listed_funds(&app) {
         for r in rows {
             all.push(MarketInstrumentDto {
                 ts_code: r.ts_code,

@@ -4,7 +4,6 @@ import {
   ChevronDown,
   ChevronRight,
   Loader2,
-  Play,
   Plus,
   Save,
   Trash2,
@@ -98,50 +97,20 @@ const verifyKey = (channelId: string, model: string) => `${channelId}::${model}`
 // ============================================================================
 
 type Props = {
-  agentEnabled: boolean;
-  agentStatus: string;
   autoRefresh: boolean;
-  briefingInterval: number;
-  bufferSize: number;
   databasePath: string | null;
-  hasDueReview: boolean;
-  isBriefing: boolean;
-  isReviewing: boolean;
-  pendingNewsCount: number;
   refreshInterval: number;
-  reviewStatus: string;
-  setAgentEnabled: (value: boolean) => void;
   setAutoRefresh: (value: boolean) => void;
-  setBriefingInterval: (value: number) => void;
-  setBufferSize: (value: number) => void;
   setRefreshInterval: (value: number) => void;
-  triggerBriefingNow: () => void;
-  triggerReviewNow: () => void;
 };
 
 export function SettingsPage({
-  agentEnabled,
-  agentStatus,
   autoRefresh,
-  briefingInterval,
-  bufferSize,
   databasePath,
-  hasDueReview,
-  isBriefing,
-  isReviewing,
-  pendingNewsCount,
   refreshInterval,
-  reviewStatus,
-  setAgentEnabled,
   setAutoRefresh,
-  setBriefingInterval,
-  setBufferSize,
   setRefreshInterval,
-  triggerBriefingNow,
-  triggerReviewNow,
 }: Props) {
-  const canTriggerBriefing = !isBriefing && pendingNewsCount > 0;
-  const canTriggerReview = !isReviewing && hasDueReview;
   return (
     <section className="page-shell settings-page">
       <header className="settings-head">
@@ -176,64 +145,6 @@ export function SettingsPage({
       </div>
 
       <DataSourceBlock />
-
-      <div className="settings-section">
-        <div className="settings-section-head">
-          <h3>Briefing</h3>
-          <p>buffer 满或定时窗口到达时，主 Agent 会一次性消化整个 buffer。</p>
-        </div>
-        <div className="settings-rows">
-          <Row title="自动 Agent" hint="关闭后 Agent 不会自动产出 briefing 或复盘——所有节奏暂停">
-            <Switch checked={agentEnabled} onChange={setAgentEnabled} />
-          </Row>
-          <Row title="Buffer 大小" hint="累计这么多条待消化资讯就触发一次 briefing">
-            <NumberInput
-              value={bufferSize}
-              min={3}
-              max={50}
-              suffix="条"
-              onChange={setBufferSize}
-            />
-          </Row>
-          <Row title="定时间隔" hint="距上次 briefing 超过这么久且 buffer 非空也会触发">
-            <NumberInput
-              value={Math.round(briefingInterval / 60_000)}
-              min={1}
-              max={60}
-              suffix="分钟"
-              onChange={(value) => setBriefingInterval(value * 60_000)}
-            />
-          </Row>
-          <Row title="当前状态" hint={`buffer ${pendingNewsCount}/${bufferSize}`}>
-            <div className="settings-row-inline">
-              <span className="settings-readonly">{agentStatus || "等待"}</span>
-              <button
-                type="button"
-                className="ghost"
-                disabled={!canTriggerBriefing}
-                onClick={triggerBriefingNow}
-              >
-                {isBriefing ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
-                立即简报
-              </button>
-            </div>
-          </Row>
-          <Row title="复盘 Agent" hint="到期 trade hypothesis 自动复盘（仅在自动 Agent 开启时运行）">
-            <div className="settings-row-inline">
-              <span className="settings-readonly">{reviewStatus || "等待"}</span>
-              <button
-                type="button"
-                className="ghost"
-                disabled={!canTriggerReview}
-                onClick={triggerReviewNow}
-              >
-                {isReviewing ? <Loader2 className="spin" size={14} /> : <Play size={14} />}
-                立即复盘
-              </button>
-            </div>
-          </Row>
-        </div>
-      </div>
 
       <NetworkBlock />
 
@@ -451,8 +362,8 @@ function ChannelsAndAssignmentsBlock() {
       if (effectiveModels.length > 0) {
         // 后端 verify 需要 stored 里能查到 channel（含最新 base_url/token）。
         // 新建未保存 或 已存在但字段改了 → 先把 channelToSave 写库一遍，
-        // 再 verify。verify 通过后会再写一遍以确认；失败也无害——availableModels
-        // 暂时多了 pending 那些没影响什么。
+        // 再 verify。verify 通过后会再写一遍以确认；失败也无害——
+        // availableModels 多一条 pending 不影响功能。
         const isNew = !config.channels.some((c) => c.id === id);
         const stored = isNew ? null : config.channels.find((c) => c.id === id);
         const channelFieldsChanged = stored
@@ -1318,7 +1229,7 @@ function DataSourceBlock() {
     setError(null);
     try {
       const value = token.trim();
-      await invoke("save_app_state", { key: TUSHARE_TOKEN_KEY, value });
+      await invoke("save_tushare_token", { token: value });
       setStored(value);
       setSavedAt(Date.now());
     } catch (e) {

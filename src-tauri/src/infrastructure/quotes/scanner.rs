@@ -3,7 +3,6 @@
 //! scanner 属于 quotes 查询能力：它只读 quotes 自己维护的行情 snapshot、
 //! stocks 静态档案和 TuShare daily_basic，不感知 agent/account/news。
 
-use crate::db;
 use crate::domain::quotes::{
     DailyBasic, QuotesError, ScanCondition, ScanFilter, ScanItem, ScanOp, ScanResult, ScanSort,
     StockQuote,
@@ -134,7 +133,7 @@ fn normalize_limit(limit: usize) -> usize {
 }
 
 fn load_stock_names(app: &AppHandle) -> Result<HashMap<String, String>, QuotesError> {
-    let rows = db::list_stocks(app).map_err(QuotesError::Network)?;
+    let rows = crate::infrastructure::quotes::repository::list_stocks(app).map_err(QuotesError::Network)?;
     Ok(rows.into_iter().map(|r| (r.code, r.name)).collect())
 }
 

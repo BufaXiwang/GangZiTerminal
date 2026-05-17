@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)] // TuShare 接口完整面：calendar / fund_klines / index_klines 等供 Step B agent 工具使用
+
 //! TuShare HTTP adapter——核心数据源。
 //!
 //! 模块拆分（按数据领域）：

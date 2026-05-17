@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)] // 仓位 repo / valuation / migration 提供完整能力面，agent 写工具 Step B 连通
+
 //! Infrastructure `account`——模拟账户子域的 I/O 实现。
 //!
 //! 包含：

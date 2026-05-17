@@ -42,8 +42,12 @@ export function SimulationPage({ riskAlerts }: Props) {
   const quoteTsCodes = useMemo(() => {
     const codes = visibleWatchlist.map((entry) => entry.tsCode);
     if (chartEntry) codes.push(chartEntry.tsCode);
+    // open positions 也加进来——卡片要显示当前价 / 市值 / 浮动盈亏
+    for (const p of openPositions) {
+      codes.push(inferStockTsCode(p.code));
+    }
     return codes;
-  }, [visibleWatchlist, chartEntry]);
+  }, [visibleWatchlist, chartEntry, openPositions]);
   const { quoteMap } = useMarketQuotesFor(quoteTsCodes);
 
   useEffect(() => {
@@ -270,6 +274,7 @@ export function SimulationPage({ riskAlerts }: Props) {
                   <OpenPositionCard
                     key={p.id}
                     position={p}
+                    quote={quoteMap.get(inferStockTsCode(p.code)) ?? null}
                     selected={p.id === selectedPosition?.id}
                     onSelect={() => setSelectedPositionId(p.id)}
                   />
@@ -384,15 +389,24 @@ function WatchlistQuoteRow({
 
 function OpenPositionCard({
   position,
+  quote,
   selected,
   onSelect,
 }: {
   position: DomainPosition;
+  quote: MarketQuote | null;
   selected: boolean;
   onSelect: () => void;
 }) {
-  // 未来可加：从 ACCOUNT_SNAPSHOT 或 MARKET_SNAPSHOT 拿当前价；现在简单展示均价
   const cost = position.avgEntryPrice * position.currentShares;
+  // 当前价拿不到时（盘外接口异常 / 新股停牌）回退到均价——marketValue 显示成本
+  const currentPrice =
+    quote?.price != null && Number.isFinite(quote.price) ? quote.price : null;
+  const marketValue =
+    currentPrice != null ? currentPrice * position.currentShares : cost;
+  const pnl = marketValue - cost;
+  const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
+  const pnlTone = pnl > 0.01 ? "up" : pnl < -0.01 ? "down" : "flat";
   return (
     <article
       className={selected ? "sim-position-card active" : "sim-position-card"}
@@ -408,8 +422,21 @@ function OpenPositionCard({
           <h3>{position.name}</h3>
           <span>{position.code}</span>
         </div>
+        <div className={`sim-position-pnl tone-${pnlTone}`}>
+          <strong>{formatSigned(pnl)}</strong>
+          <em>
+            {pnl > 0 ? "+" : ""}
+            {pnlPct.toFixed(2)}%
+          </em>
+        </div>
       </div>
       <div className="sim-position-grid">
+        <div>
+          <span>当前价</span>
+          <strong className={`tone-${pnlTone}`}>
+            {currentPrice != null ? formatNumber(currentPrice) : "—"}
+          </strong>
+        </div>
         <div>
           <span>均价</span>
           <strong>{formatNumber(position.avgEntryPrice)}</strong>
@@ -417,6 +444,10 @@ function OpenPositionCard({
         <div>
           <span>持仓股数</span>
           <strong>{position.currentShares}</strong>
+        </div>
+        <div>
+          <span>市值</span>
+          <strong>{formatAmount(marketValue)}</strong>
         </div>
         <div>
           <span>持仓成本</span>
@@ -431,6 +462,30 @@ function OpenPositionCard({
           <strong>{position.takeProfit != null ? formatNumber(position.takeProfit) : "—"}</strong>
         </div>
       </div>
+      {(quote?.bidLevels?.length || quote?.askLevels?.length) ? (
+        <div className="sim-position-orderbook">
+          {(() => {
+            const bid1 = quote?.bidLevels?.[0];
+            const ask1 = quote?.askLevels?.[0];
+            const fmtLevel = (level: typeof bid1) =>
+              level && level.price != null
+                ? `${formatNumber(level.price)}${
+                    level.volume != null ? ` × ${level.volume}` : ""
+                  }`
+                : "—";
+            return (
+              <>
+                <span>
+                  买一 <strong className="tone-up">{fmtLevel(bid1)}</strong>
+                </span>
+                <span>
+                  卖一 <strong className="tone-down">{fmtLevel(ask1)}</strong>
+                </span>
+              </>
+            );
+          })()}
+        </div>
+      ) : null}
       {position.thesis && <p>{position.thesis}</p>}
       <small>建仓时间：{formatDate(position.enteredAt)}</small>
     </article>

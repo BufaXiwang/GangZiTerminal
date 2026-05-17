@@ -9,7 +9,6 @@
 //! 持久化：`app_state[KEY_WATCHLIST]`（JSON Array）
 //! 启动 hydrate 由 main.rs setup 阶段触发。
 
-use crate::db;
 use crate::domain::shared::StockCode;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -30,7 +29,7 @@ fn store() -> &'static RwLock<BTreeSet<StockCode>> {
 
 /// 进程启动时调一次——从 app_state 把 watchlist 灌进内存单例。
 pub fn hydrate(app: &AppHandle) {
-    if let Ok(Some(value)) = db::load_app_state_value(app, KEY_WATCHLIST) {
+    if let Ok(Some(value)) = crate::infrastructure::app_state::load_app_state_value(app, KEY_WATCHLIST) {
         if let Some(arr) = value.as_array() {
             let codes: BTreeSet<StockCode> = arr
                 .iter()
@@ -97,5 +96,5 @@ pub fn replace(app: &AppHandle, codes: Vec<StockCode>) {
 
 fn persist(app: &AppHandle) {
     let codes = list_strings();
-    let _ = db::save_app_state_value(app, KEY_WATCHLIST, &Value::from(codes));
+    let _ = crate::infrastructure::app_state::save_app_state_value(app, KEY_WATCHLIST, &Value::from(codes));
 }
