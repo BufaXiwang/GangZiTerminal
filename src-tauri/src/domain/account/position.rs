@@ -47,7 +47,16 @@ pub struct Position {
     pub time_stop_at: Option<OccurredAt>,
     pub thesis: String,
     pub source_analysis_id: String,
+    /// 首次开仓时间——审计 / UI 展示用。
     pub entered_at: OccurredAt,
+    /// **最近一次买入时间**（Opened 或 ScaledIn 都更新）——T+1 判定基准。
+    ///
+    /// 为什么不直接用 `entered_at`：用户昨天 open + 今天 ScaledIn 后，`entered_at`
+    /// 仍是昨天，但**今天买的那部分股票今天不能卖**。T+1 必须看最近一次买入。
+    ///
+    /// 注：当前模型按"整仓口径"——任何一次今天买入都让整仓今天不能卖。比 FIFO
+    /// per-lot 严格，但建模简单；agent 在策略里不会主动踩这条规则。
+    pub last_acquisition_at: OccurredAt,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

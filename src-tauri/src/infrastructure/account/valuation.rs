@@ -15,7 +15,7 @@
 //! 依赖：本模块**读** MARKET_SNAPSHOT（account → quotes，spec § 1.3 允许）。
 
 use crate::domain::account::cash::reduce_events_to_cash_delta;
-use crate::domain::account::types::{AccountSnapshot, Position, PositionEvent, PositionStatus};
+use crate::domain::account::types::{AccountSnapshot, Position, PositionEvent, PositionEventKind};
 use crate::domain::shared::{OccurredAt, Yuan};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
 use std::collections::HashMap;
@@ -71,23 +71,76 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
     }
 }
 
-/// 已实现盈亏 = 每个 closed position 完整 cycle (open → close) 的 cash 净流入。
+/// 已实现盈亏——所有 position（open 或 closed）的事件链按"立刻确认费用 + 卖出时
+/// 确认价差"算法累加。
 ///
-/// 对单个 closed position 的事件链 reduce 得到的数即 PnL（含费扣除）。
+/// **为什么不简单走 cash_delta？** 旧版只对 closed 仓位算 cash_delta = realized；
+/// open 仓位的 ScaledOut 收益落进 `cash` 但不进 `realized_pnl`——agent 看到的
+/// "我交易了多少 PnL" 系统性低估。
+///
+/// 算法（与 cash 流定义自洽）：
+/// - `Opened` / `ScaledIn`：减 commission（费用立刻确认；本金留作 cost basis）
+/// - `ScaledOut` / `Closed`：加 `(sell_price - running_avg) × shares - commission - tax`
+/// - 维护 `running_avg`：Opened/ScaledIn 时刷新（用事件里已经算好的 new_avg），
+///   ScaledOut 时不变（卖部分不改剩余股的成本）
+///
+/// 事件已按 `occurred_at` 升序（`repository::list_events_batch` 保证）。
 fn compute_realized_pnl(positions: &[Position], events: &[PositionEvent]) -> f64 {
     let mut by_pos: HashMap<&str, Vec<&PositionEvent>> = HashMap::new();
     for e in events {
         by_pos.entry(e.position_id.as_str()).or_default().push(e);
     }
+
     let mut realized = 0.0;
-    for p in positions
-        .iter()
-        .filter(|p| matches!(p.status, PositionStatus::Closed { .. }))
-    {
-        if let Some(es) = by_pos.get(p.id.as_str()) {
-            let owned: Vec<PositionEvent> = es.iter().map(|e| (*e).clone()).collect();
-            let delta = reduce_events_to_cash_delta(&owned);
-            realized += delta.value();
+    for p in positions {
+        let Some(es) = by_pos.get(p.id.as_str()) else {
+            continue;
+        };
+        let mut running_avg: f64 = 0.0;
+        for e in es {
+            match &e.kind {
+                PositionEventKind::Opened {
+                    entry_price,
+                    commission,
+                    ..
+                } => {
+                    running_avg = entry_price.value();
+                    realized -= commission.value();
+                }
+                PositionEventKind::ScaledIn {
+                    new_avg,
+                    commission,
+                    ..
+                } => {
+                    running_avg = new_avg.value();
+                    realized -= commission.value();
+                }
+                PositionEventKind::ScaledOut {
+                    delta,
+                    price,
+                    commission,
+                    stamp_tax,
+                } => {
+                    let gross = (price.value() - running_avg) * delta.value() as f64;
+                    realized += gross - commission.value() - stamp_tax.value();
+                    // running_avg 不变：卖一部分不改剩余股每股成本
+                }
+                PositionEventKind::Closed {
+                    exit_price,
+                    shares,
+                    commission,
+                    stamp_tax,
+                    ..
+                } => {
+                    let gross = (exit_price.value() - running_avg) * shares.value() as f64;
+                    realized += gross - commission.value() - stamp_tax.value();
+                }
+                PositionEventKind::StopsAdjusted { .. }
+                | PositionEventKind::Reviewed { .. }
+                | PositionEventKind::Signal { .. } => {
+                    // 不影响 PnL / 成本
+                }
+            }
         }
     }
     realized
@@ -153,6 +206,7 @@ mod tests {
             thesis: String::new(),
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
+            last_acquisition_at: OccurredAt::new(1),
         }
     }
 
@@ -174,6 +228,7 @@ mod tests {
             thesis: String::new(),
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
+            last_acquisition_at: OccurredAt::new(1),
         }
     }
 
@@ -237,6 +292,52 @@ mod tests {
         assert!((snap.market_value.value() - 4000.0).abs() < 1e-6);
         // total_assets = cash + market_value
         assert!((snap.total_assets.value() - (expected_cash + 4000.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn realized_pnl_includes_scale_out_on_open_position() {
+        // 回归：旧版只算 closed 仓位的 cash_delta 当 realized，open 仓位的部分平仓
+        // 收益落进 cash 但 realized_pnl 看不见——agent self-signal 系统性偏低。
+        //
+        // 开 200 股 @ 10，commission 5 → cash -2005, running_avg=10
+        // 减仓 100 股 @ 12，commission 3, stamp_tax 1.2
+        //   gross = (12-10) × 100 = 200
+        //   realized_pnl += 200 - 3 - 1.2 = 195.8
+        // 仍 open, 100 股 cost_basis 1000
+        //
+        // 总 realized: -5 (open commission) + 195.8 = 190.8
+        let p = open_position("p1", "600519", 10.0, 100);
+        let open_e = PositionEvent {
+            id: "e1".into(),
+            position_id: PositionId::from_string("p1".into()),
+            kind: PositionEventKind::Opened {
+                entry_price: Yuan::new(10.0).unwrap(),
+                shares: Shares::new(200).unwrap(),
+                commission: Yuan::new(5.0).unwrap(),
+            },
+            occurred_at: OccurredAt::new(1),
+            source: EventSource::Manual,
+            agent_note_md: String::new(),
+        };
+        let scaled_out_e = PositionEvent {
+            id: "e2".into(),
+            position_id: PositionId::from_string("p1".into()),
+            kind: PositionEventKind::ScaledOut {
+                delta: Shares::new(100).unwrap(),
+                price: Yuan::new(12.0).unwrap(),
+                commission: Yuan::new(3.0).unwrap(),
+                stamp_tax: Yuan::new(1.2).unwrap(),
+            },
+            occurred_at: OccurredAt::new(2),
+            source: EventSource::Manual,
+            agent_note_md: String::new(),
+        };
+        let snap = compute_snapshot(&[p], &[open_e, scaled_out_e]);
+        assert!((snap.realized_pnl.value() - 190.8).abs() < 1e-6);
+        // 自洽性：cash_delta + remaining_cost_basis = realized_pnl
+        // cash_delta = -2005 + (12*100 - 3 - 1.2) = -2005 + 1195.8 = -809.2
+        // remaining_cost_basis = 10 × 100 = 1000
+        // → 190.8 ✓
     }
 
     #[test]

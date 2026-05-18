@@ -1,10 +1,13 @@
 //! A 股交易规则——纯函数，无 I/O。
 //!
-//! 涉及：T+1 / 整百 / 涨跌停 / 交易时段 / 资金 / 止损止盈合理性 / 手续费 / 印花税。
+//! 涉及：T+1 / 整百 / 填单可行性（盘口）/ 交易时段 / 资金 / 止损止盈合理性 /
+//! 手续费 / 印花税。
+//!
+//! **不判断"是否触及涨跌停"**——封板信号由盘口直接给：对手方一档为空 = 不可填单。
+//! 这样我们不用硬编码 ±5/10/20/30 阈值，也不用维护 ST 名单 / 新股期 / 板块映射。
 
 use super::errors::RuleError;
-use super::types::Side;
-use crate::domain::shared::{OccurredAt, Shares, Yuan};
+use crate::domain::shared::{Lots, OccurredAt, Shares, Yuan};
 
 // ============================================================================
 // A 股成本常数
@@ -21,9 +24,6 @@ pub const COMMISSION_MIN: f64 = 5.0;
 
 /// 印花税费率——0.1%（仅卖出）。
 pub const STAMP_TAX_RATE: f64 = 0.001;
-
-/// 涨跌停容差——触板阈值留 0.5 个百分点（涨幅 9.95% 就算到顶）。
-const LIMIT_NEAR_TOLERANCE: f64 = 0.005;
 
 // ============================================================================
 // 校验函数
@@ -77,47 +77,19 @@ fn beijing_date_str(ts: OccurredAt) -> String {
     dt.format("%Y-%m-%d").to_string()
 }
 
-/// 涨跌停判定——主板 ±10%，创业板（300/301）+ 科创板（688）±20%，北交所（4/8/92）±30%。
+/// 校验对手方盘口有量——订单能填掉。
 ///
-/// **北交所 92xxx 新段（2023+）也走 ±30%**——之前漏判 920469 这种新代码段会被
-/// 误归到主板 ±10%，在 20% 价位卡死。
-pub fn price_limit_pct(code: &str) -> f64 {
-    if code.starts_with('4') || code.starts_with('8') || code.starts_with("92") {
-        0.30
-    } else if code.starts_with("688") || code.starts_with("300") || code.starts_with("301") {
-        0.20
-    } else {
-        0.10
-    }
-}
-
-/// 校验当前价没触涨跌停（与交易方向同向时拒）。
+/// `counterparty_top` 是对手方一档量：
+/// - 买入时传**卖一量**（`ask_levels[0].volume`）
+/// - 卖出时传**买一量**（`bid_levels[0].volume`）
 ///
-/// - `change_percent` 是百分数（涨 1% → 1.0）；None 表示拿不到数据，放行
-/// - Buy 触涨停拒，Sell 触跌停拒（反向交易允许——比如涨停可以卖）
-pub fn ensure_price_not_limit(
-    change_percent: Option<f64>,
-    code: &str,
-    side: Side,
-) -> Result<(), RuleError> {
-    let Some(pct_raw) = change_percent else {
-        return Ok(());
-    };
-    let pct = pct_raw / 100.0; // 百分数 → 小数
-    let limit = price_limit_pct(code);
-    let near_limit = limit - LIMIT_NEAR_TOLERANCE;
-    match side {
-        Side::Buy if pct >= near_limit => Err(RuleError::PriceLimitHit {
-            side: "涨",
-            current_pct: pct * 100.0,
-            limit_pct: limit * 100.0,
-        }),
-        Side::Sell if pct <= -near_limit => Err(RuleError::PriceLimitHit {
-            side: "跌",
-            current_pct: pct * 100.0,
-            limit_pct: limit * 100.0,
-        }),
-        _ => Ok(()),
+/// 这是 A 股封板 / 停牌 / 数据降级的统一信号：盘口空 → 拒交易，不用区分原因。
+/// **没有 fallback**：拿不到盘口（fallback 源、未订阅 code）等同没法填——直接拒，
+/// 避免 agent 学到"封板照样能成交"的假经验。
+pub fn ensure_fillable(counterparty_top: Option<Lots>) -> Result<(), RuleError> {
+    match counterparty_top {
+        Some(v) if v.value() > 0 => Ok(()),
+        _ => Err(RuleError::NotFillable),
     }
 }
 
@@ -206,48 +178,20 @@ mod tests {
     }
 
     #[test]
-    fn price_limit_pct_buckets() {
-        assert_eq!(price_limit_pct("600519"), 0.10); // 沪主板
-        assert_eq!(price_limit_pct("000001"), 0.10); // 深主板
-        assert_eq!(price_limit_pct("300750"), 0.20); // 创业板
-        assert_eq!(price_limit_pct("301236"), 0.20); // 创业板 301 段
-        assert_eq!(price_limit_pct("688981"), 0.20); // 科创板
-        assert_eq!(price_limit_pct("430564"), 0.30); // 北交所老段 4xxxxx
-        assert_eq!(price_limit_pct("832149"), 0.30); // 北交所老段 8xxxxx
-        assert_eq!(price_limit_pct("920469"), 0.30); // 北交所新段 92xxxx
+    fn fillable_when_counterparty_has_volume() {
+        assert!(ensure_fillable(Some(Lots::from_unchecked(100))).is_ok());
     }
 
     #[test]
-    fn price_limit_blocks_buy_when_near_up_cap() {
-        let q = Some(9.96); // 9.96% > 9.5% (主板 10% - 0.5% 容差)
-        assert!(ensure_price_not_limit(q, "600519", Side::Buy).is_err());
+    fn not_fillable_when_counterparty_empty() {
+        // 封板 / 停牌典型场景：对手方 0 量
+        assert!(ensure_fillable(Some(Lots::from_unchecked(0))).is_err());
     }
 
     #[test]
-    fn price_limit_allows_sell_when_only_up_limit_hit() {
-        let q = Some(9.96);
-        assert!(ensure_price_not_limit(q, "600519", Side::Sell).is_ok());
-    }
-
-    #[test]
-    fn price_limit_handles_chinext_20pct() {
-        let q1 = Some(18.0);
-        assert!(ensure_price_not_limit(q1, "300750", Side::Buy).is_ok()); // 还没到 19.5%
-        let q2 = Some(19.6);
-        assert!(ensure_price_not_limit(q2, "300750", Side::Buy).is_err()); // 触板
-    }
-
-    #[test]
-    fn price_limit_handles_bj_30pct() {
-        let q = Some(29.6);
-        assert!(ensure_price_not_limit(q, "920469", Side::Buy).is_err()); // 北交所新段 +30%
-        let q2 = Some(28.0);
-        assert!(ensure_price_not_limit(q2, "920469", Side::Buy).is_ok());
-    }
-
-    #[test]
-    fn price_limit_no_data_passes() {
-        assert!(ensure_price_not_limit(None, "600519", Side::Buy).is_ok());
+    fn not_fillable_when_orderbook_missing() {
+        // fallback 源没有盘口，或股票未订阅——拒交易
+        assert!(ensure_fillable(None).is_err());
     }
 
     #[test]
@@ -306,6 +250,19 @@ mod tests {
     fn t_plus_one_allows_yesterday() {
         let yesterday = OccurredAt::new(OccurredAt::now().value() - 2 * 24 * 3600 * 1000);
         assert!(ensure_t_plus_one(yesterday).is_ok());
+    }
+
+    #[test]
+    fn t_plus_one_uses_last_acquisition_not_entered_at() {
+        // 回归：旧版 scale_out / close 用的是 target.entered_at——昨天开仓 + 今天加仓
+        // 后会绕过 T+1（entered_at 看着昨天）。aggregate 现在传 last_acquisition_at；
+        // 这里直接断言 rule 在两种时间点下的对比行为。
+        let two_days_ago = OccurredAt::new(OccurredAt::now().value() - 2 * 24 * 3600 * 1000);
+        let today = OccurredAt::now();
+        // 用 entered_at（两天前）→ 旧逻辑放行
+        assert!(ensure_t_plus_one(two_days_ago).is_ok());
+        // 用 last_acquisition_at（今天）→ 新逻辑拒
+        assert!(ensure_t_plus_one(today).is_err());
     }
 
     #[test]

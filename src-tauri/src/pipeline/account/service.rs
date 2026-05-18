@@ -25,7 +25,7 @@ use crate::domain::account::{
     TradeQuote,
 };
 use crate::domain::quotes::StockQuote;
-use crate::domain::shared::{OccurredAt, Shares, Yuan};
+use crate::domain::shared::{Lots, OccurredAt, Shares, Yuan};
 use crate::infrastructure::account::{
     compute_snapshot, snapshot_cache, PositionRepo, INITIAL_CASH,
 };
@@ -118,9 +118,9 @@ impl AccountService {
             source_analysis_id: req.source_analysis_id,
             agent_note_md: req.agent_note_md,
             quote: TradeQuote {
-                name: quote.name,
+                name: quote.name.clone(),
                 price: entry_price,
-                change_percent: quote.change_percent,
+                ask_top_volume: ask_top_volume(&quote),
             },
             available_cash: cash,
         })?;
@@ -152,10 +152,11 @@ impl AccountService {
         let quote = self.fetch_quote(target.code.as_str()).await?;
         let exit_price = quote_price_yuan(&quote, target.code.as_str())?;
         let mut account = Account::new(positions);
+        let bid_top = bid_top_volume(&quote);
         let mutation = account.close_position(ClosePositionCommand {
             position_id: position_id.clone(),
             exit_price,
-            change_percent: quote.change_percent,
+            bid_top_volume: bid_top,
             reason,
             source,
             agent_note_md,
@@ -185,7 +186,7 @@ impl AccountService {
         let mutation = account.close_position(ClosePositionCommand {
             position_id: position_id.clone(),
             exit_price,
-            change_percent: None,
+            bid_top_volume: None,
             reason,
             source,
             agent_note_md,
@@ -221,11 +222,14 @@ impl AccountService {
         let price = quote_price_yuan(&quote, target.code.as_str())?;
         let cash = self.current_cash()?;
         let mut account = Account::new(positions);
+        let ask_top = ask_top_volume(&quote);
+        let bid_top = bid_top_volume(&quote);
         let mutation = account.scale_position(ScalePositionCommand {
             position_id: position_id.clone(),
             shares_delta,
             price,
-            change_percent: quote.change_percent,
+            ask_top_volume: ask_top,
+            bid_top_volume: bid_top,
             available_cash: cash,
             source,
             agent_note_md,
@@ -357,4 +361,14 @@ fn quote_price_yuan(quote: &StockQuote, code: &str) -> Result<Yuan, RuleError> {
         .price
         .filter(|y| y.value().is_finite() && y.value() > 0.0)
         .ok_or_else(|| RuleError::NoCurrentPrice(code.to_string()))
+}
+
+/// 卖一档量——给"买"侧（开仓 / 加仓）填单可行性 check 用。
+fn ask_top_volume(quote: &StockQuote) -> Option<Lots> {
+    quote.ask_levels.first().and_then(|l| l.volume)
+}
+
+/// 买一档量——给"卖"侧（平仓 / 减仓）填单可行性 check 用。
+fn bid_top_volume(quote: &StockQuote) -> Option<Lots> {
+    quote.bid_levels.first().and_then(|l| l.volume)
 }

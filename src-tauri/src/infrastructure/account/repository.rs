@@ -45,6 +45,9 @@ struct DbPosition {
     current_shares: Option<i64>,
     #[serde(default)]
     avg_entry_price: Option<f64>,
+    /// 最近一次买入时间——T+1 判定基准。老数据缺这个字段时回退到 `entry_at`。
+    #[serde(default)]
+    last_acquisition_at: Option<String>,
 }
 
 impl DbPosition {
@@ -188,6 +191,12 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
     let current_shares = Shares::from_unchecked(row.current_shares());
 
     let entered_at = parse_rfc3339(&row.entry_at);
+    // 老 schema 没 last_acquisition_at——回退到 entered_at（首次开仓即首次买入）
+    let last_acquisition_at = row
+        .last_acquisition_at
+        .as_deref()
+        .map(parse_rfc3339)
+        .unwrap_or(entered_at);
 
     let status = match row.status.as_str() {
         "open" => PositionStatus::Open,
@@ -224,6 +233,7 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
         thesis: row.thesis,
         source_analysis_id: row.source_analysis_id,
         entered_at,
+        last_acquisition_at,
     })
 }
 
@@ -262,6 +272,7 @@ fn domain_to_db_position(p: &Position) -> DbPosition {
         original_shares: Some(p.current_shares.value()),
         current_shares: Some(p.current_shares.value()),
         avg_entry_price: Some(p.avg_entry_price.value()),
+        last_acquisition_at: Some(occurred_at_to_rfc3339(p.last_acquisition_at)),
     }
 }
 
@@ -562,6 +573,7 @@ mod tests {
             thesis: "技术面突破".into(),
             source_analysis_id: "a1".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
+            last_acquisition_at: OccurredAt::new(1_700_000_000_000),
         }
     }
 

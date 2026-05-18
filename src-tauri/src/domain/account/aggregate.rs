@@ -6,22 +6,25 @@
 
 use super::errors::{AccountError, RuleError};
 use super::rules::{
-    commission, compute_new_avg_price, ensure_a_share_code, ensure_integer_lot,
-    ensure_price_not_limit, ensure_stops_make_sense, ensure_t_plus_one, ensure_trading_hours,
-    stamp_tax,
+    commission, compute_new_avg_price, ensure_a_share_code, ensure_fillable, ensure_integer_lot,
+    ensure_stops_make_sense, ensure_t_plus_one, ensure_trading_hours, stamp_tax,
 };
 use super::sizing::derive_time_stop_at;
 use super::types::{
     CloseReason, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
     PositionStatus, Side,
 };
-use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
+use crate::domain::shared::{Lots, OccurredAt, Shares, StockCode, Yuan};
 
+/// 开仓 / 加仓买入时给 aggregate 的最少行情数据。
+///
+/// `ask_top_volume`：卖一档量（`StockQuote.ask_levels[0].volume`）。`None` /
+/// 0 量 = 封板或盘口缺失，aggregate 拒交易。
 #[derive(Debug, Clone)]
 pub struct TradeQuote {
     pub name: String,
     pub price: Yuan,
-    pub change_percent: Option<f64>,
+    pub ask_top_volume: Option<Lots>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +47,8 @@ pub struct OpenPositionCommand {
 pub struct ClosePositionCommand {
     pub position_id: PositionId,
     pub exit_price: Yuan,
-    pub change_percent: Option<f64>,
+    /// 买一档量（卖出时填单依据）；None / 0 → 拒交易。`unchecked=true` 时忽略。
+    pub bid_top_volume: Option<Lots>,
     pub reason: CloseReason,
     pub source: EventSource,
     pub agent_note_md: String,
@@ -56,7 +60,10 @@ pub struct ScalePositionCommand {
     pub position_id: PositionId,
     pub shares_delta: i64,
     pub price: Yuan,
-    pub change_percent: Option<f64>,
+    /// 加仓（shares_delta > 0）用——卖一档量。
+    pub ask_top_volume: Option<Lots>,
+    /// 减仓（shares_delta < 0）用——买一档量。
+    pub bid_top_volume: Option<Lots>,
     pub available_cash: Yuan,
     pub source: EventSource,
     pub agent_note_md: String,
@@ -105,7 +112,7 @@ impl Account {
             return Err(RuleError::DuplicateOpenCode(cmd.code).into());
         }
 
-        ensure_price_not_limit(cmd.quote.change_percent, &cmd.code, Side::Buy)?;
+        ensure_fillable(cmd.quote.ask_top_volume)?;
         ensure_stops_make_sense(cmd.quote.price, cmd.stop_loss, cmd.take_profit)?;
 
         let comm = commission(cmd.quote.price, cmd.shares);
@@ -137,6 +144,7 @@ impl Account {
             thesis: cmd.thesis,
             source_analysis_id: cmd.source_analysis_id,
             entered_at,
+            last_acquisition_at: entered_at,
         };
 
         let event = PositionEvent {
@@ -170,8 +178,8 @@ impl Account {
 
         let target = self.open_position_by_id(&cmd.position_id)?.clone();
         if !cmd.unchecked {
-            ensure_t_plus_one(target.entered_at)?;
-            ensure_price_not_limit(cmd.change_percent, target.code.as_str(), Side::Sell)?;
+            ensure_t_plus_one(target.last_acquisition_at)?;
+            ensure_fillable(cmd.bid_top_volume)?;
         }
 
         let position_id = target.id.clone();
@@ -245,7 +253,7 @@ impl Account {
 
         let event_kind = if cmd.shares_delta > 0 {
             ensure_integer_lot(cmd.shares_delta)?;
-            ensure_price_not_limit(cmd.change_percent, target.code.as_str(), Side::Buy)?;
+            ensure_fillable(cmd.ask_top_volume)?;
 
             let comm = commission(cmd.price, abs_delta);
             let cost = cmd.price.value() * cmd.shares_delta as f64 + comm.value();
@@ -264,6 +272,7 @@ impl Account {
                 abs_delta,
             );
             new_position.avg_entry_price = new_avg;
+            new_position.last_acquisition_at = OccurredAt::now();
 
             PositionEventKind::ScaledIn {
                 delta: abs_delta,
@@ -272,9 +281,9 @@ impl Account {
                 commission: comm,
             }
         } else {
-            ensure_t_plus_one(target.entered_at)?;
+            ensure_t_plus_one(target.last_acquisition_at)?;
             ensure_integer_lot(-cmd.shares_delta)?;
-            ensure_price_not_limit(cmd.change_percent, target.code.as_str(), Side::Sell)?;
+            ensure_fillable(cmd.bid_top_volume)?;
 
             let comm = commission(cmd.price, abs_delta);
             let tax = stamp_tax(cmd.price, abs_delta);

@@ -18,11 +18,8 @@ pub enum RuleError {
         today: String,
     },
     OutsideTradingHours,
-    PriceLimitHit {
-        side: &'static str,
-        current_pct: f64,
-        limit_pct: f64,
-    },
+    /// 对手方盘口为空（封板 / 停牌 / 数据降级），订单填不掉。
+    NotFillable,
     SharesNotIntegerLot {
         shares: i64,
     },
@@ -56,9 +53,9 @@ impl fmt::Display for RuleError {
                 f,
                 "现在不在 A 股盘中（9:30-11:30 / 13:00-15:00 北京时间）；下个交易时段再发起；盘外只能用 adjust_stops 修改止损止盈，开/平/加减仓都拒"
             ),
-            RuleError::PriceLimitHit { side, current_pct, limit_pct } => write!(
+            RuleError::NotFillable => write!(
                 f,
-                "当前涨跌幅 {current_pct:+.2}% 触及{side}停板（限制 ±{limit_pct:.0}%），无法同向交易；可挂明日条件单"
+                "对手方盘口为空——封板 / 停牌 / 数据降级，订单无法成交；换标的或等数据恢复"
             ),
             RuleError::SharesNotIntegerLot { shares } => write!(
                 f,
