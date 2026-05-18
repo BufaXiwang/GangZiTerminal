@@ -14,7 +14,7 @@
 
 ---
 
-## 1. 核心哲学（不可妥协的 6 条）
+## 1. 核心哲学（不可妥协的 7 条）
 
 ### 1.1 Agent 自驱动（Notify Mode）
 
@@ -74,12 +74,31 @@ infrastructure/ SQLite / HTTP / provider / cache / snapshot
 domain/         entities / value objects / rules（纯 Rust，无 I/O）
 ```
 
-依赖规则：
+**层间依赖矩阵**（行 = 调用方，列 = 被调方；✅ 允许，❌ 禁止）：
+
+| ＼ 被调 | domain | infrastructure | pipeline | adapters | tauri/db/http |
+|---|:-:|:-:|:-:|:-:|:-:|
+| **domain** | ✅ | ❌ | ❌ | ❌ | ❌（必须无 I/O） |
+| **infrastructure** | ✅ | ✅ | ❌ | ❌ | ✅ |
+| **pipeline** | ✅ | ✅ | ✅ | ❌ | ✅ |
+| **adapters** | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+**BC 间依赖矩阵**（行 = 调用方 BC，列 = 被调方 BC）：
+
+| ＼ 被调 | quotes | account | news | agent |
+|---|:-:|:-:|:-:|:-:|
+| **quotes** | ✅ | ❌ | ❌ | ❌ |
+| **account** | ✅（只为 valuation 读 quotes snapshot） | ✅ | ❌ | ❌ |
+| **news** | ❌ | ❌ | ✅ | ❌ |
+| **agent** | ✅（**只通过** `adapters/agent_tools` 反腐译码） | ✅（同上） | ✅（同上） | ✅ |
+
+**关键约束**：
 - `domain/` 不允许 use `tauri | rusqlite | reqwest | infrastructure | pipeline | adapters`
 - `infrastructure/` 可实现 DB / HTTP / cache / provider，但不允许 use `pipeline | adapters`
-- `pipeline/` 负责编排 use case；不暴露 `#[tauri::command]`
-- `adapters/` 是唯一 IPC / LLM tool 协议层；可以调用 pipeline，也可以做 DTO 转换
-- Quotes / SimAccount / News 不感知 Agent；Agent 通过 `adapters/agent_tools` 调它们的公开能力
+- `pipeline/` 负责编排 use case；不暴露 `#[tauri::command]`；不允许 use `adapters`
+- `adapters/` 是唯一 IPC / LLM tool 协议层；可以 use 所有下层；做 DTO 转换 + 协议反腐
+- **Quotes / SimAccount / News 任何一层都不允许 import agent 代码**（核心边界）
+- Agent 调三个执行模块走 `adapters/agent_tools/*.rs`（实现 `pipeline::agent::tools::Tool`），由 `adapters/chat_commands` 构造 `ToolRegistry` 注入 pipeline——Tool trait/Registry 抽象在 pipeline，具体 tool 在 adapters，pipeline 不反向依赖 adapters
 
 ### 1.4 持久化是命脉
 
@@ -155,6 +174,69 @@ Snapshot-first：
 - ✅ migration 期可以有（PR 内部多次 commit），但 **PR merge 前删干净**
 - ✅ 数据库一次性 ALTER TABLE / 重建表，不维护两份 schema
 - ❌ 不留"半年后再删"的代码桩
+
+### 1.7 DDD-driven 开发（**所有新功能必须遵守**）
+
+> 自 2026-05-18 起，**所有新代码必须按 BC + 层级定位**。 跳层 / 反向依赖 / 跨 BC 错位的 PR 不接受。
+
+**新功能开发的标准 7 步**（按顺序，每步通过再下一步）：
+
+```
+Step 1. 选定 BC（quotes / account / news / agent）
+        判据：业务概念归属。"涨跌幅扫描" → quotes；"加仓规则" → account；
+              "资讯抽取" → news；"工具调用 / 记忆" → agent。
+        若一个功能跨多个 BC（如"按持仓自动订阅行情"），写在 pipeline 层用
+        多个 BC 的公开 API 编排——而不是在 domain 里互相 import。
+
+Step 2. 写 domain 层（如果是新概念）
+        - 纯 Rust：无 tauri、无 rusqlite、无 reqwest、无 chrono 网络时间
+        - newtype ID + value object 强类型（见 § 9.2 / 9.3）
+        - 规则用纯函数 / 聚合根方法
+        - 写单元测试（无 mock，纯函数测）
+
+Step 3. 写 infrastructure 层（如果有 I/O）
+        - DB 表 / migration / repository
+        - HTTP client / provider
+        - snapshot 内存表 + RwLock / OnceLock
+        - 实现 trait 把 domain 类型投射到 row / wire format
+
+Step 4. 写 pipeline 层（编排 use case）
+        - 调用 infrastructure 读写数据
+        - 调用 domain 算规则 / 派生
+        - 暴露 use case 函数；**不暴露 #[tauri::command]**
+        - 跨 BC 编排只在这一层（如 account valuation 读 quotes snapshot）
+
+Step 5. 写 adapters 层（如果对外暴露）
+        - Tauri command：薄包装，调 pipeline 函数；做 DTO 转换
+        - LLM 工具：实现 pipeline::agent::tools::Tool；
+          在 build_chat_registry 里注册
+
+Step 6. 依赖方向自检（PR 前必跑）
+        grep -rE "use crate::adapters"      src-tauri/src/{pipeline,domain,infrastructure}
+        grep -rE "use crate::pipeline"      src-tauri/src/{domain,infrastructure}
+        grep -rE "use crate::infrastructure" src-tauri/src/domain
+        grep -rE "use crate::(adapters::agent|pipeline::agent|domain::agent|infrastructure::agent)" \
+          src-tauri/src/{domain,infrastructure,pipeline}/{quotes,account,news}
+        任一非空 = bug。
+
+Step 7. 门禁：cargo check && cargo test && npm run build 全绿
+```
+
+**常见错放反例**：
+
+| 错放位置 | 正确位置 | 为什么 |
+|---|---|---|
+| `domain/quotes/fetch_klines.rs` 调 reqwest | `infrastructure/quotes/tushare/klines.rs` | domain 不允许 I/O |
+| `pipeline/account/positions.rs` 直接写 SQL | `infrastructure/account/repository.rs` 出函数，pipeline 调它 | pipeline 只编排，不接 SQL |
+| `infrastructure/account/repository.rs` 调 `pipeline::market::overview` | 把需要的逻辑放进 domain，infra 调 domain | infra 不依赖 pipeline |
+| `adapters/account_commands.rs` 里写涨跌停校验 | `domain/account/rules.rs` 加规则 + pipeline 调；adapter 只做 DTO | 业务规则不进 adapter |
+| `domain/quotes/types.rs` import `crate::domain::agent::*` | 解耦：把 agent 消费 quotes 的 DTO 放到 `domain/agent` 或 `adapters/agent_tools` | quotes BC 不感知 agent |
+| `pipeline/chat.rs` 直接调 `adapters::agent_tools::*` | 把 Tool 抽象放 pipeline，concrete impl 在 adapter，adapter 注入 registry | pipeline → adapters 反向 |
+
+**BC 边界澄清**：
+- **quotes ↔ account 唯一允许的方向**：account 在 `infrastructure/account/valuation.rs` 里读 `MARKET_SNAPSHOT`（quotes 提供的同步快照）算 PnL。account 不调 `pipeline::market::*`，不调 `infrastructure::quotes::tushare::*`——只接 snapshot 出口。
+- **agent ↔ 其它三个 BC**：agent 永远从 `adapters/agent_tools/<bc>.rs` 经反腐译码层调三个执行模块的公开 API。三个执行模块不能反向 import 任何 agent 代码（包括 domain/agent）。
+- **跨 BC 共享类型**：放 `domain/shared/`（StockCode / Money / TradeDate）。不要为了共用一个 helper 而让 BC A 的 domain import BC B 的 domain。
 
 ---
 
@@ -765,40 +847,47 @@ WebP / GIF，每条消息最多 4 张、每张最大 8 MB。
 
 ## 7. 现状与目标的 Gap（重构 backlog）
 
-| Gap | 现状 | 目标 |
+> **DDD 4 层落地状态（2026-05-18 复审）**：依赖方向已全部单向化，pipeline → adapters 反向引用已消除，所有 BC 拆分到 `domain / infrastructure / pipeline / adapters` 四层。新功能开发遵循 § 1.7。剩余条目都是**业务能力增强**，不是结构债。
+
+### 7.1 结构债（✅ 全部清零）
+
+| 项 | 状态 |
+|---|---|
+| DDD 4 层结构 | ✅ adapters → pipeline → infrastructure → domain；grep 自检全绿 |
+| BC 间隔离（quotes/account/news 不感知 agent）| ✅ grep `crate::*agent*` 在三个 BC 各层都 0 命中 |
+| IPC 边界 | ✅ `#[tauri::command]` 只在 `adapters/`；前端不绕过 use case |
+| Agent tool 边界 | ✅ 抽象 `pipeline/agent/tools` + 具体实现 `adapters/agent_tools`；registry 由 `adapters::chat_commands` 注入 pipeline |
+| Account 聚合根 | ✅ `domain/account/aggregate.rs` 承接事件构造 + state 变更 |
+| Newtype IDs | ✅ `PositionId / StockCode / NewsId / TradeDate / OccurredAt` |
+| Account 模块独立目录 | ✅ domain 拆 `aggregate / position / events / snapshot / cash / rules / sizing` |
+| News 模块独立目录 | ✅ `domain/news` + `infrastructure/news` + `pipeline/news`；`NewsStatus` 状态流 |
+| Snapshot-first 数据访问 | ✅ 核心行情 / 账户读已走 snapshot；agent 工具按需 fetch 限于研究查询 |
+| Quotes 全局 AppHandle | ✅ 显式参数为主 |
+| 五档盘口数据 | ✅ StockQuote 含 bid/ask 五档、内外盘、委比（TDX 主路径填充） |
+| Watchlist 归属 | ✅ Account-owned KV；Quotes 只消费 subscriptions |
+
+### 7.2 业务能力 backlog（与 DDD 无关）
+
+| 项 | 现状 | 目标 |
 |---|---|---|
-| Snapshot-first 数据访问 | ✅ 核心行情 / 账户读已走 snapshot；研究查询仍按需 fetch | snapshot 由各模块自治；按需 fetch 只用于明确研究查询 |
-| IPC 边界 | ✅ `#[tauri::command]` 只允许在 `adapters/` | 前端不能直接调用 repository / pipeline 内部函数 |
-| Agent tool 边界 | ✅ 抽象 `pipeline/agent/tools` + 具体实现 `adapters/agent_tools` | Tool trait/Registry 在 pipeline；具体 tool 在 adapter 作为反腐译码；adapter 在 chat command 把 registry 注入 pipeline，pipeline 不反向依赖 adapters |
-| Account 聚合根 | ✅ `domain/account/aggregate.rs` 已承接事件构造 + positions 状态变更；字段仍 public | 后续收窄 `Position` private 字段 |
-| Newtype IDs | ✅ `PositionId / StockCode / NewsId / TradeDate / OccurredAt` 已接 | `PositionId / StockCode / NewsId` |
-| Account 模块独立目录 | ✅ `domain/account` + `infrastructure/account` + `pipeline/account`；domain 已拆 `aggregate / position / events / snapshot` | 后续收窄 `Position` 字段可见性 |
-| News 模块独立目录 | ✅ `domain/news` + `infrastructure/news` + `pipeline/news`；`NewsItem` typed repository + `NewsStatus` payload 状态流已接 | 后续恢复定时 agent workflow 时接入 claim/consume 调度 |
-| DDD 分层结构 | ✅ `domain / infrastructure / pipeline / adapters` | 严格依赖方向：adapters → pipeline → infrastructure → domain；domain 不依赖外层 |
-| Quotes 全局 AppHandle | ✅ 显式参数为主 | 禁止新增全局 AppHandle hack |
 | `indicators_at_open` 持久化 | 未实现 | open 时算并存 PositionEvent payload |
-| 五档盘口数据 | ✅ TDX 主路径填充，fallback 源为空 | StockQuote 已含 bid/ask 五档、内外盘、委比 |
-| 分钟 K 线 | ✅ 已接 | `fetch_minute_klines` + MinuteKlineSeries（EM kline klt=1/5/15/30/60） |
-| 基本面字段 | ✅ 已接 | TuShare `daily_basic` + DailyBasic；scanner/profile 已消费 |
-| 北向资金 + 融资融券 | ✅ 已接出 | `fetch_north_flow` / `fetch_north_top10` / `fetch_margin_summary` |
-| 公司动作 | ✅ 已接出 | TuShare `dividend` + `suspend_d` + `namechange` + `forecast` + `share_float` → CompanyEvent enum |
-| 板块涨跌 | ✅ 已接出 | TuShare `concept_detail` + 客户端聚合做"概念涨跌榜" |
 | 交易日历 | clock.rs 硬编码 | 接 TuShare `trade_cal`，启动 hydrate 一年；scanner 倒推用日历不试错 |
 | 指数历史 K | MarketIndex 只有快照 | `get_index_klines(index_code, period)` |
-| 复合 query scanner | ✅ 已接 | `scan_market_query(conditions, sort_by, limit)` 多条件 + 排序 |
-| Newtype 单位 | f64/i64 满天飞 | `Yuan / KYuan / Lots / Shares / TradeDate / OccurredAt` |
 | StockQuote 数据新鲜度 | 只有 quote_time | 加 `captured_at`——agent 判断 snapshot 多旧 |
 | 技术指标参数可配 | 硬编码周期 | `compute_indicators(klines, cfg: IndicatorConfig)` |
-| Watchlist 归属 | ✅ Account-owned KV + hooks | Quotes 只消费 Account subscriptions，不拥有 CRUD |
+| Newtype 单位（金额/股数）| f64/i64 满天飞 | `Yuan / KYuan / Lots / Shares` 全链路覆盖 |
+| Position 字段可见性 | 仍 public | 收窄到 private + 聚合根方法 |
+| News claim/consume | 未启用 | 恢复定时 agent workflow 时接入调度 |
 
 ---
 
 ## 8. 文档更新规则
 
 - 任何架构 / 接口 / 数据模型变更**先改本文档**再写代码
-- PR description 引用本文档对应章节
+- 任何新功能开发**按 § 1.7 的 7 步走**：先选 BC + 选层，再写代码
+- PR description 引用本文档对应章节（最少 § 1.3 依赖矩阵 + § 1.7 工作流）
 - 模块边界 / 核心哲学的改动需要 ADR — 放到 `docs/design/` 子目录
-- 本文档保持精简（< 1000 行）；细节往子文档迁
+- 本文档保持精简（< 1500 行）；细节往子文档迁
 
 ---
 
