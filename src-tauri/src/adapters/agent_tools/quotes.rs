@@ -3,15 +3,15 @@
 //! 所有数据走 quotes 模块的 snapshot-first 路径：
 //! - `infrastructure::quotes::snapshot::market_snapshot`（scheduler 维护，同步读）
 //! - `infrastructure::quotes::cache::kline_cache`（K 线持久化缓存）
-//! - `pipeline::market_overview`（大盘指数拼装）
+//! - `pipeline::market::overview`（大盘指数拼装）
 
+use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::adapters::quotes_commands::StockQuoteDto;
-use crate::infrastructure::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::agent::types::ToolResultContent;
 use crate::domain::quotes::KlinePeriod;
 use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
-use crate::pipeline::market_overview;
+use crate::pipeline::market::overview as market_overview;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tauri::AppHandle;
@@ -91,7 +91,9 @@ impl Tool for GetQuoteTool {
             Ok(c) => c,
             Err(e) => return err_text(e),
         };
-        let ts_code = match crate::infrastructure::quotes::repository::resolve_stock_ts_code(&self.app, &code) {
+        let ts_code = match crate::infrastructure::quotes::repository::resolve_stock_ts_code(
+            &self.app, &code,
+        ) {
             Some(ts) => ts,
             None => {
                 return err_text(format!(

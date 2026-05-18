@@ -5,6 +5,45 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::NewsError;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NewsId(String);
+
+impl NewsId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// News processing state for future briefing/review pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewsStatus {
+    Pending,
+    Processing,
+    Consumed,
+    Failed,
+}
+
+impl NewsStatus {
+    pub fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Processing)
+                | (Self::Processing, Self::Consumed)
+                | (Self::Processing, Self::Failed)
+                | (Self::Processing, Self::Pending)
+                | (Self::Failed, Self::Pending)
+        )
+    }
+}
+
 /// 一条资讯（标题 + 元信息）。
 ///
 /// `id` 由 fetcher 决定唯一性策略：
@@ -20,6 +59,31 @@ pub struct NewsItem {
     pub source: String,
     pub published: Option<String>,
     pub summary: Option<String>,
+    #[serde(
+        default,
+        rename = "analysisStatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub analysis_status: Option<NewsStatus>,
+}
+
+impl NewsItem {
+    pub fn status_or_pending(&self) -> NewsStatus {
+        self.analysis_status.unwrap_or(NewsStatus::Pending)
+    }
+
+    pub fn transition_to(&mut self, next: NewsStatus) -> Result<(), NewsError> {
+        let current = self.status_or_pending();
+        if current.can_transition_to(next) || current == next {
+            self.analysis_status = Some(next);
+            Ok(())
+        } else {
+            Err(NewsError::InvalidState(format!(
+                "news {} 状态不能从 {:?} 转到 {:?}",
+                self.id, current, next
+            )))
+        }
+    }
 }
 
 /// 一篇资讯的正文抽取结果——`fetch_article_content` Tauri command 返回，

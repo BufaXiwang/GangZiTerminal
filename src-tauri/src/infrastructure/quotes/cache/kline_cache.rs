@@ -10,9 +10,9 @@
 //! - adapter `fetch_a_share_klines`（前端 KlineChart）
 //! - pipeline `kline_warm`（启动后预热 Account subscriptions）
 
-use crate::infrastructure::db::{migrate, open_database};
 use crate::domain::quotes::{AdjMode, KlinePeriod, KlineSeries};
 use crate::domain::shared::StockCode;
+use crate::infrastructure::db::{migrate, open_database};
 use crate::infrastructure::quotes::tushare::{
     fund as ts_fund, index as ts_index, stock as ts_stock,
 };
@@ -449,4 +449,3 @@ pub fn upsert_kline_meta(
         .map_err(|err| format!("kline_meta upsert 失败：{err}"))?;
     Ok(())
 }
-

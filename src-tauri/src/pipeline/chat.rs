@@ -12,27 +12,32 @@
 //! Memory 更新由 agent 通过 update_memory / remove_memory 工具自己写——
 //! pipeline 不再 parse JSON。
 
-use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config, ProviderKind};
-use crate::pipeline::agent::observer;
-use crate::infrastructure::agent::tools::{build_chat_registry, ToolContext};
 use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
     ServerSideTool, StopReason, SystemBlock, ToolDef,
 };
-use crate::pipeline::agent::{run_agent, SummarizeOptions};
+use crate::domain::agent::ProviderKind;
 use crate::infrastructure::account::watchlist;
-use crate::pipeline::history::{
-    build_assistant_content_json, build_compact_boundary_row, build_user_content_json,
-    read_recent_chat_thread,
-};
-use crate::pipeline::{
-    collect_relevant_codes, emit_status, fetch_market_overview, fetch_quotes_with_visibility,
-    new_id, now_iso, read_investor_memory, read_position_events_for_open, read_positions,
-};
+use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config};
+use crate::pipeline::agent::observer;
 use crate::pipeline::agent::prompt::{
     build_chat_dynamic_context, build_chat_system_context, ChatDynamicContextInput,
     ChatSystemContextInput, AGENT_IDENTITY, CHAT_SYSTEM_INSTRUCTIONS,
 };
+use crate::pipeline::agent::tools::{ToolContext, ToolRegistry};
+use crate::pipeline::agent::{run_agent, SummarizeOptions};
+use crate::pipeline::history::{
+    build_assistant_content_json, build_compact_boundary_row, build_user_content_json,
+    read_recent_chat_thread,
+};
+use crate::pipeline::context::{
+    collect_relevant_codes, read_position_events_for_open, read_positions,
+};
+use crate::pipeline::events::emit_status;
+use crate::pipeline::market::overview::fetch_market_overview;
+use crate::pipeline::memory::read_investor_memory;
+use crate::pipeline::quotes_fetch::fetch_quotes_with_visibility;
+use crate::pipeline::util::{new_id, now_iso};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -56,11 +61,11 @@ pub struct ChatReplyResult {
     pub run_id: String,
 }
 
-#[tauri::command]
 pub async fn send_chat_message_now(
     app: AppHandle,
     content: String,
     #[allow(non_snake_case)] images: Option<Vec<String>>,
+    registry: Arc<ToolRegistry>,
 ) -> Result<ChatReplyResult, String> {
     if CHAT_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -121,7 +126,8 @@ pub async fn send_chat_message_now(
         "sourceNewsIds": null,
         "sourceRecordId": null,
     });
-    crate::infrastructure::agent::repository::append_chat_message(app.clone(), user_msg).map_err(|e| format!("写 user 消息失败：{e}"))?;
+    crate::infrastructure::agent::repository::append_chat_message(app.clone(), user_msg)
+        .map_err(|e| format!("写 user 消息失败：{e}"))?;
 
     // 2. 读上下文。
     //    - history（结构化）：DB 里最近的真实对话，若有 compact_boundary 会优先吃边界后的全部
@@ -142,7 +148,7 @@ pub async fn send_chat_message_now(
     let codes = collect_relevant_codes(&watchlist, &positions);
     let quotes_status = fetch_quotes_with_visibility(&app, "chat", codes).await;
     let quotes_availability = quotes_status.to_prompt_section();
-    let market = fetch_market_overview(&app).await;
+    let market = fetch_market_overview(&app).await.ok();
 
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
@@ -187,8 +193,6 @@ pub async fn send_chat_message_now(
         role: Role::User,
         content: user_blocks.clone(),
     });
-
-    let registry = Arc::new(build_chat_registry(&app));
 
     // 解析 chat pipeline 用的 (channel, model)——决定 provider build + tools 里要不要加
     // server-side web_search。
@@ -471,7 +475,9 @@ pub async fn send_chat_message_now(
                 map.insert("sourceNewsIds".into(), Value::Null);
                 map.insert("sourceRecordId".into(), Value::Null);
             }
-            if let Err(e) = crate::infrastructure::agent::repository::append_chat_message(app.clone(), row) {
+            if let Err(e) =
+                crate::infrastructure::agent::repository::append_chat_message(app.clone(), row)
+            {
                 tracing::warn!(error = %e, "落 compact_boundary 行失败——下次 chat 加载会回到 N 条 history");
             }
         }

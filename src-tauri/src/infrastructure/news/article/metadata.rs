@@ -1,4 +1,6 @@
-use crate::infrastructure::news::article::cleanup::{dedupe, is_content_text, normalize_text, parse_selector};
+use crate::infrastructure::news::article::cleanup::{
+    dedupe, is_content_text, normalize_text, parse_selector,
+};
 use crate::infrastructure::news::article::model::ExtractContext;
 use scraper::Html;
 use serde_json::Value;

@@ -16,10 +16,10 @@
 //! ```
 
 use crate::domain::agent::types::{AgentEvent, PipelineKind, StopReason};
-use crate::pipeline::agent::RunSummary;
 use crate::infrastructure::agent::repository::{
     finalize_agent_run, insert_agent_run_start, insert_agent_run_turn,
 };
+use crate::pipeline::agent::RunSummary;
 use chrono::Utc;
 use std::collections::HashMap;
 use tauri::AppHandle;

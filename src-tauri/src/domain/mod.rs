@@ -3,11 +3,11 @@
 //! 按 architecture.md § 9.1 DDD-lite 结构：
 //! - `shared/`：跨 Bounded Context 复用的 newtype + value object
 //! - `quotes/`：市场数据 BC
-//! - `account/`（后续 phase）：模拟账户 BC
-//! - `news/`（后续 phase）：资讯 BC
-//! - `agent/`（后续 phase）：Agent 决策 BC
+//! - `account/`：模拟账户 BC（aggregate / events / cash / rules / sizing / snapshot）
+//! - `news/`：资讯 BC
+//! - `agent/`：Agent 决策 BC（canonical wire types + InvestorMemory）
 //!
-//! Domain 模块**不引用** infrastructure / application / adapters。所有 I/O 在
+//! Domain 模块**不引用** infrastructure / pipeline / adapters。所有 I/O 在
 //! domain 之外实现，通过 trait 在 domain 内定义契约。
 
 pub mod account;

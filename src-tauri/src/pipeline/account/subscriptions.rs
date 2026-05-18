@@ -21,7 +21,9 @@ pub fn subscribed_codes(app: &AppHandle) -> Vec<String> {
 
     // 1. watchlist —— 用户自选股 + agent 添加
     for code in watchlist::list() {
-        if let Some(ts) = crate::infrastructure::quotes::repository::resolve_stock_ts_code(app, code.as_str()) {
+        if let Some(ts) =
+            crate::infrastructure::quotes::repository::resolve_stock_ts_code(app, code.as_str())
+        {
             set.insert(ts);
         }
     }
@@ -30,7 +32,10 @@ pub fn subscribed_codes(app: &AppHandle) -> Vec<String> {
     let repo = PositionRepo::new(app.clone());
     if let Ok(positions) = repo.list_open() {
         for p in positions {
-            if let Some(ts) = crate::infrastructure::quotes::repository::resolve_stock_ts_code(app, p.code.as_str()) {
+            if let Some(ts) = crate::infrastructure::quotes::repository::resolve_stock_ts_code(
+                app,
+                p.code.as_str(),
+            ) {
                 set.insert(ts);
             }
         }

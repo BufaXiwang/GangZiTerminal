@@ -11,8 +11,8 @@
 //!
 //! 错误分类参见 [`classify`]——只对 `RateLimited` / `Transient` / 5xx 退避。
 
-use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent};
 use crate::domain::agent::types::AgentRequest;
+use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent};
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use std::sync::Arc;
@@ -138,10 +138,10 @@ impl ChatProvider for RetryingProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::agent::provider::TokenUsage;
     use crate::domain::agent::types::{
         AgentOptions, ContextBudget, Message, PipelineKind, Role, StopReason, SystemBlock,
     };
+    use crate::infrastructure::agent::provider::TokenUsage;
     use futures_util::stream::{self, BoxStream, StreamExt};
     use std::sync::Mutex;
 

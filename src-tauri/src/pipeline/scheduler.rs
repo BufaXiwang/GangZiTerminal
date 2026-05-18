@@ -52,7 +52,7 @@ async fn market_universe_loop(app: AppHandle) {
 
     loop {
         let started = std::time::Instant::now();
-        let summary = crate::pipeline::market_universe::run_universe_refresh(&app).await;
+        let summary = crate::pipeline::market::universe::run_universe_refresh(&app).await;
         let elapsed_ms = started.elapsed().as_millis();
         tracing::info!(
             stocks = summary.stock_count,
@@ -143,13 +143,13 @@ async fn refresh_account_snapshot(app: &AppHandle) {
 
 async fn kline_warm_loop(app: AppHandle) {
     tokio::time::sleep(Duration::from_secs(30)).await;
-    crate::pipeline::kline_warm::warm_klines_once(&app).await;
+    crate::pipeline::market::kline_warm::warm_klines_once(&app).await;
 
     loop {
         let wait = duration_until_next_16_beijing();
         tracing::info!(secs = wait.as_secs(), "下一次 K 线预热等待");
         tokio::time::sleep(wait).await;
-        crate::pipeline::kline_warm::warm_klines_once(&app).await;
+        crate::pipeline::market::kline_warm::warm_klines_once(&app).await;
     }
 }
 
@@ -180,7 +180,9 @@ async fn tushare_probe_once(app: AppHandle) {
     tokio::time::sleep(Duration::from_secs(20)).await;
 
     // 已跑过就跳
-    if let Ok(Some(_)) = crate::infrastructure::app_state::load_app_state_value(&app, KEY_TUSHARE_PROBE_DONE) {
+    if let Ok(Some(_)) =
+        crate::infrastructure::app_state::load_app_state_value(&app, KEY_TUSHARE_PROBE_DONE)
+    {
         tracing::debug!("TuShare probe 已跑过，跳过");
         return;
     }
@@ -217,7 +219,7 @@ async fn tushare_probe_once(app: AppHandle) {
 // - 盘后（其它时段）：60s
 // - 周末：10min
 //
-// 实现走 EM ulist.np 分批 + 并发 + 重试。详见 pipeline::market_refresh。
+// 实现走 EM ulist.np 分批 + 并发 + 重试。详见 pipeline::market::refresh。
 
 async fn market_quote_loop(app: AppHandle) {
     // 启动延迟 8s——等 stocks_refresh_loop 先把档案表 hydrate（首次启动时）
@@ -225,7 +227,7 @@ async fn market_quote_loop(app: AppHandle) {
 
     loop {
         // 先跑一次
-        match crate::pipeline::market_refresh::run_market_quote_refresh(&app).await {
+        match crate::pipeline::market::refresh::run_market_quote_refresh(&app).await {
             Ok(summary) => tracing::info!(
                 total = summary.total,
                 success = summary.success,
@@ -328,7 +330,7 @@ impl FailureCounter {
         let n = self.consecutive.fetch_add(1, Ordering::SeqCst) + 1;
         if n == 5 || n == 10 || n == 20 {
             // 每达一个里程碑发一次 status，UI 可见
-            crate::pipeline::emit_status(
+            crate::pipeline::events::emit_status(
                 app,
                 "loop-degraded",
                 &format!(
@@ -436,7 +438,6 @@ fn read_bool(app: &AppHandle, key: &str, default: bool) -> bool {
         .and_then(|v| v.as_bool())
         .unwrap_or(default)
 }
-
 
 fn read_u64(app: &AppHandle, key: &str, default: u64) -> u64 {
     crate::infrastructure::app_state::load_app_state_value(app, key)

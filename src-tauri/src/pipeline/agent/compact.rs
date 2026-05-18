@@ -20,11 +20,11 @@
 //! - 模型偷调工具：当前 prompt 没声明任何 tool，provider 不允许调；
 //!   极端情况下返回的 stop_reason 不是 EndTurn 时按 ParseFailed 处理
 
-use crate::infrastructure::agent::provider::{ChatProvider, ProviderError};
 use crate::domain::agent::types::{
     AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role, StopReason,
     SystemBlock, ToolDef,
 };
+use crate::infrastructure::agent::provider::{ChatProvider, ProviderError};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -171,7 +171,9 @@ pub async fn summarize_messages(
 
     while let Some(ev) = stream.next().await {
         match ev? {
-            crate::infrastructure::agent::provider::ProviderEvent::TextDelta(d) => text.push_str(&d),
+            crate::infrastructure::agent::provider::ProviderEvent::TextDelta(d) => {
+                text.push_str(&d)
+            }
             crate::infrastructure::agent::provider::ProviderEvent::Usage(u) => {
                 input_tokens += u.input_tokens;
                 output_tokens += u.output_tokens;

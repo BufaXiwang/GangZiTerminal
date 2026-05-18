@@ -4,7 +4,7 @@
 
 ## Project
 
-A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资讯识别机会 → 在模拟账户里实盘验证 → 沉淀成可学习的判断链。
+A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资讯识别机会 → 在模拟账户里实盘验证 → 沉淀成可审计、可复盘的判断链。
 
 **不连真券商，只做模拟。**
 
@@ -18,73 +18,68 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 
 - Tauri v2（Rust 后端 + React/TS 前端）
 - SQLite via `rusqlite`（持久化真源）
-- 自托管 agent loop（`src-tauri/src/agent/`）——支持 Anthropic / OpenAI Responses / OpenAI Chat Completions 三个 wire format
-- 行情数据：**TuShare Pro**（历史 / 财务 / 板块 / 基金）+ **Eastmoney ulist.np**（实时报价）
+- 自托管 agent loop（`src-tauri/src/pipeline/agent/`）——支持 Anthropic / OpenAI Responses / OpenAI Chat Completions 三个 wire format
+- 行情数据：**TDX**（实时报价主路径）+ **Eastmoney**（BJ / fallback / 分钟 K）+ **TuShare Pro**（历史 / 财务 / 板块 / 基金）
 
 ## Architecture Boundary
 
 参见 [architecture.md § 1.3](docs/architecture.md)。简短版：
 
 ```
-Chat → Agent → { Quotes, SimAccount, News }
-                SimAccount → Quotes  (for valuation)
+React UI
+   ↓ invoke / events
+adapters/            Tauri commands + LLM tools
+   ↓
+pipeline/            use cases: chat / account / refresh / scheduler
+   ↓
+infrastructure/      SQLite / HTTP / provider / cache / snapshot
+   ↓
+domain/              pure entities, value objects, rules
 ```
 
-依赖单向。Quotes / SimAccount / News **不感知** Agent。
+业务依赖单向。`domain` 不依赖外层；`infrastructure` 不依赖 `pipeline/adapters`；`pipeline` 不暴露 IPC；`adapters` 是唯一 Tauri command surface。Quotes / SimAccount / News **不感知** Agent。
 
 ## Code Map（current state）
 
 ```
 src-tauri/src/
 ├── main.rs              setup hook + invoke_handler
-├── agent/               Self-hosted agent loop
-│   ├── types.rs         Block / Message / AgentEvent / AgentRequest
-│   ├── provider/        ChatProvider trait + anthropic / openai_responses / openai_chat 三家
-│   ├── tools/           ToolRegistry + 14+ tools（quotes / scanner / research / funds / account / memory / news / positions）
-│   ├── loop_.rs         tool-use 迭代 + 并行执行 + max_turns
-│   ├── context.rs       3-tier 压缩
-│   ├── compact.rs       summarize 摘要
-│   ├── observer.rs      AgentEvent emit + agent_runs 落审计
-│   └── config.rs        Provider/model/runtime KV 配置
-├── pipeline/            Use cases / 用例编排（briefing/review/chat/refresh）
-│   ├── briefing.rs / review.rs / chat.rs / refresh.rs
-│   ├── stocks.rs        stocks 表刷新
-│   ├── history.rs       chat 历史读取
-│   └── runner.rs        briefing/review 共用 helper
-├── quotes/              市场数据（TuShare + EM 实时）
-│   ├── tushare/         10 个 TuShare 接口（stock_basic / klines / market_scan / index_daily / top_list / moneyflow / fund_*）
-│   ├── eastmoney.rs     实时报价 ulist.np + 分时 push2his
-│   ├── indicators.rs    技术指标纯函数（MA/EMA/MACD/RSI/KDJ/CCI/BOLL/ATR/OBV）
-│   ├── scanner.rs       全市场扫描（filter + 排序 + 缓存）
-│   ├── cache.rs / clock.rs / util.rs / validation.rs
-│   └── mod.rs
-├── account.rs           模拟账户（待按 spec 拆为 account/ 子目录 + 聚合根）
-├── news.rs              资讯拉取（待整合到 news/ 子目录）
-├── article/             资讯正文抽取
-├── scheduler.rs         5 个 Tokio loop（briefing / review / quote refresh / news refresh / stocks refresh）
-├── prompt.rs            prompt builder + briefing/review JSON parser
-├── identity.md          Agent 身份（include_str! 注入 system block）
-├── memory.rs            投资者记忆 merge（80 字 cap）
-├── trade.rs             仓位 sizing
-├── risk.rs              模拟账户风控校验
-├── learning.rs          学习画像派生
-├── agent_io.rs          持久化数据类型
-├── models.rs            通用数据结构
-├── chat_attachments.rs  图片粘贴白名单 + 大小 cap
-├── security.rs          外部 URL 校验 + 8MB cap
-├── db.rs                SQLite 层 + schema 迁移
-└── logging.rs           tracing 初始化
+├── domain/              纯 domain：无 I/O、无 Tauri 依赖
+│   ├── shared/          StockCode / PositionId / NewsId / Money / Shares / time
+│   ├── account/         Account aggregate + Position / PositionEvent / rules / sizing / snapshot
+│   ├── quotes/          Quote/Kline/Indicator 类型 + 纯指标函数 + 交易日历逻辑
+│   ├── news/            NewsItem / NewsStatus / NewsError
+│   └── agent/           AgentRequest / AgentEvent / ProviderKind / InvestorMemory
+├── infrastructure/      I/O 实现：SQLite / HTTP / provider / cache / snapshot
+│   ├── account/         repository / snapshot_cache / valuation / watchlist / migration
+│   ├── quotes/          TuShare / Eastmoney / TDX / realtime dispatch / cache / scanner
+│   ├── news/            NewsNow / RSS / article extractor / repository
+│   ├── agent/           ChatProvider + Anthropic / OpenAI Responses / OpenAI Chat
+│   ├── app_state/       KV repository
+│   └── db/              SQLite connection + migrations
+├── pipeline/            Use cases / 用例编排
+│   ├── chat.rs          当前唯一 agent 入口：用户消息 → agent loop → assistant 消息
+│   ├── agent/           loop / prompt / context / compact / observer / config / tools (Tool trait + Registry 抽象)
+│   ├── account/         AccountService + close / subscriptions
+│   ├── news/refresh.rs  资讯刷新用例
+│   ├── market/          refresh / overview / universe / kline_warm
+│   ├── history.rs · memory.rs · context.rs · quotes_fetch.rs · events.rs · stocks.rs · chat_attachments.rs · util.rs  跨 use case 复用的 helper
+│   └── scheduler.rs     news / market / account / kline warm 后台 loop
+├── adapters/            边界层
+│   ├── *_commands.rs    唯一 Tauri IPC surface
+│   └── agent_tools/     具体 LLM 工具实现（实现 pipeline::agent::tools::Tool；adapter 在 chat command 里构造 registry 注入 pipeline）
+└── infrastructure/logging.rs
 
 src/
 ├── App.tsx              render shell
-├── components/          UI: ChatPage / SimulationPage / TodayPage / SettingsPage / MarketOverview / KlineChart / SecondaryView
-├── hooks/               useAppState / useChatMessageStream / useAgentEventStream / useNewsRefresh / useQuotes / useQuotesFetchStatus
+├── components/          UI: ChatPage / SimulationPage / TodayPage / NewsPage / SettingsPage / MarketOverview / KlineChart / SecondaryView
+├── hooks/               useAppState / chat stream / agent events / account / market / news / quotes / watchlist
 ├── lib.ts               defaultWatchlist
-├── lib/                 UI 派生 state: learning / simulation / reviewSchedule / format / news / market
+├── lib/                 UI 派生 state: simulation / format / news / market
 └── types.ts             前端类型契约
 ```
 
-> 注：`account.rs` / `news.rs` 单文件 + `quotes/` 子目录是**当前过渡态**。spec § 9 的目标是 4 层 DDD（domain/infrastructure/application/adapters）。见 architecture.md § 7 Gap 表。
+> 当前后端已按 `domain / infrastructure / pipeline / adapters` 四层落地。新增业务能力优先放进对应 bounded context；不要在 `adapters` 或 React 里写业务规则。
 
 ## Core Commands
 
@@ -102,10 +97,10 @@ npm run tmux:logs / restart / stop
 参见 architecture.md § 1 完整 6 条。简短版：
 
 1. **Agent Notify Mode** — 决策即执行，chat 是事后通知
-2. **派生 over 存储** — cash / PnL / learning_profile 现算不存
+2. **派生 over 存储** — cash / PnL 现算不存
 3. **模块边界单向** — Quotes / SimAccount / News 不感知 Agent
 4. **持久化先 event 后 state** — append-only audit
-5. **Snapshot-first 数据访问** — Agent 读 snapshot 不 fetch
+5. **Snapshot-first 数据访问** — Agent 读 snapshot，不在热路径直接 fetch
 6. **不背历史包袱**（快速迭代期）— 删干净 vs deprecate
 
 ## Handoff Checklist

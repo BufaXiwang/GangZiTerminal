@@ -29,7 +29,9 @@ fn store() -> &'static RwLock<BTreeSet<StockCode>> {
 
 /// 进程启动时调一次——从 app_state 把 watchlist 灌进内存单例。
 pub fn hydrate(app: &AppHandle) {
-    if let Ok(Some(value)) = crate::infrastructure::app_state::load_app_state_value(app, KEY_WATCHLIST) {
+    if let Ok(Some(value)) =
+        crate::infrastructure::app_state::load_app_state_value(app, KEY_WATCHLIST)
+    {
         if let Some(arr) = value.as_array() {
             let codes: BTreeSet<StockCode> = arr
                 .iter()
@@ -96,5 +98,9 @@ pub fn replace(app: &AppHandle, codes: Vec<StockCode>) {
 
 fn persist(app: &AppHandle) {
     let codes = list_strings();
-    let _ = crate::infrastructure::app_state::save_app_state_value(app, KEY_WATCHLIST, &Value::from(codes));
+    let _ = crate::infrastructure::app_state::save_app_state_value(
+        app,
+        KEY_WATCHLIST,
+        &Value::from(codes),
+    );
 }

@@ -1,4 +1,5 @@
-#![allow(dead_code, unused_imports)] // TDX 协议层提供完整能力面，agent 工具按需调用；未连通的 API 保留供未来用
+#![allow(dead_code, unused_imports)]
+// TDX 协议层提供完整能力面，agent 工具按需调用；未连通的 API 保留供未来用
 
 //! 通达信 (TDX) 行情协议 Rust 端口——完整复刻 mootdx / pytdx wire format。
 //!

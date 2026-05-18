@@ -118,92 +118,6 @@ export type PositionEvent = {
   agentNoteMd?: string;        // Agent 当时的判断摘要
 };
 
-export type Decision = "watch" | "bullish" | "bearish" | "wait";
-
-export type AnalysisResult = {
-  summary: string;
-  relatedStocks: string[];
-  keyFacts: string[];
-  sectors: string[];
-  themes: string[];
-  impact: "positive" | "negative" | "neutral" | "mixed";
-  confidence: number;
-  timeHorizon: "short" | "medium" | "long";
-  reasoning: string[];
-  risks: string[];
-  verificationChecklist: string[];
-  externalResearch: ExternalResearch;
-  learningNotes: string;
-  decision: Decision;
-  tradePlan: SimulatedTradePlan;
-};
-
-export type ReviewResult = {
-  summary: string;
-  thesisStatus: "validated" | "invalidated" | "watching" | "inconclusive";
-  confidence: number;
-  evidence: string[];
-  priceAction: string[];
-  newsFollowUp: string[];
-  checklistReview: string[];
-  mistakes: string[];
-  nextActions: string[];
-  learningUpdate: string;
-  reviewedAt: string;
-  nextReviewAt?: string;
-};
-
-export type ExternalResearch = {
-  used: boolean;
-  queries: string[];
-  findings: string[];
-  sources: Array<{
-    title: string;
-    url?: string;
-    note: string;
-  }>;
-};
-
-export type SimulatedTradePlan = {
-  action: "buy" | "watch" | "avoid" | "sell_if_holding";
-  suitability: "low" | "medium" | "high";
-  targetStocks: TradeTargetStock[];
-  entryStrategy: {
-    style: "breakout" | "pullback" | "event_follow" | "wait_confirmation";
-    triggerCondition: string;
-    invalidationCondition: string;
-  };
-  positionSizing: {
-    suggestedWeight: string;
-    maxLossPerTrade: string;
-    reason: string;
-  };
-  exitPlan: {
-    takeProfitCondition: string;
-    stopLossCondition: string;
-    timeStop: string;
-  };
-  riskLevel: "low" | "medium" | "high";
-  confidence: number;
-  whyNotBuyNow: string[];
-};
-
-export type TradeTargetStock = {
-  name: string;
-  code?: string;
-  reason: string;
-  priority: number;
-};
-
-export type AnalysisRecord = {
-  id: string;
-  item: NewsItem;
-  result: AnalysisResult;
-  createdAt: string;
-  nextReviewAt?: string;
-  review?: ReviewResult;
-};
-
 export type SimulatedPosition = {
   id: string;
   code: string;
@@ -221,24 +135,6 @@ export type SimulatedPosition = {
   timeStopAt?: string;
   sourceAnalysisId: string;
   status: "open" | "closed";
-};
-
-export type LearningProfile = {
-  level: number;
-  score: number;
-  totalRecords: number;
-  reviewedRecords: number;
-  reviewRate: number;
-  validatedCount: number;
-  invalidatedCount: number;
-  watchingCount: number;
-  inconclusiveCount: number;
-  validationRate: number;
-  topThemes: Array<{ name: string; count: number }>;
-  commonMistakes: Array<{ text: string; count: number }>;
-  recentLearningUpdates: string[];
-  focusSuggestions: string[];
-  updatedAt: string;
 };
 
 export type InvestorMemory = {
@@ -271,62 +167,14 @@ export type ChatMessage = {
 };
 
 export type ChatMessageContent = {
-  /** 仅 briefing 携带：解析后的批量分析 */
-  briefing?: BriefingResult;
-  /** 仅 chat（assistant）/ briefing 携带：本轮新沉淀的长期记忆增量（自动应用） */
+  /** 仅 chat（assistant）携带：本轮新沉淀的长期记忆增量（自动应用） */
   memoryUpdates?: InvestorMemoryUpdate;
   /** 本轮主动从长期记忆里删除的条目（按字段名+精确字符串匹配）——重放和审计用 */
   memoryRemovals?: InvestorMemoryUpdate;
-  /** review 携带的结构化复盘 */
-  review?: ReviewResult;
   /** 系统消息附带备注 */
   note?: string;
-  /** highlight 携带：关联的 briefing 消息 id，便于跳转到对应简报 */
-  sourceBriefingId?: string;
   /** chat（user）携带：用户粘/拖进来的图片，存的是后端落盘的绝对路径 */
   images?: string[];
-};
-
-/** 主 Agent 一次 briefing 的结构化输出 */
-export type BriefingResult = {
-  /** 8-16 字的精炼标题，给右侧列表展示用 */
-  headline: string;
-  summaryMd: string;
-  signals: BriefingSignal[];
-  tradeCalls: BriefingTradeCall[];
-  coveredNewsIds: string[];
-  nextFocus: string[];
-  /** 平时为 null；真有重点才返。importance=high 时会作为对话流里的主动"划重点"消息发给用户 */
-  highlight?: BriefingHighlight | null;
-  memoryUpdates?: InvestorMemoryUpdate;
-  /** 主动遗忘——Agent 在本次判断里认为应当从长期记忆中移除的旧条目（精确字符串匹配）。 */
-  memoryRemovals?: InvestorMemoryUpdate;
-};
-
-export type BriefingHighlight = {
-  importance: "high" | "medium";
-  /** 30-80 字口语化提示，第一人称风格，像投资者朋友在跟用户讲话 */
-  message: string;
-};
-
-export type BriefingSignal = {
-  theme: string;
-  direction: "bullish" | "bearish" | "mixed" | "watch";
-  evidence: string;
-};
-
-export type BriefingTradeCall = {
-  code?: string;
-  name: string;
-  action: "buy" | "watch" | "avoid" | "sell_if_holding";
-  thesis: string;
-  triggerCondition: string;
-  invalidationCondition: string;
-  stopLoss?: string;
-  takeProfit?: string;
-  timeStop?: string;
-  riskLevel: "low" | "medium" | "high";
-  confidence: number;
 };
 
 export type RiskAlert = {

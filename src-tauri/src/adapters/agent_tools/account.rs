@@ -14,9 +14,9 @@
 //! agent 调用 source 统一传 `EventSource::Chat { message_id }`——run_id 充当 message_id，
 //! 让后续 review/审计能追溯到具体 chat run。
 
-use crate::infrastructure::agent::tools::{err_text, ok_json, Tool, ToolContext};
-use crate::domain::agent::types::ToolResultContent;
+use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::account::types::{CloseReason, EventSource, Position};
+use crate::domain::agent::types::ToolResultContent;
 use crate::domain::shared::{OccurredAt, Shares, Yuan};
 use crate::pipeline::account::service::{AccountService, OpenRequest};
 use async_trait::async_trait;
@@ -121,11 +121,7 @@ impl Tool for GetAccountTool {
         json!({ "type": "object", "properties": {}, "additionalProperties": false })
     }
 
-    async fn execute(
-        &self,
-        _input: Value,
-        _ctx: &ToolContext,
-    ) -> (Vec<ToolResultContent>, bool) {
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
         let service = AccountService::new(self.app.clone());
         match service.snapshot() {
             Ok(snap) => {
@@ -184,11 +180,7 @@ impl Tool for OpenPositionTool {
         })
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> (Vec<ToolResultContent>, bool) {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
         let code = match crate::pipeline::stocks::resolve_stock(
             &self.app,
             input
@@ -277,11 +269,7 @@ impl Tool for ClosePositionTool {
         })
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> (Vec<ToolResultContent>, bool) {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
         let position_id = match parse_position_id(&input) {
             Ok(p) => p,
             Err(e) => return err_text(e),
@@ -342,11 +330,7 @@ impl Tool for ScalePositionTool {
         })
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> (Vec<ToolResultContent>, bool) {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
         let position_id = match parse_position_id(&input) {
             Ok(p) => p,
             Err(e) => return err_text(e),
@@ -411,11 +395,7 @@ impl Tool for AdjustStopsTool {
         })
     }
 
-    async fn execute(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> (Vec<ToolResultContent>, bool) {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
         let position_id = match parse_position_id(&input) {
             Ok(p) => p,
             Err(e) => return err_text(e),

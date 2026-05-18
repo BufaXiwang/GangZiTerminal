@@ -13,6 +13,9 @@
 //! Token 不做加密——SQLite 文件在 macOS 应用沙盒里，本地威胁模型基本是
 //! "防止误传 git"，不是"防止本机攻击者读取磁盘"。
 
+use crate::domain::agent::types::{
+    EffortLevel, PipelineKind, ProviderKind, ThinkingConfig, ThinkingDisplay,
+};
 use crate::infrastructure::agent::provider::anthropic::{AnthropicConfig, AnthropicProvider};
 use crate::infrastructure::agent::provider::openai::{
     OpenAIChatCompletionsConfig, OpenAIChatCompletionsProvider, OpenAIResponsesConfig,
@@ -20,7 +23,6 @@ use crate::infrastructure::agent::provider::openai::{
 };
 use crate::infrastructure::agent::provider::retry::{RetryPolicy, RetryingProvider};
 use crate::infrastructure::agent::provider::{ChatProvider, ProviderError};
-use crate::domain::agent::types::{EffortLevel, PipelineKind, ThinkingConfig, ThinkingDisplay};
 use crate::infrastructure::app_state::{load_app_state_value, save_app_state_value};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,38 +30,6 @@ use std::sync::Arc;
 use tauri::AppHandle;
 
 const AGENT_CONFIG_KEY: &str = "agent.config";
-
-// ===== Wire format 枚举 ===================================================
-
-/// 一个渠道使用的 wire format。
-///
-/// serde rename 显式给——`rename_all = "snake_case"` 对 `OpenAI` 这种连续大写
-/// 缩写会拆成 `open_a_i_*`，不是我们要的形态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderKind {
-    #[serde(rename = "anthropic")]
-    Anthropic,
-    #[serde(rename = "openai_responses")]
-    OpenAIResponses,
-    #[serde(rename = "openai_chat_completions")]
-    OpenAIChatCompletions,
-}
-
-impl ProviderKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProviderKind::Anthropic => "anthropic",
-            ProviderKind::OpenAIResponses => "openai_responses",
-            ProviderKind::OpenAIChatCompletions => "openai_chat_completions",
-        }
-    }
-}
-
-impl Default for ProviderKind {
-    fn default() -> Self {
-        ProviderKind::Anthropic
-    }
-}
 
 // ===== Channel ============================================================
 
@@ -326,7 +296,6 @@ impl AgentConfig {
         // compact 不强求——chat 没撞 summarize threshold 不会用，缺了不阻塞 chat 启动
         Ok(())
     }
-
 }
 
 // ===== KV 存取 + 老配置迁移 ===============================================

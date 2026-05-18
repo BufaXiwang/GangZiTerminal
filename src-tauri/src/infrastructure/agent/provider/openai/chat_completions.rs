@@ -14,10 +14,12 @@
 use super::common::{
     build_http_client, map_http_error, normalize_base_url, require_token, ReasoningEffort,
 };
-use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent, TokenUsage};
 use crate::domain::agent::types::{
     AgentRequest, Block, Message, Role, ServerSideTool, StopReason, SystemBlock, ToolDef,
     ToolResultContent,
+};
+use crate::infrastructure::agent::provider::{
+    ChatProvider, ProviderError, ProviderEvent, TokenUsage,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;

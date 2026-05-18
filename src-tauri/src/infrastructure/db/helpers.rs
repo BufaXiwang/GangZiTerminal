@@ -47,4 +47,3 @@ pub fn json_string(value: &Value, pointer: &str) -> Option<String> {
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
-

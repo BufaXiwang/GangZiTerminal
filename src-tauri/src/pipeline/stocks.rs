@@ -9,9 +9,9 @@
 //! - 每天 08:30 北京时间 → 盘前预热拉一次（覆盖前一晚的新股 / 改名 / 摘牌）。
 //! - 失败仅日志告警，不影响其它流水线。
 
-use crate::infrastructure::quotes::repository::StockRow;
 use crate::domain::shared::StockCode;
 use crate::infrastructure::quotes::eastmoney::realtime as em_realtime;
+use crate::infrastructure::quotes::repository::StockRow;
 use crate::infrastructure::quotes::tushare::stock as ts_stock;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
@@ -161,7 +161,6 @@ pub async fn refresh_universe(app: &AppHandle) -> (usize, usize, usize) {
 ///
 /// 同时删 probe-done flag，让下次 backend 重启时能重新跑一遍 TuShare 能力探测
 /// （旧 flag 是用旧 token 跑的，结果不可信）。
-#[tauri::command]
 pub async fn save_tushare_token(app: AppHandle, token: String) -> Result<(), String> {
     let trimmed = token.trim().to_string();
     crate::infrastructure::app_state::save_app_state_value(
@@ -170,7 +169,10 @@ pub async fn save_tushare_token(app: AppHandle, token: String) -> Result<(), Str
         &serde_json::Value::String(trimmed.clone()),
     )?;
     // 老 probe 结果用的是旧 token —— 删 flag 让下次 backend 启动时重新探测
-    crate::infrastructure::app_state::delete_app_state_value(&app, "gangzi-terminal.tushare-probe-done")?;
+    crate::infrastructure::app_state::delete_app_state_value(
+        &app,
+        "gangzi-terminal.tushare-probe-done",
+    )?;
 
     // token 为空（用户清空）→ 不 spawn refresh，避免对空 token 跑 68 个失败请求
     if !trimmed.is_empty() {
@@ -178,7 +180,12 @@ pub async fn save_tushare_token(app: AppHandle, token: String) -> Result<(), Str
         tauri::async_runtime::spawn(async move {
             tracing::info!("token 已更新，立刻拉一次全市场档案");
             let (s, i, f) = refresh_universe(&app_for_spawn).await;
-            tracing::info!(stocks = s, indexes = i, funds = f, "token 更新后档案刷新完成");
+            tracing::info!(
+                stocks = s,
+                indexes = i,
+                funds = f,
+                "token 更新后档案刷新完成"
+            );
         });
     }
     Ok(())
@@ -214,7 +221,9 @@ pub async fn resolve_stock(app: &AppHandle, identifier: &str) -> Result<StockRef
     }
     // 6 位纯数字 → 先查本地档案，未命中时回退到实时报价探测
     if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
-        if let Some(row) = crate::infrastructure::quotes::repository::find_stock_by_code(app, trimmed)? {
+        if let Some(row) =
+            crate::infrastructure::quotes::repository::find_stock_by_code(app, trimmed)?
+        {
             return Ok(row.into());
         }
         return resolve_by_quote_probe(trimmed).await;

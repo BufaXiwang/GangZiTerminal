@@ -19,4 +19,7 @@ pub enum NewsError {
     /// 响应过大（防 SSRF / 防爆内存）。
     #[error("响应过大：{0}")]
     TooLarge(String),
+    /// 状态流转不符合 NewsStatus 状态机。
+    #[error("状态错误：{0}")]
+    InvalidState(String),
 }

@@ -3,14 +3,6 @@ mod domain; // DDD domain 层（types + 业务规则）
 mod infrastructure; // I/O 适配 + cross-cutting infra
 mod pipeline; // application 用例编排 + 顶级 chat / scheduler 等
 
-#[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("只允许打开 http/https 原文链接。".to_string());
-    }
-    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|err| err.to_string())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -48,12 +40,14 @@ pub fn run() {
             adapters::app_state_commands::load_app_state,
             adapters::app_state_commands::save_app_state,
             // 流水线触发（用户点击 / 计划任务）
-            pipeline::chat::send_chat_message_now,
+            adapters::chat_commands::send_chat_message_now,
             adapters::news_commands::run_news_refresh,
             // 模拟账户 IPC（adapters/account_commands.rs）
             adapters::account_commands::get_account_snapshot,
             adapters::account_commands::list_positions,
+            adapters::account_commands::list_simulated_positions,
             adapters::account_commands::list_position_events,
+            adapters::account_commands::list_position_events_batch,
             adapters::account_commands::list_watchlist,
             adapters::account_commands::list_watchlist_with_info,
             adapters::account_commands::add_watchlist_code,
@@ -61,12 +55,10 @@ pub fn run() {
             adapters::account_commands::get_default_watchlist,
             adapters::account_commands::reset_simulation_account,
             // 只读 list/get/count——前端 refetch 时用
-            infrastructure::news::repository::get_news_items_by_ids,
-            infrastructure::agent::repository::list_chat_messages,
-            infrastructure::news::repository::list_news_items,
-            infrastructure::account::repository::list_simulated_positions,
-            infrastructure::account::repository::list_position_events_batch,
-            infrastructure::agent::repository::search_chat_messages,
+            adapters::news_commands::get_news_items_by_ids,
+            adapters::chat_commands::list_chat_messages,
+            adapters::news_commands::list_news_items,
+            adapters::chat_commands::search_chat_messages,
             // UI 直接渲染的辅助命令
             adapters::news_commands::fetch_article_content, // hover 看资讯原文
             adapters::quotes_commands::fetch_a_share_klines, // 日/周/月 K（TuShare）
@@ -88,14 +80,14 @@ pub fn run() {
             adapters::quotes_commands::fetch_stock_profile,
             // 今日市场——全市场列表 + 旁路实时
             adapters::market_commands::list_market_instruments, // 全市场静态档案（一次拉）
-            pipeline::market_refresh::run_market_quote_refresh_cmd, // 手动触发旁路刷新
-            pipeline::market_refresh::snapshot_market_quotes,   // 首次进页面 hydrate 全部当前快照
-            pipeline::market_refresh::snapshot_market_quotes_for,
+            adapters::market_commands::run_market_quote_refresh_cmd, // 手动触发旁路刷新
+            adapters::market_commands::snapshot_market_quotes,  // 首次进页面 hydrate 全部当前快照
+            adapters::market_commands::snapshot_market_quotes_for,
             // TuShare 能力探测（dev / 一次性）
-            infrastructure::quotes::tushare::probe::probe_tushare_capabilities,
-            open_external_url, // 打开浏览器
+            adapters::quotes_commands::probe_tushare_capabilities,
+            adapters::app_commands::open_external_url, // 打开浏览器
             // 数据源配置（SettingsPage → 数据源）
-            pipeline::stocks::save_tushare_token,
+            adapters::quotes_commands::save_tushare_token,
             // Agent provider 配置（SettingsPage → AI 配置）
             adapters::agent_commands::get_agent_config,
             adapters::agent_commands::set_agent_config,

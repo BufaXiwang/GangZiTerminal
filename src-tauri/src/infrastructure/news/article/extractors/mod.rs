@@ -6,9 +6,15 @@ mod jin10;
 mod wallstreetcn;
 mod xueqiu;
 
-use crate::infrastructure::news::article::cleanup::{collect_paragraphs, has_quality, parse_selector};
-use crate::infrastructure::news::article::metadata::{extract_description, extract_embedded_paragraphs};
-use crate::infrastructure::news::article::model::{ArticleExtractor, ExtractContext, ExtractedArticle};
+use crate::infrastructure::news::article::cleanup::{
+    collect_paragraphs, has_quality, parse_selector,
+};
+use crate::infrastructure::news::article::metadata::{
+    extract_description, extract_embedded_paragraphs,
+};
+use crate::infrastructure::news::article::model::{
+    ArticleExtractor, ExtractContext, ExtractedArticle,
+};
 use scraper::Html;
 
 pub fn extract_article(document: &Html, context: &ExtractContext<'_>) -> ExtractedArticle {

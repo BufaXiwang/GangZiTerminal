@@ -7,6 +7,9 @@
 //! 这里 IPC 只做"静态列表"和"手动触发"。
 
 use serde::Serialize;
+use tauri::AppHandle;
+
+pub use crate::pipeline::market::refresh::{MarketQuoteDto, MarketRefreshSummary};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -22,9 +25,7 @@ pub struct MarketInstrumentDto {
 /// 数据来自本地 stocks / indexes / funds 表——首次启动若表空，scheduler 会拉，
 /// 返回空数组也是合法的（前端展示"档案刷新中"提示）。
 #[tauri::command]
-pub async fn list_market_instruments(
-    app: tauri::AppHandle,
-) -> Result<Vec<MarketInstrumentDto>, String> {
+pub async fn list_market_instruments(app: AppHandle) -> Result<Vec<MarketInstrumentDto>, String> {
     let mut all: Vec<MarketInstrumentDto> = Vec::with_capacity(7000);
 
     // stocks
@@ -79,4 +80,19 @@ pub async fn list_market_instruments(
     }
 
     Ok(all)
+}
+
+#[tauri::command]
+pub async fn run_market_quote_refresh_cmd(app: AppHandle) -> Result<MarketRefreshSummary, String> {
+    crate::pipeline::market::refresh::run_market_quote_refresh(&app).await
+}
+
+#[tauri::command]
+pub async fn snapshot_market_quotes() -> Vec<MarketQuoteDto> {
+    crate::pipeline::market::refresh::snapshot_market_quotes().await
+}
+
+#[tauri::command]
+pub async fn snapshot_market_quotes_for(ts_codes: Vec<String>) -> Vec<MarketQuoteDto> {
+    crate::pipeline::market::refresh::snapshot_market_quotes_for(ts_codes).await
 }

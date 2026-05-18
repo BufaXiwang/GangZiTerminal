@@ -10,7 +10,7 @@ use crate::domain::shared::StockCode;
 use crate::infrastructure::account::{snapshot_cache, watchlist, PositionRepo};
 use crate::pipeline::account::AccountService;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use tauri::{AppHandle, Emitter};
 
@@ -36,6 +36,13 @@ pub fn list_positions(app: AppHandle) -> Result<Vec<Position>, String> {
     PositionRepo::new(app).list_all().map_err(|e| e.to_string())
 }
 
+/// Legacy frontend DTO path. Kept at the adapter boundary while the UI still
+/// renders the old JSON shape.
+#[tauri::command]
+pub fn list_simulated_positions(app: AppHandle) -> Result<Vec<Value>, String> {
+    crate::infrastructure::account::repository::list_simulated_positions(app)
+}
+
 #[tauri::command]
 pub fn list_position_events(
     app: AppHandle,
@@ -45,6 +52,14 @@ pub fn list_position_events(
     PositionRepo::new(app)
         .list_events(&id)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_position_events_batch(
+    app: AppHandle,
+    position_ids: Vec<String>,
+) -> Result<Vec<Value>, String> {
+    crate::infrastructure::account::repository::list_position_events_batch(app, position_ids)
 }
 
 // ============================================================================
@@ -71,22 +86,23 @@ pub fn list_watchlist() -> Vec<String> {
 /// 带元信息的自选股——前端"历史行情"列表展示用。
 #[tauri::command]
 pub fn list_watchlist_with_info(app: AppHandle) -> Vec<WatchlistEntry> {
-    let stock_map: HashMap<String, (String, String)> = crate::infrastructure::quotes::repository::list_stocks(&app)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|row| {
-            let suffix = match row.market.as_str() {
-                "sh" => "SH",
-                "sz" => "SZ",
-                "bj" => "BJ",
-                _ => return None,
-            };
-            Some((
-                row.code.clone(),
-                (format!("{}.{}", row.code, suffix), row.name),
-            ))
-        })
-        .collect();
+    let stock_map: HashMap<String, (String, String)> =
+        crate::infrastructure::quotes::repository::list_stocks(&app)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                let suffix = match row.market.as_str() {
+                    "sh" => "SH",
+                    "sz" => "SZ",
+                    "bj" => "BJ",
+                    _ => return None,
+                };
+                Some((
+                    row.code.clone(),
+                    (format!("{}.{}", row.code, suffix), row.name),
+                ))
+            })
+            .collect();
 
     watchlist::list()
         .into_iter()
@@ -138,7 +154,7 @@ fn emit_watchlist_changed(app: &AppHandle, action: &str, code: &str, total: usiz
 fn spawn_immediate_quote_refresh(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        match crate::pipeline::market_refresh::run_market_quote_refresh(&app).await {
+        match crate::pipeline::market::refresh::run_market_quote_refresh(&app).await {
             Ok(summary) => tracing::info!(
                 total = summary.total,
                 success = summary.success,

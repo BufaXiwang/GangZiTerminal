@@ -6,9 +6,9 @@
 //! - 全部走 EM push2his klt 端点（TuShare 分钟 K 5000+ 积分门槛）
 //! - 不做复权（分钟级数据复权不实用）
 
-use crate::infrastructure::db::{migrate, open_database};
 use crate::domain::quotes::{is_a_share_trading_hours, MinutePeriod};
 use crate::domain::shared::TsCode;
+use crate::infrastructure::db::{migrate, open_database};
 use crate::infrastructure::quotes::eastmoney::kline as em_kline;
 use rusqlite::{params, OptionalExtension};
 use tauri::AppHandle;

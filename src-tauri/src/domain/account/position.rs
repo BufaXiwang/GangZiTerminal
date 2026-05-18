@@ -1,0 +1,101 @@
+//! Position entity and position identity.
+
+use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PositionId(String);
+
+impl PositionId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn from_string(s: String) -> Self {
+        Self(s)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PositionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Default for PositionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Position {
+    pub id: PositionId,
+    pub code: StockCode,
+    pub name: String,
+    pub avg_entry_price: Yuan,
+    pub current_shares: Shares,
+    pub status: PositionStatus,
+    pub stop_loss: Option<Yuan>,
+    pub take_profit: Option<Yuan>,
+    pub time_stop_at: Option<OccurredAt>,
+    pub thesis: String,
+    pub source_analysis_id: String,
+    pub entered_at: OccurredAt,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PositionStatus {
+    Open,
+    Closed {
+        exit_price: Yuan,
+        exit_at: OccurredAt,
+        reason: CloseReason,
+    },
+}
+
+impl PositionStatus {
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    Manual,
+    StopLoss,
+    TakeProfit,
+    TimeStop,
+    Invalidated,
+}
+
+impl CloseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::StopLoss => "stop_loss",
+            Self::TakeProfit => "take_profit",
+            Self::TimeStop => "time_stop",
+            Self::Invalidated => "invalidated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Side {
+    Buy,
+    Sell,
+}

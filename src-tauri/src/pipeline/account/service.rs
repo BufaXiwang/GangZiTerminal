@@ -17,18 +17,15 @@
 
 use crate::domain::account::cash::reduce_events_to_cash_delta;
 use crate::domain::account::errors::{AccountError, RuleError};
-use crate::domain::account::rules::{
-    commission, compute_new_avg_price, ensure_a_share_code, ensure_integer_lot,
-    ensure_price_not_limit, ensure_stops_make_sense, ensure_t_plus_one, ensure_trading_hours,
-    stamp_tax,
-};
-use crate::domain::account::sizing::derive_time_stop_at;
 use crate::domain::account::types::{
-    AccountSnapshot, CloseReason, EventSource, Position, PositionEvent, PositionEventKind,
-    PositionId, PositionStatus, Side,
+    AccountSnapshot, CloseReason, EventSource, Position, PositionId,
+};
+use crate::domain::account::{
+    Account, AdjustStopsCommand, ClosePositionCommand, OpenPositionCommand, ScalePositionCommand,
+    TradeQuote,
 };
 use crate::domain::quotes::StockQuote;
-use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
+use crate::domain::shared::{OccurredAt, Shares, Yuan};
 use crate::infrastructure::account::{
     compute_snapshot, snapshot_cache, PositionRepo, INITIAL_CASH,
 };
@@ -104,74 +101,34 @@ impl AccountService {
     pub async fn open_position(&self, req: OpenRequest) -> Result<Position, AccountError> {
         let _guard = account_write_lock().lock().await;
 
-        ensure_a_share_code(&req.code)?;
-        ensure_integer_lot(req.shares.value())?;
-        ensure_trading_hours()?;
-
         let positions = self.repo.list_all()?;
-        if positions
-            .iter()
-            .any(|p| p.status.is_open() && p.code.as_str() == req.code)
-        {
-            return Err(RuleError::DuplicateOpenCode(req.code).into());
-        }
-
         let quote = self.fetch_quote(&req.code).await?;
         let entry_price = quote_price_yuan(&quote, &req.code)?;
-        ensure_price_not_limit(quote.change_percent, &req.code, Side::Buy)?;
-        ensure_stops_make_sense(entry_price, req.stop_loss, req.take_profit)?;
-
-        let comm = commission(entry_price, req.shares);
-        let cost = entry_price.value() * req.shares.value() as f64 + comm.value();
         let cash = self.current_cash()?;
-        if cost > cash.value() + f64::EPSILON {
-            return Err(RuleError::InsufficientFunds {
-                needed: cost,
-                available: cash.value(),
-            }
-            .into());
-        }
-
-        let position_id = PositionId::new();
-        let entered_at = OccurredAt::now();
-        let position = Position {
-            id: position_id.clone(),
-            code: StockCode::new(&req.code).map_err(|e| AccountError::Io(e.to_string()))?,
-            name: if req.name.is_empty() {
-                quote.name.clone()
-            } else {
-                req.name
-            },
-            avg_entry_price: entry_price,
-            current_shares: req.shares,
-            status: PositionStatus::Open,
+        let mut account = Account::new(positions);
+        let mutation = account.open_position(OpenPositionCommand {
+            code: req.code,
+            shares: req.shares,
+            name: req.name,
+            thesis: req.thesis,
             stop_loss: req.stop_loss,
             take_profit: req.take_profit,
-            time_stop_at: req.time_stop_at.or(Some(derive_time_stop_at(entered_at))),
-            thesis: req.thesis,
-            source_analysis_id: req.source_analysis_id,
-            entered_at,
-        };
-
-        // Event + state 同一事务提交；事务内部先 insert event，再 replace positions。
-        let event = PositionEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            position_id: position_id.clone(),
-            kind: PositionEventKind::Opened {
-                entry_price,
-                shares: req.shares,
-                commission: comm,
-            },
-            occurred_at: entered_at,
+            time_stop_at: req.time_stop_at,
             source: req.source,
+            source_analysis_id: req.source_analysis_id,
             agent_note_md: req.agent_note_md,
-        };
-        let mut all = positions;
-        all.push(position.clone());
-        self.repo.commit_event_and_positions(&event, &all)?;
+            quote: TradeQuote {
+                name: quote.name,
+                price: entry_price,
+                change_percent: quote.change_percent,
+            },
+            available_cash: cash,
+        })?;
 
+        self.repo
+            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
         self.emit_positions_changed();
-        Ok(position)
+        Ok(mutation.position)
     }
 
     // ========================================================================
@@ -186,27 +143,29 @@ impl AccountService {
         agent_note_md: String,
     ) -> Result<Position, AccountError> {
         let _guard = account_write_lock().lock().await;
-        ensure_trading_hours()?;
-
         let positions = self.repo.list_all()?;
         let target = positions
             .iter()
             .find(|p| p.id == *position_id)
             .cloned()
             .ok_or_else(|| RuleError::PositionNotFound(position_id.as_str().to_string()))?;
-        if !target.status.is_open() {
-            return Err(RuleError::PositionAlreadyClosed(position_id.as_str().to_string()).into());
-        }
-        ensure_t_plus_one(target.entered_at)?;
-
         let quote = self.fetch_quote(target.code.as_str()).await?;
         let exit_price = quote_price_yuan(&quote, target.code.as_str())?;
-        ensure_price_not_limit(quote.change_percent, target.code.as_str(), Side::Sell)?;
+        let mut account = Account::new(positions);
+        let mutation = account.close_position(ClosePositionCommand {
+            position_id: position_id.clone(),
+            exit_price,
+            change_percent: quote.change_percent,
+            reason,
+            source,
+            agent_note_md,
+            unchecked: false,
+        })?;
+        self.repo
+            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
 
-        let updated = self
-            .apply_close(target, exit_price, reason, source, agent_note_md, positions)
-            .await?;
-        Ok(updated)
+        self.emit_positions_changed();
+        Ok(mutation.position)
     }
 
     /// 不校验交易时段 / T+1 / 涨跌停的"系统强平"路径——用于 reset / 未来 risk_scan。
@@ -222,70 +181,21 @@ impl AccountService {
         let _guard = account_write_lock().lock().await;
 
         let positions = self.repo.list_all()?;
-        let target = positions
-            .iter()
-            .find(|p| p.id == *position_id)
-            .cloned()
-            .ok_or_else(|| RuleError::PositionNotFound(position_id.as_str().to_string()))?;
-        if !target.status.is_open() {
-            return Err(RuleError::PositionAlreadyClosed(position_id.as_str().to_string()).into());
-        }
-
-        self.apply_close(target, exit_price, reason, source, agent_note_md, positions)
-            .await
-    }
-
-    async fn apply_close(
-        &self,
-        target: Position,
-        exit_price: Yuan,
-        reason: CloseReason,
-        source: EventSource,
-        agent_note_md: String,
-        positions: Vec<Position>,
-    ) -> Result<Position, AccountError> {
-        let position_id = target.id.clone();
-        let shares = target.current_shares;
-        let exit_at = OccurredAt::now();
-        let comm = commission(exit_price, shares);
-        let tax = stamp_tax(exit_price, shares);
-
-        let mut updated = target;
-        updated.status = PositionStatus::Closed {
-            exit_price,
-            exit_at,
-            reason,
-        };
-
-        let event = PositionEvent {
-            id: uuid::Uuid::new_v4().to_string(),
+        let mut account = Account::new(positions);
+        let mutation = account.close_position(ClosePositionCommand {
             position_id: position_id.clone(),
-            kind: PositionEventKind::Closed {
-                exit_price,
-                shares,
-                reason,
-                commission: comm,
-                stamp_tax: tax,
-            },
-            occurred_at: exit_at,
+            exit_price,
+            change_percent: None,
+            reason,
             source,
             agent_note_md,
-        };
-        let new_positions: Vec<Position> = positions
-            .into_iter()
-            .map(|p| {
-                if p.id == position_id {
-                    updated.clone()
-                } else {
-                    p
-                }
-            })
-            .collect();
+            unchecked: true,
+        })?;
         self.repo
-            .commit_event_and_positions(&event, &new_positions)?;
+            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
 
         self.emit_positions_changed();
-        Ok(updated)
+        Ok(mutation.position)
     }
 
     // ========================================================================
@@ -299,11 +209,7 @@ impl AccountService {
         agent_note_md: String,
         source: EventSource,
     ) -> Result<Position, AccountError> {
-        if shares_delta == 0 {
-            return Err(AccountError::Io("shares_delta 不能为 0".into()));
-        }
         let _guard = account_write_lock().lock().await;
-        ensure_trading_hours()?;
 
         let positions = self.repo.list_all()?;
         let target = positions
@@ -311,106 +217,24 @@ impl AccountService {
             .find(|p| p.id == *position_id)
             .cloned()
             .ok_or_else(|| RuleError::PositionNotFound(position_id.as_str().to_string()))?;
-        if !target.status.is_open() {
-            return Err(RuleError::PositionAlreadyClosed(position_id.as_str().to_string()).into());
-        }
-
-        let current = target.current_shares.value();
-        let new_shares_value = current + shares_delta;
-        if new_shares_value < 0 {
-            return Err(RuleError::InsufficientShares {
-                holding: current,
-                requested: -shares_delta,
-            }
-            .into());
-        }
-        if new_shares_value == 0 {
-            return Err(RuleError::ScaleWouldZero.into());
-        }
-        if new_shares_value % 100 != 0 {
-            return Err(RuleError::SharesNotIntegerLot {
-                shares: new_shares_value,
-            }
-            .into());
-        }
-
         let quote = self.fetch_quote(target.code.as_str()).await?;
         let price = quote_price_yuan(&quote, target.code.as_str())?;
-
-        let abs_delta = Shares::from_unchecked(shares_delta.abs());
-        let mut new_position = target.clone();
-        new_position.current_shares = Shares::from_unchecked(new_shares_value);
-
-        let event_kind = if shares_delta > 0 {
-            // 加仓
-            ensure_integer_lot(shares_delta)?;
-            ensure_price_not_limit(quote.change_percent, target.code.as_str(), Side::Buy)?;
-
-            let comm = commission(price, abs_delta);
-            let cost = price.value() * shares_delta as f64 + comm.value();
-            let cash = self.current_cash()?;
-            if cost > cash.value() + f64::EPSILON {
-                return Err(RuleError::InsufficientFunds {
-                    needed: cost,
-                    available: cash.value(),
-                }
-                .into());
-            }
-
-            let new_avg = compute_new_avg_price(
-                target.avg_entry_price,
-                target.current_shares,
-                price,
-                abs_delta,
-            );
-            new_position.avg_entry_price = new_avg;
-
-            PositionEventKind::ScaledIn {
-                delta: abs_delta,
-                price,
-                new_avg,
-                commission: comm,
-            }
-        } else {
-            // 减仓
-            ensure_t_plus_one(target.entered_at)?;
-            ensure_integer_lot(-shares_delta)?;
-            ensure_price_not_limit(quote.change_percent, target.code.as_str(), Side::Sell)?;
-
-            let comm = commission(price, abs_delta);
-            let tax = stamp_tax(price, abs_delta);
-
-            PositionEventKind::ScaledOut {
-                delta: abs_delta,
-                price,
-                commission: comm,
-                stamp_tax: tax,
-            }
-        };
-
-        let event = PositionEvent {
-            id: uuid::Uuid::new_v4().to_string(),
+        let cash = self.current_cash()?;
+        let mut account = Account::new(positions);
+        let mutation = account.scale_position(ScalePositionCommand {
             position_id: position_id.clone(),
-            kind: event_kind,
-            occurred_at: OccurredAt::now(),
+            shares_delta,
+            price,
+            change_percent: quote.change_percent,
+            available_cash: cash,
             source,
             agent_note_md,
-        };
-        let new_positions: Vec<Position> = positions
-            .into_iter()
-            .map(|p| {
-                if p.id == *position_id {
-                    new_position.clone()
-                } else {
-                    p
-                }
-            })
-            .collect();
+        })?;
         self.repo
-            .commit_event_and_positions(&event, &new_positions)?;
+            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
 
         self.emit_positions_changed();
-        Ok(new_position)
+        Ok(mutation.position)
     }
 
     // ========================================================================
@@ -434,59 +258,29 @@ impl AccountService {
             .find(|p| p.id == *position_id)
             .cloned()
             .ok_or_else(|| RuleError::PositionNotFound(position_id.as_str().to_string()))?;
-        if !target.status.is_open() {
-            return Err(RuleError::PositionAlreadyClosed(position_id.as_str().to_string()).into());
-        }
 
         // 拿到实时价就校验止损止盈关系（盘外可能拿不到价——放行）
-        if let Ok(quote) = self.fetch_quote(target.code.as_str()).await {
-            if let Some(price) = quote.price {
-                ensure_stops_make_sense(
-                    price,
-                    stop_loss.or(target.stop_loss),
-                    take_profit.or(target.take_profit),
-                )?;
-            }
-        }
+        let current_price = self
+            .fetch_quote(target.code.as_str())
+            .await
+            .ok()
+            .and_then(|quote| quote.price);
 
-        let mut new_position = target.clone();
-        if let Some(sl) = stop_loss {
-            new_position.stop_loss = Some(sl);
-        }
-        if let Some(tp) = take_profit {
-            new_position.take_profit = Some(tp);
-        }
-        if let Some(ts) = time_stop_at {
-            new_position.time_stop_at = Some(ts);
-        }
-
-        let event = PositionEvent {
-            id: uuid::Uuid::new_v4().to_string(),
+        let mut account = Account::new(positions);
+        let mutation = account.adjust_stops(AdjustStopsCommand {
             position_id: position_id.clone(),
-            kind: PositionEventKind::StopsAdjusted {
-                stop_loss: new_position.stop_loss,
-                take_profit: new_position.take_profit,
-                time_stop_at: new_position.time_stop_at,
-            },
-            occurred_at: OccurredAt::now(),
+            stop_loss,
+            take_profit,
+            time_stop_at,
+            current_price,
             source,
             agent_note_md,
-        };
-        let new_positions: Vec<Position> = positions
-            .into_iter()
-            .map(|p| {
-                if p.id == *position_id {
-                    new_position.clone()
-                } else {
-                    p
-                }
-            })
-            .collect();
+        })?;
         self.repo
-            .commit_event_and_positions(&event, &new_positions)?;
+            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
 
         self.emit_positions_changed();
-        Ok(new_position)
+        Ok(mutation.position)
     }
 
     // ========================================================================
@@ -511,8 +305,9 @@ impl AccountService {
 
     /// 拿单股 quote——优先 MARKET_SNAPSHOT，缺则 lazy ensure 一次（走 dispatch 多源 fallback）。
     async fn fetch_quote(&self, code: &str) -> Result<StockQuote, AccountError> {
-        let ts_code = crate::infrastructure::quotes::repository::resolve_stock_ts_code(&self.app, code)
-            .ok_or_else(|| AccountError::Io(format!("stocks 档案找不到 {code}")))?;
+        let ts_code =
+            crate::infrastructure::quotes::repository::resolve_stock_ts_code(&self.app, code)
+                .ok_or_else(|| AccountError::Io(format!("stocks 档案找不到 {code}")))?;
         if let Some(q) = market_snapshot::get(&ts_code) {
             return Ok(q);
         }

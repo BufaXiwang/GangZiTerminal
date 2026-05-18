@@ -14,8 +14,8 @@
 
 use crate::domain::news::NewsItem;
 use crate::infrastructure::news::{fetch_newsnow_source, fetch_rss};
-use crate::pipeline::EVENT_AGENT_STATUS;
-use serde_json::{json, Value};
+use crate::pipeline::events::EVENT_AGENT_STATUS;
+use serde_json::json;
 use std::collections::HashSet;
 use tauri::{AppHandle, Emitter};
 
@@ -83,12 +83,10 @@ pub async fn run_news_refresh(app: AppHandle) -> Result<NewsRefreshResult, Strin
         }
     }
 
-    let payload: Vec<Value> = all_items
-        .iter()
-        .filter_map(|item| serde_json::to_value(item).ok())
-        .collect();
-    if !payload.is_empty() {
-        if let Err(err) = crate::infrastructure::news::repository::save_news_items(app.clone(), payload) {
+    if !all_items.is_empty() {
+        if let Err(err) =
+            crate::infrastructure::news::repository::save_news_items(app.clone(), all_items.clone())
+        {
             failures.push(format!("save_news_items: {err}"));
         }
     }

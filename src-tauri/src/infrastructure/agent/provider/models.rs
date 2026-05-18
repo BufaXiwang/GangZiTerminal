@@ -5,7 +5,7 @@
 //!
 //! 自带 20s 超时——relay 可能会卡，UI 不能傻等。
 
-use crate::pipeline::agent::config::ProviderKind;
+use crate::domain::agent::ProviderKind;
 use crate::infrastructure::agent::provider::anthropic::ANTHROPIC_VERSION;
 use crate::infrastructure::agent::provider::openai::common::build_http_client;
 use crate::infrastructure::agent::provider::ProviderError;

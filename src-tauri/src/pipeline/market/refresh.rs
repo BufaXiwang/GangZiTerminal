@@ -137,13 +137,7 @@ async fn fetch_with_retry(
     Err(last_err.unwrap_or_else(|| "未知错误".into()))
 }
 
-/// Tauri command——保留给调试/诊断手动触发一次实时行情刷新。
-#[tauri::command]
-pub async fn run_market_quote_refresh_cmd(app: AppHandle) -> Result<MarketRefreshSummary, String> {
-    run_market_quote_refresh(&app).await
-}
-
-/// Tauri command——前端首次进今日市场页 hydrate 时拿当前快照（全量 dump）。
+/// 前端首次进今日市场页 hydrate 时拿当前快照（全量 dump）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketQuoteDto {
@@ -174,7 +168,6 @@ pub struct OrderBookLevelDto {
     pub volume: Option<f64>,
 }
 
-#[tauri::command]
 pub async fn snapshot_market_quotes() -> Vec<MarketQuoteDto> {
     market_snapshot::snapshot_all()
         .into_iter()
@@ -182,7 +175,6 @@ pub async fn snapshot_market_quotes() -> Vec<MarketQuoteDto> {
         .collect()
 }
 
-#[tauri::command]
 pub async fn snapshot_market_quotes_for(ts_codes: Vec<String>) -> Vec<MarketQuoteDto> {
     ts_codes
         .into_iter()

@@ -13,10 +13,12 @@
 //! - server_tool_use / web_search_tool_result 是 provider 替我们执行 web_search
 //!   的产物——loop 不要执行，原样转回下一轮即可。
 
-use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent, TokenUsage};
 use crate::domain::agent::types::{
     AgentRequest, Block, Message, Role, ServerSideTool, StopReason, SystemBlock, ThinkingConfig,
     ThinkingDisplay, ToolDef, ToolResultContent,
+};
+use crate::infrastructure::agent::provider::{
+    ChatProvider, ProviderError, ProviderEvent, TokenUsage,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;

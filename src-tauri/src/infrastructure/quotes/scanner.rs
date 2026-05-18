@@ -133,7 +133,8 @@ fn normalize_limit(limit: usize) -> usize {
 }
 
 fn load_stock_names(app: &AppHandle) -> Result<HashMap<String, String>, QuotesError> {
-    let rows = crate::infrastructure::quotes::repository::list_stocks(app).map_err(QuotesError::Network)?;
+    let rows = crate::infrastructure::quotes::repository::list_stocks(app)
+        .map_err(QuotesError::Network)?;
     Ok(rows.into_iter().map(|r| (r.code, r.name)).collect())
 }
 

@@ -61,7 +61,6 @@ pub fn append_chat_message(app: AppHandle, message: Value) -> Result<Value, Stri
 ///
 /// **不要给 agent pipeline 用**——agent 读历史应该走 `read_all_chat_messages` 拿全量，
 /// 由 compact tier（MicroClear → Summarize → Drop）决定语义截断。
-#[tauri::command]
 pub fn list_chat_messages(
     app: AppHandle,
     before: Option<String>,
@@ -119,7 +118,6 @@ pub fn read_all_chat_messages(app: &AppHandle, before: Option<&str>) -> Result<V
     Ok(rows)
 }
 
-#[tauri::command]
 pub fn search_chat_messages(
     app: AppHandle,
     query: String,

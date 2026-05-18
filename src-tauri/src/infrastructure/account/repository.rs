@@ -6,15 +6,15 @@
 //! - **Domain layer**（PositionRepo struct）：domain 富类型 ↔ DB 扁平行的投射层。
 //!   PositionRepo 内部调 raw-JSON layer 完成 DB IO。
 
-use crate::infrastructure::db::{
-    json_string, list_json_payloads, migrate, now, open_database, required_json_string,
-};
 use crate::domain::account::errors::AccountError;
 use crate::domain::account::types::{
     CloseReason, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
     PositionSignalKind, PositionStatus,
 };
 use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
+use crate::infrastructure::db::{
+    json_string, list_json_payloads, migrate, now, open_database, required_json_string,
+};
 use rusqlite::{params, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -161,8 +161,8 @@ impl PositionRepo {
             return Ok(Vec::new());
         }
         let id_strings: Vec<String> = ids.iter().map(|id| id.as_str().to_string()).collect();
-        let raw = list_position_events_batch(self.app.clone(), id_strings)
-            .map_err(AccountError::Io)?;
+        let raw =
+            list_position_events_batch(self.app.clone(), id_strings).map_err(AccountError::Io)?;
         let mut out = Vec::with_capacity(raw.len());
         for v in raw {
             out.push(db_json_to_event(v)?);
@@ -697,7 +697,6 @@ mod tests {
 // （Tauri IPC 直读形态；PositionRepo 内部也调这层）
 // ============================================================================
 
-#[tauri::command]
 pub fn list_simulated_positions(app: AppHandle) -> Result<Vec<Value>, String> {
     let connection = open_database(&app)?;
     migrate(&connection)?;
@@ -810,7 +809,6 @@ fn insert_position_event_tx(tx: &Transaction<'_>, event: &Value) -> Result<(), S
     Ok(())
 }
 
-
 /// 持仓事件（append-only 审计流）：opened / reviewed / adjusted / trimmed / added /
 /// stop_triggered / invalidated / closed。事件不能被修改或删除，是 Agent 复盘时
 /// 看到"这个仓位是怎么走过来的"的唯一可信来源。
@@ -848,7 +846,6 @@ pub fn append_position_event(app: AppHandle, event: Value) -> Result<Value, Stri
 }
 
 /// 一次拉多个持仓的事件，按 occurred_at 升序。前端在内存里按 positionId 分组。
-#[tauri::command]
 pub fn list_position_events_batch(
     app: AppHandle,
     position_ids: Vec<String>,
@@ -881,4 +878,3 @@ pub fn list_position_events_batch(
         .collect();
     Ok(rows)
 }
-

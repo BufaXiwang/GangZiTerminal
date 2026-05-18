@@ -1,4 +1,5 @@
-#![allow(dead_code, unused_imports)] // 纯 domain 类型与函数提供完整面向 agent 工具的契约；部分 indicator / 时钟函数待接通
+#![allow(dead_code, unused_imports)]
+// 纯 domain 类型与函数提供完整面向 agent 工具的契约；部分 indicator / 时钟函数待接通
 
 //! Domain `quotes`——市场数据 Bounded Context。
 //!

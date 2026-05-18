@@ -660,9 +660,8 @@ pub async fn run_probe(app: &AppHandle) -> Vec<ProbeResult> {
     results
 }
 
-/// IPC 命令——前端 invoke 触发探测。返回结果数组。
+/// 前端 invoke 触发探测。返回结果数组。
 /// 同时把结果写到 app data dir 下 `tushare-probe-result.json`。
-#[tauri::command]
 pub async fn probe_tushare_capabilities(app: AppHandle) -> Result<Vec<ProbeResult>, String> {
     let results = run_probe(&app).await;
 

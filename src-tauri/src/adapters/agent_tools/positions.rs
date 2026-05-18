@@ -3,7 +3,7 @@
 //! SQLite 查询是同步阻塞的，通过 `tokio::task::spawn_blocking` 把它挪到
 //! blocking 线程池，避免占住 agent loop 所在的 async worker。
 
-use crate::infrastructure::agent::tools::{err_text, ok_json, Tool, ToolContext};
+use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::agent::types::ToolResultContent;
 use async_trait::async_trait;
 use rusqlite::{params, Connection};

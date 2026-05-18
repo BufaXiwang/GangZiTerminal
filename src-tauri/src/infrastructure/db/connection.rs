@@ -40,4 +40,3 @@ pub fn open_database(app: &AppHandle) -> Result<Connection, String> {
         .map_err(|err| format!("启用外键失败：{err}"))?;
     Ok(connection)
 }
-

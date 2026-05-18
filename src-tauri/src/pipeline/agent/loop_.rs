@@ -7,13 +7,13 @@
 //!   4. 并行调度 ToolRegistry 执行（每个 tool 各自带超时），结果作为 user 消息再追加
 //!   5. 没有需要本地执行的 ToolUse → 结束（emit Done）；否则 ContextManager 压缩 → 回到 1
 
-use crate::pipeline::agent::compact::summarize_messages;
-use crate::pipeline::agent::context::{compact_if_needed, estimate_tokens, CompactAction};
-use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent};
-use crate::infrastructure::agent::tools::{Tool, ToolContext, ToolRegistry};
+use crate::pipeline::agent::tools::{Tool, ToolContext, ToolRegistry};
 use crate::domain::agent::types::{
     AgentEvent, AgentRequest, Block, CompactTier, Message, Role, StopReason, ToolResultContent,
 };
+use crate::infrastructure::agent::provider::{ChatProvider, ProviderError, ProviderEvent};
+use crate::pipeline::agent::compact::summarize_messages;
+use crate::pipeline::agent::context::{compact_if_needed, estimate_tokens, CompactAction};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -888,9 +888,11 @@ mod tests {
 
     // ===== 端到端：FakeProvider + FakeTool 走完整 loop =====
 
+    use crate::pipeline::agent::tools::Tool;
+    use crate::domain::agent::types::{
+        AgentOptions, ContextBudget, PipelineKind, SystemBlock, ToolDef,
+    };
     use crate::infrastructure::agent::provider::{ChatProvider, ProviderEvent, TokenUsage};
-    use crate::infrastructure::agent::tools::Tool;
-    use crate::domain::agent::types::{AgentOptions, ContextBudget, PipelineKind, SystemBlock, ToolDef};
     use async_trait::async_trait;
     use futures_util::stream::{self, BoxStream};
     use std::sync::{Arc, Mutex};

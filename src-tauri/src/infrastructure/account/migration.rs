@@ -29,7 +29,8 @@ use super::repository::{occurred_at_to_rfc3339, parse_rfc3339};
 /// 失败仅日志告警，不抛出——migration 失败也不应该阻塞启动。
 pub fn migrate_legacy_positions(app: &AppHandle) -> Result<usize, String> {
     // 1. 读 positions
-    let raw_positions = crate::infrastructure::account::repository::list_simulated_positions(app.clone())?;
+    let raw_positions =
+        crate::infrastructure::account::repository::list_simulated_positions(app.clone())?;
     if raw_positions.is_empty() {
         return Ok(0);
     }
@@ -42,7 +43,10 @@ pub fn migrate_legacy_positions(app: &AppHandle) -> Result<usize, String> {
     }
 
     // 2. 读 events 并按 position_id 聚合
-    let raw_events = crate::infrastructure::account::repository::list_position_events_batch(app.clone(), position_ids.clone())?;
+    let raw_events = crate::infrastructure::account::repository::list_position_events_batch(
+        app.clone(),
+        position_ids.clone(),
+    )?;
     let mut positions_with_events: HashSet<String> = HashSet::new();
     for e in &raw_events {
         if let Some(pid) = e.get("positionId").and_then(|v| v.as_str()) {

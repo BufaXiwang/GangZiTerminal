@@ -10,10 +10,10 @@
 //! 全部调 `infrastructure/quotes` 的现成接口。错误统一映射成 is_error=true 让 agent
 //! 看到失败描述（接口降级 / 缺 token / 日期不合规等）。
 
+use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::agent::types::ToolResultContent;
 use crate::domain::quotes::ScanFilter;
 use crate::domain::shared::{StockCode, TradeDate};
-use crate::infrastructure::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::infrastructure::quotes::scanner;
 use crate::infrastructure::quotes::tushare::{calendar, concept, events, flow};
 use async_trait::async_trait;
@@ -92,10 +92,7 @@ impl Tool for ScanMarketTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let filter_str = input
-            .get("filter")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let filter_str = input.get("filter").and_then(Value::as_str).unwrap_or("");
         let filter = match parse_scan_filter(filter_str) {
             Ok(f) => f,
             Err(e) => return err_text(e),
@@ -349,4 +346,3 @@ impl Tool for GetCompanyEventsTool {
         }
     }
 }
-

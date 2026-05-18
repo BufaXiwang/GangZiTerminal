@@ -5,7 +5,10 @@
 
 pub mod account_commands;
 pub mod agent_commands;
+pub mod agent_tools;
+pub mod app_commands;
 pub mod app_state_commands;
+pub mod chat_commands;
 pub mod market_commands;
 pub mod news_commands;
 pub mod proxy_commands;

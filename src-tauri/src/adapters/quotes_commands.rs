@@ -21,6 +21,7 @@ use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
 use crate::infrastructure::quotes::eastmoney::kline as em_kline;
 use crate::infrastructure::quotes::realtime::dispatch;
 use crate::infrastructure::quotes::scanner as quotes_scanner;
+use crate::infrastructure::quotes::tushare::probe::ProbeResult;
 use crate::infrastructure::quotes::tushare::{concept, events, flow, stock as ts_stock};
 use serde::Serialize;
 
@@ -385,7 +386,7 @@ pub async fn fetch_a_share_quotes(
 
 #[tauri::command]
 pub async fn get_market_overview(app: tauri::AppHandle) -> Result<MarketOverviewDto, String> {
-    let domain = crate::pipeline::market_overview::fetch_market_overview(&app).await?;
+    let domain = crate::pipeline::market::overview::fetch_market_overview(&app).await?;
     Ok(domain.into())
 }
 
@@ -544,4 +545,14 @@ fn parse_optional_trade_date(input: Option<String>) -> Result<Option<TradeDate>,
             .map_err(|e| e.to_string()),
         None => Ok(None),
     }
+}
+
+#[tauri::command]
+pub async fn save_tushare_token(app: tauri::AppHandle, token: String) -> Result<(), String> {
+    crate::pipeline::stocks::save_tushare_token(app, token).await
+}
+
+#[tauri::command]
+pub async fn probe_tushare_capabilities(app: tauri::AppHandle) -> Result<Vec<ProbeResult>, String> {
+    crate::infrastructure::quotes::tushare::probe::probe_tushare_capabilities(app).await
 }

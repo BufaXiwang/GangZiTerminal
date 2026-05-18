@@ -2,16 +2,17 @@
 
 //! Domain `agent`——Agent 决策子域。
 //!
-//! 当前只放 `types`（Block / Message / AgentEvent / AgentRequest 等 canonical 形态，
-//! 贴合 Anthropic Messages API 的 wire shape，是 provider / tool / loop 三方共识）。
+//! - `types`：Block / Message / AgentEvent / AgentRequest 等 canonical 形态，贴合
+//!   Anthropic Messages API 的 wire shape，是 provider / tool / loop 三方共识
+//! - `memory`：InvestorMemory（投资记忆实体 + 合并规则）
 //!
-//! 后续可拆出：
-//! - `errors.rs`：AgentError / ProviderError / ToolError（目前散在各 file）
-//! - `provider.rs`：ChatProvider trait + ProviderEvent（目前在 infrastructure）
-//! - `tool_spec.rs`：Tool trait（目前在 infrastructure）
+//! `ChatProvider` trait 在 `infrastructure::agent::provider`，`Tool` trait 在
+//! `adapters::agent_tools`——两者都是协议适配，不属于 domain。
+//! identity.md（Agent 人设档案）在 `pipeline::agent`，由 `prompt.rs` `include_str!` 读入。
 //!
-//! identity.md（Agent 人设档案）目前仍由 `prompt.rs` 用 `include_str!` 直接读，
-//! 保留在 src/ 顶层避免 prompt.rs 同步搬动；后续 prompt 重构时一并迁移。
+//! 后续可拆 `errors.rs` 收拢 AgentError / ProviderError / ToolError（目前散在各 file）。
 
 pub mod memory;
 pub mod types;
+
+pub use types::ProviderKind;

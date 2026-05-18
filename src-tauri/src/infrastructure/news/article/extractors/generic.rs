@@ -1,5 +1,7 @@
 use crate::infrastructure::news::article::extractors::extract_from_selectors;
-use crate::infrastructure::news::article::model::{ArticleExtractor, ExtractContext, ExtractedArticle};
+use crate::infrastructure::news::article::model::{
+    ArticleExtractor, ExtractContext, ExtractedArticle,
+};
 use scraper::Html;
 
 pub struct GenericExtractor;

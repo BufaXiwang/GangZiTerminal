@@ -5,10 +5,7 @@
 //! - `fetch_article_content`：拉一篇正文（先查 article_contents 缓存，未命中调
 //!   `infrastructure::news::article::fetch_article_remote` 然后写缓存）
 //!
-//! `list_news_items` / `get_news_items_by_ids` 仍直接挂在 `db` 模块上（纯 DB 查询，
-//! 没必要再包一层 adapter）。
-
-use crate::domain::news::ArticleContent;
+use crate::domain::news::{ArticleContent, NewsItem};
 use crate::infrastructure::news::article::fetch_article_remote;
 use crate::pipeline::news::{self, NewsRefreshResult};
 use tauri::AppHandle;
@@ -16,6 +13,16 @@ use tauri::AppHandle;
 #[tauri::command]
 pub async fn run_news_refresh(app: AppHandle) -> Result<NewsRefreshResult, String> {
     news::run_news_refresh(app).await
+}
+
+#[tauri::command]
+pub fn list_news_items(app: AppHandle, limit: Option<i64>) -> Result<Vec<NewsItem>, String> {
+    crate::infrastructure::news::repository::list_news_items(app, limit)
+}
+
+#[tauri::command]
+pub fn get_news_items_by_ids(app: AppHandle, ids: Vec<String>) -> Result<Vec<NewsItem>, String> {
+    crate::infrastructure::news::repository::get_news_items_by_ids(app, ids)
 }
 
 /// 拉文章正文——逻辑：缓存命中 → 直接返；否则 fetch + 保存。
@@ -30,7 +37,9 @@ pub async fn fetch_article_content(
     fallback_summary: Option<String>,
     fallback_published: Option<String>,
 ) -> Result<ArticleContent, String> {
-    if let Ok(Some(cached_value)) = crate::infrastructure::news::repository::load_article_content(app.clone(), url.clone()) {
+    if let Ok(Some(cached_value)) =
+        crate::infrastructure::news::repository::load_article_content(app.clone(), url.clone())
+    {
         if let Ok(cached) = serde_json::from_value::<ArticleContent>(cached_value) {
             if !cached.paragraphs.is_empty() {
                 return Ok(cached);
