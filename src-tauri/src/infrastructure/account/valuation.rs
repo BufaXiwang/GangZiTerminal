@@ -136,7 +136,6 @@ fn compute_realized_pnl(positions: &[Position], events: &[PositionEvent]) -> f64
                     realized += gross - commission.value() - stamp_tax.value();
                 }
                 PositionEventKind::StopsAdjusted { .. }
-                | PositionEventKind::Reviewed { .. }
                 | PositionEventKind::Signal { .. } => {
                     // 不影响 PnL / 成本
                 }
@@ -204,6 +203,7 @@ mod tests {
             take_profit: None,
             time_stop_at: None,
             thesis: String::new(),
+            thesis_id: None,
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),
@@ -226,6 +226,7 @@ mod tests {
             take_profit: None,
             time_stop_at: None,
             thesis: String::new(),
+            thesis_id: None,
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),

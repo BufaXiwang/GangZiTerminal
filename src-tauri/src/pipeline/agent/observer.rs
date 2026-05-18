@@ -1,4 +1,4 @@
-//! 把 [`AgentEvent`] 流桥到「Tauri emit + agent_runs 表」。
+//! 把 [`AgentEvent`] 流桥到「Tauri emit + agent_episodes 表」。
 //!
 //! Pipeline 用法（chat 和 runner 都是这条模式）：
 //! ```ignore
@@ -17,7 +17,7 @@
 
 use crate::domain::agent::types::{AgentEvent, PipelineKind, StopReason};
 use crate::infrastructure::agent::repository::{
-    finalize_agent_run, insert_agent_run_start, insert_agent_run_turn,
+    finalize_agent_episode, insert_agent_episode_start, insert_agent_episode_turn,
 };
 use crate::pipeline::agent::RunSummary;
 use chrono::Utc;
@@ -28,6 +28,15 @@ use tauri::AppHandle;
 /// 前端 listen 一次，按 payload.run_id 区分归属。
 pub const AGENT_EVENT: &str = "agent-event";
 
+/// 把 PipelineKind 映射到 agent_episodes.trigger_kind。
+/// Phase 1：chat pipeline → 'chat'。reflection / scheduled tick 自己显式传 trigger_kind 字符串。
+fn pipeline_to_trigger_kind(pipeline: PipelineKind) -> &'static str {
+    match pipeline.as_str() {
+        // 旧 briefing / review 已下线，pipeline 已经收缩到 chat；保险起见 fallback 也写 chat
+        _ => "chat",
+    }
+}
+
 pub fn start_run(
     app: &AppHandle,
     run_id: &str,
@@ -36,22 +45,48 @@ pub fn start_run(
     model: &str,
     trigger_message_id: Option<&str>,
 ) -> Result<String, String> {
-    let started_at = Utc::now().to_rfc3339();
-    insert_agent_run_start(
+    start_episode(
         app,
         run_id,
-        pipeline.as_str(),
+        pipeline_to_trigger_kind(pipeline),
+        None,
+        provider,
+        model,
+        trigger_message_id,
+        None,
+    )
+}
+
+/// 通用 episode 启动入口——reflection / scheduled tick 等非 chat 触发的 run 走这条。
+#[allow(clippy::too_many_arguments)]
+pub fn start_episode(
+    app: &AppHandle,
+    run_id: &str,
+    trigger_kind: &str,
+    trigger_ref: Option<&str>,
+    provider: &str,
+    model: &str,
+    trigger_message_id: Option<&str>,
+    parent_episode_id: Option<&str>,
+) -> Result<String, String> {
+    let started_at = Utc::now().to_rfc3339();
+    insert_agent_episode_start(
+        app,
+        run_id,
+        trigger_kind,
+        trigger_ref,
         provider,
         model,
         &started_at,
         trigger_message_id,
+        parent_episode_id,
     )?;
     Ok(started_at)
 }
 
 pub fn finalize(app: &AppHandle, summary: &RunSummary, error: Option<&str>) -> Result<(), String> {
     let ended_at = Utc::now().to_rfc3339();
-    finalize_agent_run(
+    finalize_agent_episode(
         app,
         &summary.run_id,
         &ended_at,
@@ -64,13 +99,42 @@ pub fn finalize(app: &AppHandle, summary: &RunSummary, error: Option<&str>) -> R
         summary.server_tool_calls,
         Some(stop_reason_str(summary.stop_reason)),
         error,
+        None, // thesis_ids — reflection pipeline 会传，chat 暂不写
+        None, // outcome_summary — reflection pipeline 会传，chat 暂不写
+    )
+}
+
+/// reflection / 其他需要写 thesis_ids + outcome_summary 的 pipeline 用这个。
+pub fn finalize_with_context(
+    app: &AppHandle,
+    summary: &RunSummary,
+    error: Option<&str>,
+    thesis_ids: Option<&str>,
+    outcome_summary: Option<&str>,
+) -> Result<(), String> {
+    let ended_at = Utc::now().to_rfc3339();
+    finalize_agent_episode(
+        app,
+        &summary.run_id,
+        &ended_at,
+        summary.turns,
+        summary.total_input_tokens,
+        summary.total_output_tokens,
+        summary.total_cache_read_tokens,
+        summary.total_cache_write_tokens,
+        summary.local_tool_calls,
+        summary.server_tool_calls,
+        Some(stop_reason_str(summary.stop_reason)),
+        error,
+        thesis_ids,
+        outcome_summary,
     )
 }
 
 /// run 启动失败（连模型都没调通）——只补一条 ended_at + error，不带 token 数据。
 pub fn finalize_failure(app: &AppHandle, run_id: &str, error: &str) -> Result<(), String> {
     let ended_at = Utc::now().to_rfc3339();
-    finalize_agent_run(
+    finalize_agent_episode(
         app,
         run_id,
         &ended_at,
@@ -83,11 +147,13 @@ pub fn finalize_failure(app: &AppHandle, run_id: &str, error: &str) -> Result<()
         0,
         None,
         Some(error),
+        None,
+        None,
     )
 }
 
 /// pipeline 端的 collector 在 await run_agent 时同步累积 per-turn 状态——
-/// 这里把累积状态翻译成 agent_run_turns 行写入。每条 run 会调用 N 次（N = turns 数）。
+/// 这里把累积状态翻译成 agent_episode_turns 行写入。每条 run 会调用 N 次（N = turns 数）。
 ///
 /// 用法：collector 在收到 [`AgentEvent::Done`] 之前，按 [`AgentEvent::Usage`] /
 /// [`AgentEvent::ToolStart`] / [`AgentEvent::ToolEnd`] 切分 turn，调用本函数 flush。
@@ -108,7 +174,7 @@ pub fn record_turn(
     server_tool_calls: u32,
     error: Option<&str>,
 ) -> Result<(), String> {
-    insert_agent_run_turn(
+    insert_agent_episode_turn(
         app,
         run_id,
         turn,
@@ -126,7 +192,7 @@ pub fn record_turn(
 
 /// AgentEvent 流的 turn 切分器——pipeline 的 collector 调用：
 /// - `consume(ev)` —— 累计单 turn 的 token + tool count
-/// - 当 `consume` 返回 `Some(TurnRecord)` 时，把它持久化到 agent_run_turns
+/// - 当 `consume` 返回 `Some(TurnRecord)` 时，把它持久化到 agent_episode_turns
 ///
 /// **事件顺序**（关键，决定切分逻辑）：每 turn 的 provider stream 先 emit Usage
 /// 然后 MessageComplete；loop 拿到 message 之后才执行工具，因此 ToolStart/ToolEnd

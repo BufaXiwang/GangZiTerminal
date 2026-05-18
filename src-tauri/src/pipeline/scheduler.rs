@@ -36,6 +36,8 @@ pub fn spawn_all(app: AppHandle) {
     tauri::async_runtime::spawn(kline_warm_loop(app.clone()));
     tauri::async_runtime::spawn(account_snapshot_loop(app.clone()));
     tauri::async_runtime::spawn(tushare_probe_once(app));
+    // 注：reflection tick 在 main.rs 直接 spawn——它需要 adapters::agent_tools 构造
+    // registry，而 pipeline 不允许 use adapters。
 }
 
 // ====== 全市场 universe 刷新 loop ======

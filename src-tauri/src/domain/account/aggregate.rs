@@ -33,6 +33,9 @@ pub struct OpenPositionCommand {
     pub shares: Shares,
     pub name: String,
     pub thesis: String,
+    /// 关联的 Thesis aggregate id（v2 新增）。
+    /// agent 主动建仓必须设；用户直接命令建仓可 None。
+    pub thesis_id: Option<crate::domain::account::thesis::ThesisId>,
     pub stop_loss: Option<Yuan>,
     pub take_profit: Option<Yuan>,
     pub time_stop_at: Option<OccurredAt>,
@@ -142,6 +145,7 @@ impl Account {
             take_profit: cmd.take_profit,
             time_stop_at: cmd.time_stop_at.or(Some(derive_time_stop_at(entered_at))),
             thesis: cmd.thesis,
+            thesis_id: cmd.thesis_id,
             source_analysis_id: cmd.source_analysis_id,
             entered_at,
             last_acquisition_at: entered_at,

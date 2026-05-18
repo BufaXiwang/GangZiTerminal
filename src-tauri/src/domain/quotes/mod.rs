@@ -19,11 +19,13 @@
 pub mod clock;
 pub mod errors;
 pub mod indicators;
+pub mod regime;
 pub mod types;
 
 pub use clock::is_a_share_trading_hours;
 pub use errors::QuotesError;
 pub use indicators::{compute_indicators, IndicatorConfig, IndicatorSnapshot};
+pub use regime::Regime;
 pub use types::{
     AdjMode, CompanyEvent, ConceptPerformance, ConceptSector, DailyBasic, ForecastType,
     HistorySource, InstrumentCategory, KlinePeriod, KlinePoint, KlineSeries, ListStatus,

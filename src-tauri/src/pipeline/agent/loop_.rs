@@ -43,7 +43,7 @@ pub struct SummarizeOptions {
     pub keep_last_n_turns: u32,
 }
 
-/// 一次 run 的统计——pipeline 拿来落 agent_runs 表。
+/// 一次 run 的统计——pipeline 拿来落 agent_episodes 表。
 #[derive(Debug, Clone)]
 pub struct RunSummary {
     pub run_id: String,

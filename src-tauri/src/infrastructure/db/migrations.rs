@@ -1,7 +1,21 @@
-//! Schema 迁移 + 升级 helpers。
+//! SQLite schema 单一来源（v3 expectation-driven）。
 //!
-//! `migrate()` 是 SQLite schema 的单一来源——所有 `CREATE TABLE IF NOT EXISTS` 在一个事务里跑。
-//! 4 个 upgrade helper 处理跨版本的 ALTER（SQLite 不支持 ALTER CHECK，只能 rename → 新建 → copy → drop）。
+//! 旧 DB 文件在 `connection::open_database` 启动时根据 SCHEMA_VERSION 比对自动备份
+//! （`gangzi-terminal.sqlite3.legacy-{ts}`），本文件**只**负责在空 DB 上建一遍新 schema。
+//! 不需要 in-place 升级、不需要 add_column_if_missing。
+//!
+//! 模块归属：
+//! - **Account**: simulated_positions / position_events / expectations / expectation_events
+//!                  （v2 残留：theses / thesis_codes / thesis_events——W23/W24 删旧 code 时一起去掉 CREATE TABLE）
+//! - **Agent**: chat_messages / agent_episodes / agent_episode_turns / heuristics / strategies /
+//!              strategy_events / lessons / signal_detections / news_tags / news_tickers
+//!              （v2 残留：principles——W22 末迁移到 heuristics 后删除）
+//! - **Quotes**: stocks / indexes / funds / klines / kline_meta / minute_klines / minute_kline_meta
+//! - **News**: news_items / article_contents
+//! - **系统**: schema_meta / app_state (KV)
+//!
+//! 注：simulated_positions 多了 `current_expectation_id` 列；agent_episodes 多了 `expectation_ids` 列。
+//! v2 时代的 `thesis_id` / `thesis_ids` 列暂保留兼容旧代码——W23 切干净后 schema v4 删。
 
 use crate::infrastructure::db::connection::SCHEMA_VERSION;
 use crate::infrastructure::db::helpers::now;
@@ -9,288 +23,8 @@ use rusqlite::{params, Connection};
 
 pub fn migrate(connection: &Connection) -> Result<(), String> {
     connection
-        .execute_batch(
-            "
-            create table if not exists schema_meta (
-                id integer primary key check (id = 1),
-                version integer not null,
-                updated_at text not null
-            );
-
-            create table if not exists app_state (
-                key text primary key,
-                value_json text not null,
-                updated_at text not null
-            );
-
-            create table if not exists news_items (
-                id text primary key,
-                source text not null,
-                published text,
-                payload_json text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists article_contents (
-                url text primary key,
-                item_id text,
-                payload_json text not null,
-                fetched_at text not null
-            );
-
-            create table if not exists simulated_positions (
-                id text primary key,
-                code text not null,
-                source_analysis_id text not null,
-                status text not null,
-                payload_json text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists agent_tasks (
-                id text primary key,
-                item_id text not null,
-                title text not null,
-                task_type text,
-                agent_role text,
-                status text not null check (status in ('queued', 'running', 'completed', 'failed', 'skipped')),
-                priority integer not null default 100,
-                attempts integer not null default 0,
-                input_json text not null,
-                result_json text,
-                error text,
-                session_id text,
-                parent_task_id text,
-                locked_at text,
-                created_at text not null,
-                updated_at text not null,
-                started_at text,
-                completed_at text
-            );
-
-            create table if not exists position_events (
-                id text primary key,
-                position_id text not null,
-                event_kind text not null,
-                occurred_at text not null,
-                source_kind text,
-                source_ref text,
-                payload_json text not null,
-                agent_note_md text,
-                created_at text not null
-            );
-
-            create table if not exists chat_messages (
-                id text primary key,
-                created_at text not null,
-                role text not null check (role in ('user', 'assistant', 'system')),
-                kind text not null check (kind in ('chat', 'system', 'highlight', 'compact_boundary')),
-                content_md text not null,
-                content_json text,
-                source_task_id text,
-                source_news_ids text,
-                source_record_id text
-            );
-
-            create table if not exists agent_runs (
-                run_id text primary key,
-                pipeline text not null check (pipeline in ('chat', 'briefing', 'review')),
-                provider text not null,
-                model text not null,
-                started_at text not null,
-                ended_at text,
-                turns integer not null default 0,
-                input_tokens integer not null default 0,
-                output_tokens integer not null default 0,
-                cache_read_tokens integer not null default 0,
-                cache_write_tokens integer not null default 0,
-                local_tool_calls integer not null default 0,
-                server_tool_calls integer not null default 0,
-                stop_reason text,
-                error text,
-                trigger_message_id text
-            );
-            create index if not exists idx_agent_runs_pipeline_started on agent_runs(pipeline, started_at desc);
-
-            create table if not exists agent_run_turns (
-                run_id text not null,
-                turn integer not null,
-                started_at text not null,
-                ended_at text,
-                stop_reason text,
-                input_tokens integer not null default 0,
-                output_tokens integer not null default 0,
-                cache_read_tokens integer not null default 0,
-                local_tool_calls integer not null default 0,
-                server_tool_calls integer not null default 0,
-                error text,
-                primary key (run_id, turn)
-            );
-            create index if not exists idx_agent_run_turns_run on agent_run_turns(run_id, turn);
-
-            create table if not exists stocks (
-                code text primary key,
-                name text not null,
-                sector text,
-                market text not null,
-                updated_at text not null
-            );
-
-            -- 大盘指数档案：ts_code (000001.SH 形式) 是 PK，和 stocks 不冲突
-            create table if not exists indexes (
-                ts_code text primary key,
-                code text not null,
-                name text not null,
-                market text not null,        -- SSE / SZSE / CSI / SW（申万）
-                publisher text,              -- 发布机构
-                category text,               -- 大盘 / 行业 / 主题 / 风格
-                updated_at text not null
-            );
-
-            -- 基金档案：ETF / LOF / 封基 等 ts_code 是 PK
-            create table if not exists funds (
-                ts_code text primary key,
-                code text not null,
-                name text not null,
-                market text not null,        -- E (场内) / O (场外)
-                fund_type text,              -- 股票型 / 混合型 / 债券型 / 货币型 / ETF / LOF
-                management text,             -- 管理人
-                list_date text,              -- 上市日 YYYYMMDD
-                status text,                 -- L (上市) / D (退市)
-                updated_at text not null
-            );
-
-            -- K 线缓存：个股 / 指数 / 基金 统一存这里
-            -- ts_code 作为 PK 一部分，避免 000001 SH（上证）vs 000001 SZ（平安）冲突
-            create table if not exists klines (
-                ts_code text not null,       -- 形如 000001.SZ / 510300.SH / 399006.SZ
-                period text not null,        -- day / week / month
-                adjust text not null,        -- qfq / hfq / none
-                date text not null,          -- YYYYMMDD
-                open real not null,
-                close real not null,
-                high real not null,
-                low real not null,
-                volume real,
-                amount real,
-                source text not null,        -- tushare / em / stale
-                primary key (ts_code, period, adjust, date)
-            );
-
-            create table if not exists kline_meta (
-                ts_code text not null,
-                period text not null,
-                adjust text not null,
-                last_known_date text not null,
-                fetched_at text not null,
-                primary key (ts_code, period, adjust)
-            );
-
-            -- 分钟 K 缓存：1m / 5m / 15m / 30m / 60m
-            -- 走 EM push2his klt 端点拉取，盘中持续累加，TTL 30s
-            create table if not exists minute_klines (
-                ts_code text not null,
-                period text not null,           -- 1m / 5m / 15m / 30m / 60m
-                timestamp_ms integer not null,  -- unix ms（北京 9:30 = UTC 01:30）
-                open real not null,
-                close real not null,
-                high real not null,
-                low real not null,
-                volume integer not null,
-                amount real not null,
-                source text not null,
-                primary key (ts_code, period, timestamp_ms)
-            );
-
-            create table if not exists minute_kline_meta (
-                ts_code text not null,
-                period text not null,
-                last_known_ts integer not null,
-                fetched_at text not null,
-                primary key (ts_code, period)
-            );
-
-            create index if not exists idx_agent_tasks_status_priority on agent_tasks(status, priority, created_at);
-            create index if not exists idx_simulated_positions_code_status on simulated_positions(code, status);
-            create index if not exists idx_chat_messages_created on chat_messages(created_at desc);
-            create index if not exists idx_chat_messages_kind on chat_messages(kind, created_at desc);
-            create index if not exists idx_position_events_pos_time on position_events(position_id, occurred_at);
-            create index if not exists idx_stocks_name on stocks(name);
-            create index if not exists idx_indexes_name on indexes(name);
-            create index if not exists idx_funds_name on funds(name);
-            create index if not exists idx_funds_market on funds(market);
-            -- 注意：klines 表的索引 idx_klines_ts_period_date 不在这里建——
-            -- 必须等 upgrade_klines_to_ts_code 把旧 schema (列 `code`) 升级为新 schema (列 `ts_code`)
-            -- 之后才能建。见 migrate() 末尾。
-            ",
-        )
+        .execute_batch(SCHEMA_SQL)
         .map_err(|err| format!("初始化 SQLite schema 失败：{err}"))?;
-
-    // K 线表 schema 升级：旧版列叫 `code`（6 位），新版叫 `ts_code`（带后缀）。
-    // 老表存在且没有 ts_code 列 → DROP 重建（缓存数据丢就丢，反正是缓存）
-    upgrade_klines_to_ts_code(connection)?;
-
-    // upgrade 完成后，安全建 klines 的新索引（针对 ts_code 列）
-    connection
-        .execute_batch(
-            "create index if not exists idx_minute_klines_ts_period_ts
-             on minute_klines(ts_code, period, timestamp_ms desc);
-             create index if not exists idx_klines_ts_period_date
-             on klines(ts_code, period, adjust, date desc);",
-        )
-        .map_err(|err| format!("建 klines 索引失败：{err}"))?;
-
-    // briefing/review 已下线——一次性清理：
-    // 1. DROP analysis_records 表 + 其索引
-    // 2. 重建 news_items 去掉 analysis_status 列（SQLite 不支持 DROP COLUMN）
-    drop_briefing_review_remnants(connection)?;
-    // 旧版多 session 对话表已弃用，直接清掉避免存量数据干扰
-    connection
-        .execute("drop table if exists chat_sessions", [])
-        .map_err(|err| format!("清理旧 chat_sessions 表失败：{err}"))?;
-    connection
-        .execute("drop table if exists investor_memory_log", [])
-        .map_err(|err| format!("清理旧 investor_memory_log 表失败：{err}"))?;
-    // 旧行情 DB 快照已被 `MARKET_SNAPSHOT` in-memory 真源替代；不保留兼容。
-    connection
-        .execute("drop table if exists quote_snapshots", [])
-        .map_err(|err| format!("清理旧 quote_snapshots 表失败：{err}"))?;
-    connection
-        .execute("drop table if exists market_quotes_snapshot", [])
-        .map_err(|err| format!("清理旧 market_quotes_snapshot 表失败：{err}"))?;
-    // codex 时代的 MCP 注册诊断状态——agent 直连后已不写入；老用户本地若残留
-    // 一条失败记录会让前端 status bar 持续显示"MCP 工具未启用"，一次性清掉。
-    connection
-        .execute(
-            "delete from app_state where key = 'gangzi-terminal.mcp-status'",
-            [],
-        )
-        .map_err(|err| format!("清理旧 mcp-status key 失败：{err}"))?;
-    // codex CLI 的长会话 id——agent 自管 messages，不再需要 resume；清掉避免误读。
-    connection
-        .execute(
-            "delete from app_state where key = 'gangzi-terminal.main-agent-session-id'",
-            [],
-        )
-        .map_err(|err| format!("清理旧 codex session-id key 失败：{err}"))?;
-    add_column_if_missing(connection, "agent_tasks", "task_type", "text")?;
-    add_column_if_missing(connection, "agent_tasks", "agent_role", "text")?;
-    add_column_if_missing(
-        connection,
-        "agent_tasks",
-        "attempts",
-        "integer not null default 0",
-    )?;
-    add_column_if_missing(connection, "agent_tasks", "parent_task_id", "text")?;
-    add_column_if_missing(connection, "agent_tasks", "locked_at", "text")?;
-
-    // 老库的 chat_messages 表 CHECK 约束没有 'compact_boundary'——让 compact 边界
-    // 行写入会失败。SQLite 不支持 ALTER CHECK，必须重建表。检查现有 sql 文本里
-    // 是否已包含新值，否则做一次性重建。
-    upgrade_chat_messages_kind_check(connection)?;
-
     connection
         .execute(
             "insert into schema_meta (id, version, updated_at)
@@ -302,195 +36,375 @@ pub fn migrate(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// briefing / review 下线后的一次性清理（幂等）：
-/// 1. DROP TABLE analysis_records + 其索引——表本身和索引都不再需要
-/// 2. 重建 news_items 表去掉 analysis_status 列（SQLite 不支持 DROP COLUMN，
-///    走 rename → 新建 → copy → drop legacy 的套路，事务里完成）
-///
-/// 两步都做"先看在不在再处理"的幂等判断，重启不会重做。
-fn drop_briefing_review_remnants(connection: &Connection) -> Result<(), String> {
-    // 1) 先扔掉 analysis_records 表 + 索引
-    connection
-        .execute_batch(
-            "drop index if exists idx_analysis_records_item_id;
-             drop table if exists analysis_records;",
-        )
-        .map_err(|err| format!("清理 analysis_records 失败：{err}"))?;
+const SCHEMA_SQL: &str = r#"
+-- ===== 系统 =====
+create table if not exists schema_meta (
+    id integer primary key check (id = 1),
+    version integer not null,
+    updated_at text not null
+);
 
-    // 2) news_items 表如果还含 analysis_status 列，重建去掉
-    let has_status = {
-        let mut stmt = connection
-            .prepare("pragma table_info(news_items)")
-            .map_err(|err| format!("读取 news_items schema 失败：{err}"))?;
-        let cols: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|err| format!("读取 news_items schema 失败：{err}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        cols.iter().any(|n| n == "analysis_status")
-    };
-    if has_status {
-        tracing::info!("一次性清理：news_items 删除 analysis_status 列（重建表）");
-        connection
-            .execute_batch(
-                "begin transaction;
-                 drop index if exists idx_news_items_status_published;
-                 alter table news_items rename to news_items_legacy;
-                 create table news_items (
-                    id text primary key,
-                    source text not null,
-                    published text,
-                    payload_json text not null,
-                    created_at text not null,
-                    updated_at text not null
-                 );
-                 insert into news_items (id, source, published, payload_json, created_at, updated_at)
-                 select id, source, published, payload_json, created_at, updated_at
-                 from news_items_legacy;
-                 drop table news_items_legacy;
-                 commit;",
-            )
-            .map_err(|err| format!("重建 news_items（去掉 analysis_status）失败：{err}"))?;
-    }
-    Ok(())
-}
+create table if not exists app_state (
+    key text primary key,
+    value_json text not null,
+    updated_at text not null
+);
 
-/// 一次性升级 chat_messages 表的 kind CHECK 约束。
-///
-/// 触发条件：现有表的 CHECK 约束里仍包含 'briefing'（老 schema）。
-/// 步骤：
-/// 1. 先 DELETE 掉 kind='briefing'/'review' 的历史数据（briefing/review 已下线）
-/// 2. 重建表去掉 'briefing'/'review' 允许值，并加入 'compact_boundary'
-///
-/// SQLite 不支持 ALTER CHECK，只能 rename → 新建 → copy → drop。整套包事务。
-fn upgrade_chat_messages_kind_check(connection: &Connection) -> Result<(), String> {
-    let existing_sql: Option<String> = connection
-        .query_row(
-            "select sql from sqlite_master where type='table' and name='chat_messages'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    let needs_upgrade = match existing_sql {
-        // 老 schema 含 'briefing' 字面量 → 重建；新 schema 已经没有这串了
-        Some(sql) => sql.contains("'briefing'"),
-        None => false, // 表不存在——上一步 create table if not exists 已用新约束建好
-    };
-    if !needs_upgrade {
-        return Ok(());
-    }
-    tracing::info!("升级 chat_messages.kind CHECK：去掉 briefing/review，加 compact_boundary");
-    connection
-        .execute_batch(
-            "begin transaction;
-             delete from chat_messages where kind in ('briefing', 'review');
-             alter table chat_messages rename to chat_messages_legacy;
-             create table chat_messages (
-                id text primary key,
-                created_at text not null,
-                role text not null check (role in ('user', 'assistant', 'system')),
-                kind text not null check (kind in ('chat', 'system', 'highlight', 'compact_boundary')),
-                content_md text not null,
-                content_json text,
-                source_task_id text,
-                source_news_ids text,
-                source_record_id text
-             );
-             insert into chat_messages
-                (id, created_at, role, kind, content_md, content_json,
-                 source_task_id, source_news_ids, source_record_id)
-             select id, created_at, role, kind, content_md, content_json,
-                    source_task_id, source_news_ids, source_record_id
-             from chat_messages_legacy;
-             drop table chat_messages_legacy;
-             create index if not exists idx_chat_messages_created on chat_messages(created_at desc);
-             create index if not exists idx_chat_messages_kind on chat_messages(kind, created_at desc);
-             commit;",
-        )
-        .map_err(|err| format!("升级 chat_messages CHECK 约束失败：{err}"))?;
-    Ok(())
-}
+-- ===== News BC =====
+create table if not exists news_items (
+    id text primary key,
+    source text not null,
+    published text,
+    payload_json text not null,
+    created_at text not null,
+    updated_at text not null
+);
 
-/// K 线表 schema 升级——把旧 `klines`/`kline_meta`（列 `code` 6 位）替换为新版（列 `ts_code` 带后缀）。
-/// 旧 schema 不能容纳指数/基金（000001.SH 和 000001.SZ 冲突），直接 DROP 重建。缓存丢就丢。
-fn upgrade_klines_to_ts_code(connection: &Connection) -> Result<(), String> {
-    let has_ts_code = |table: &str| -> Result<bool, String> {
-        let mut stmt = connection
-            .prepare(&format!("pragma table_info({table})"))
-            .map_err(|err| format!("读取 {table} schema 失败：{err}"))?;
-        let names: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|err| format!("读取 {table} schema 失败：{err}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        if names.is_empty() {
-            return Ok(true); // 表不存在 → 由 create table if not exists 建好
-        }
-        Ok(names.iter().any(|n| n == "ts_code"))
-    };
+create table if not exists article_contents (
+    url text primary key,
+    item_id text,
+    payload_json text not null,
+    fetched_at text not null
+);
 
-    if !has_ts_code("klines")? {
-        tracing::info!("升级 klines schema：DROP + 重建（旧缓存丢失，下次访问会重拉）");
-        connection
-            .execute_batch(
-                "drop table if exists klines;
-                 create table klines (
-                     ts_code text not null,
-                     period text not null,
-                     adjust text not null,
-                     date text not null,
-                     open real not null,
-                     close real not null,
-                     high real not null,
-                     low real not null,
-                     volume real,
-                     amount real,
-                     source text not null,
-                     primary key (ts_code, period, adjust, date)
-                 );
-                 create index idx_klines_ts_period_date on klines(ts_code, period, adjust, date desc);",
-            )
-            .map_err(|err| format!("升级 klines 失败：{err}"))?;
-    }
-    if !has_ts_code("kline_meta")? {
-        tracing::info!("升级 kline_meta schema：DROP + 重建");
-        connection
-            .execute_batch(
-                "drop table if exists kline_meta;
-                 create table kline_meta (
-                     ts_code text not null,
-                     period text not null,
-                     adjust text not null,
-                     last_known_date text not null,
-                     fetched_at text not null,
-                     primary key (ts_code, period, adjust)
-                 );",
-            )
-            .map_err(|err| format!("升级 kline_meta 失败：{err}"))?;
-    }
-    Ok(())
-}
+-- ===== Account BC =====
+create table if not exists simulated_positions (
+    id text primary key,
+    code text not null,
+    source_analysis_id text not null,
+    status text not null,
+    thesis_id text,                       -- v2 兼容列，W24 删
+    current_expectation_id text,          -- v3 新增：关联 expectations 表
+    payload_json text not null,
+    created_at text not null,
+    updated_at text not null
+);
+create index if not exists idx_simulated_positions_code_status on simulated_positions(code, status);
+create index if not exists idx_simulated_positions_thesis on simulated_positions(thesis_id);
+create index if not exists idx_simulated_positions_expectation on simulated_positions(current_expectation_id);
 
-fn add_column_if_missing(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), String> {
-    let mut statement = connection
-        .prepare(&format!("pragma table_info({table})"))
-        .map_err(|err| format!("读取 {table} schema 失败：{err}"))?;
-    let exists = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|err| format!("读取 {table} schema 失败：{err}"))?
-        .any(|name| name.map(|value| value == column).unwrap_or(false));
-    if !exists {
-        connection
-            .execute(
-                &format!("alter table {table} add column {column} {definition}"),
-                [],
-            )
-            .map_err(|err| format!("升级 {table}.{column} 失败：{err}"))?;
-    }
-    Ok(())
-}
+create table if not exists position_events (
+    id text primary key,
+    position_id text not null,
+    event_kind text not null,
+    occurred_at text not null,
+    source_kind text,
+    source_ref text,
+    payload_json text not null,
+    agent_note_md text,
+    created_at text not null
+);
+create index if not exists idx_position_events_pos_time on position_events(position_id, occurred_at);
+
+-- Thesis 一等聚合根（agent-redesign.md § 3.1）
+create table if not exists theses (
+    id text primary key,
+    hypothesis text not null,
+    invalidation text not null,
+    validation_checks text,               -- JSON array
+    conviction text not null check (conviction in ('low', 'medium', 'high')),
+    state text not null check (state in ('drafted', 'active', 'validated', 'drifted', 'invalidated', 'abandoned')),
+    regime_at_creation text,              -- bull / bear / choppy
+    created_at text not null,
+    updated_at text not null,
+    closed_at text
+);
+create index if not exists idx_theses_state on theses(state, updated_at desc);
+
+create table if not exists thesis_codes (
+    thesis_id text not null,
+    code text not null,
+    primary key (thesis_id, code)
+);
+create index if not exists idx_thesis_codes_code on thesis_codes(code);
+
+create table if not exists thesis_events (
+    id integer primary key autoincrement,
+    thesis_id text not null,
+    kind text not null,
+    payload text,                         -- JSON
+    occurred_at text not null
+);
+create index if not exists idx_thesis_events_id_time on thesis_events(thesis_id, occurred_at);
+
+-- ===== Agent BC =====
+create table if not exists chat_messages (
+    id text primary key,
+    created_at text not null,
+    role text not null check (role in ('user', 'assistant', 'system')),
+    kind text not null check (kind in ('chat', 'system', 'highlight', 'compact_boundary')),
+    content_md text not null,
+    content_json text,
+    source_task_id text,
+    source_news_ids text,
+    source_record_id text
+);
+create index if not exists idx_chat_messages_created on chat_messages(created_at desc);
+create index if not exists idx_chat_messages_kind on chat_messages(kind, created_at desc);
+
+-- agent_episodes：每次 agent run 一行。trigger_kind 区分 chat / scheduled / reflection 等
+create table if not exists agent_episodes (
+    run_id text primary key,
+    trigger_kind text not null check (trigger_kind in ('scheduled', 'user_message', 'user_instruction', 'reflection', 'chat')),
+    trigger_ref text,
+    provider text not null,
+    model text not null,
+    started_at text not null,
+    ended_at text,
+    turns integer not null default 0,
+    input_tokens integer not null default 0,
+    output_tokens integer not null default 0,
+    cache_read_tokens integer not null default 0,
+    cache_write_tokens integer not null default 0,
+    local_tool_calls integer not null default 0,
+    server_tool_calls integer not null default 0,
+    stop_reason text,
+    error text,
+    trigger_message_id text,
+    thesis_ids text,                      -- v2 兼容列（JSON array），W24 删
+    expectation_ids text,                 -- v3 新增（JSON array）
+    outcome_summary text,
+    parent_episode_id text                -- 因果链
+);
+create index if not exists idx_agent_episodes_trigger_started on agent_episodes(trigger_kind, started_at desc);
+create index if not exists idx_agent_episodes_parent on agent_episodes(parent_episode_id);
+
+create table if not exists agent_episode_turns (
+    run_id text not null,
+    turn integer not null,
+    started_at text not null,
+    ended_at text,
+    stop_reason text,
+    input_tokens integer not null default 0,
+    output_tokens integer not null default 0,
+    cache_read_tokens integer not null default 0,
+    local_tool_calls integer not null default 0,
+    server_tool_calls integer not null default 0,
+    error text,
+    primary key (run_id, turn)
+);
+create index if not exists idx_agent_episode_turns_run on agent_episode_turns(run_id, turn);
+
+-- Principles：结构化投资原则 / 已知偏差 / 风险偏好
+create table if not exists principles (
+    id text primary key,
+    body text not null,
+    category text not null check (category in ('principle', 'known_bias', 'risk_preference')),
+    origin text not null check (origin in ('user_stated', 'agent_inferred')),
+    state text not null check (state in ('proposed', 'active', 'dormant', 'retired')),
+    regime_tags text,                     -- JSON array of regime strings
+    hit_count integer not null default 0,
+    last_applied_at text,
+    created_at text not null
+);
+create index if not exists idx_principles_state_hit on principles(state, hit_count desc);
+create index if not exists idx_principles_origin on principles(origin, state);
+
+-- ===== Quotes BC =====
+create table if not exists stocks (
+    code text primary key,
+    name text not null,
+    sector text,
+    market text not null,
+    updated_at text not null
+);
+create index if not exists idx_stocks_name on stocks(name);
+
+create table if not exists indexes (
+    ts_code text primary key,
+    code text not null,
+    name text not null,
+    market text not null,
+    publisher text,
+    category text,
+    updated_at text not null
+);
+create index if not exists idx_indexes_name on indexes(name);
+
+create table if not exists funds (
+    ts_code text primary key,
+    code text not null,
+    name text not null,
+    market text not null,
+    fund_type text,
+    management text,
+    list_date text,
+    status text,
+    updated_at text not null
+);
+create index if not exists idx_funds_name on funds(name);
+create index if not exists idx_funds_market on funds(market);
+
+create table if not exists klines (
+    ts_code text not null,
+    period text not null,
+    adjust text not null,
+    date text not null,
+    open real not null,
+    close real not null,
+    high real not null,
+    low real not null,
+    volume real,
+    amount real,
+    source text not null,
+    primary key (ts_code, period, adjust, date)
+);
+create index if not exists idx_klines_ts_period_date on klines(ts_code, period, adjust, date desc);
+
+create table if not exists kline_meta (
+    ts_code text not null,
+    period text not null,
+    adjust text not null,
+    last_known_date text not null,
+    fetched_at text not null,
+    primary key (ts_code, period, adjust)
+);
+
+create table if not exists minute_klines (
+    ts_code text not null,
+    period text not null,
+    timestamp_ms integer not null,
+    open real not null,
+    close real not null,
+    high real not null,
+    low real not null,
+    volume integer not null,
+    amount real not null,
+    source text not null,
+    primary key (ts_code, period, timestamp_ms)
+);
+create index if not exists idx_minute_klines_ts_period_ts on minute_klines(ts_code, period, timestamp_ms desc);
+
+create table if not exists minute_kline_meta (
+    ts_code text not null,
+    period text not null,
+    last_known_ts integer not null,
+    fetched_at text not null,
+    primary key (ts_code, period)
+);
+
+-- ===== v3 expectation-driven 新表 =====
+
+-- Expectation：投资预期一等聚合根（归 account BC）
+create table if not exists expectations (
+    id text primary key,
+    code text not null,
+    direction text not null check (direction in ('up', 'down', 'range_bound')),
+    target_price real,
+    target_price_ceiling real,
+    horizon_days integer not null,
+    reasoning text not null,
+    signals_used text not null,            -- JSON array of SignalKind
+    conviction text not null check (conviction in ('low', 'medium', 'high')),
+    theme text,
+    supersedes_expectation_id text,
+    state text not null check (state in ('pending', 'hit', 'missed', 'expired', 'cancelled', 'superseded')),
+    regime_at_creation text,
+    created_at text not null,
+    expires_at text not null,
+    closed_at text
+);
+create index if not exists idx_expectations_code_state on expectations(code, state);
+create index if not exists idx_expectations_state_expires on expectations(state, expires_at);
+create index if not exists idx_expectations_theme on expectations(theme);
+
+-- Expectation 事件链（状态机审计 + 用户反馈 append-only）
+create table if not exists expectation_events (
+    id integer primary key autoincrement,
+    expectation_id text not null,
+    kind text not null,
+    payload text,                          -- JSON
+    occurred_at text not null
+);
+create index if not exists idx_expectation_events_id on expectation_events(expectation_id, occurred_at);
+
+-- Strategy：用户 + agent 共建的规则集
+create table if not exists strategies (
+    id text primary key,
+    name text not null,
+    description text,
+    config_json text not null,             -- 完整 DSL（trigger_when + target + conviction_rule）
+    enabled integer not null default 1,
+    applied_count integer not null default 0,
+    hit_count integer not null default 0,
+    miss_count integer not null default 0,
+    created_at text not null,
+    updated_at text not null
+);
+create index if not exists idx_strategies_enabled on strategies(enabled);
+
+-- Strategy 修改审计
+create table if not exists strategy_events (
+    id integer primary key autoincrement,
+    strategy_id text not null,
+    kind text not null,                    -- created/updated/enabled/disabled/user_comment
+    payload text,                          -- JSON
+    occurred_at text not null
+);
+create index if not exists idx_strategy_events_id on strategy_events(strategy_id, occurred_at);
+
+-- Lesson：每个 expectation 终态自动生成的原子观察（学习闭环底层原料）
+create table if not exists lessons (
+    id text primary key,
+    expectation_id text not null,
+    code text not null,
+    observation text not null,
+    takeaway text not null,
+    outcome text not null check (outcome in ('hit', 'miss', 'expired')),
+    regime_at_close text,
+    signals_in_play text,                  -- JSON array
+    pnl_pct real,
+    created_at text not null
+);
+create index if not exists idx_lessons_expectation on lessons(expectation_id);
+create index if not exists idx_lessons_code_time on lessons(code, created_at desc);
+
+-- Heuristic：结构化启发式规则 + track record（取代 v2 principles）
+create table if not exists heuristics (
+    id text primary key,
+    body text not null,
+    category text not null check (category in ('principle', 'known_bias', 'risk_preference')),
+    origin text not null check (origin in ('seed', 'user_stated', 'agent_inferred')),
+    regime_tags text,                      -- JSON array
+    supporting_lesson_ids text,            -- JSON array
+    application_count integer not null default 0,
+    hit_count integer not null default 0,
+    miss_count integer not null default 0,
+    last_applied_at text,
+    retired_at text,
+    retired_reason text,
+    created_at text not null
+);
+create index if not exists idx_heuristics_origin on heuristics(origin);
+create index if not exists idx_heuristics_retired on heuristics(retired_at);
+
+-- Signal detection log（per-tick 检测结果，审计 + 命中率统计）
+create table if not exists signal_detections (
+    id integer primary key autoincrement,
+    tick_id text not null,
+    code text not null,
+    signal_family text not null,           -- 稳定 key（无参数），便于按家族聚合
+    signal_json text not null,             -- 完整 SignalKind 序列化（含参数）
+    detected_at text not null
+);
+create index if not exists idx_signal_detections_code_time on signal_detections(code, detected_at desc);
+create index if not exists idx_signal_detections_tick on signal_detections(tick_id);
+create index if not exists idx_signal_detections_family on signal_detections(signal_family, detected_at desc);
+
+-- News tagger 输出（资讯入库时打 kind/importance/tickers/sectors）
+create table if not exists news_tags (
+    news_id text primary key,
+    kind text not null check (kind in ('earnings','halt','restructure','regulatory','ownership','operating','policy','sector_trend','market','other')),
+    importance text not null check (importance in ('high','medium','low')),
+    sectors text,                          -- JSON array
+    tagged_at text not null
+);
+create index if not exists idx_news_tags_importance on news_tags(importance);
+
+create table if not exists news_tickers (
+    news_id text not null,
+    code text not null,
+    primary key (news_id, code)
+);
+create index if not exists idx_news_tickers_code on news_tickers(code, news_id);
+"#;

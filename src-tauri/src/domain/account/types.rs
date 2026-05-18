@@ -74,12 +74,12 @@ mod tests {
 
     #[test]
     fn event_source_serde_round_trip() {
-        let src = EventSource::Briefing {
-            analysis_id: "abc-123".into(),
+        let src = EventSource::Chat {
+            message_id: "msg-123".into(),
         };
         let json = serde_json::to_string(&src).unwrap();
-        assert!(json.contains("\"kind\":\"briefing\""));
-        assert!(json.contains("\"analysis_id\":\"abc-123\""));
+        assert!(json.contains("\"kind\":\"chat\""));
+        assert!(json.contains("\"message_id\":\"msg-123\""));
         let back: EventSource = serde_json::from_str(&json).unwrap();
         assert_eq!(src, back);
     }

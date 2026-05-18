@@ -169,7 +169,7 @@ pub fn read_recent_chat_thread(
 // ====== 写库辅助 ==========================================================
 
 /// 构造 chat_messages user 行的 contentJson——blocks 字段记录结构化内容，
-/// 同时保留 images 字段供前端 MemoryChips/缩略图渲染（兼容旧前端代码）。
+/// images 字段保留用户附带图片路径，前端渲染缩略图。
 pub fn build_user_content_json(blocks: &[Block], image_paths: &[String]) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("blocks".into(), blocks_to_json(blocks));
@@ -179,8 +179,8 @@ pub fn build_user_content_json(blocks: &[Block], image_paths: &[String]) -> Valu
     Value::Object(obj)
 }
 
-/// 构造 assistant 行的 contentJson——blocks 字段 + 既有的 run/memory 元数据。
-/// `extras` 是其他需要并入 contentJson 的字段（runId / turns / memoryUpdates 等）。
+/// 构造 assistant 行的 contentJson——blocks 字段 + 运行元数据。
+/// `extras` 是其他需要并入 contentJson 的字段（runId / turns / localToolCalls 等）。
 pub fn build_assistant_content_json(blocks: &[Block], extras: Value) -> Value {
     let mut obj = match extras {
         Value::Object(m) => m,

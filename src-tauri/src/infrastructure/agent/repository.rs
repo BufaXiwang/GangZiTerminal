@@ -1,9 +1,10 @@
-//! Agent 子域 DB 访问——chat_messages + agent_runs + agent_run_turns 三张表。
+//! Agent 子域 DB 访问——chat_messages + agent_episodes + agent_episode_turns 三张表。
 //!
-//! 表设计：
+//! 表设计（v2 重构后）：
 //! - `chat_messages`：对话流（id PK / role / kind / content_md / content_json / source_*）
-//! - `agent_runs`：每次 run 的统计（run_id PK / pipeline / model / turns / tokens / stop_reason）
-//! - `agent_run_turns`：每个 turn 的细粒度统计（(run_id, turn) PK）
+//! - `agent_episodes`：每次 run 的统计 + trigger_kind / thesis_ids / outcome_summary
+//!   （run_id PK / trigger_kind / model / turns / tokens / stop_reason）
+//! - `agent_episode_turns`：每个 turn 的细粒度统计（(run_id, turn) PK）
 //!
 //! 写路径：pipeline::chat / pipeline::agent::observer 调 append + finalize。
 //! 读路径：Tauri IPC list/search 给前端 chat UI 用；read_all 给 agent 历史上下文用。
@@ -145,33 +146,51 @@ pub fn search_chat_messages(
     Ok(rows)
 }
 
-/// agent_runs 表的写入入口——在 run 启动时插一条 started_at；run 结束时
+/// agent_episodes 表的写入入口——在 run 启动时插一条 started_at；run 结束时
 /// update token / turns / stop_reason / ended_at。observer.rs 调这两个。
-pub fn insert_agent_run_start(
+///
+/// 参数 `trigger_kind` 取代旧 `pipeline`：取值之一 `scheduled / user_message /
+/// user_instruction / reflection / chat`。Phase 1 用户驱动统一传 'chat'，
+/// 后续 reflection pipeline 传 'reflection'，scheduler 触发的传 'scheduled'。
+#[allow(clippy::too_many_arguments)]
+pub fn insert_agent_episode_start(
     app: &AppHandle,
     run_id: &str,
-    pipeline: &str,
+    trigger_kind: &str,
+    trigger_ref: Option<&str>,
     provider: &str,
     model: &str,
     started_at: &str,
     trigger_message_id: Option<&str>,
+    parent_episode_id: Option<&str>,
 ) -> Result<(), String> {
     let connection = open_database(app)?;
     migrate(&connection)?;
     connection
         .execute(
-            "insert into agent_runs (run_id, pipeline, provider, model, started_at, trigger_message_id)
-             values (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run_id, pipeline, provider, model, started_at, trigger_message_id],
+            "insert into agent_episodes
+                (run_id, trigger_kind, trigger_ref, provider, model, started_at,
+                 trigger_message_id, parent_episode_id)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                trigger_kind,
+                trigger_ref,
+                provider,
+                model,
+                started_at,
+                trigger_message_id,
+                parent_episode_id
+            ],
         )
-        .map_err(|err| format!("写 agent_runs 失败：{err}"))?;
+        .map_err(|err| format!("写 agent_episodes 失败：{err}"))?;
     Ok(())
 }
 
-/// 每个 turn 收尾时落一行 agent_run_turns。
-/// 投资学习的关键审计点——briefing 给错答案时能 grep 出第几 turn 出岔子。
+/// 每个 turn 收尾时落一行 agent_episode_turns。
+/// 投资学习的关键审计点——给错答案时能 grep 出第几 turn 出岔子。
 #[allow(clippy::too_many_arguments)]
-pub fn insert_agent_run_turn(
+pub fn insert_agent_episode_turn(
     app: &AppHandle,
     run_id: &str,
     turn: u32,
@@ -189,7 +208,7 @@ pub fn insert_agent_run_turn(
     migrate(&connection)?;
     connection
         .execute(
-            "insert or replace into agent_run_turns
+            "insert or replace into agent_episode_turns
                 (run_id, turn, started_at, ended_at, stop_reason,
                  input_tokens, output_tokens, cache_read_tokens,
                  local_tool_calls, server_tool_calls, error)
@@ -208,12 +227,12 @@ pub fn insert_agent_run_turn(
                 error,
             ],
         )
-        .map_err(|err| format!("写 agent_run_turns 失败：{err}"))?;
+        .map_err(|err| format!("写 agent_episode_turns 失败：{err}"))?;
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn finalize_agent_run(
+pub fn finalize_agent_episode(
     app: &AppHandle,
     run_id: &str,
     ended_at: &str,
@@ -226,12 +245,14 @@ pub fn finalize_agent_run(
     server_tool_calls: u32,
     stop_reason: Option<&str>,
     error: Option<&str>,
+    thesis_ids: Option<&str>,
+    outcome_summary: Option<&str>,
 ) -> Result<(), String> {
     let connection = open_database(app)?;
     migrate(&connection)?;
     connection
         .execute(
-            "update agent_runs set
+            "update agent_episodes set
                 ended_at = ?2,
                 turns = ?3,
                 input_tokens = ?4,
@@ -241,7 +262,9 @@ pub fn finalize_agent_run(
                 local_tool_calls = ?8,
                 server_tool_calls = ?9,
                 stop_reason = ?10,
-                error = ?11
+                error = ?11,
+                thesis_ids = ?12,
+                outcome_summary = ?13
              where run_id = ?1",
             params![
                 run_id,
@@ -255,9 +278,11 @@ pub fn finalize_agent_run(
                 server_tool_calls,
                 stop_reason,
                 error,
+                thesis_ids,
+                outcome_summary,
             ],
         )
-        .map_err(|err| format!("更新 agent_runs 失败：{err}"))?;
+        .map_err(|err| format!("更新 agent_episodes 失败：{err}"))?;
     Ok(())
 }
 

@@ -47,16 +47,16 @@ Schema migrations live in `src-tauri/src/infrastructure/db/migrations.rs`. Table
 
 | Table | Owner / writer |
 |---|---|
-| `app_state` (KV) | frontend UI settings via adapters; account watchlist; agent provider config; `update_memory` / `remove_memory` tools |
+| `app_state` (KV) | frontend UI settings via adapters; account watchlist; agent provider config |
 | `chat_messages` | chat pipeline only |
 | `news_items` | news refresh + typed news repository status transitions |
 | `simulated_positions` | account pipeline/service via Account aggregate + PositionRepo |
 | `position_events` | account pipeline/service via Account aggregate + PositionRepo |
+| `theses` / `thesis_codes` / `thesis_events` | account BC; Thesis aggregate write tools (create_thesis, update_thesis_state, attach_thesis_feedback) |
+| `principles` | agent BC; principle write tools + reflection pipeline + startup seed |
 | `article_contents` | news article extractor cache |
-| `agent_runs` | `pipeline::agent::observer` run-level audit |
-| `agent_run_turns` | `pipeline::agent::observer::TurnAccumulator` per-turn audit |
-
-`analysis_records` and old briefing/review chat rows are removed by migration. `agent_tasks` remains a historical table only; no runtime path writes it.
+| `agent_episodes` | `pipeline::agent::observer` run-level audit (含 trigger_kind / thesis_ids / outcome_summary) |
+| `agent_episode_turns` | `pipeline::agent::observer::TurnAccumulator` per-turn audit |
 
 `app_state` keys currently in use:
 
@@ -119,7 +119,7 @@ Token storage: tokens are stored plaintext in SQLite. The Settings page displays
 - Keep `src-tauri/.cargo/config.toml`; it moves Cargo target output outside `src-tauri` to avoid Tauri watcher rebuild loops.
 - Tauri needs a valid PNG icon with correct RGBA dimensions.
 - **Provider misconfig** is the #1 source of "agent does not respond". Check Settings → AI 配置 and logs under the app data dir.
-- **Cache hit verification**: with prompt caching working, the second chat turn should show non-zero `cache_read_tokens` in `agent_runs`.
+- **Cache hit verification**: with prompt caching working, the second chat turn should show non-zero `cache_read_tokens` in `agent_episodes`.
 - **Stuck loops**: `FailureCounter` aggregates consecutive failures per loop and emits `loop-degraded` status at 5/10/20 milestones.
 
 ## Architecture Boundary (don't violate)
@@ -173,7 +173,7 @@ cargo test  --manifest-path src-tauri/Cargo.toml
 For NewsNow changes, test `/api/latest` and at least one `/api/s?id=...` endpoint.
 For quote changes, test TDX / Eastmoney fallback paths with index + stock codes.
 For provider changes:
-- Set base_url + token in Settings → AI 配置, send a chat message, verify `cache_read_tokens > 0` in `agent_runs` after the second turn
+- Set base_url + token in Settings → AI 配置, send a chat message, verify `cache_read_tokens > 0` in `agent_episodes` after the second turn
 - For OpenAI Responses: verify the `input` array preserves canonical Block order (`Text`, `ToolUse`, `Text` → `message`, `function_call`, `message`)
 - For retry: temporarily inject `ProviderError::Transient` and confirm at least one retry log line at level `WARN` with `attempt=N`
 

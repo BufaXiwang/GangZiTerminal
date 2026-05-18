@@ -86,11 +86,11 @@ pub struct AgentRequest {
     pub messages: Vec<Message>,
     pub options: AgentOptions,
     pub budget: ContextBudget,
-    /// 可选的关联 id——落 agent_runs 表时用，便于后续按 chat_messages.id
-    /// 反查这条 run 的成本和工具调用。
+    /// 可选的关联 id——落 agent_episodes.trigger_message_id 列，
+    /// 便于后续按 chat_messages.id 反查这条 episode 的成本和工具调用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_message_id: Option<String>,
-    /// 这次 run 属于哪条 pipeline，落 agent_runs.pipeline 列。
+    /// 这次 run 的 pipeline 类型——v2 重构后只剩 chat。
     pub pipeline: PipelineKind,
 }
 
@@ -202,20 +202,18 @@ pub struct ContextBudget {
     pub max_search_calls: u32,
 }
 
+/// v2 重构后只剩 chat 一种 pipeline。reflection 是 chat pipeline 的另一种 trigger，
+/// 不是单独的 PipelineKind——它复用 chat 的 loop + tools，只是 prompt 不同。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum PipelineKind {
     Chat,
-    Briefing,
-    Review,
 }
 
 impl PipelineKind {
     pub fn as_str(self) -> &'static str {
         match self {
             PipelineKind::Chat => "chat",
-            PipelineKind::Briefing => "briefing",
-            PipelineKind::Review => "review",
         }
     }
 }
@@ -227,7 +225,5 @@ mod tests {
     #[test]
     fn pipeline_kind_string_round_trip() {
         assert_eq!(PipelineKind::Chat.as_str(), "chat");
-        assert_eq!(PipelineKind::Briefing.as_str(), "briefing");
-        assert_eq!(PipelineKind::Review.as_str(), "review");
     }
 }

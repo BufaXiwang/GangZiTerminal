@@ -1,16 +1,16 @@
-//! Chat reply 流水线——基于新 agent loop 的实现。
+//! Chat reply 流水线——v2 重构后的 agent loop 入口。
 //!
 //! 流程：
 //! 1. 立刻写 user message（emit chat-message-appended，UI 即刻渲染）
-//! 2. 读上下文（行情/持仓/记忆/学习/最近 briefing/最近消息）
-//! 3. 构 AgentRequest（identity+instructions 进 system，上下文+用户输入进 user）
-//! 4. 启 agent_run（agent_runs 表先插一行）
+//! 2. 读上下文（active principles / active theses / 行情 / 持仓 / 最近消息）
+//! 3. 构 AgentRequest（identity + instructions 进 system，上下文 + 用户输入进 user）
+//! 4. 启 episode（agent_episodes 表先插一行）
 //! 5. spawn forwarder：把 AgentEvent 流转发给前端 + 累计文本
 //! 6. await run_agent → 拿 RunSummary + 最终文本
-//! 7. 写 assistant message + finalize agent_runs
+//! 7. 写 assistant message + finalize agent_episodes
 //!
-//! Memory 更新由 agent 通过 update_memory / remove_memory 工具自己写——
-//! pipeline 不再 parse JSON。
+//! Principle / Thesis 更新由 agent 通过 propose_principle / create_thesis 等
+//! 工具自己写——pipeline 不再 parse JSON。
 
 use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
@@ -35,7 +35,6 @@ use crate::pipeline::context::{
 };
 use crate::pipeline::events::emit_status;
 use crate::pipeline::market::overview::fetch_market_overview;
-use crate::pipeline::memory::read_investor_memory;
 use crate::pipeline::quotes_fetch::fetch_quotes_with_visibility;
 use crate::pipeline::util::{new_id, now_iso};
 use serde_json::{json, Value};
@@ -141,7 +140,6 @@ pub async fn send_chat_message_now(
     // exclude 掉本轮刚刚写入的 user_message_id，否则当前提问会在 messages 里出现两次。
     let (history_messages, boundary_summary) =
         read_recent_chat_thread(&app, Some(&user_message_id));
-    let memory = read_investor_memory(&app);
     let positions = read_positions(&app).unwrap_or_default();
     let position_events = read_position_events_for_open(&app, &positions);
     let watchlist = watchlist::list_strings();
@@ -150,15 +148,30 @@ pub async fn send_chat_message_now(
     let quotes_availability = quotes_status.to_prompt_section();
     let market = fetch_market_overview(&app).await.ok();
 
+    // 当前 active / drafted theses（agent 决策上下文核心之一）
+    let active_theses =
+        crate::infrastructure::account::thesis_repo::list_open_theses(&app, 20).unwrap_or_default();
+
+    // 当前 active principles（按 hit_count + regime 过滤）+ 当前 regime
+    let current_regime: Option<crate::domain::quotes::regime::Regime> = None; // TODO: 接 quotes 派生
+    let principles = crate::infrastructure::agent::principle_repo::list_for_prompt(
+        &app,
+        current_regime,
+        25,
+    )
+    .unwrap_or_default();
+
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
         market_overview: market.as_ref(),
         simulated_positions: &positions,
         position_events: &position_events,
+        active_theses: &active_theses,
         quotes_availability: quotes_availability.as_deref(),
     });
     let static_system_context = build_chat_system_context(&ChatSystemContextInput {
-        investor_memory: Some(&memory),
+        principles: &principles,
+        current_regime,
     });
 
     // messages 拼装顺序（旧 → 新）：
@@ -222,7 +235,7 @@ pub async fn send_chat_message_now(
     let req = AgentRequest {
         // system 三段：identity → 指令 → 半静态投资上下文。
         // cache_control 只打在最后一段末尾——整段 system 形成一个 cache prefix，
-        // 跨多轮 chat 复用（直到 update_memory / remove_memory 触发记忆变化才失效）。
+        // 跨多轮 chat 复用（直到 propose/confirm/retire principle 改变 active 集合才失效）。
         system: vec![
             SystemBlock {
                 text: AGENT_IDENTITY.to_string(),
@@ -279,18 +292,14 @@ pub async fn send_chat_message_now(
     // 5. 起一对 channel：一条给 forwarder（emit 给前端），一条给本地累积文本
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let app_for_collector = app.clone();
-    // collector 累积四件事：
+    // collector 累积三件事：
     //   (a) TextDelta 拼成 assistant 最终文本
-    //   (b) update_memory / remove_memory 工具的 input —— 写到 assistant 消息的
-    //       contentJson 里让 MemoryChips 仍然能展示这条对话沉淀的记忆增量
-    //   (c) 把每条事件 emit 给前端供 UI 流式渲染
-    //   (d) 用 TurnAccumulator 把 turn 边界识别出来，落 agent_run_turns 表
+    //   (b) 把每条事件 emit 给前端供 UI 流式渲染
+    //   (c) 用 TurnAccumulator 把 turn 边界识别出来，落 agent_episode_turns 表
     let collector_run_id = run_id.clone();
     let collector = tokio::spawn(async move {
         use tauri::Emitter;
         let mut answer = String::new();
-        let mut memory_updates: Vec<Value> = Vec::new();
-        let mut memory_removals: Vec<Value> = Vec::new();
         let mut acc = observer::TurnAccumulator::new(collector_run_id);
         while let Some(ev) = rx.recv().await {
             let _ = app_for_collector.emit(observer::AGENT_EVENT, &ev);
@@ -309,20 +318,14 @@ pub async fn send_chat_message_now(
                     rec.server_tool_calls,
                     None,
                 ) {
-                    tracing::warn!(error = %e, run_id = acc.run_id(), turn = rec.turn, "落 agent_run_turns 失败");
+                    tracing::warn!(error = %e, run_id = acc.run_id(), turn = rec.turn, "落 agent_episode_turns 失败");
                 }
             }
-            match &ev {
-                AgentEvent::TextDelta { delta, .. } => answer.push_str(delta),
-                AgentEvent::ToolStart { name, input, .. } => match name.as_str() {
-                    "update_memory" => memory_updates.push(input.clone()),
-                    "remove_memory" => memory_removals.push(input.clone()),
-                    _ => {}
-                },
-                _ => {}
+            if let AgentEvent::TextDelta { delta, .. } = &ev {
+                answer.push_str(delta);
             }
         }
-        (answer, memory_updates, memory_removals)
+        answer
     });
 
     emit_status(&app, "running", "Agent 正在回复…");
@@ -357,7 +360,7 @@ pub async fn send_chat_message_now(
     let summary_result = run_agent(provider, summarize_opts, registry, req, ctx, tx).await;
 
     // 6. drain collector（tx drop 后 rx 自然 close）
-    let (assistant_text, memory_updates, memory_removals) = collector
+    let assistant_text = collector
         .await
         .map_err(|e| format!("collector join 失败：{e}"))?;
 
@@ -404,22 +407,11 @@ pub async fn send_chat_message_now(
     } else {
         assistant_text
     };
-    // memory_updates / memory_removals 是 ToolStart input 的合并形态——单条 chat 内
-    // agent 可能调多次工具，每次 input 是一条 InvestorMemoryUpdate。前端 MemoryChips
-    // 历来按"单一 update + removal"渲染，这里把多条 input merge 成一条用于展示。
-    // 注意：merge 不影响 DB——DB 已经被 update_memory 工具逐次写入。
-    let merged_updates_for_display = merge_memory_inputs_for_display(&memory_updates);
-    let merged_removals_for_display = merge_memory_inputs_for_display(&memory_removals);
-
     // assistant 持久化形态：
     // - contentMd：最终展示文本（含 max_tokens 截断提示）——前端列表渲染用
     // - contentJson.blocks：完整结构化 final_message.content（含 tool_use 块），
     //   下次 chat 加载时直接反序列化，恢复多轮工具调用上下文
-    // - contentJson.{runId, turns, ...}：运行元数据 + memory chip 显示数据
-    // 优先用 summary.final_message 的结构化 blocks（包含 tool_use 块——下次加载历史
-    // 时能让模型看到上一轮调用了哪些工具）。极端情况（流早断、无 MessageComplete）
-    // 退回到 final_text 兜成单 Text block，保证下次 row_to_message 不会因为空 blocks
-    // 而把这条消息丢掉。
+    // - contentJson.{runId, turns, ...}：运行元数据
     let assistant_blocks: Vec<Block> = match summary.final_message.as_ref() {
         Some(m) if !m.content.is_empty() => m.content.clone(),
         _ => vec![Block::Text {
@@ -432,9 +424,6 @@ pub async fn send_chat_message_now(
         "turns": summary.turns,
         "localToolCalls": summary.local_tool_calls,
         "serverToolCalls": summary.server_tool_calls,
-        // MemoryChips 兼容：保持和老版本同字段名
-        "memoryUpdates": merged_updates_for_display,
-        "memoryRemovals": merged_removals_for_display,
     });
     let assistant_msg = json!({
         "id": assistant_message_id,
@@ -492,50 +481,6 @@ pub async fn send_chat_message_now(
         assistant_message_id,
         run_id,
     })
-}
-
-/// 把多次 update_memory / remove_memory 工具调用的 input 合并成一条
-/// `InvestorMemoryUpdate` 形态（list 字段 concat 去重，单字符串字段用最后一条）。
-/// 仅用于 MemoryChips 展示——DB 实际写入已经由工具完成。
-fn merge_memory_inputs_for_display(inputs: &[Value]) -> Value {
-    if inputs.is_empty() {
-        return Value::Null;
-    }
-    let mut out = serde_json::Map::new();
-    let list_fields = [
-        "focusThemes",
-        "preferredMarkets",
-        "learningGoals",
-        "knownBiases",
-        "investmentPrinciples",
-        "watchQuestions",
-        "recentInsights",
-    ];
-    for input in inputs {
-        let Some(obj) = input.as_object() else {
-            continue;
-        };
-        for (key, value) in obj {
-            if list_fields.contains(&key.as_str()) {
-                if let Some(arr) = value.as_array() {
-                    let entry = out
-                        .entry(key.clone())
-                        .or_insert_with(|| Value::Array(Vec::new()));
-                    if let Value::Array(existing) = entry {
-                        for item in arr {
-                            if !existing.contains(item) {
-                                existing.push(item.clone());
-                            }
-                        }
-                    }
-                }
-            } else {
-                // 单字符串字段（riskPreference）——取最后一条
-                out.insert(key.clone(), value.clone());
-            }
-        }
-    }
-    Value::Object(out)
 }
 
 /// 把磁盘上的图读成 base64 + 推断 mime——chat 的 user 图片附件转成 Block::Image。

@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-const MAX_IMAGES_PER_MESSAGE: usize = 4;
+const MAX_IMAGES_PER_MESSAGE: usize = 10;
 const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BASE64_CHARS: usize = (MAX_IMAGE_BYTES * 4 / 3) + 4096;
 

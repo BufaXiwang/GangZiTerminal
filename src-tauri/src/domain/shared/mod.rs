@@ -8,9 +8,13 @@
 pub mod ids;
 pub mod money;
 pub mod shares;
+pub mod signal;
 pub mod time;
 
 pub use ids::{IdError, StockCode, TsCode};
 pub use money::{KYuan, MoneyError, Yuan};
 pub use shares::{Lots, Shares, SharesError};
+pub use signal::{
+    EventKind, NewsImportance, NewsKind, SignalDetection, SignalKind,
+};
 pub use time::{OccurredAt, TimeError, TradeDate};

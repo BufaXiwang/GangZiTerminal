@@ -58,8 +58,6 @@ type AgentConfigPayload = {
   channels: Channel[];
   assignments: {
     chat: ModelRef;
-    briefing: ModelRef;
-    review: ModelRef;
     compact: ModelRef;
   };
   agent: {
@@ -74,12 +72,10 @@ type AgentConfigPayload = {
   };
 };
 
-type SlotKey = "chat" | "briefing" | "review" | "compact";
-const SLOT_KEYS: SlotKey[] = ["chat", "briefing", "review", "compact"];
+type SlotKey = "chat" | "compact";
+const SLOT_KEYS: SlotKey[] = ["chat", "compact"];
 const SLOT_LABELS: Record<SlotKey, { title: string; hint: string }> = {
-  chat: { title: "Chat 模型", hint: "对话用，一般选偏快的模型" },
-  briefing: { title: "Briefing 模型", hint: "批量简报用，一般选深度推理模型" },
-  review: { title: "Review 模型", hint: "复盘用，一般选深度推理模型" },
+  chat: { title: "Chat 模型", hint: "Agent 主模型——对话 / reflection 都用它" },
   compact: { title: "Compact 模型", hint: "chat 上下文压缩用，一般选便宜款" },
 };
 
@@ -160,9 +156,40 @@ export function SettingsPage({
           <Row title="风险边界" hint="所有交易假设仅写入模拟账户">
             <span className="settings-readonly">仅做学习型分析，不接券商</span>
           </Row>
+          <Row title="立即触发 reflection" hint="平常每交易日 15:30 自动触发一次；这里强制立即跑">
+            <TriggerReflectionButton />
+          </Row>
         </div>
       </div>
     </section>
+  );
+}
+
+function TriggerReflectionButton() {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  return (
+    <div>
+      <button
+        disabled={busy}
+        onClick={() => {
+          setBusy(true);
+          setMsg("running…");
+          invoke<{ runId: string; outcomeSummary: string; thesisCount: number }>(
+            "trigger_reflection_now",
+          )
+            .then((r) => setMsg(`完成（${r.thesisCount} 个 thesis 被复盘）`))
+            .catch((e) => setMsg(`失败: ${e}`))
+            .finally(() => setBusy(false));
+        }}
+        style={{ padding: "4px 12px" }}
+      >
+        立即跑一次
+      </button>
+      {msg && (
+        <span style={{ marginLeft: 12, fontSize: 12, color: "#64748b" }}>{msg}</span>
+      )}
+    </div>
   );
 }
 
@@ -299,8 +326,6 @@ function ChannelsAndAssignmentsBlock() {
         channels: d.channels.filter((c) => c.id !== id),
         assignments: {
           chat: cleared(d.assignments.chat),
-          briefing: cleared(d.assignments.briefing),
-          review: cleared(d.assignments.review),
           compact: cleared(d.assignments.compact),
         },
       };
@@ -477,8 +502,6 @@ function ChannelsAndAssignmentsBlock() {
         ),
         assignments: {
           chat: cleared(d.assignments.chat),
-          briefing: cleared(d.assignments.briefing),
-          review: cleared(d.assignments.review),
           compact: cleared(d.assignments.compact),
         },
       };

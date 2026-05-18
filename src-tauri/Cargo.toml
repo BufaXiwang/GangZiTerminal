@@ -29,6 +29,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
+regex = "1.10"
 # 通达信 (TDX) 行情协议——内部实现在 infrastructure/quotes/tdx/
 # 参考实现：https://github.com/mootdx/mootdx （Python 版 pytdx wire 兼容）
 # Rust 端口参考：https://github.com/mootdx/mootdx-rust

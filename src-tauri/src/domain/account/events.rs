@@ -48,10 +48,6 @@ pub enum PositionEventKind {
         take_profit: Option<Yuan>,
         time_stop_at: Option<OccurredAt>,
     },
-    Reviewed {
-        thesis_status: Option<String>,
-        confidence: Option<f64>,
-    },
     Signal {
         signal: PositionSignalKind,
     },
@@ -74,7 +70,6 @@ impl PositionEventKind {
             Self::ScaledOut { .. } => "scaled_out",
             Self::Closed { .. } => "closed",
             Self::StopsAdjusted { .. } => "stops_adjusted",
-            Self::Reviewed { .. } => "reviewed",
             Self::Signal { signal } => signal.as_str(),
         }
     }
@@ -94,9 +89,10 @@ impl PositionSignalKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventSource {
-    Briefing { analysis_id: String },
-    Review { analysis_id: String },
+    /// 用户 chat 触发的写动作（含用户指令 + agent 主动判断）
     Chat { message_id: String },
+    /// 收盘 reflection tick 触发（如 thesis 标记 invalidated 后自动平仓）
+    Reflection { episode_id: String },
     Manual,
     System,
 }

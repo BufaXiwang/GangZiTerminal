@@ -53,8 +53,9 @@ pub enum CompactAction {
 /// agent 真要决策会重新调用。
 ///
 /// **不在白名单**的工具：
-/// - `update_memory` / `remove_memory`：mutation 工具，结果是确认文本，
-///   清掉反而让 agent 怀疑 "我刚才存进 memory 了吗"。
+/// - `propose_principle` / `confirm_principle` / `retire_principle` / `create_thesis` /
+///   `update_thesis_state` / `attach_thesis_feedback`：mutation 工具，结果是确认文本，
+///   清掉反而让 agent 怀疑"我刚才存进去了吗"。
 /// - `list_positions`：状态快照但本来就短，不浪费 token；agent 也可能依赖
 ///   "上一轮看到的持仓状态" 做对比，清掉破坏因果链。
 /// - 未来加新工具默认不在白名单——只有明确"易腐"才加。
@@ -367,45 +368,28 @@ mod tests {
 
     #[test]
     fn micro_clear_skips_non_volatile_tools() {
-        // update_memory 的 ToolResult 不在白名单——不应被清理
+        // propose_principle 的 ToolResult 不在白名单——不应被清理
         let big = "x".repeat(4000);
         let mut msgs = Vec::new();
         msgs.extend(tool_call_pair(
-            "toolu_mem",
-            "update_memory",
-            "memory updated ok",
+            "toolu_pri",
+            "propose_principle",
+            "principle proposed ok",
         ));
-        // 用大文本压上下文
         msgs.push(text_msg(Role::User, &big));
         msgs.push(text_msg(Role::Assistant, &big));
         msgs.push(text_msg(Role::User, "尾"));
         msgs.push(text_msg(Role::Assistant, "答"));
         let before = estimate_tokens(&msgs);
         let report = compact_if_needed(msgs, &budget(before / 2, before * 2, 1));
-        // memory 工具结果不被清——micro_clear 救不下来时会进 drop
-        // 不论最终走 MicroClear 还是 Drop，update_memory 这条 tool_result 的内容应保持原样
-        let preserved = report.messages.iter().any(|m| {
+        let any_stub = report.messages.iter().any(|m| {
             m.content.iter().any(|b| matches!(b,
                 Block::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "toolu_mem"
-                && content.first().map(|c| matches!(c, ToolResultContent::Text { text } if text == "memory updated ok")).unwrap_or(false)
-            ))
-        });
-        // 要么被保留（mem 工具不清），要么整条 message 被 drop（但没被截而留下空壳）
-        // 检查: 如果 toolu_mem 的 result 还在 messages 里，它的 content 必须是原文
-        let any_mem_stub = report.messages.iter().any(|m| {
-            m.content.iter().any(|b| matches!(b,
-                Block::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "toolu_mem"
+                if tool_use_id == "toolu_pri"
                 && content.first().map(|c| matches!(c, ToolResultContent::Text { text } if text.starts_with("[过期工具结果"))).unwrap_or(false)
             ))
         });
-        assert!(
-            !any_mem_stub,
-            "update_memory 的 tool_result 不该被 micro_clear"
-        );
-        // 信息提示性 assert：要么保留，要么被 drop——两者都合法
-        let _ = preserved;
+        assert!(!any_stub, "propose_principle 的 tool_result 不该被 micro_clear");
     }
 
     #[test]

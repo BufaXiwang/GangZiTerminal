@@ -78,7 +78,7 @@ OpenAI Responses 的 function 默认 `strict: true`，要求 schema 严格符合
 
 每个 tool 调用包了 `tokio::time::timeout(tool_timeout, ...)`，默认 30s（`AgentRuntimeConfig.tool_timeout_secs`）。超时返回 `is_error=true` + "工具 X 调用超时" 文案——agent 下一轮看到错误自己决定是否换工具或放弃。这避免了 NewsNow / Eastmoney 单次卡死把整个 run 拖死。
 
-## 观测：agent_runs 表关键字段
+## 观测：agent_episodes 表关键字段
 
 每次 run 落一行：
 - `provider` 列存 wire format 名（`anthropic` / `openai_responses` / `openai_chat_completions`），不是模型名

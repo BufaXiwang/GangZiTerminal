@@ -55,7 +55,6 @@ pub fn single_event_cash_delta(kind: &PositionEventKind) -> f64 {
             ..
         } => (exit_price.value() * shares.value() as f64) - commission.value() - stamp_tax.value(),
         PositionEventKind::StopsAdjusted { .. }
-        | PositionEventKind::Reviewed { .. }
         | PositionEventKind::Signal { .. } => 0.0, // 审计/调参事件不动现金
     }
 }

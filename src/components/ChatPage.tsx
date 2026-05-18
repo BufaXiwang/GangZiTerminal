@@ -4,10 +4,10 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAgentEventStream } from "../hooks/useAgentEventStream";
 import { formatDate } from "../lib/format";
-import type { ChatMessage, InvestorMemoryUpdate, StreamingRunState } from "../types";
+import type { ChatMessage, StreamingRunState } from "../types";
 
 const acceptedImageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
-const maxImagesPerMessage = 4;
+const maxImagesPerMessage = 10;
 const maxImageBytes = 8 * 1024 * 1024;
 
 type Props = {
@@ -119,9 +119,8 @@ export function ChatPage({
   // 搜索：输入防抖
   // 注意：只在 searchInput 真的变化时才查——searchMessages 是 App.tsx 内联箭头函数，
   // 每次 App 渲染都是新引用；如果 effect deps 包含 searchMessages，任何无关的 App
-  // re-render（比如刚刚 setInvestorMemory）都会让 effect 重跑、触发 searchMessages("")
-  // 把 list_chat_messages 的最新 50 条覆盖回去——用户点完"加载更早"看到的旧消息瞬间
-  // 又消失就是这个原因。
+  // re-render 都会让 effect 重跑、触发 searchMessages("") 把 list_chat_messages 的
+  // 最新 50 条覆盖回去——用户点完"加载更早"看到的旧消息瞬间又消失就是这个原因。
   const prevSearchRef = useRef("");
   useEffect(() => {
     const trimmed = searchInput.trim();
@@ -181,7 +180,6 @@ export function ChatPage({
                     <MarkdownText content={message.contentMd} highlight={searchInput.trim()} />
                   )}
                   <MessageImages images={message.contentJson?.images} />
-                  {message.role === "assistant" && <MemoryChips message={message} />}
                 </article>
               ))
             )}
@@ -420,48 +418,6 @@ function ImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
     </div>,
     document.body,
   );
-}
-
-// ---------- Memory chips ----------
-
-function MemoryChips({ message }: { message: ChatMessage }) {
-  const adds = collectMemoryUpdateChips(message.contentJson?.memoryUpdates);
-  const removes = collectMemoryUpdateChips(message.contentJson?.memoryRemovals);
-  if (!adds.length && !removes.length) return null;
-  return (
-    <div className="chat-memory-footer">
-      {adds.length > 0 && (
-        <>
-          <strong>已沉淀新记忆</strong>
-          {adds.slice(0, 6).map((chip) => (
-            <span key={`add-${chip}`}>{chip}</span>
-          ))}
-        </>
-      )}
-      {removes.length > 0 && (
-        <>
-          <strong className="memory-strike">已移除旧记忆</strong>
-          {removes.slice(0, 6).map((chip) => (
-            <span className="memory-strike" key={`rm-${chip}`}>{chip}</span>
-          ))}
-        </>
-      )}
-    </div>
-  );
-}
-
-function collectMemoryUpdateChips(update?: InvestorMemoryUpdate) {
-  if (!update) return [];
-  const items: string[] = [];
-  if (update.riskPreference) items.push(update.riskPreference);
-  for (const value of update.focusThemes ?? []) items.push(value);
-  for (const value of update.preferredMarkets ?? []) items.push(value);
-  for (const value of update.learningGoals ?? []) items.push(value);
-  for (const value of update.knownBiases ?? []) items.push(value);
-  for (const value of update.investmentPrinciples ?? []) items.push(value);
-  for (const value of update.watchQuestions ?? []) items.push(value);
-  for (const value of update.recentInsights ?? []) items.push(value);
-  return Array.from(new Set(items));
 }
 
 // ---------- Markdown ----------

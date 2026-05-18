@@ -21,13 +21,26 @@ pub fn run() {
             // 自选股 watchlist：从 KV 恢复到内存（account 模块）
             infrastructure::account::watchlist::hydrate(&handle);
 
-            // Legacy positions 反向生成 events（启动一次，已迁移过的跳过）
-            if let Err(e) = infrastructure::account::migration::migrate_legacy_positions(&handle) {
-                tracing::warn!(error = %e, "legacy positions migration 失败（跳过，不阻塞启动）");
+            // Seed principles（v2 残留，W23 删 principle 代码时一起去掉）
+            if let Err(e) = infrastructure::agent::seed_principles::seed_if_empty(&handle) {
+                tracing::warn!(error = %e, "seed principles 失败（跳过，不阻塞启动）");
+            }
+            // Seed v3 heuristics + strategies：表为空时注入
+            // 见 docs/design/agent-v3-expectation-driven.md § 4 + § 9.6
+            if let Err(e) = infrastructure::agent::seed_heuristics::seed_if_empty(&handle) {
+                tracing::warn!(error = %e, "seed heuristics 失败（跳过，不阻塞启动）");
+            }
+            if let Err(e) = infrastructure::agent::seed_strategies::seed_if_empty(&handle) {
+                tracing::warn!(error = %e, "seed strategies 失败（跳过，不阻塞启动）");
             }
 
             // Tokio 任务：scheduler 启动后台 loop（news / market / account / kline warm）
             pipeline::scheduler::spawn_all(app.handle().clone());
+
+            // Reflection tick 单独走 adapters/ 入口（需要构造 tool registry，pipeline 不能 use adapters）
+            adapters::reflection_scheduler::spawn(app.handle().clone());
+            // Scan tick（9 ticks/天）—— v3 expectation-driven 自驱观察循环
+            adapters::scan_scheduler::spawn(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。
@@ -96,6 +109,23 @@ pub fn run() {
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,
             adapters::proxy_commands::get_realtime_health,
+            // Agent v2 重构：Thesis / Principle / Episode 只读 + 健康度 + 手动 reflection
+            adapters::thesis_commands::list_theses,
+            adapters::thesis_commands::get_thesis,
+            adapters::thesis_commands::list_thesis_events,
+            adapters::principle_commands::list_principles,
+            adapters::principle_commands::get_health_metrics,
+            adapters::principle_commands::trigger_reflection_now,
+            adapters::episode_commands::list_agent_episodes,
+            adapters::episode_commands::get_account_metrics,
+            // v3 expectation-driven commands
+            adapters::expectation_commands::list_expectations,
+            adapters::expectation_commands::get_expectation,
+            adapters::expectation_commands::list_expectation_events,
+            adapters::expectation_commands::list_strategies,
+            adapters::expectation_commands::list_lessons,
+            adapters::expectation_commands::list_heuristics,
+            adapters::expectation_commands::get_heuristic_counts,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

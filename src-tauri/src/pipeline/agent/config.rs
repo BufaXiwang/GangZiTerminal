@@ -1,11 +1,6 @@
 //! Agent 运行时配置——**N 渠道模型**：用户可以加任意多个渠道，每个独立持有
-//! `(wire_format + base_url + token + 可用模型清单)`；4 个 pipeline slot
-//! （chat / briefing / review / compact）各自分配一对 `(channel_id, model_id)`，
-//! 互不影响。
-//!
-//! 老配置（3 槽固定 anthropic / openaiResponses / openaiChatCompletions）通过
-//! `migrate_legacy_three_channel_config` 自动转成 channels 数组，第一次写库后
-//! 老字段消失。
+//! `(wire_format + base_url + token + 可用模型清单)`；2 个 slot（chat / compact）
+//! 各自分配一对 `(channel_id, model_id)`。v2 重构后 briefing / review 已下线。
 //!
 //! 存在 app_state 表的单 key `agent.config` 下，整个 JSON object 一次读写。
 //! 前端 Settings 页通过 `get_agent_config` / `set_agent_config` 命令访问。
@@ -103,6 +98,7 @@ fn default_thinking_display() -> ThinkingDisplay {
 }
 
 impl Channel {
+    #[allow(dead_code)] // 测试构造器；production 通过 set_agent_config 反序列化建
     pub fn new(name: impl Into<String>, wire_format: ProviderKind) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -158,10 +154,6 @@ impl ModelRef {
 pub struct PipelineAssignments {
     #[serde(default)]
     pub chat: ModelRef,
-    #[serde(default)]
-    pub briefing: ModelRef,
-    #[serde(default)]
-    pub review: ModelRef,
     /// 用于 chat 上下文压缩（Summarize tier）的便宜模型。
     #[serde(default)]
     pub compact: ModelRef,
@@ -245,8 +237,6 @@ impl AgentConfig {
     pub fn assignment_for(&self, pipeline: PipelineKind) -> &ModelRef {
         match pipeline {
             PipelineKind::Chat => &self.assignments.chat,
-            PipelineKind::Briefing => &self.assignments.briefing,
-            PipelineKind::Review => &self.assignments.review,
         }
     }
 
@@ -284,15 +274,9 @@ impl AgentConfig {
         Some((chan, r.model.as_str()))
     }
 
-    /// 全部 pipeline + compact 都已经分配且渠道存在。
+    /// chat pipeline 已经分配且渠道存在。
     pub fn ensure_ready(&self) -> Result<(), String> {
-        for pipe in [
-            PipelineKind::Chat,
-            PipelineKind::Briefing,
-            PipelineKind::Review,
-        ] {
-            self.resolve_pipeline(pipe)?;
-        }
+        self.resolve_pipeline(PipelineKind::Chat)?;
         // compact 不强求——chat 没撞 summarize threshold 不会用，缺了不阻塞 chat 启动
         Ok(())
     }
@@ -307,176 +291,10 @@ pub fn read_agent_config(app: &AppHandle) -> AgentConfig {
     }
 }
 
-fn parse_with_migration(mut v: Value) -> AgentConfig {
-    // 已经是新形态（含 channels 字段）→ 直接 deserialize
-    if v.get("channels").is_some() {
-        return serde_json::from_value::<AgentConfig>(v).unwrap_or_default();
-    }
-    // 老形态——迁移到 channels[] + assignments
-    if let Some(migrated) = migrate_legacy_three_channel_config(&mut v) {
-        return migrated;
-    }
-    AgentConfig::default()
-}
-
-/// 老 schema 三种已见形态：
-///   - 最早：`{ provider, anthropic: {...}, openai: {...}, agent }`
-///   - 中间：`{ provider, anthropic: {...}, openaiResponses: {...},
-///             openaiChatCompletions: {...}, agent }`
-///   - 也可能字段都缺，此时 fall through
-///
-/// 都映射成 channels = [..1-3 条预设渠道..] + assignments。返回 None 表示这个
-/// JSON 形态完全不认识，调用方该用 default。
-fn migrate_legacy_three_channel_config(v: &mut Value) -> Option<AgentConfig> {
-    let obj = v.as_object_mut()?;
-    let mut channels: Vec<Channel> = Vec::new();
-    let mut id_anthropic: Option<String> = None;
-    let mut id_openai_resp: Option<String> = None;
-    let mut id_openai_chat: Option<String> = None;
-
-    if let Some(anth) = obj.get("anthropic") {
-        let mut chan = Channel::new("Anthropic", ProviderKind::Anthropic);
-        copy_str(&mut chan.base_url, anth, "baseUrl");
-        copy_str(&mut chan.token, anth, "token");
-        copy_string_array(&mut chan.available_models, anth, "availableModels");
-        copy_bool(
-            &mut chan.enable_native_web_search,
-            anth,
-            "enableNativeWebSearch",
-        );
-        copy_u32(
-            &mut chan.thinking_budget_tokens,
-            anth,
-            "thinkingBudgetTokens",
-        );
-        // 老配置只有 enableThinking: bool——true 对应 Enabled，false 对应 Disabled。
-        // 新装机 / 未设字段保持 Adaptive 默认。
-        if let Some(legacy_enabled) = anth.get("enableThinking").and_then(Value::as_bool) {
-            chan.thinking_mode = if legacy_enabled {
-                ThinkingMode::Enabled
-            } else {
-                ThinkingMode::Disabled
-            };
-        }
-        id_anthropic = Some(chan.id.clone());
-        channels.push(chan);
-    }
-    // 老的 "openai" 字段（在 openai_responses / chat_completions 拆分前）
-    let legacy_openai = obj.get("openai").cloned();
-    let openai_resp_src = obj
-        .get("openaiResponses")
-        .cloned()
-        .or_else(|| legacy_openai.clone());
-    let openai_chat_src = obj.get("openaiChatCompletions").cloned().or(legacy_openai);
-
-    if let Some(o) = openai_resp_src.as_ref() {
-        let mut chan = Channel::new("OpenAI Responses", ProviderKind::OpenAIResponses);
-        copy_str(&mut chan.base_url, o, "baseUrl");
-        copy_str(&mut chan.token, o, "token");
-        copy_string_array(&mut chan.available_models, o, "availableModels");
-        copy_bool(&mut chan.enable_web_search, o, "enableWebSearch");
-        if let Some(re) = o
-            .get("reasoningEffort")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
-            chan.reasoning_effort = re;
-        }
-        id_openai_resp = Some(chan.id.clone());
-        channels.push(chan);
-    }
-    if let Some(o) = openai_chat_src.as_ref() {
-        let mut chan = Channel::new("OpenAI Chat", ProviderKind::OpenAIChatCompletions);
-        copy_str(&mut chan.base_url, o, "baseUrl");
-        copy_str(&mut chan.token, o, "token");
-        copy_string_array(&mut chan.available_models, o, "availableModels");
-        if let Some(re) = o
-            .get("reasoningEffort")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-        {
-            chan.reasoning_effort = re;
-        }
-        id_openai_chat = Some(chan.id.clone());
-        channels.push(chan);
-    }
-
-    if channels.is_empty() {
-        return None;
-    }
-
-    // assignments：用旧 provider 字段 + 对应渠道的 models map 填
-    let provider_str = obj
-        .get("provider")
-        .and_then(Value::as_str)
-        .unwrap_or("anthropic");
-    let active_id = match provider_str {
-        "openai_responses" => id_openai_resp.clone(),
-        "openai_chat_completions" => id_openai_chat.clone(),
-        _ => id_anthropic.clone(),
-    }
-    .or(channels.first().map(|c| c.id.clone()))
-    .unwrap_or_default();
-
-    let provider_block = match provider_str {
-        "openai_responses" => obj.get("openaiResponses").or(obj.get("openai")),
-        "openai_chat_completions" => obj.get("openaiChatCompletions").or(obj.get("openai")),
-        _ => obj.get("anthropic"),
-    };
-    let mk_ref = |slot: &str| -> ModelRef {
-        let model = provider_block
-            .and_then(|p| p.get("models"))
-            .and_then(|m| m.get(slot))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if model.is_empty() {
-            return ModelRef::default();
-        }
-        ModelRef {
-            channel_id: active_id.clone(),
-            model,
-        }
-    };
-    let assignments = PipelineAssignments {
-        chat: mk_ref("chat"),
-        briefing: mk_ref("briefing"),
-        review: mk_ref("review"),
-        compact: mk_ref("compact"),
-    };
-
-    let agent: AgentRuntimeConfig = obj
-        .get("agent")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    Some(AgentConfig {
-        channels,
-        assignments,
-        agent,
-    })
-}
-
-fn copy_str(dst: &mut String, src: &Value, key: &str) {
-    if let Some(s) = src.get(key).and_then(Value::as_str) {
-        *dst = s.to_string();
-    }
-}
-fn copy_bool(dst: &mut bool, src: &Value, key: &str) {
-    if let Some(b) = src.get(key).and_then(Value::as_bool) {
-        *dst = b;
-    }
-}
-fn copy_u32(dst: &mut u32, src: &Value, key: &str) {
-    if let Some(n) = src.get(key).and_then(Value::as_u64) {
-        *dst = n as u32;
-    }
-}
-fn copy_string_array(dst: &mut Vec<String>, src: &Value, key: &str) {
-    if let Some(arr) = src.get(key).and_then(Value::as_array) {
-        *dst = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-    }
+/// v2 重构后 app_state 跟随 DB 一起备份重建——这里不需要兼容老 schema 的 config JSON。
+/// 直接 deserialize，失败回 default。
+fn parse_with_migration(v: Value) -> AgentConfig {
+    serde_json::from_value::<AgentConfig>(v).unwrap_or_default()
 }
 
 pub fn write_agent_config(app: &AppHandle, cfg: &AgentConfig) -> Result<(), String> {
@@ -553,15 +371,6 @@ mod tests {
             channel_id: chan_id.clone(),
             model: "deepseek-chat".into(),
         };
-        cfg.assignments.briefing = ModelRef {
-            channel_id: chan_id.clone(),
-            model: "deepseek-reasoner".into(),
-        };
-        cfg.assignments.review = ModelRef {
-            channel_id: chan_id.clone(),
-            model: "deepseek-reasoner".into(),
-        };
-        // chat / briefing / review 都填了才 ensure_ready ok
         assert!(cfg.ensure_ready().is_ok());
         let (chan_ref, model) = cfg.resolve_pipeline(PipelineKind::Chat).unwrap();
         assert_eq!(chan_ref.id, chan_id);
@@ -577,68 +386,5 @@ mod tests {
         };
         let err = cfg.resolve_pipeline(PipelineKind::Chat).unwrap_err();
         assert!(err.contains("不存在的渠道"), "got {err}");
-    }
-
-    #[test]
-    fn migrate_legacy_three_channel_works() {
-        let v = json!({
-            "provider": "anthropic",
-            "anthropic": {
-                "baseUrl": "https://anthro",
-                "token": "cr_xxx",
-                "availableModels": ["claude-opus-4-7", "claude-sonnet-4-6"],
-                "models": {
-                    "chat": "claude-sonnet-4-6",
-                    "briefing": "claude-opus-4-7",
-                    "review": "claude-opus-4-7",
-                    "compact": "claude-haiku-4-5-20251001"
-                },
-                "enableThinking": true,
-                "thinkingBudgetTokens": 6000
-            },
-            "openaiResponses": {
-                "baseUrl": "https://openai",
-                "token": "sk-test",
-                "availableModels": ["gpt-5"],
-                "models": {"chat": "", "briefing": "", "review": "", "compact": ""}
-            },
-            "agent": {
-                "maxTurnsPerRun": 12,
-                "maxSearchCallsPerRun": 5,
-                "contextSoftLimitTokens": 80000,
-                "contextHardLimitTokens": 160000,
-                "compactKeepLastNTurns": 6,
-                "toolTimeoutSecs": 30
-            }
-        });
-        let cfg = parse_with_migration(v);
-        assert_eq!(cfg.channels.len(), 2);
-        // active provider 是 anthropic → assignments.chat 指向 anthropic 渠道 + sonnet
-        let (chan, model) = cfg.resolve_pipeline(PipelineKind::Chat).unwrap();
-        assert_eq!(chan.name, "Anthropic");
-        assert_eq!(model, "claude-sonnet-4-6");
-        assert_eq!(chan.thinking_mode, ThinkingMode::Enabled);
-        assert_eq!(chan.thinking_budget_tokens, 6000);
-    }
-
-    #[test]
-    fn migrate_with_legacy_openai_field_duplicates_to_responses_and_chat() {
-        // 最早期的 openai 单字段——迁移后 openaiResponses + openaiChatCompletions 都拿到
-        let v = json!({
-            "provider": "openai_chat_completions",
-            "anthropic": {"baseUrl":"","token":""},
-            "openai": {
-                "baseUrl": "https://api.deepseek.com",
-                "token": "sk-x",
-                "availableModels": ["deepseek-chat"],
-                "models": {"chat":"deepseek-chat","briefing":"","review":"","compact":""}
-            },
-            "agent": {"maxTurnsPerRun":12,"maxSearchCallsPerRun":5,"contextSoftLimitTokens":80000,"contextHardLimitTokens":160000,"compactKeepLastNTurns":6,"toolTimeoutSecs":30}
-        });
-        let cfg = parse_with_migration(v);
-        assert_eq!(cfg.channels.len(), 3); // anthropic + responses + chat_completions
-        let (chan, model) = cfg.resolve_pipeline(PipelineKind::Chat).unwrap();
-        assert_eq!(chan.wire_format, ProviderKind::OpenAIChatCompletions);
-        assert_eq!(model, "deepseek-chat");
     }
 }

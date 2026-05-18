@@ -158,8 +158,11 @@ impl Tool for OpenPositionTool {
         \n失败常见原因：涨/跌停（买不进/卖不出）、T+1（当日开仓不可减）、资金不足、\
         重复开仓（同一 code 已有 open）、code 不存在、盘外（仅交易时段允许开）。\
         失败会返 is_error=true，请如实告诉用户。\
-        \n**必填**：code（6 位代码或可解析名）、shares（100 的整数倍）、thesis（开仓理由，\
-        会写入 opened 事件供复盘）。\
+        \n**必填**：code（6 位代码或可解析名）、shares（100 的整数倍）、thesis（开仓理由摘要，\
+        会写入 opened 事件供 UI 快速展示）。\
+        \n**强烈建议**：thesis_id ——关联到先 `create_thesis` 生成的 Thesis aggregate，让\
+        invalidation / validation_checks 能被 reflection 对照。如果你自己识别的机会，必须\
+        先 create_thesis 拿 thesis_id 再开仓；只有用户直接命令开仓时可省略。\
         建议同时提供 stop_loss / take_profit，让账户能在价格突破时给出 reason。"
     }
 
@@ -169,7 +172,8 @@ impl Tool for OpenPositionTool {
             "properties": {
                 "code": { "type": "string", "description": "A 股 6 位代码或可解析的中文名" },
                 "shares": { "type": "integer", "description": "股数，必须 100 的整数倍（最小 1 手）" },
-                "thesis": { "type": "string", "description": "开仓逻辑（必填，复盘用）" },
+                "thesis": { "type": "string", "description": "开仓逻辑摘要（必填，UI 快速展示用；详细论点请用 create_thesis）" },
+                "thesis_id": { "type": "string", "description": "（强烈建议）关联的 Thesis id；agent 主动开仓必须先 create_thesis 拿到这个 id" },
                 "stop_loss": { "type": "number", "description": "止损价（可选，元）" },
                 "take_profit": { "type": "number", "description": "止盈价（可选，元）" },
                 "name": { "type": "string", "description": "公司名（可省略，会自动从行情拉取）" },
@@ -207,11 +211,23 @@ impl Tool for OpenPositionTool {
         let name = optional_string(&input, "name");
         let note = optional_string(&input, "note");
 
+        // W2-4 会把 thesis_id 提到必填——目前先支持 optional 解析，让 cargo 通过；
+        // adapters/agent_tools/account.rs 接 thesis tools 时一并改成必填。
+        let thesis_id_raw = optional_string(&input, "thesis_id");
+        let thesis_id = if thesis_id_raw.is_empty() {
+            None
+        } else {
+            Some(crate::domain::account::thesis::ThesisId::from_string(
+                thesis_id_raw,
+            ))
+        };
+
         let req = OpenRequest {
             code,
             shares: Shares::from_unchecked(shares_n),
             name,
             thesis,
+            thesis_id,
             stop_loss,
             take_profit,
             time_stop_at: None, // 留空让 service 自动算 entered_at + 7 日历日

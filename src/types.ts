@@ -112,7 +112,7 @@ export type PositionEvent = {
   positionId: string;
   eventKind: PositionEventKind;
   occurredAt: string;
-  sourceKind?: "briefing" | "review" | "chat" | "manual" | "system";
+  sourceKind?: "chat" | "reflection" | "manual" | "system";
   sourceRef?: string;          // task_id / record_id / message_id
   payload?: Record<string, unknown>;
   agentNoteMd?: string;        // Agent 当时的判断摘要
@@ -137,22 +137,8 @@ export type SimulatedPosition = {
   status: "open" | "closed";
 };
 
-export type InvestorMemory = {
-  focusThemes: string[];
-  preferredMarkets: string[];
-  riskPreference: string;
-  learningGoals: string[];
-  knownBiases: string[];
-  investmentPrinciples: string[];
-  watchQuestions: string[];
-  recentInsights: string[];
-  updatedAt: string;
-};
-
-export type InvestorMemoryUpdate = Partial<Omit<InvestorMemory, "updatedAt">>;
-
-/** 单一对话流的消息行：briefing/review/chat/system/highlight 全部混排 */
-export type ChatMessageKind = "chat" | "briefing" | "review" | "system" | "highlight";
+/** 单一对话流的消息行（v2 重构后：chat / system / highlight / compact_boundary） */
+export type ChatMessageKind = "chat" | "system" | "highlight" | "compact_boundary";
 
 export type ChatMessage = {
   id: string;
@@ -167,10 +153,6 @@ export type ChatMessage = {
 };
 
 export type ChatMessageContent = {
-  /** 仅 chat（assistant）携带：本轮新沉淀的长期记忆增量（自动应用） */
-  memoryUpdates?: InvestorMemoryUpdate;
-  /** 本轮主动从长期记忆里删除的条目（按字段名+精确字符串匹配）——重放和审计用 */
-  memoryRemovals?: InvestorMemoryUpdate;
   /** 系统消息附带备注 */
   note?: string;
   /** chat（user）携带：用户粘/拖进来的图片，存的是后端落盘的绝对路径 */
@@ -321,7 +303,8 @@ export type MarketOverview = {
 
 // ===== Agent loop 事件流（镜像 src-tauri/src/agent/types.rs::AgentEvent）=====
 
-export type PipelineKind = "chat" | "briefing" | "review";
+/** v2 重构后只剩 chat；reflection 是 chat 的另一种 trigger，不是单独 pipeline */
+export type PipelineKind = "chat";
 
 export type StopReason =
   | "end_turn"
@@ -388,7 +371,7 @@ export type AgentEvent =
  * - 两者都为空 = 不应该收到这个事件（后端 has_any_issue 已过滤）
  */
 export type QuotesFetchStatus = {
-  stage: "chat" | "briefing" | "review" | "refresh";
+  stage: "chat" | "reflection" | "refresh";
   requested: number;
   ok: number;
   missing: string[];

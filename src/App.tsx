@@ -12,6 +12,12 @@ import { useEffect, useMemo, useState } from "react";
 import { NewsPage } from "./components/NewsPage";
 import { SecondaryView } from "./components/SecondaryView";
 import { TodayPage } from "./components/TodayPage";
+import { ThesesPage } from "./components/ThesesPage";
+import { PrinciplesPage } from "./components/PrinciplesPage";
+import { ExpectationsPage } from "./components/ExpectationsPage";
+import { StrategiesPage } from "./components/StrategiesPage";
+import { LessonsPage } from "./components/LessonsPage";
+import { HeuristicsPage } from "./components/HeuristicsPage";
 import { useAppState } from "./hooks/useAppState";
 import { useChatMessageStream } from "./hooks/useChatMessageStream";
 import { useNewsRefresh } from "./hooks/useNewsRefresh";
@@ -28,11 +34,24 @@ const activeViewKey = "gangzi-terminal.active-view";
 const simulationInitialCash = 20000;
 const messagesPageSize = 50;
 
-type ViewId = "today" | "news" | "simulation" | "chat" | "settings";
+type ViewId =
+  | "today"
+  | "news"
+  | "simulation"
+  | "chat"
+  | "expectations"
+  | "strategies"
+  | "heuristics"
+  | "lessons"
+  | "settings";
 
 const navItems: Array<{ id: ViewId; label: string; icon: typeof BarChart3 }> = [
   { id: "chat", label: "Agent", icon: MessageSquare },
-  { id: "today", label: "今日市场", icon: BarChart3 },
+  { id: "expectations", label: "Expectations", icon: BarChart3 },
+  { id: "strategies", label: "Strategies", icon: BarChart3 },
+  { id: "heuristics", label: "Heuristics", icon: BarChart3 },
+  { id: "lessons", label: "Lessons", icon: BarChart3 },
+  { id: "today", label: "市场", icon: BarChart3 },
   { id: "news", label: "资讯", icon: Newspaper },
   { id: "simulation", label: "模拟账户", icon: WalletCards },
   { id: "settings", label: "设置", icon: Settings },
@@ -54,9 +73,9 @@ function App() {
   // ====== app_state-backed state（唯一持久化路径 = SQLite app_state） ======
   const [activeView, setActiveView] = useAppState<ViewId>(
     activeViewKey,
-    "today",
-    // 兜底：上一版本的 "tasks" 视图已经移除；老值落到磁盘上要重置到 today
-    (value) => (navItems.some((nav) => nav.id === value) ? value : "today"),
+    "expectations",
+    // 兜底：老视图值落到磁盘上时重置到 expectations（v3 默认首屏）
+    (value) => (navItems.some((nav) => nav.id === value) ? value : "expectations"),
   );
   const [autoRefresh, setAutoRefresh] = useAppState<boolean>(autoRefreshKey, true);
   const [refreshInterval, setRefreshInterval] = useAppState<number>(refreshIntervalKey, 60000);
@@ -185,6 +204,19 @@ function App() {
             <TodayPage />
           ) : activeView === "news" ? (
             <NewsPage />
+          ) : activeView === "expectations" ? (
+            <ExpectationsPage onAskAgent={(prefill) => {
+              setActiveView("chat");
+              window.dispatchEvent(
+                new CustomEvent("agent-prefill", { detail: prefill }),
+              );
+            }} />
+          ) : activeView === "strategies" ? (
+            <StrategiesPage />
+          ) : activeView === "heuristics" ? (
+            <HeuristicsPage />
+          ) : activeView === "lessons" ? (
+            <LessonsPage />
           ) : (
             <SecondaryView
               activeView={activeView as "simulation" | "chat" | "settings"}
