@@ -202,7 +202,7 @@ pub fn list_for_prompt(
     limit: i64,
 ) -> Result<Vec<Heuristic>, String> {
     let all = list_all(app, 1000)?;
-    let filtered: Vec<Heuristic> = all
+    let mut filtered: Vec<Heuristic> = all
         .into_iter()
         .filter(|h| h.retired_at.is_none())
         .filter(|h| h.is_promptable())
@@ -215,9 +215,42 @@ pub fn list_for_prompt(
             };
             h.regime_tags.contains(&reg)
         })
-        .take(limit as usize)
         .collect();
+
+    sort_by_prompt_priority(&mut filtered);
+    filtered.truncate(limit as usize);
     Ok(filtered)
+}
+
+/// Prompt 注入优先级排序（高 → 低）：
+/// 1. origin = UserStated       ← 用户口头说的硬纪律，必须 inject 给 agent 看
+/// 2. category = RiskPreference ← 风险规则不允许漏（止损、仓位上限）
+/// 3. confidence 高              ← 历史命中率高的 agent_inferred / seed
+/// 4. created_at desc            ← 新的优先（最近沉淀的更可能 relevant）
+///
+/// 这一段修复 Phase 2 发现的 bug——之前从 list_all 继承的 created_at desc 单一排序,
+/// 会让用户 10 天前说的 "我不碰白酒" 被后续 agent_inferred 新条目挤出 top-N。
+pub(crate) fn sort_by_prompt_priority(heuristics: &mut [Heuristic]) {
+    heuristics.sort_by(|a, b| {
+        let a_us = matches!(a.origin, HeuristicOrigin::UserStated);
+        let b_us = matches!(b.origin, HeuristicOrigin::UserStated);
+        if a_us != b_us {
+            return b_us.cmp(&a_us);
+        }
+        let a_risk = matches!(a.category, HeuristicCategory::RiskPreference);
+        let b_risk = matches!(b.category, HeuristicCategory::RiskPreference);
+        if a_risk != b_risk {
+            return b_risk.cmp(&a_risk);
+        }
+        let a_conf = a.confidence().unwrap_or(0.0);
+        let b_conf = b.confidence().unwrap_or(0.0);
+        if let Some(ord) = b_conf.partial_cmp(&a_conf) {
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        b.created_at.value().cmp(&a.created_at.value())
+    });
 }
 
 pub fn count_by_state(app: &AppHandle) -> Result<HeuristicCounts, String> {
@@ -311,4 +344,146 @@ fn parse_occurred(s: &str) -> Result<OccurredAt, String> {
     let dt = chrono::DateTime::parse_from_rfc3339(s)
         .map_err(|err| format!("解析 RFC3339 失败 ({s}): {err}"))?;
     Ok(OccurredAt::new(dt.timestamp_millis()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_heuristic(
+        id: &str,
+        body: &str,
+        category: HeuristicCategory,
+        origin: HeuristicOrigin,
+        hit: u32,
+        miss: u32,
+        created_ms: i64,
+    ) -> Heuristic {
+        Heuristic {
+            id: HeuristicId::from_string(id.to_string()),
+            body: body.to_string(),
+            category,
+            origin,
+            regime_tags: vec![],
+            supporting_lesson_ids: vec![],
+            application_count: hit + miss,
+            hit_count: hit,
+            miss_count: miss,
+            last_applied_at: None,
+            retired_at: None,
+            retired_reason: None,
+            created_at: OccurredAt::new(created_ms),
+        }
+    }
+
+    #[test]
+    fn user_stated_wins_over_newer_agent_inferred() {
+        // 关键回归——10 天前用户说的 user_stated 必须排在 30 条新生 agent_inferred 之前
+        let user_old = make_heuristic(
+            "h_user",
+            "我不碰白酒板块",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::UserStated,
+            0,
+            0,
+            1_700_000_000_000, // 老
+        );
+        let agent_new = make_heuristic(
+            "h_agent",
+            "MACD 金叉 + 量比 > 1.5 视作信号",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::AgentInferred,
+            10,
+            2,
+            1_700_864_000_000, // 新（10 天后）
+        );
+        let mut list = vec![agent_new, user_old];
+        sort_by_prompt_priority(&mut list);
+        assert_eq!(
+            list[0].id.as_str(),
+            "h_user",
+            "user_stated 必须排前面，即使它更老"
+        );
+    }
+
+    #[test]
+    fn risk_preference_wins_over_principle_at_same_origin() {
+        // 同为 user_stated 时，RiskPreference 优先
+        let user_principle = make_heuristic(
+            "h_principle",
+            "偏好短线",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::UserStated,
+            0,
+            0,
+            1_700_864_000_000, // 新
+        );
+        let user_risk = make_heuristic(
+            "h_risk",
+            "单仓 ≤ 10%",
+            HeuristicCategory::RiskPreference,
+            HeuristicOrigin::UserStated,
+            0,
+            0,
+            1_700_000_000_000, // 老
+        );
+        let mut list = vec![user_principle, user_risk];
+        sort_by_prompt_priority(&mut list);
+        assert_eq!(
+            list[0].id.as_str(),
+            "h_risk",
+            "RiskPreference 必须排前面"
+        );
+    }
+
+    #[test]
+    fn higher_confidence_wins_at_same_category_and_origin() {
+        // 同为 agent_inferred + Principle，高 confidence 优先
+        let low_conf = make_heuristic(
+            "h_low",
+            "低命中率规则",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::AgentInferred,
+            3,
+            7, // 30%
+            1_700_864_000_000,
+        );
+        let high_conf = make_heuristic(
+            "h_high",
+            "高命中率规则",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::AgentInferred,
+            8,
+            2, // 80%
+            1_700_000_000_000,
+        );
+        let mut list = vec![low_conf, high_conf];
+        sort_by_prompt_priority(&mut list);
+        assert_eq!(list[0].id.as_str(), "h_high");
+    }
+
+    #[test]
+    fn falls_back_to_created_at_desc_when_all_tied() {
+        let older = make_heuristic(
+            "h_old",
+            "a",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::Seed,
+            0,
+            0,
+            1_700_000_000_000,
+        );
+        let newer = make_heuristic(
+            "h_new",
+            "b",
+            HeuristicCategory::Principle,
+            HeuristicOrigin::Seed,
+            0,
+            0,
+            1_700_864_000_000,
+        );
+        let mut list = vec![older, newer];
+        sort_by_prompt_priority(&mut list);
+        assert_eq!(list[0].id.as_str(), "h_new", "新的优先");
+    }
 }
