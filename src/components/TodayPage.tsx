@@ -48,7 +48,7 @@ export function TodayPage() {
   const [selectedTsCode, setSelectedTsCode] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [category, setCategory] = useState<Category>("stock");
-  const [sortKey, setSortKey] = useState<SortKey>("change");
+  const [sortKey, setSortKey] = useState<SortKey>("volume");
   const [rowMenu, setRowMenu] = useState<RowMenu | null>(null);
 
   // 自选股 code 集合（用于 row indicator + 菜单状态判断）
@@ -57,7 +57,7 @@ export function TodayPage() {
     [watchlistEntries],
   );
 
-  // 列表 derive：分类 → 过滤 → 排序。默认股票按涨跌幅从高到低。
+  // 列表 derive：分类 → 过滤 → 排序。默认按成交量从高到低。
   const filteredRows = useMemo(() => {
     let next = instruments.filter((i) => i.category === category);
     const trimmed = filter.trim().toLowerCase();

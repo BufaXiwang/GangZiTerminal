@@ -1,8 +1,9 @@
 //! Quotes 子域参考表的 SQLite 读写——stocks / indexes / funds 三张静态档案表。
 //!
-//! 这些表由 TuShare scheduler 每天 08:30 北京时间盘前刷新一遍（见
-//! `pipeline::stocks::refresh_universe`），其他时段只读。共 stocks 5500+ /
-//! indexes 5900+ / funds 2000+，提供 agent 工具按代码 / 按名字解析的能力面。
+//! 这些表由 scheduler 每天 08:30 北京时间盘前刷新一遍（见
+//! `pipeline::stocks::refresh_universe`）：TuShare 是权威源，TDX 在 TuShare 不可用时
+//! 提供最小档案 fallback。共 stocks 5500+ / indexes 5900+ / funds 2000+，
+//! 提供 agent 工具按代码 / 按名字解析的能力面。
 //!
 //! K 线缓存（按 ts_code 索引）在 `super::cache`，不在这里。
 
@@ -40,6 +41,37 @@ pub fn upsert_stocks(app: AppHandle, rows: Vec<StockRow>) -> Result<usize, Strin
                      updated_at = excluded.updated_at",
             )
             .map_err(|err| format!("准备 stocks upsert 失败：{err}"))?;
+        for row in rows {
+            stmt.execute(params![row.code, row.name, row.sector, row.market, now])
+                .map_err(|err| format!("写入 stock {} 失败：{err}", row.code))?;
+        }
+    }
+    tx.commit().map_err(|err| format!("提交事务失败：{err}"))?;
+    Ok(count)
+}
+
+/// Minimal stock upsert for fallback providers such as TDX.
+/// Existing rich metadata from TuShare is preserved.
+pub fn upsert_stocks_minimal(app: AppHandle, rows: Vec<StockRow>) -> Result<usize, String> {
+    let mut connection = open_database(&app)?;
+    migrate(&connection)?;
+    let now = now();
+    let count = rows.len();
+    let tx = connection
+        .transaction()
+        .map_err(|err| format!("开启事务失败：{err}"))?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "insert into stocks (code, name, sector, market, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5)
+                 on conflict(code) do update set
+                     name = excluded.name,
+                     market = excluded.market,
+                     sector = coalesce(stocks.sector, excluded.sector),
+                     updated_at = excluded.updated_at",
+            )
+            .map_err(|err| format!("准备 stocks minimal upsert 失败：{err}"))?;
         for row in rows {
             stmt.execute(params![row.code, row.name, row.sector, row.market, now])
                 .map_err(|err| format!("写入 stock {} 失败：{err}", row.code))?;
@@ -196,6 +228,47 @@ pub fn upsert_indexes(app: AppHandle, rows: Vec<IndexRow>) -> Result<usize, Stri
     Ok(count)
 }
 
+/// Minimal index upsert for fallback providers such as TDX.
+/// Existing publisher/category metadata from TuShare is preserved.
+pub fn upsert_indexes_minimal(app: AppHandle, rows: Vec<IndexRow>) -> Result<usize, String> {
+    let mut connection = open_database(&app)?;
+    migrate(&connection)?;
+    let now = now();
+    let count = rows.len();
+    let tx = connection
+        .transaction()
+        .map_err(|err| format!("开启事务失败：{err}"))?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "insert into indexes (ts_code, code, name, market, publisher, category, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 on conflict(ts_code) do update set
+                     code = excluded.code,
+                     name = excluded.name,
+                     market = excluded.market,
+                     publisher = coalesce(indexes.publisher, excluded.publisher),
+                     category = coalesce(indexes.category, excluded.category),
+                     updated_at = excluded.updated_at",
+            )
+            .map_err(|err| format!("准备 indexes minimal upsert 失败：{err}"))?;
+        for r in rows {
+            stmt.execute(params![
+                r.ts_code,
+                r.code,
+                r.name,
+                r.market,
+                r.publisher,
+                r.category,
+                now
+            ])
+            .map_err(|err| format!("写入 index {} 失败：{err}", r.ts_code))?;
+        }
+    }
+    tx.commit().map_err(|err| format!("提交事务失败：{err}"))?;
+    Ok(count)
+}
+
 pub fn list_indexes(app: &AppHandle) -> Result<Vec<IndexRow>, String> {
     let connection = open_database(app)?;
     migrate(&connection)?;
@@ -266,6 +339,51 @@ pub fn upsert_funds(app: AppHandle, rows: Vec<FundRow>) -> Result<usize, String>
                      updated_at = excluded.updated_at",
             )
             .map_err(|err| format!("准备 funds upsert 失败：{err}"))?;
+        for r in rows {
+            stmt.execute(params![
+                r.ts_code,
+                r.code,
+                r.name,
+                r.market,
+                r.fund_type,
+                r.management,
+                r.list_date,
+                r.status,
+                now,
+            ])
+            .map_err(|err| format!("写入 fund {} 失败：{err}", r.ts_code))?;
+        }
+    }
+    tx.commit().map_err(|err| format!("提交事务失败：{err}"))?;
+    Ok(count)
+}
+
+/// Minimal fund upsert for fallback providers such as TDX.
+/// Existing management/list_date/status metadata from TuShare is preserved.
+pub fn upsert_funds_minimal(app: AppHandle, rows: Vec<FundRow>) -> Result<usize, String> {
+    let mut connection = open_database(&app)?;
+    migrate(&connection)?;
+    let now = now();
+    let count = rows.len();
+    let tx = connection
+        .transaction()
+        .map_err(|err| format!("开启事务失败：{err}"))?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "insert into funds (ts_code, code, name, market, fund_type, management, list_date, status, updated_at)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 on conflict(ts_code) do update set
+                     code = excluded.code,
+                     name = excluded.name,
+                     market = excluded.market,
+                     fund_type = coalesce(funds.fund_type, excluded.fund_type),
+                     management = coalesce(funds.management, excluded.management),
+                     list_date = coalesce(funds.list_date, excluded.list_date),
+                     status = coalesce(funds.status, excluded.status),
+                     updated_at = excluded.updated_at",
+            )
+            .map_err(|err| format!("准备 funds minimal upsert 失败：{err}"))?;
         for r in rows {
             stmt.execute(params![
                 r.ts_code,

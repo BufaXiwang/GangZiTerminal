@@ -32,6 +32,7 @@ pub mod error;
 pub mod helper;
 pub mod hosts;
 pub mod types;
+pub mod universe;
 
 pub use error::{Error, Result};
 pub use types::{Bar, BarCategory, Market, QuoteLevel, SecurityListEntry, SecurityQuote};

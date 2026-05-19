@@ -133,7 +133,7 @@ function cacheKey(tsCode: string, period: KlinePeriod, limit: number): string {
 // ===== 主组件 ==============================================================
 
 export function KlineChart({ code, tsCode, name, category = "stock", meta }: Props) {
-  const [period, setPeriod] = useState<KlinePeriod>("minute");
+  const [period, setPeriod] = useState<KlinePeriod>("day");
   const [bars, setBars] = useState<ChartBar[]>([]);
   const [minutePoints, setMinutePoints] = useState<MinutePoint[]>([]);
   const klineLimit = 500;

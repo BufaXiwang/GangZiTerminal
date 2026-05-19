@@ -663,21 +663,10 @@ function ChannelsAndAssignmentsBlock() {
     }
   };
 
-  /** 删除渠道——同时把任何指向该渠道的 assignment 清空。 */
-  const removeChannel = (id: string) => {
-    if (!confirm(`确认删除该渠道？引用此渠道的模型分配会被清空。`)) return;
-    updateDraft((d) => {
-      const cleared = (r: ModelRef): ModelRef =>
-        r.channelId === id ? { channelId: "", model: "" } : r;
-      return {
-        ...d,
-        channels: d.channels.filter((c) => c.id !== id),
-        assignments: {
-          chat: cleared(d.assignments.chat),
-          compact: cleared(d.assignments.compact),
-        },
-      };
-    });
+  /** 删除渠道——立即写库，并同时把任何指向该渠道的 assignment 清空。 */
+  const removeChannel = async (id: string) => {
+    const nextDraft = removeChannelFromConfig(draft, id);
+    setDraft(nextDraft);
     setExpanded((s) => {
       const n = new Set(s);
       n.delete(id);
@@ -689,6 +678,20 @@ function ChannelsAndAssignmentsBlock() {
       delete next[id];
       return next;
     });
+
+    // 未保存的新渠道只需要从 draft 移除；已保存渠道必须立刻持久化。
+    if (!config?.channels.some((c) => c.id === id)) return;
+
+    try {
+      const nextConfig = removeChannelFromConfig(config, id);
+      await invoke("set_agent_config", { config: nextConfig });
+      setConfig(nextConfig);
+      setAssignmentFeedback("渠道已删除；相关模型分配已清空");
+      await refresh();
+    } catch (err) {
+      setDraft(draft);
+      setAssignmentFeedback(`删除渠道失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   /** 添加新渠道——前端生成 uuid，立刻进入展开编辑。 */
@@ -927,7 +930,7 @@ function ChannelsAndAssignmentsBlock() {
               }
               onUpdate={(patch) => updateChannel(chan.id, patch)}
               onUpdateClearVerify={(patch) => updateChannelClearVerify(chan.id, patch)}
-              onRemove={() => removeChannel(chan.id)}
+              onRemove={() => void removeChannel(chan.id)}
               onAddModel={(m) => addModelToChannel(chan.id, m)}
               onRemoveModel={(m) => removeModelFromChannel(chan.id, m)}
               onVerifyModel={(m) => verifyModel(chan, m)}
@@ -1059,6 +1062,19 @@ function mergeOneChannel(stored: AgentConfigPayload, chan: Channel): AgentConfig
     channels: exists
       ? stored.channels.map((c) => (c.id === chan.id ? chan : c))
       : [...stored.channels, chan],
+  };
+}
+
+function removeChannelFromConfig(config: AgentConfigPayload, id: string): AgentConfigPayload {
+  const cleared = (ref: ModelRef): ModelRef =>
+    ref.channelId === id ? { channelId: "", model: "" } : ref;
+  return {
+    ...config,
+    channels: config.channels.filter((c) => c.id !== id),
+    assignments: {
+      chat: cleared(config.assignments.chat),
+      compact: cleared(config.assignments.compact),
+    },
   };
 }
 

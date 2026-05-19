@@ -11,7 +11,8 @@
 
 use crate::domain::shared::StockCode;
 use crate::infrastructure::quotes::eastmoney::realtime as em_realtime;
-use crate::infrastructure::quotes::repository::StockRow;
+use crate::infrastructure::quotes::repository::{FundRow, IndexRow, StockRow};
+use crate::infrastructure::quotes::tdx::universe::TdxUniverse;
 use crate::infrastructure::quotes::tushare::stock as ts_stock;
 use serde_json::json;
 use tauri::{AppHandle, Emitter};
@@ -39,9 +40,7 @@ impl From<StockRow> for StockRef {
 
 /// 从 TuShare `stock_basic` 拉全市场 A 股档案，写入 `stocks` 表。返回写入条数。
 ///
-/// 数据源：**仅 TuShare**——之前的 EM clist 路径偶发风控不稳，这次重构后
-/// stocks 表只走 TuShare。没配 token 时返 `MissingToken` 错误，业务侧应该让
-/// 用户去 Settings 配；不再回落 EM。
+/// TuShare 是权威档案源；失败时由 `refresh_universe` 统一走 TDX minimal fallback。
 ///
 /// 失败时不改动现有表（事务回滚）；caller 决定要不要重试 / 等下次定时刷新。
 pub async fn refresh_now(app: &AppHandle) -> Result<usize, String> {
@@ -103,37 +102,133 @@ pub async fn refresh_funds(app: &AppHandle) -> Result<usize, String> {
     crate::infrastructure::quotes::repository::upsert_funds(app.clone(), rows)
 }
 
+fn write_tdx_stocks(app: &AppHandle, universe: &TdxUniverse) -> Result<usize, String> {
+    let rows: Vec<StockRow> = universe
+        .stocks
+        .iter()
+        .map(|s| StockRow {
+            code: s.code.clone(),
+            name: s.name.clone(),
+            sector: None,
+            market: s.market.clone(),
+        })
+        .collect();
+    crate::infrastructure::quotes::repository::upsert_stocks_minimal(app.clone(), rows)
+}
+
+fn write_tdx_indexes(app: &AppHandle, universe: &TdxUniverse) -> Result<usize, String> {
+    let rows: Vec<IndexRow> = universe
+        .indexes
+        .iter()
+        .map(|i| IndexRow {
+            ts_code: i.ts_code.clone(),
+            code: i.code.clone(),
+            name: i.name.clone(),
+            market: i.market.clone(),
+            publisher: Some("TDX".into()),
+            category: None,
+        })
+        .collect();
+    crate::infrastructure::quotes::repository::upsert_indexes_minimal(app.clone(), rows)
+}
+
+fn write_tdx_funds(app: &AppHandle, universe: &TdxUniverse) -> Result<usize, String> {
+    let rows: Vec<FundRow> = universe
+        .funds
+        .iter()
+        .map(|f| FundRow {
+            ts_code: f.ts_code.clone(),
+            code: f.code.clone(),
+            name: f.name.clone(),
+            market: "E".into(),
+            fund_type: f.fund_type.clone(),
+            management: None,
+            list_date: None,
+            status: Some("L".into()),
+        })
+        .collect();
+    crate::infrastructure::quotes::repository::upsert_funds_minimal(app.clone(), rows)
+}
+
 /// 全市场档案三件套刷新——stocks + indexes + funds。
-/// 任一失败不影响其它（独立 try）。返回各自写入条数 (stocks, indexes, funds)。
+/// TuShare 是权威源；任一 TuShare 档案失败时，一次性拉 TDX security_list 作为
+/// SH/SZ 的最小档案 fallback。TDX minimal upsert 不会清空 TuShare 已有元数据。
 pub async fn refresh_universe(app: &AppHandle) -> (usize, usize, usize) {
-    let stocks = match refresh_now(app).await {
+    let stocks_result = refresh_now(app).await;
+    let indexes_result = refresh_indexes(app).await;
+    let funds_result = refresh_funds(app).await;
+
+    let needs_tdx = stocks_result.is_err() || indexes_result.is_err() || funds_result.is_err();
+    let tdx_universe = if needs_tdx {
+        match crate::infrastructure::quotes::tdx::universe::fetch_universe().await {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(error = %e, "TDX minimal 档案 fallback 失败");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let stocks = match stocks_result {
         Ok(n) => {
-            tracing::info!(count = n, "stocks 档案刷新成功");
+            tracing::info!(count = n, source = "tushare", "stocks 档案刷新成功");
             n
         }
         Err(e) => {
-            tracing::warn!(error = %e, "stocks 档案刷新失败");
-            0
+            tracing::warn!(error = %e, "stocks TuShare 档案刷新失败，尝试 TDX minimal fallback");
+            match tdx_universe.as_ref().map(|u| write_tdx_stocks(app, u)) {
+                Some(Ok(n)) => {
+                    tracing::info!(count = n, source = "tdx", "stocks minimal 档案刷新成功");
+                    n
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "stocks TDX minimal 档案写入失败");
+                    0
+                }
+                None => 0,
+            }
         }
     };
-    let indexes = match refresh_indexes(app).await {
+    let indexes = match indexes_result {
         Ok(n) => {
-            tracing::info!(count = n, "indexes 档案刷新成功");
+            tracing::info!(count = n, source = "tushare", "indexes 档案刷新成功");
             n
         }
         Err(e) => {
-            tracing::warn!(error = %e, "indexes 档案刷新失败");
-            0
+            tracing::warn!(error = %e, "indexes TuShare 档案刷新失败，尝试 TDX minimal fallback");
+            match tdx_universe.as_ref().map(|u| write_tdx_indexes(app, u)) {
+                Some(Ok(n)) => {
+                    tracing::info!(count = n, source = "tdx", "indexes minimal 档案刷新成功");
+                    n
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "indexes TDX minimal 档案写入失败");
+                    0
+                }
+                None => 0,
+            }
         }
     };
-    let funds = match refresh_funds(app).await {
+    let funds = match funds_result {
         Ok(n) => {
-            tracing::info!(count = n, "funds 档案刷新成功");
+            tracing::info!(count = n, source = "tushare", "funds 档案刷新成功");
             n
         }
         Err(e) => {
-            tracing::warn!(error = %e, "funds 档案刷新失败");
-            0
+            tracing::warn!(error = %e, "funds TuShare 档案刷新失败，尝试 TDX minimal fallback");
+            match tdx_universe.as_ref().map(|u| write_tdx_funds(app, u)) {
+                Some(Ok(n)) => {
+                    tracing::info!(count = n, source = "tdx", "funds minimal 档案刷新成功");
+                    n
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(error = %err, "funds TDX minimal 档案写入失败");
+                    0
+                }
+                None => 0,
+            }
         }
     };
 
