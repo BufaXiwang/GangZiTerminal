@@ -34,27 +34,37 @@ const activeViewKey = "gangzi-terminal.active-view";
 const simulationInitialCash = 20000;
 const messagesPageSize = 50;
 
-type ViewId =
-  | "today"
-  | "news"
-  | "simulation"
+/// 一级 nav——Agent 是聚合视图，内部含 5 个子 tab
+type ViewId = "agent" | "today" | "news" | "simulation" | "settings";
+
+/// Agent 视图内的子 tab——chat 是默认入口；其他 4 个看 agent 大脑状态
+type AgentSubView =
   | "chat"
   | "expectations"
   | "strategies"
   | "heuristics"
-  | "lessons"
-  | "settings";
+  | "lessons";
 
 const navItems: Array<{ id: ViewId; label: string; icon: typeof BarChart3 }> = [
-  { id: "chat", label: "Agent", icon: MessageSquare },
-  { id: "expectations", label: "Expectations", icon: BarChart3 },
-  { id: "strategies", label: "Strategies", icon: BarChart3 },
-  { id: "heuristics", label: "Heuristics", icon: BarChart3 },
-  { id: "lessons", label: "Lessons", icon: BarChart3 },
+  { id: "agent", label: "Agent", icon: MessageSquare },
   { id: "today", label: "市场", icon: BarChart3 },
   { id: "news", label: "资讯", icon: Newspaper },
   { id: "simulation", label: "模拟账户", icon: WalletCards },
   { id: "settings", label: "设置", icon: Settings },
+];
+
+/// Agent 内子 nav——左侧 rail 显示
+const agentSubTabs: Array<{
+  id: AgentSubView;
+  icon: string;
+  label: string;
+  hint: string;
+}> = [
+  { id: "chat", icon: "💬", label: "Chat", hint: "和 agent 对话——决策入口" },
+  { id: "expectations", icon: "📊", label: "Expectations", hint: "agent 当前跟踪的投资预期" },
+  { id: "strategies", icon: "🎯", label: "Strategies", hint: "触发 expectation 的规则集" },
+  { id: "heuristics", icon: "🧠", label: "Heuristics", hint: "agent 学到的启发式规则" },
+  { id: "lessons", icon: "📝", label: "Lessons", hint: "每次复盘的原子观察" },
 ];
 
 function App() {
@@ -73,10 +83,12 @@ function App() {
   // ====== app_state-backed state（唯一持久化路径 = SQLite app_state） ======
   const [activeView, setActiveView] = useAppState<ViewId>(
     activeViewKey,
-    "expectations",
-    // 兜底：老视图值落到磁盘上时重置到 expectations（v3 默认首屏）
-    (value) => (navItems.some((nav) => nav.id === value) ? value : "expectations"),
+    "agent",
+    // 兜底：老视图值落到磁盘上时重置到 agent
+    (value) => (navItems.some((nav) => nav.id === value) ? value : "agent"),
   );
+  /// Agent 内子 tab 不持久化——session 内有效，每次进 Agent 默认 chat
+  const [agentSubView, setAgentSubView] = useState<AgentSubView>("chat");
   const [autoRefresh, setAutoRefresh] = useAppState<boolean>(autoRefreshKey, true);
   const [refreshInterval, setRefreshInterval] = useAppState<number>(refreshIntervalKey, 60000);
 
@@ -204,22 +216,112 @@ function App() {
             <TodayPage />
           ) : activeView === "news" ? (
             <NewsPage />
-          ) : activeView === "expectations" ? (
-            <ExpectationsPage onAskAgent={(prefill) => {
-              setActiveView("chat");
-              window.dispatchEvent(
-                new CustomEvent("agent-prefill", { detail: prefill }),
-              );
-            }} />
-          ) : activeView === "strategies" ? (
-            <StrategiesPage />
-          ) : activeView === "heuristics" ? (
-            <HeuristicsPage />
-          ) : activeView === "lessons" ? (
-            <LessonsPage />
+          ) : activeView === "agent" ? (
+            <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+              {/* 左侧二级 rail — VS Code 风格：紧凑图标 + 文字 */}
+              <nav
+                style={{
+                  width: 76,
+                  flexShrink: 0,
+                  borderRight: "1px solid #e5e7eb",
+                  background: "#fafafa",
+                  display: "flex",
+                  flexDirection: "column",
+                  padding: "8px 0",
+                  gap: 2,
+                }}
+              >
+                {agentSubTabs.map((tab) => {
+                  const active = agentSubView === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      onClick={() => setAgentSubView(tab.id)}
+                      title={tab.hint}
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: 2,
+                        padding: "10px 4px",
+                        margin: "0 6px",
+                        background: active ? "#fff" : "transparent",
+                        border: active ? "1px solid #cbd5e1" : "1px solid transparent",
+                        borderRadius: 6,
+                        cursor: "pointer",
+                        color: active ? "#0f172a" : "#64748b",
+                        fontWeight: active ? 600 : 400,
+                        boxShadow: active ? "0 1px 2px rgba(0,0,0,0.04)" : "none",
+                        transition: "background 120ms, color 120ms",
+                      }}
+                    >
+                      <span style={{ fontSize: 20, lineHeight: 1 }}>{tab.icon}</span>
+                      <span style={{ fontSize: 10, marginTop: 2 }}>{tab.label}</span>
+                    </button>
+                  );
+                })}
+              </nav>
+
+              {/* 主区——根据 sub view 渲染 */}
+              <div style={{ flex: 1, overflow: "auto" }}>
+                {agentSubView === "chat" ? (
+                  <SecondaryView
+                    activeView="chat"
+                    autoRefresh={autoRefresh}
+                    databasePath={databasePath}
+                    hasMoreMessages={hasMoreMessages}
+                    isChatting={isChatting}
+                    loadMoreMessages={() => void loadMoreMessages()}
+                    messages={messages}
+                    refreshInterval={refreshInterval}
+                    riskAlerts={riskAlerts}
+                    searchMessages={(query) => void searchMessages(query)}
+                    sendChatMessage={(content, images) => {
+                      const hasImages = images && images.length > 0;
+                      if ((!content.trim() && !hasImages) || isChatting) return;
+                      setIsChatting(true);
+                      const timeoutId = window.setTimeout(() => {
+                        setIsChatting(false);
+                        setStatus(
+                          "对话超时（5 分钟）。Agent 可能仍在后台运行，请稍后查看对话流。",
+                        );
+                      }, 5 * 60 * 1000);
+                      void invoke("send_chat_message_now", {
+                        content,
+                        images: images ?? [],
+                      })
+                        .catch((err) =>
+                          setStatus(err instanceof Error ? err.message : String(err)),
+                        )
+                        .finally(() => {
+                          window.clearTimeout(timeoutId);
+                          setIsChatting(false);
+                        });
+                    }}
+                    setAutoRefresh={setAutoRefresh}
+                    setRefreshInterval={setRefreshInterval}
+                  />
+                ) : agentSubView === "expectations" ? (
+                  <ExpectationsPage
+                    onAskAgent={(prefill) => {
+                      setAgentSubView("chat");
+                      window.dispatchEvent(
+                        new CustomEvent("agent-prefill", { detail: prefill }),
+                      );
+                    }}
+                  />
+                ) : agentSubView === "strategies" ? (
+                  <StrategiesPage />
+                ) : agentSubView === "heuristics" ? (
+                  <HeuristicsPage />
+                ) : (
+                  <LessonsPage />
+                )}
+              </div>
+            </div>
           ) : (
             <SecondaryView
-              activeView={activeView as "simulation" | "chat" | "settings"}
+              activeView={activeView as "simulation" | "settings"}
               autoRefresh={autoRefresh}
               databasePath={databasePath}
               hasMoreMessages={hasMoreMessages}
