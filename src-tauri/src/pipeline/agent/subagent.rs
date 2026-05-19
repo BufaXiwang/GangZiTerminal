@@ -22,7 +22,7 @@ use crate::domain::agent::types::{
 };
 use crate::infrastructure::agent::provider::ChatProvider;
 use crate::pipeline::agent::loop_::{run_agent, AgentError};
-use crate::pipeline::agent::tools::{Tool, ToolContext, ToolRegistry};
+use crate::pipeline::agent::tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -262,6 +262,7 @@ fn filter_registry(parent: &ToolRegistry, allowed: &[&str]) -> ToolRegistry {
 mod tests {
     use super::*;
     use crate::domain::agent::types::ToolResultContent;
+    use crate::pipeline::agent::tools::Tool;
     use async_trait::async_trait;
     use serde_json::Value;
 

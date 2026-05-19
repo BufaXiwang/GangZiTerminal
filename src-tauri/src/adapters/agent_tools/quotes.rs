@@ -276,14 +276,9 @@ fn kline_chart_payload(
     if points.len() < 5 {
         return err_text(format!("{code} K 线数据不足 5 根，无法渲染"));
     }
-    let title = format!("{} {} ({} bars)", code, period_label(period), points.len());
-    let png = match render_kline_png(
-        &points,
-        &ChartRenderOptions {
-            title,
-            ..Default::default()
-        },
-    ) {
+    // 标题信息（code / period / bars）放在 format_chart_summary 的文本里给 agent 看，
+    // 不渲到图上——plotters 在无 fontconfig 环境会 panic
+    let png = match render_kline_png(&points, &ChartRenderOptions::default()) {
         Ok(b) => b,
         Err(e) => return err_text(format!("渲染失败：{e}")),
     };

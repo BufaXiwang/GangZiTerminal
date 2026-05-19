@@ -19,7 +19,7 @@
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::indicators::IndicatorSnapshot;
 use crate::domain::quotes::types::{
-    DailyBasic, KlinePoint, MoneyFlowItem, NorthMoneyFlow, StockQuote, TopListItem,
+    DailyBasic, KlinePoint, NorthMoneyFlow, StockQuote, TopListItem,
 };
 
 /// 阈值默认值集合——后续可由 strategy 覆盖。
@@ -69,8 +69,6 @@ pub struct ScanContext<'a> {
     pub north_flow: Option<&'a [NorthMoneyFlow]>,
     /// 今日龙虎榜——若该 code 在列表里则触发 OnDragonTigerList
     pub dragon_tiger_today: Option<&'a [TopListItem]>,
-    /// 个股资金流（用于判断 VolumePriceDivergence 的另一种口径）
-    pub moneyflow: Option<&'a [MoneyFlowItem]>,
     /// 所在板块今日涨幅（%）
     pub sector_pct_change_today: Option<f64>,
     /// 净利润 YoY 增速（%）
@@ -82,21 +80,11 @@ pub struct ScanContext<'a> {
 }
 
 /// 单股扫描入口——返回触发的所有 SignalKind。
-///
-/// 调用方负责拉数据：`klines` 是近 60 日（升序），`snap` 是 `compute_indicators(klines, cfg)`
-/// 的结果，`quote` 是当前实时报价。`prev_snap` 是上一交易日的 indicators 快照（用于
-/// 检测金叉死叉等跨日事件，可为 None——首次跑时跳过这类信号）。
-pub fn scan_one(
-    klines: &[KlinePoint],
-    snap: &IndicatorSnapshot,
-    prev_snap: Option<&IndicatorSnapshot>,
-    quote: Option<&StockQuote>,
-    cfg: &DetectorConfig,
-) -> Vec<SignalKind> {
-    scan_one_with_context(klines, snap, prev_snap, quote, cfg, &ScanContext::default())
-}
-
 /// 带上下文的扫描——上下文中存在的字段会被对应 detector 消费。
+///
+/// `klines` 近 60 日（升序），`snap` 是 `compute_indicators(klines, cfg)` 的结果，
+/// `quote` 是当前实时报价。`prev_snap` 是上一交易日的 indicators 快照（金叉/死叉
+/// 等跨日事件用，可为 None——首次跑时跳过这类信号）。
 pub fn scan_one_with_context(
     klines: &[KlinePoint],
     snap: &IndicatorSnapshot,

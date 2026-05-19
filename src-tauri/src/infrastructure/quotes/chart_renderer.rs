@@ -33,7 +33,6 @@ pub fn klinerow_to_point(r: &KlineRow) -> Option<KlinePoint> {
 pub struct ChartRenderOptions {
     pub width: u32,
     pub height: u32,
-    pub title: String,
     /// 是否叠加 20 日 MA
     pub show_ma20: bool,
 }
@@ -43,7 +42,6 @@ impl Default for ChartRenderOptions {
         Self {
             width: 800,
             height: 500,
-            title: "K-line".into(),
             show_ma20: true,
         }
     }

@@ -344,7 +344,6 @@ pub fn build_provider_for_channel(chan: &Channel) -> Result<Arc<dyn ChatProvider
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn default_config_is_empty() {

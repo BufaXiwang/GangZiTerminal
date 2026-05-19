@@ -66,10 +66,3 @@ pub fn current(app: &AppHandle) -> Option<Regime> {
     }
     Some(regime)
 }
-
-/// 强制刷新——清缓存。供测试 / 手动重算用。
-pub fn invalidate() {
-    if let Ok(mut cache) = CACHE.lock() {
-        *cache = None;
-    }
-}

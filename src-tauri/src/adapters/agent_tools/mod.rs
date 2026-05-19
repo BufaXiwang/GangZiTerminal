@@ -9,8 +9,10 @@
 //! - `research`：龙虎榜 / 资金流 / 板块涨幅 / 扫盘 / 公司事件
 //! - `news`：资讯检索
 //! - `account` / `positions`：账户读 + 写（open / close / scale / adjust_stops）
-//! - `theses`：投资论点 create / update_state / attach_feedback
-//! - `principles`：投资原则 propose / confirm / retire（v2 重构替代旧 memory tools）
+//! - `expectations`：v3 核心实体——create / update / cancel
+//! - `visual`：analyze_chart / propose_visual_pattern
+//! - `delegate`：派 researcher / bear_advocate 子 agent
+//! - `compact`：compact_now 主动压缩 context
 
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -35,8 +37,10 @@ pub mod visual;
 ///   get_company_events）只读
 /// - news（search_news）只读
 /// - account 读（get_account / get_position）+ 写（open / close / scale / adjust_stops）
-/// - theses（create_thesis / update_thesis_state / attach_thesis_feedback）写
-/// - principles（propose_principle / confirm_principle / retire_principle）写
+/// - expectations 写（create / update / cancel）——v3 核心实体
+/// - visual（analyze_chart 读 + propose_visual_pattern 写）
+/// - delegate（派 researcher / bear_advocate 子 agent）
+/// - compact_now（主动压缩 context）
 pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // 行情

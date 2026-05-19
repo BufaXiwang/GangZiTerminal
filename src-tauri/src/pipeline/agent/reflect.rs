@@ -33,7 +33,6 @@ pub struct ReflectionResult {
     pub run_id: String,
     pub outcome_summary: String,
     pub thesis_count: usize, // 保留字段名兼容旧前端；语义改为 expectations_reviewed
-    pub takeaways_filled: usize,
 }
 
 /// 触发一次收盘复盘——可由 scheduler 15:30 tick / Settings 立即按钮调。
@@ -111,7 +110,6 @@ pub async fn run_close_reflection(
         run_id,
         outcome_summary: outcome,
         thesis_count: review.examined,
-        takeaways_filled,
     })
 }
 

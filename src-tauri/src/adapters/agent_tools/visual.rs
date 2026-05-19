@@ -92,8 +92,7 @@ impl Tool for AnalyzeChartTool {
         if points.len() < 30 {
             return err_text(format!("{code_raw} K 线数据不足 30 根，无法识别形态"));
         }
-        let title = format!("{code_raw} {} ({} bars)", period_label(period), points.len());
-        let png = match render_kline_png(&points, &ChartRenderOptions { title, ..Default::default() }) {
+        let png = match render_kline_png(&points, &ChartRenderOptions::default()) {
             Ok(b) => b,
             Err(e) => return err_text(format!("渲染失败：{e}")),
         };

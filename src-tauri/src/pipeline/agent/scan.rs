@@ -203,13 +203,8 @@ pub async fn prefetch_capital_context(
     (north, dragon)
 }
 
-/// 给单只股票跑信号检测——纯技术面 + news（不含资金面）。保留为兼容入口；
-/// 调用方若想要资金面，请用 [`scan_one_stock_with_capital`]。
-pub fn scan_one_stock(app: &AppHandle, code: &StockCode, now: OccurredAt) -> Vec<SignalKind> {
-    scan_one_stock_with_capital(app, code, now, None, None)
-}
-
 /// 带资金面 context 的扫描——`north_flow` / `dragon_tiger` 由 tick 顶层一次性拉好后注入。
+/// 不需要资金面时调用方传 None。
 pub fn scan_one_stock_with_capital(
     app: &AppHandle,
     code: &StockCode,

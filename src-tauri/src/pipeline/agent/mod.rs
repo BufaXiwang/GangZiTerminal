@@ -24,4 +24,4 @@ pub mod subagent;
 pub mod tools;
 
 pub use loop_::{run_agent, RunSummary, SummarizeOptions};
-pub use subagent::{run_subagent, SubAgentError, SubAgentResult, SubAgentType};
+pub use subagent::{run_subagent, SubAgentType};

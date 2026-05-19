@@ -14,7 +14,7 @@
 //! 摘要 + 边界 user 消息——agent 看到的 messages 列表变短，token 释放。
 
 use crate::domain::agent::types::ToolResultContent;
-use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
+use crate::pipeline::agent::tools::{ok_json, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tauri::AppHandle;
