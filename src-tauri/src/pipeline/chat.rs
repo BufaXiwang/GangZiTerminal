@@ -14,9 +14,8 @@
 
 use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
-    ServerSideTool, StopReason, SystemBlock, ToolDef,
+    StopReason, SystemBlock,
 };
-use crate::domain::agent::ProviderKind;
 use crate::infrastructure::account::watchlist;
 use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config};
 use crate::pipeline::agent::observer;
@@ -228,30 +227,15 @@ pub async fn send_chat_message_now(
         }
     }
 
-    // 解析 chat pipeline 用的 (channel, model)——决定 provider build + tools 里要不要加
-    // server-side web_search。
+    // 解析 chat pipeline 用的 (channel, model)。
     let (chat_channel_ref, chat_model_ref) =
         cfg.resolve_pipeline(PipelineKind::Chat).map_err(|e| e)?;
     let chat_channel = chat_channel_ref.clone();
     let chat_model = chat_model_ref.to_string();
 
-    // tools = 所有本地工具 + 可选的 server-side web_search。
-    // 这里仍然用 AnthropicWebSearch variant 作为 canonical——OpenAI provider 在
-    // serialize 时会把它降级翻译成 `{type:"web_search"}`。
-    let mut tools = registry.to_tool_defs(true);
-    let want_web_search = match chat_channel.wire_format {
-        ProviderKind::Anthropic => chat_channel.enable_native_web_search,
-        ProviderKind::OpenAIResponses => chat_channel.enable_web_search,
-        ProviderKind::OpenAIChatCompletions => false,
-    };
-    if want_web_search {
-        tools.push(ToolDef::ServerSide(ServerSideTool::AnthropicWebSearch {
-            name: "web_search".into(),
-            max_uses: Some(cfg.agent.max_search_calls_per_run),
-            allowed_domains: vec![],
-            blocked_domains: vec![],
-        }));
-    }
+    // 当前不暴露 server-side web_search——本地 FTS5 资讯（search_news）足够覆盖大部分场景，
+    // 跨 provider 测试维护成本与实际使用频率不成比例。底层 ServerSideTool 协议保留以备未来。
+    let tools = registry.to_tool_defs(true);
 
     let req = AgentRequest {
         // system 三段：identity → 指令 → 半静态投资上下文。
