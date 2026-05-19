@@ -102,7 +102,7 @@ fn row_to_boundary_summary(row: &Value) -> Option<String> {
 
 // ====== thread 加载入口 ===================================================
 
-/// 加载结构化 chat 历史——返回 `(messages, boundary_summary?)`。
+/// 加载结构化 chat 历史——返回 [`ChatThreadLoad`]。
 ///
 /// - **若存在 compact_boundary 行**：只读 boundary 之后的 user/assistant 消息（结构化），
 ///   boundary 摘要单独返回，由调用方决定怎么注入（一般作为 messages[0] 的 user 摘要 block）。
@@ -117,10 +117,16 @@ fn row_to_boundary_summary(row: &Value) -> Option<String> {
 ///
 /// `exclude_id`：跳过指定 id 的消息——chat pipeline 在写完本轮 user 消息后立刻读
 /// 历史，需要排除"自己"，否则当前提问会出现两次。
-pub fn read_recent_chat_thread(
-    app: &AppHandle,
-    exclude_id: Option<&str>,
-) -> (Vec<Message>, Option<String>) {
+///
+/// `last_assistant_at_ms`：boundary 后最近一条 assistant 消息的 createdAt（ms epoch）；
+/// chat.rs 用它配 `time_based_micro_clear` 在 prompt cache 必然失效时预清易腐工具结果。
+pub struct ChatThreadLoad {
+    pub messages: Vec<Message>,
+    pub boundary_summary: Option<String>,
+    pub last_assistant_at_ms: Option<i64>,
+}
+
+pub fn read_recent_chat_thread(app: &AppHandle, exclude_id: Option<&str>) -> ChatThreadLoad {
     // read_all_chat_messages 按 created_at desc——最新在前；无条数截断。
     let raw = crate::infrastructure::agent::repository::read_all_chat_messages(app, None)
         .unwrap_or_default();
@@ -151,6 +157,17 @@ pub fn read_recent_chat_thread(
         }
     };
 
+    // boundary 后最近一条 assistant 消息的时间戳——desc 顺序里第一条 role=assistant
+    let last_assistant_at_ms = slice.iter().find_map(|r| {
+        if r.get("kind").and_then(Value::as_str) != Some(CHAT_KIND_CHAT) {
+            return None;
+        }
+        if r.get("role").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        parse_created_at_ms(r)
+    });
+
     // 反序列化 + 反转成正序
     let mut messages: Vec<Message> = slice
         .iter()
@@ -163,7 +180,26 @@ pub fn read_recent_chat_thread(
         .filter_map(|r| row_to_message(r))
         .collect();
     messages.reverse();
-    (messages, boundary_summary)
+    ChatThreadLoad {
+        messages,
+        boundary_summary,
+        last_assistant_at_ms,
+    }
+}
+
+/// chat_messages 行的 createdAt 字段有两种形态：ISO8601 字符串、ms epoch 数字。
+/// 这里两种都接，统一返 ms epoch。
+fn parse_created_at_ms(row: &Value) -> Option<i64> {
+    let v = row.get("createdAt")?;
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(s) = v.as_str() {
+        return chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.timestamp_millis());
+    }
+    None
 }
 
 // ====== 写库辅助 ==========================================================

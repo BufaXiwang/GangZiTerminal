@@ -1,4 +1,5 @@
-//! K 线图渲染——为 `analyze_chart` 工具生成 PNG 字节给 LLM vision 看。
+//! K 线图渲染——为 `analyze_chart` / `get_kline(mode=chart)` 工具生成 PNG 字节
+//! 给 LLM vision 看。
 //!
 //! 设计目标：
 //! - 纯函数：吃 `&[KlinePoint]` + 渲染参数，吐 `Vec<u8>` (PNG)
@@ -10,7 +11,24 @@
 //! 2. 副图：成交量柱（按当日涨跌着色）
 
 use crate::domain::quotes::types::KlinePoint;
+use crate::domain::shared::{Lots, TradeDate, Yuan};
+use crate::infrastructure::quotes::cache::kline_cache::KlineRow;
 use plotters::prelude::*;
+
+/// `KlineRow`（DB 行 / cache）→ `KlinePoint`（domain 类型）的统一转换器。
+/// 老调用方分散在 visual.rs / quotes.rs 各自维护一份；现在共享这一份。
+pub fn klinerow_to_point(r: &KlineRow) -> Option<KlinePoint> {
+    let date = TradeDate::from_compact(&r.date).ok()?;
+    Some(KlinePoint {
+        date,
+        open: Yuan::from_unchecked(r.open),
+        close: Yuan::from_unchecked(r.close),
+        high: Yuan::from_unchecked(r.high),
+        low: Yuan::from_unchecked(r.low),
+        volume: Lots::from_unchecked(r.volume.unwrap_or(0.0) as i64),
+        amount: Yuan::from_unchecked(r.amount.unwrap_or(0.0)),
+    })
+}
 
 pub struct ChartRenderOptions {
     pub width: u32,

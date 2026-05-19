@@ -8,11 +8,16 @@
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::adapters::quotes_commands::StockQuoteDto;
 use crate::domain::agent::types::ToolResultContent;
+use crate::domain::quotes::types::KlinePoint;
 use crate::domain::quotes::KlinePeriod;
 use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
+use crate::infrastructure::quotes::chart_renderer::{
+    klinerow_to_point, render_kline_png, ChartRenderOptions,
+};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
 use crate::pipeline::market::overview as market_overview;
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
@@ -148,8 +153,11 @@ impl Tool for GetKlineTool {
     }
 
     fn description(&self) -> &'static str {
-        "拉个股日/周/月 K 线（OHLC + 成交量/额）。判断趋势、识别形态、回顾历史走势时调用。\
-        本地缓存优先（< 5ms），过期时同步增量拉 TuShare。"
+        "拉个股日/周/月 K 线。默认 **mode=chart**——返回一张渲染好的 K 线 PNG（蜡烛 + \
+        MA20 + 成交量副图，A 股惯例红涨绿跌）给你看，**最适合判断趋势 / 形态 / 位置**，\
+        仅 ~1.5k token。\n\
+        需要精确数值（突破价、止损位、MA20 数字）时传 mode=data 拿 OHLC 表；\
+        mode=both 同时返图 + 简表。本地缓存优先（< 5ms）。"
     }
 
     fn input_schema(&self) -> Value {
@@ -158,7 +166,19 @@ impl Tool for GetKlineTool {
             "properties": {
                 "code":   { "type": "string", "description": "6 位 A 股代码或股票中文名" },
                 "period": { "type": "string", "enum": ["day", "week", "month"], "default": "day" },
-                "limit":  { "type": "integer", "minimum": 30, "maximum": 800, "default": 120 }
+                "limit":  {
+                    "type": "integer",
+                    "minimum": 30,
+                    "maximum": 800,
+                    "default": 120,
+                    "description": "K 线根数。chart 模式建议 60-120 根；data 模式按需"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["chart", "data", "both"],
+                    "default": "chart",
+                    "description": "chart=渲图给你看（默认，省 token，最直观）；data=OHLC 表（精确数值用）；both=两者都返"
+                }
             },
             "required": ["code"]
         })
@@ -176,6 +196,10 @@ impl Tool for GetKlineTool {
             .map(|n| n as usize)
             .unwrap_or(120)
             .clamp(30, 800);
+        let mode = input
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("chart");
         let ts_code = match resolve_stock_ts_code(&self.app, &code) {
             Some(ts) => ts,
             None => {
@@ -201,28 +225,154 @@ impl Tool for GetKlineTool {
         if rows.is_empty() {
             return err_text(format!("{code} 无 K 线数据"));
         }
-        let klines: Vec<Value> = rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "date": format_iso(&r.date),
-                    "open": r.open,
-                    "close": r.close,
-                    "high": r.high,
-                    "low": r.low,
-                    "volume": r.volume,
-                    "amount": r.amount,
-                })
+
+        match mode {
+            "data" => kline_data_payload(&code, period, &rows),
+            "both" => kline_both_payload(&code, period, &rows),
+            _ => kline_chart_payload(&code, period, &rows), // chart / 任何无效值 fallback
+        }
+    }
+}
+
+/// 渲染 PNG + 一段元数据文本（最近 close / MA20 / 区间 / 最近 5 根简表）。
+/// 一次调用约 1500 token（图本身是 vision tokenizer 固定 ~1500），比纯 data 模式
+/// 8-12k 省 80%+。
+fn kline_chart_payload(
+    code: &str,
+    period: KlinePeriod,
+    rows: &[kline_cache::KlineRow],
+) -> (Vec<ToolResultContent>, bool) {
+    let points: Vec<KlinePoint> = rows.iter().filter_map(klinerow_to_point).collect();
+    if points.len() < 5 {
+        return err_text(format!("{code} K 线数据不足 5 根，无法渲染"));
+    }
+    let title = format!("{} {} ({} bars)", code, period_label(period), points.len());
+    let png = match render_kline_png(
+        &points,
+        &ChartRenderOptions {
+            title,
+            ..Default::default()
+        },
+    ) {
+        Ok(b) => b,
+        Err(e) => return err_text(format!("渲染失败：{e}")),
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    let summary = format_chart_summary(code, period, &points);
+    let blocks = vec![
+        ToolResultContent::Text { text: summary },
+        ToolResultContent::Image {
+            mime: "image/png".into(),
+            data: b64,
+        },
+    ];
+    (blocks, false)
+}
+
+/// 数值表模式——保留兼容性。返回完整 OHLC JSON。
+fn kline_data_payload(
+    code: &str,
+    period: KlinePeriod,
+    rows: &[kline_cache::KlineRow],
+) -> (Vec<ToolResultContent>, bool) {
+    let klines: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "date": format_iso(&r.date),
+                "open": r.open,
+                "close": r.close,
+                "high": r.high,
+                "low": r.low,
+                "volume": r.volume,
+                "amount": r.amount,
             })
-            .collect();
-        let payload = json!({
+        })
+        .collect();
+    (
+        ok_json(json!({
             "code": code,
             "period": period_label(period),
             "count": klines.len(),
             "klines": klines,
-        });
-        (ok_json(payload), false)
-    }
+        })),
+        false,
+    )
+}
+
+/// 图 + 简表（最近 20 根）。
+fn kline_both_payload(
+    code: &str,
+    period: KlinePeriod,
+    rows: &[kline_cache::KlineRow],
+) -> (Vec<ToolResultContent>, bool) {
+    let (mut chart_blocks, _) = kline_chart_payload(code, period, rows);
+    let tail = rows.iter().rev().take(20).rev();
+    let recent: Vec<Value> = tail
+        .map(|r| {
+            json!({
+                "date": format_iso(&r.date),
+                "open": r.open,
+                "close": r.close,
+                "high": r.high,
+                "low": r.low,
+                "volume": r.volume,
+            })
+        })
+        .collect();
+    let table_block = ToolResultContent::Text {
+        text: format!("最近 20 根 OHLC：\n{}", serde_json::to_string(&recent).unwrap_or_default()),
+    };
+    chart_blocks.push(table_block);
+    (chart_blocks, false)
+}
+
+/// 给 chart 模式生成一段"关键数值"摘要——agent 看图同时拿到精确数字定位。
+fn format_chart_summary(code: &str, period: KlinePeriod, points: &[KlinePoint]) -> String {
+    let first = points.first().unwrap();
+    let last = points.last().unwrap();
+    let close = last.close.value();
+    let range_low = points
+        .iter()
+        .map(|p| p.low.value())
+        .fold(f64::INFINITY, f64::min);
+    let range_high = points
+        .iter()
+        .map(|p| p.high.value())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let ma20 = if points.len() >= 20 {
+        let sum: f64 = points[points.len() - 20..]
+            .iter()
+            .map(|p| p.close.value())
+            .sum();
+        Some(sum / 20.0)
+    } else {
+        None
+    };
+    let change_pct = if first.close.value() > 0.0 {
+        (close - first.close.value()) / first.close.value() * 100.0
+    } else {
+        0.0
+    };
+    let ma20_line = match ma20 {
+        Some(v) => format!("MA20 ¥{:.2}（最新价相对 MA20 {:+.2}%）", v, (close - v) / v * 100.0),
+        None => "MA20 N/A（数据不足 20 根）".into(),
+    };
+    format!(
+        "{} {} {} 根；区间 {} → {}，close ¥{:.2}（区间变化 {:+.2}%）\n\
+         区间高低 ¥{:.2} / ¥{:.2}；{}\n\
+         看图判断趋势 / 形态 / 位置。需要精确数值可调 mode=data。",
+        code,
+        period_label(period),
+        points.len(),
+        first.date.to_compact(),
+        last.date.to_compact(),
+        close,
+        change_pct,
+        range_high,
+        range_low,
+        ma20_line,
+    )
 }
 
 fn format_iso(compact: &str) -> String {

@@ -131,6 +131,80 @@ fn est_text(text: &str) -> usize {
     ascii / 4 + other / 2
 }
 
+/// Anthropic / OpenAI 的 prompt cache TTL 大约 5min~1h（具体看厂商和价位）。
+/// 上次 assistant 消息距今超过这个时长，prompt cache 必定已失效；这时与其原样
+/// 重发带着老 tool_result 的整段历史（白付一次完整 cache miss 的费用），不如
+/// 提前 micro_clear 把易腐工具结果换成 stub——反正这些数据已经过期了。
+///
+/// 触发条件：`last_assistant_at_ms < now_ms - gap_minutes*60_000`
+///
+/// `keep_recent_n` 是从末尾开始保留**不清**的 ToolResult 数（最近调用结果还有用）。
+/// 返回值：实际清掉的 ToolResult 数。
+///
+/// 与 `compact_if_needed::MicroClear` 的区别：
+/// - 那个是**超 soft_limit 才动**、且**保护 keep_last_n*2 条尾窗**；
+/// - 这个是**纯时间触发**、独立于 token 用量、动整个 messages 列表。
+pub fn time_based_micro_clear(
+    messages: &mut [Message],
+    last_assistant_at_ms: Option<i64>,
+    now_ms: i64,
+    gap_minutes: i64,
+    keep_recent_n: usize,
+) -> u32 {
+    let last_at = match last_assistant_at_ms {
+        Some(v) => v,
+        None => return 0, // 没有上次 assistant—不是续聊，跳
+    };
+    let gap_ms = gap_minutes.saturating_mul(60_000);
+    if now_ms - last_at < gap_ms {
+        return 0;
+    }
+    let id_to_name = build_tool_use_id_to_name(messages);
+    // 倒序扫，跳过最后 keep_recent_n 个白名单 tool_result，剩下的清
+    let mut skipped_recent = 0usize;
+    let mut cleared = 0u32;
+    for msg in messages.iter_mut().rev() {
+        for block in msg.content.iter_mut() {
+            if let Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } = block
+            {
+                let tool_name = id_to_name
+                    .get(tool_use_id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if !is_volatile_tool(tool_name) {
+                    continue;
+                }
+                // 已是 stub 跳过
+                if content.len() == 1 {
+                    if let Some(ToolResultContent::Text { text }) = content.first() {
+                        if text.starts_with("[过期工具结果已清理")
+                            || text.starts_with("[interrupted:")
+                            || text.starts_with("[tool result truncated")
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if skipped_recent < keep_recent_n {
+                    skipped_recent += 1;
+                    continue;
+                }
+                let stub_text = format!(
+                    "[过期工具结果已清理 — 距上轮对话 >{} 分钟，prompt cache 已失效，需要最新数据请重新调用 `{}`]",
+                    gap_minutes, tool_name
+                );
+                *content = vec![ToolResultContent::Text { text: stub_text }];
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
 /// 对消息列表压缩到 soft_limit 以下；超 hard_limit 时返回 HardLimit 让调用方停。
 ///
 /// `keep_last_n_turns` 表示尾部要保留的 user/assistant 对数（一对计 2 条消息）。
@@ -501,6 +575,64 @@ mod tests {
                 "stub 不应被二次套层：{text}"
             );
         }
+    }
+
+    #[test]
+    fn time_based_micro_clear_fires_when_gap_exceeded() {
+        // 4 个 get_quote ToolResult。keep_recent_n=1：保留最末 1 条，清前 3 条
+        let big = "x".repeat(2000);
+        let mut msgs = Vec::new();
+        for tag in ["q1", "q2", "q3", "q4"] {
+            msgs.extend(tool_call_pair(tag, "get_quote", &big));
+        }
+        let now_ms = 1_700_000_000_000i64;
+        let last_at = now_ms - 90 * 60_000; // 90 分钟前
+        let cleared = time_based_micro_clear(&mut msgs, Some(last_at), now_ms, 60, 1);
+        assert_eq!(cleared, 3);
+        // 末位的 q4 应仍是原始 big 内容
+        let q4_kept = msgs.iter().any(|m| {
+            m.content.iter().any(|b| matches!(b,
+                Block::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "q4" && content.iter().any(|c| matches!(c, ToolResultContent::Text { text } if text.starts_with("xxx")))
+            ))
+        });
+        assert!(q4_kept, "最末一条 q4 应保留原始内容");
+    }
+
+    #[test]
+    fn time_based_micro_clear_skips_when_gap_short() {
+        let big = "x".repeat(2000);
+        let mut msgs = Vec::new();
+        msgs.extend(tool_call_pair("a", "get_quote", &big));
+        let now_ms = 1_700_000_000_000i64;
+        let last_at = now_ms - 10 * 60_000; // 10 分钟前——不到 gap
+        let cleared = time_based_micro_clear(&mut msgs, Some(last_at), now_ms, 60, 1);
+        assert_eq!(cleared, 0);
+    }
+
+    #[test]
+    fn time_based_micro_clear_skips_non_volatile() {
+        // propose_heuristic 不在白名单——即使时间过了也不清
+        let mut msgs = Vec::new();
+        msgs.extend(tool_call_pair(
+            "h1",
+            "propose_heuristic",
+            "heuristic proposed ok",
+        ));
+        let now_ms = 1_700_000_000_000i64;
+        let last_at = now_ms - 120 * 60_000;
+        let cleared = time_based_micro_clear(&mut msgs, Some(last_at), now_ms, 60, 0);
+        assert_eq!(cleared, 0);
+    }
+
+    #[test]
+    fn time_based_micro_clear_no_last_at() {
+        // 没有 last_assistant_at_ms（新对话）→ 不动
+        let mut msgs = Vec::new();
+        msgs.extend(tool_call_pair("a", "get_quote", "data"));
+        let cleared =
+            time_based_micro_clear(&mut msgs, None, 1_700_000_000_000, 60, 0);
+        assert_eq!(cleared, 0);
     }
 
     #[test]

@@ -4,9 +4,11 @@
 use crate::domain::agent::types::ToolResultContent;
 use crate::domain::quotes::types::KlinePoint;
 use crate::domain::shared::signal::SignalKind;
-use crate::domain::shared::{Lots, OccurredAt, StockCode, TradeDate, Yuan};
-use crate::infrastructure::quotes::cache::kline_cache::{self, Category, KlineRow};
-use crate::infrastructure::quotes::chart_renderer::{render_kline_png, ChartRenderOptions};
+use crate::domain::shared::{OccurredAt, StockCode};
+use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
+use crate::infrastructure::quotes::chart_renderer::{
+    klinerow_to_point, render_kline_png, ChartRenderOptions,
+};
 use crate::infrastructure::quotes::repository::resolve_stock_ts_code;
 use crate::infrastructure::agent::signal_detection_repo;
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
@@ -25,19 +27,6 @@ impl AnalyzeChartTool {
     pub fn new(app: AppHandle) -> Self {
         Self { app }
     }
-}
-
-fn klinerow_to_point(r: &KlineRow) -> Option<KlinePoint> {
-    let date = TradeDate::from_compact(&r.date).ok()?;
-    Some(KlinePoint {
-        date,
-        open: Yuan::from_unchecked(r.open),
-        close: Yuan::from_unchecked(r.close),
-        high: Yuan::from_unchecked(r.high),
-        low: Yuan::from_unchecked(r.low),
-        volume: Lots::from_unchecked(r.volume.unwrap_or(0.0) as i64),
-        amount: Yuan::from_unchecked(r.amount.unwrap_or(0.0)),
-    })
 }
 
 #[async_trait]

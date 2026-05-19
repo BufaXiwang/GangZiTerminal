@@ -136,8 +136,11 @@ pub async fn send_chat_message_now(
     // 命中后只读 boundary-after 切片，工作集很小。
     //
     // exclude 掉本轮刚刚写入的 user_message_id，否则当前提问会在 messages 里出现两次。
-    let (history_messages, boundary_summary) =
-        read_recent_chat_thread(&app, Some(&user_message_id));
+    let crate::pipeline::history::ChatThreadLoad {
+        messages: history_messages,
+        boundary_summary,
+        last_assistant_at_ms,
+    } = read_recent_chat_thread(&app, Some(&user_message_id));
     let positions = read_positions(&app).unwrap_or_default();
     let watchlist = watchlist::list_strings();
     let codes = collect_relevant_codes(&watchlist, &positions);
@@ -200,6 +203,26 @@ pub async fn send_chat_message_now(
         role: Role::User,
         content: user_blocks.clone(),
     });
+
+    // 时间触发 micro_clear——上次 assistant 距今 >60min 时 prompt cache 必定已
+    // 失效，提前把易腐工具结果换成 stub（保留最近 5 条），省一次完整 cache miss。
+    {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cleared = crate::pipeline::agent::context::time_based_micro_clear(
+            &mut messages,
+            last_assistant_at_ms,
+            now_ms,
+            60,
+            5,
+        );
+        if cleared > 0 {
+            tracing::info!(
+                cleared,
+                last_assistant_at_ms = ?last_assistant_at_ms,
+                "time_based_micro_clear: 清理了过期工具结果"
+            );
+        }
+    }
 
     // 解析 chat pipeline 用的 (channel, model)——决定 provider build + tools 里要不要加
     // server-side web_search。
