@@ -113,8 +113,7 @@ impl Tool for GetAccountTool {
     }
 
     fn description(&self) -> &'static str {
-        "获取模拟账户当前快照：现金、市值、已实现盈亏、未实现盈亏、所有 open 持仓明细。\
-        决定开/加/减/平仓前必查，避免凭印象。"
+        "账户快照：现金 / 市值 / PnL / open 持仓。开/平/调仓前必查。"
     }
 
     fn input_schema(&self) -> Value {
@@ -153,15 +152,8 @@ impl Tool for OpenPositionTool {
     }
 
     fn description(&self) -> &'static str {
-        "在模拟账户开新仓（A 股，整数手 = 100 股一手）。入场价由后端按最新实时报价决定，\
-        agent 只提供数量 + 思路 + 可选止损止盈。\
-        \n失败常见原因：涨/跌停（买不进/卖不出）、T+1（当日开仓不可减）、资金不足、\
-        重复开仓（同一 code 已有 open）、code 不存在、盘外（仅交易时段允许开）。\
-        失败会返 is_error=true，请如实告诉用户。\
-        \n**必填**：code（6 位代码或可解析名）、shares（100 的整数倍）、thesis（开仓理由摘要）、\
-        expectation_id（先 `create_expectation` 拿到的预期 id——agent 通过 chat 主动开仓**必须**\
-        关联预期；否则该笔交易无法在 reflection 阶段被复盘）。\
-        \n建议同时提供 stop_loss / take_profit，让账户能在价格突破时给出 reason。"
+        "开仓（A 股 100 股整数倍）。入场价用最新实时报价。agent 主动开仓必须传\
+        expectation_id（先 create_expectation 拿到）。失败原因看 is_error 文本。"
     }
 
     fn input_schema(&self) -> Value {
@@ -262,9 +254,7 @@ impl Tool for ClosePositionTool {
     }
 
     fn description(&self) -> &'static str {
-        "在模拟账户全平一个 open 持仓。需要 position_id（从 get_account 拿）。\
-        \n失败常见原因：T+1（当日开仓不可平）、跌停（卖不出去）、盘外、position_id 不存在。\
-        \nreason 用于复盘归因，填 manual / stop_loss / take_profit / time_stop / invalidated 之一。"
+        "全平 open 持仓。reason 填 manual/stop_loss/take_profit/time_stop/invalidated。"
     }
 
     fn input_schema(&self) -> Value {
@@ -322,11 +312,8 @@ impl Tool for ScalePositionTool {
     }
 
     fn description(&self) -> &'static str {
-        "加仓或减仓一个 open 持仓。shares_delta 正数 = 加仓，负数 = 减仓。\
-        \n加仓后均价按加权平均更新；减仓不动均价。\
-        减仓全清会拒绝——想全清请用 close_position。\
-        \n失败常见原因：T+1（减仓限制）、资金不足（加仓）、整手限制（结果须为 100 倍数）、\
-        涨/跌停、盘外。"
+        "加减仓 open 持仓。shares_delta 正加负减（100 整数倍）。\
+        全清用 close_position（本工具拒绝全清）。加仓后均价加权平均；减仓不动均价。"
     }
 
     fn input_schema(&self) -> Value {
@@ -386,10 +373,7 @@ impl Tool for AdjustStopsTool {
     }
 
     fn description(&self) -> &'static str {
-        "调整 open 持仓的止损 / 止盈 / 时间止损。\
-        每个字段独立可选；不传 = 不改。\
-        time_stop_at_ms 用 Unix ms 时间戳；不传 = 不动时间止损。\
-        允许在盘外调（与 open/close/scale 不同——后者要求交易时段）。"
+        "调止损 / 止盈 / 时间止损。各字段独立可选不传则不改。允许盘外调。"
     }
 
     fn input_schema(&self) -> Value {

@@ -36,10 +36,8 @@ impl Tool for AnalyzeChartTool {
     }
 
     fn description(&self) -> &'static str {
-        "把个股 K 线渲染成 PNG 给你看——用于识别经典形态（双底/头肩顶/突破/旗形/缠绕等）。\
-        返回 image block + 简要元数据。看完后必须调 propose_visual_pattern 把识到的结构落库，\
-        否则 vision 观察不会进入信号链。\
-        参数：code（6 位 A 股代码），period（day/week，默认 day），lookback_days（默认 120）。"
+        "渲染 K 线 PNG 让你识别经典形态（双底 / 头肩 / 突破 / 旗形 / 衰竭）。\
+        看完必须调 propose_visual_pattern 落 signal_detections，否则观察不进信号链。"
     }
 
     fn input_schema(&self) -> Value {
@@ -149,11 +147,9 @@ impl Tool for ProposeVisualPatternTool {
     }
 
     fn description(&self) -> &'static str {
-        "把你从 analyze_chart 看到的形态作为视觉信号落库——会写入 signal_detections，\
-        后续 create_expectation 可在 signals_used 里引用 VisualPatternRead。\
-        参数：code（6 位 A 股），pattern（如 double_bottom / head_and_shoulders_top / breakout / \
-        flag / wedge / exhaustion_top），confidence (0..1)，timeframe（day/week/60m）。\
-        confidence < 0.5 的形态视为不确定，仍可落但下游 strategy 通常忽略。"
+        "把 analyze_chart 识到的形态落 signal_detections。\
+        pattern 枚举：double_bottom / head_and_shoulders_top / breakout / flag / wedge / exhaustion_top。\
+        confidence < 0.5 下游通常忽略。"
     }
 
     fn input_schema(&self) -> Value {

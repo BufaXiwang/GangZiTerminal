@@ -27,8 +27,7 @@ impl Tool for GetPositionTool {
     }
 
     fn description(&self) -> &'static str {
-        "查询模拟持仓的全档案——基础信息（开仓价、止损、止盈、入场逻辑）+ 完整事件链\
-        （opened/reviewed/adjusted/closed 等）。复盘和调仓判断时调用。"
+        "查模拟持仓全档案（基础信息 + 完整事件链）。复盘 / 调仓判断时调。"
     }
 
     fn input_schema(&self) -> Value {

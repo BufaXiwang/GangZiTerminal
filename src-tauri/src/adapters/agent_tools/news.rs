@@ -30,12 +30,8 @@ impl Tool for SearchNewsTool {
     }
 
     fn description(&self) -> &'static str {
-        "本地资讯库 FTS5 全文搜索（标题/摘要/来源）。\
-        覆盖最近 30 天多源（NewsNow / 6 个财经站抽取）；trigram 索引，\
-        毫秒级返回。按相关度（BM25）排序——靠前的更贴查询语义。\
-        \nlimit 默认 5，最大 30——只要 top-N 最相关条目即可，多了徒增 token。\
-        \n建议先用本工具回查历史背景；找不到再考虑 web_search 求外网新信息。\
-        \n例：query='光模块 北向'、'600519 分红'、'央行降准'。"
+        "本地资讯 FTS5 搜索（30 天内多源）。先调本工具；找不到再 web_search。\
+        例：query='光模块 北向' / '600519 分红'。"
     }
 
     fn input_schema(&self) -> Value {

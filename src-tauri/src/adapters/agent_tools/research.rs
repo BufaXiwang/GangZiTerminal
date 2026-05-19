@@ -121,10 +121,8 @@ impl Tool for ScanMarketTool {
     }
 
     fn description(&self) -> &'static str {
-        "扫 A 股全市场榜单——上一交易日盘后落盘的数据，**不是盘中实时**。\
-        判断板块强弱 / 个股异动 / 涨停跌停分布时调。\
-        默认精简模式（rank/code/name/price/change_pct/amount）；需要 pe/pb/turnover_rate 等\
-        量化字段时传 verbose=true。"
+        "扫 A 股榜单（涨停/跌停/涨幅/跌幅/成交额/成交量）。盘后数据非实时。\
+        verbose=true 加 pe/pb/turnover_rate 等量化字段。"
     }
 
     fn input_schema(&self) -> Value {
@@ -188,9 +186,7 @@ impl Tool for GetTopListTool {
     }
 
     fn description(&self) -> &'static str {
-        "龙虎榜——上榜股票的成交额、净买入额、净买率、上榜原因。\
-        判断主力博弈 / 异动诱因时调。trade_date 留空 = 最近一个交易日。\
-        默认返回 top 30（按净买入额排序）。"
+        "龙虎榜——主力成交 / 净买入 / 上榜原因。trade_date 留空 = 最近交易日。"
     }
 
     fn input_schema(&self) -> Value {
@@ -255,8 +251,7 @@ impl Tool for GetMoneyflowTool {
     }
 
     fn description(&self) -> &'static str {
-        "个股资金流向——按单笔规模拆分的小/中/大/特大单净流入。\
-        特大单（>100 万元）通常代表主力 / 机构动向。判断主力是否进出场时调。"
+        "个股资金流（小/中/大/特大单净流入）。特大单（>100 万）通常代表主力动向。"
     }
 
     fn input_schema(&self) -> Value {
@@ -321,9 +316,7 @@ impl Tool for GetConceptPerformanceTool {
     }
 
     fn description(&self) -> &'static str {
-        "概念板块涨幅排行——某交易日各板块平均涨幅 / 成交额 / 成分股数。\
-        判断热点轮动 / 行业贝塔时调。trade_date 留空 = 最近一个交易日。\
-        默认返回涨幅 top 20。"
+        "概念板块涨幅 top 20（含成交额 / 成分股数）。判断热点轮动时调。"
     }
 
     fn input_schema(&self) -> Value {
@@ -384,8 +377,7 @@ impl Tool for GetCompanyEventsTool {
     }
 
     fn description(&self) -> &'static str {
-        "公司事件——未来 N 天内的分红、解禁、财报、股东大会等。\
-        判断短期事件驱动 / 解禁压力 / 财报窗口时调。"
+        "公司事件（未来 N 天的分红 / 解禁 / 财报 / 股东大会）。"
     }
 
     fn input_schema(&self) -> Value {

@@ -61,12 +61,8 @@ impl Tool for CreateExpectationTool {
     }
 
     fn description(&self) -> &'static str {
-        "创建一个 investment expectation——可量化、有时间窗口的押注。\
-        必填：code（A 股 6 位代码），direction（up/down/range_bound），target_price，\
-        horizon_days（交易日，相对当前），reasoning（叙事），signals_used（触发用的结构化信号数组），\
-        conviction（low/medium/high）。\
-        可选：target_price_ceiling（区间预期上沿）、theme（主题 tag）、supersedes_expectation_id（替换上一条）。\
-        返回 expectation_id。后续如要开仓，用此 id 传给 open_position 的 expectation_id 字段。"
+        "创建可量化 expectation——agent 主动开仓前必先调拿 id 传给 open_position。\
+        返回 expectation_id。supersedes_expectation_id 用于替换同方向旧预期。"
     }
 
     fn input_schema(&self) -> Value {
@@ -182,9 +178,8 @@ impl Tool for UpdateExpectationTool {
     }
 
     fn description(&self) -> &'static str {
-        "调整一个 pending expectation 的 target_price / horizon / reasoning。\
-        仅对 state=pending 有效。不能改 direction（要改方向应 cancel 后建新的）。\
-        必填：expectation_id。可选：target_price, target_price_ceiling, horizon_days, reasoning。"
+        "调 pending expectation 的 target / horizon / reasoning。不能改 direction\
+        （要改方向请先 cancel）。"
     }
 
     fn input_schema(&self) -> Value {
@@ -248,8 +243,8 @@ impl Tool for CancelExpectationTool {
     }
 
     fn description(&self) -> &'static str {
-        "主动取消一个 pending expectation——区别于到期 missed/expired。\
-        用于 agent 判断假设已经不成立主动撤。必填：expectation_id, reason。"
+        "主动撤 pending expectation——区别于到期自动 missed/expired。\
+        agent 判断假设已不成立时调。"
     }
 
     fn input_schema(&self) -> Value {

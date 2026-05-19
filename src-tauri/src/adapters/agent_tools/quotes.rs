@@ -77,8 +77,7 @@ impl Tool for GetQuoteTool {
     }
 
     fn description(&self) -> &'static str {
-        "获取 A 股某只股票的实时行情快照（最新价、涨跌幅、成交量、开盘/最高/最低）。\
-        判断当前价位、是否突破压力位、当日异动时调用。"
+        "A 股实时行情快照（价 / 涨跌幅 / 成交量 / OHLC）。"
     }
 
     fn input_schema(&self) -> Value {
@@ -153,11 +152,8 @@ impl Tool for GetKlineTool {
     }
 
     fn description(&self) -> &'static str {
-        "拉个股日/周/月 K 线。默认 **mode=chart**——返回一张渲染好的 K 线 PNG（蜡烛 + \
-        MA20 + 成交量副图，A 股惯例红涨绿跌）给你看，**最适合判断趋势 / 形态 / 位置**，\
-        仅 ~1.5k token。\n\
-        需要精确数值（突破价、止损位、MA20 数字）时传 mode=data 拿 OHLC 表；\
-        mode=both 同时返图 + 简表。本地缓存优先（< 5ms）。"
+        "K 线。默认 mode=chart 返 PNG（蜡烛 + MA20 + 量，红涨绿跌），最适合判断趋势 / 形态。\
+        需要精确数值传 mode=data 拿 OHLC 表；mode=both 两者都返。"
     }
 
     fn input_schema(&self) -> Value {
@@ -402,8 +398,7 @@ impl Tool for GetMarketOverviewTool {
     }
 
     fn description(&self) -> &'static str {
-        "大盘指数（上证、深证、创业板、科创 50）快照。判断风险偏好、行业轮动时调用。\
-        breadth + sectors 字段当前为空（数据源重构中）。"
+        "大盘指数快照（上证 / 深证 / 创业板 / 科创 50）。"
     }
 
     fn input_schema(&self) -> Value {

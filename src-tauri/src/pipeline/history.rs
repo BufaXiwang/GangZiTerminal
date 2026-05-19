@@ -126,7 +126,11 @@ pub struct ChatThreadLoad {
     pub last_assistant_at_ms: Option<i64>,
 }
 
-pub fn read_recent_chat_thread(app: &AppHandle, exclude_id: Option<&str>) -> ChatThreadLoad {
+pub fn read_recent_chat_thread(
+    app: &AppHandle,
+    exclude_id: Option<&str>,
+    window_hours: u32,
+) -> ChatThreadLoad {
     // read_all_chat_messages 按 created_at desc——最新在前；无条数截断。
     let raw = crate::infrastructure::agent::repository::read_all_chat_messages(app, None)
         .unwrap_or_default();
@@ -168,16 +172,32 @@ pub fn read_recent_chat_thread(app: &AppHandle, exclude_id: Option<&str>) -> Cha
         parse_created_at_ms(r)
     });
 
-    // 反序列化 + 反转成正序
+    // 时间窗截止：window_hours 之前的真实对话整条丢，由 boundary_summary 接管。
+    // window_hours=0 等价于"不开窗"（全保留），保留这个语义方便 briefing 等非
+    // chat pipeline 复用本函数时绕过窗口（虽然当前没有，未来扩展用）。
+    let cutoff_ms = if window_hours == 0 {
+        i64::MIN
+    } else {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        now_ms - (window_hours as i64) * 3_600_000
+    };
+
+    // 反序列化 + 内容裁剪 + 反转成正序
     let mut messages: Vec<Message> = slice
         .iter()
         // 跳过非 user/assistant 类行（kind=system / briefing / review / highlight）
-        // 这些不是真实对话，不该塞进 messages
         .filter(|r| {
             let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
             kind == CHAT_KIND_CHAT
         })
+        // 时间窗外整条丢——投资场景里几小时前的数据已经过期，复述等于误导；
+        // 真正的"判断逻辑链"应该已经沉淀到 SQLite (expectations / heuristics / lessons)
+        .filter(|r| match parse_created_at_ms(r) {
+            Some(ms) => ms >= cutoff_ms,
+            None => true, // 没时间戳的兜底保留——别因为 schema 兼容问题误伤
+        })
         .filter_map(|r| row_to_message(r))
+        .filter_map(strip_volatile_blocks)
         .collect();
     messages.reverse();
     ChatThreadLoad {
@@ -185,6 +205,35 @@ pub fn read_recent_chat_thread(app: &AppHandle, exclude_id: Option<&str>) -> Cha
         boundary_summary,
         last_assistant_at_ms,
     }
+}
+
+/// 历史消息的内容裁剪：删 ToolUse / ToolResult / Thinking / RedactedThinking blocks，
+/// 只留 Text + Image。返回 None 表示裁剪后空消息（整条丢，避免 provider 拒收空 content）。
+///
+/// 为什么这么裁：
+/// - **ToolUse / ToolResult**：数据已过期；agent 复述等于误导
+/// - **Thinking / RedactedThinking**：agent 的旧推理，留着会 anchor 当前判断
+///   （"我之前说看涨，现在改主意似乎打脸"——这是 § 2 Bull/Bear Steelman 要治的偏差）
+///
+/// 留下的 Text/Image 保的是"对话连续性 + 用户提问语境"——agent 仍能回应"你刚才说的 X"。
+fn strip_volatile_blocks(msg: Message) -> Option<Message> {
+    let kept: Vec<Block> = msg
+        .content
+        .into_iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Block::Text { .. } | Block::Image { .. }
+            )
+        })
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(Message {
+        role: msg.role,
+        content: kept,
+    })
 }
 
 /// chat_messages 行的 createdAt 字段有两种形态：ISO8601 字符串、ms epoch 数字。
@@ -253,6 +302,53 @@ mod tests {
     use super::*;
     use crate::domain::agent::types::ToolResultContent;
     use serde_json::json;
+
+    #[test]
+    fn strip_volatile_blocks_keeps_text_and_image_drops_rest() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                Block::Text {
+                    text: "结论文本".into(),
+                    cache_control: false,
+                },
+                Block::Thinking {
+                    thinking: "内部推理".into(),
+                    signature: None,
+                },
+                Block::ToolUse {
+                    id: "t1".into(),
+                    name: "get_quote".into(),
+                    input: json!({}),
+                    server_side: false,
+                },
+            ],
+        };
+        let stripped = strip_volatile_blocks(msg).expect("应该有内容残留");
+        assert_eq!(stripped.content.len(), 1);
+        match &stripped.content[0] {
+            Block::Text { text, .. } => assert_eq!(text, "结论文本"),
+            _ => panic!("应只剩 text"),
+        }
+    }
+
+    #[test]
+    fn strip_volatile_blocks_returns_none_for_all_volatile() {
+        // 一条 user 消息只有 tool_result——strip 后空，整条丢
+        let msg = Message {
+            role: Role::User,
+            content: vec![Block::ToolResult {
+                tool_use_id: "t1".into(),
+                content: vec![ToolResultContent::Text {
+                    text: "data".into(),
+                }],
+                is_error: false,
+                server_side: false,
+                cache_control: false,
+            }],
+        };
+        assert!(strip_volatile_blocks(msg).is_none());
+    }
 
     #[test]
     fn row_with_blocks_returns_structured_message() {
