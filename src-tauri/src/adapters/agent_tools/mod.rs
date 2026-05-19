@@ -23,6 +23,7 @@ pub mod news;
 pub mod positions;
 pub mod quotes;
 pub mod research;
+pub mod visual;
 
 /// Chat pipeline 工具注册表——chat / reflection 共用。
 ///
@@ -62,5 +63,8 @@ pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     reg.register(Arc::new(expectations::CreateExpectationTool::new(app.clone())));
     reg.register(Arc::new(expectations::UpdateExpectationTool::new(app.clone())));
     reg.register(Arc::new(expectations::CancelExpectationTool::new(app.clone())));
+    // 视觉——LLM 看 K 线图 → 形态识别 → 落 SignalDetection
+    reg.register(Arc::new(visual::AnalyzeChartTool::new(app.clone())));
+    reg.register(Arc::new(visual::ProposeVisualPatternTool::new(app.clone())));
     reg
 }

@@ -18,7 +18,9 @@
 
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::indicators::IndicatorSnapshot;
-use crate::domain::quotes::types::{KlinePoint, StockQuote};
+use crate::domain::quotes::types::{
+    DailyBasic, KlinePoint, MoneyFlowItem, NorthMoneyFlow, StockQuote, TopListItem,
+};
 
 /// 阈值默认值集合——后续可由 strategy 覆盖。
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +29,16 @@ pub struct DetectorConfig {
     pub rsi_overbought_threshold: f64,
     pub volume_spike_ratio: f32,
     pub volume_shrink_ratio: f32,
+    /// 北向连续净流入 / 流出阈值（默认 3 天）
+    pub north_streak_days: u32,
+    /// PB 触发阈值
+    pub pb_threshold: f32,
+    /// ROE 触发阈值
+    pub roe_threshold_pct: f32,
+    /// 净利润增长率触发阈值
+    pub earnings_growth_threshold_pct: f32,
+    /// 板块涨幅触发阈值
+    pub sector_strength_pct: f32,
 }
 
 impl Default for DetectorConfig {
@@ -36,8 +48,37 @@ impl Default for DetectorConfig {
             rsi_overbought_threshold: 70.0,
             volume_spike_ratio: 1.5,
             volume_shrink_ratio: 0.5,
+            north_streak_days: 3,
+            pb_threshold: 1.0,
+            roe_threshold_pct: 15.0,
+            earnings_growth_threshold_pct: 30.0,
+            sector_strength_pct: 3.0,
         }
     }
+}
+
+/// 扩展数据上下文——调用方按需预先 fetch；检测函数纯。
+///
+/// 凡是字段 None 的，对应 detector 自动跳过——这让 scan_tick 可以在不同 budget
+/// 下按 tier 注入不同数据量（quick tick 只带 quote/klines；full tick 带全套）。
+#[derive(Debug, Clone, Default)]
+pub struct ScanContext<'a> {
+    /// 最新 daily_basic（含 PE / PB / 市值）
+    pub fundamentals: Option<&'a DailyBasic>,
+    /// 北向资金近 N 日序列（升序）
+    pub north_flow: Option<&'a [NorthMoneyFlow]>,
+    /// 今日龙虎榜——若该 code 在列表里则触发 OnDragonTigerList
+    pub dragon_tiger_today: Option<&'a [TopListItem]>,
+    /// 个股资金流（用于判断 VolumePriceDivergence 的另一种口径）
+    pub moneyflow: Option<&'a [MoneyFlowItem]>,
+    /// 所在板块今日涨幅（%）
+    pub sector_pct_change_today: Option<f64>,
+    /// 净利润 YoY 增速（%）
+    pub earnings_growth_yoy_pct: Option<f64>,
+    /// 最新 ROE（%）
+    pub roe_pct: Option<f64>,
+    /// 即将到来的事件——(EventKind, days_ahead)，days_ahead<=7 视为 upcoming
+    pub upcoming_events: Option<&'a [(crate::domain::shared::signal::EventKind, u32)]>,
 }
 
 /// 单股扫描入口——返回触发的所有 SignalKind。
@@ -52,13 +93,28 @@ pub fn scan_one(
     quote: Option<&StockQuote>,
     cfg: &DetectorConfig,
 ) -> Vec<SignalKind> {
+    scan_one_with_context(klines, snap, prev_snap, quote, cfg, &ScanContext::default())
+}
+
+/// 带上下文的扫描——上下文中存在的字段会被对应 detector 消费。
+pub fn scan_one_with_context(
+    klines: &[KlinePoint],
+    snap: &IndicatorSnapshot,
+    prev_snap: Option<&IndicatorSnapshot>,
+    quote: Option<&StockQuote>,
+    cfg: &DetectorConfig,
+    ctx: &ScanContext<'_>,
+) -> Vec<SignalKind> {
     let mut out = Vec::new();
     detect_trend_momentum(klines, snap, prev_snap, &mut out);
     detect_oscillator(snap, cfg, &mut out);
-    detect_volume(snap, cfg, &mut out);
+    detect_volume(snap, prev_snap, cfg, &mut out);
     if let Some(q) = quote {
         detect_a_share_special(q, &mut out);
     }
+    detect_capital_flow(quote, ctx, cfg, &mut out);
+    detect_fundamentals(ctx, cfg, &mut out);
+    detect_sector_and_events(ctx, cfg, &mut out);
     out
 }
 
@@ -148,9 +204,14 @@ fn detect_oscillator(
     }
 }
 
-// ====== 量能（2/3 个 detector） =========================================
+// ====== 量能（3 个 detector） ===========================================
 
-fn detect_volume(snap: &IndicatorSnapshot, cfg: &DetectorConfig, out: &mut Vec<SignalKind>) {
+fn detect_volume(
+    snap: &IndicatorSnapshot,
+    prev: Option<&IndicatorSnapshot>,
+    cfg: &DetectorConfig,
+    out: &mut Vec<SignalKind>,
+) {
     if let Some(ratio) = snap.volume_ratio {
         if (ratio as f32) >= cfg.volume_spike_ratio {
             out.push(SignalKind::VolumeSpike {
@@ -162,7 +223,18 @@ fn detect_volume(snap: &IndicatorSnapshot, cfg: &DetectorConfig, out: &mut Vec<S
             });
         }
     }
-    // VolumePriceDivergence：W23 接 scan_tick 时按需基于 OBV 序列实现
+    // 量价背离：今日 close > 昨日，但 OBV 下降（或反之）。需要 prev 才能比较趋势。
+    if let (Some(prev), Some(obv_now), Some(obv_prev)) = (
+        prev,
+        snap.obv,
+        prev.and_then(|p| p.obv),
+    ) {
+        let price_up = snap.close.value() > prev.close.value();
+        let obv_up = obv_now > obv_prev;
+        if price_up != obv_up {
+            out.push(SignalKind::VolumePriceDivergence);
+        }
+    }
 }
 
 // ====== A 股特殊（3 个 detector） =======================================
@@ -191,12 +263,105 @@ fn detect_a_share_special(quote: &StockQuote, out: &mut Vec<SignalKind>) {
     }
 }
 
+// ====== 资金 / 主力（3 个 detector） =====================================
+
+fn detect_capital_flow(
+    quote: Option<&StockQuote>,
+    ctx: &ScanContext<'_>,
+    cfg: &DetectorConfig,
+    out: &mut Vec<SignalKind>,
+) {
+    if let Some(series) = ctx.north_flow {
+        let need = cfg.north_streak_days as usize;
+        if series.len() >= need {
+            let tail = &series[series.len() - need..];
+            let all_in = tail.iter().all(|n| n.total.value() > 0.0);
+            let all_out = tail.iter().all(|n| n.total.value() < 0.0);
+            if all_in {
+                out.push(SignalKind::NorthInflowStreak {
+                    days: cfg.north_streak_days,
+                });
+            } else if all_out {
+                out.push(SignalKind::NorthOutflowStreak {
+                    days: cfg.north_streak_days,
+                });
+            }
+        }
+    }
+    if let (Some(q), Some(list)) = (quote, ctx.dragon_tiger_today) {
+        if list.iter().any(|item| item.code == q.code) {
+            out.push(SignalKind::OnDragonTigerList);
+        }
+    }
+}
+
+// ====== 基本面因子（4 个 detector） ======================================
+
+fn detect_fundamentals(ctx: &ScanContext<'_>, cfg: &DetectorConfig, out: &mut Vec<SignalKind>) {
+    if let Some(fund) = ctx.fundamentals {
+        if let Some(pb) = fund.pb {
+            if (pb as f32) <= cfg.pb_threshold {
+                out.push(SignalKind::PBBelowThreshold {
+                    value: cfg.pb_threshold,
+                });
+            }
+        }
+        // PEBelowSectorPct：需要"PE 在板块内的百分位"——板块 PE 序列没装。
+        // 现阶段降级：若 PE 在 [0, 15] 视为偏低 1 分位（占位 pct=20）。
+        if let Some(pe) = fund.pe_ttm.or(fund.pe) {
+            if pe > 0.0 && pe <= 15.0 {
+                out.push(SignalKind::PEBelowSectorPct { pct: 20.0 });
+            }
+        }
+    }
+    if let Some(roe) = ctx.roe_pct {
+        if (roe as f32) >= cfg.roe_threshold_pct {
+            out.push(SignalKind::ROEAboveThreshold {
+                pct: cfg.roe_threshold_pct,
+            });
+        }
+    }
+    if let Some(g) = ctx.earnings_growth_yoy_pct {
+        if (g as f32) >= cfg.earnings_growth_threshold_pct {
+            out.push(SignalKind::EarningsGrowthAbove {
+                pct: cfg.earnings_growth_threshold_pct,
+            });
+        }
+    }
+}
+
+// ====== 板块 / 事件（2 个 detector） =====================================
+
+fn detect_sector_and_events(
+    ctx: &ScanContext<'_>,
+    cfg: &DetectorConfig,
+    out: &mut Vec<SignalKind>,
+) {
+    if let Some(pct) = ctx.sector_pct_change_today {
+        if (pct as f32) >= cfg.sector_strength_pct {
+            out.push(SignalKind::SectorStrengthAbove {
+                pct: cfg.sector_strength_pct,
+            });
+        }
+    }
+    if let Some(events) = ctx.upcoming_events {
+        for (kind, days_ahead) in events {
+            if *days_ahead <= 7 {
+                out.push(SignalKind::UpcomingEvent {
+                    event_kind: *kind,
+                    days_ahead: *days_ahead,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::quotes::indicators::{compute_indicators, IndicatorConfig};
-    use crate::domain::quotes::types::KlinePoint;
-    use crate::domain::shared::{Lots, TradeDate, Yuan};
+    use crate::domain::quotes::types::{DailyBasic, KlinePoint, NorthMoneyFlow, TopListItem};
+    use crate::domain::shared::{Lots, StockCode, TradeDate, Yuan};
 
     fn synthetic_kline(close: f64, volume: i64, date: i32) -> KlinePoint {
         KlinePoint {
@@ -232,10 +397,105 @@ mod tests {
         klines.last_mut().unwrap().volume = Lots::from_unchecked(50_000);
         let snap = compute_indicators(&klines, &IndicatorConfig::default()).unwrap();
         let mut out = Vec::new();
-        detect_volume(&snap, &DetectorConfig::default(), &mut out);
+        detect_volume(&snap, None, &DetectorConfig::default(), &mut out);
         assert!(matches!(
             out.first(),
             Some(SignalKind::VolumeSpike { .. })
         ));
+    }
+
+    #[test]
+    fn detect_north_inflow_streak() {
+        let series: Vec<NorthMoneyFlow> = (0..3)
+            .map(|i| NorthMoneyFlow {
+                trade_date: TradeDate::from_unchecked(20260101 + i),
+                sh_north: Yuan::from_unchecked(1.0),
+                sz_north: Yuan::from_unchecked(1.0),
+                total: Yuan::from_unchecked(2.0),
+            })
+            .collect();
+        let ctx = ScanContext {
+            north_flow: Some(&series),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        detect_capital_flow(None, &ctx, &DetectorConfig::default(), &mut out);
+        assert!(matches!(
+            out.first(),
+            Some(SignalKind::NorthInflowStreak { .. })
+        ));
+    }
+
+    #[test]
+    fn detect_pb_below_threshold() {
+        let fund = DailyBasic {
+            code: StockCode::new("600000").unwrap(),
+            trade_date: TradeDate::from_unchecked(20260101),
+            pe: Some(20.0),
+            pe_ttm: Some(20.0),
+            pb: Some(0.8),
+            ps: None,
+            ps_ttm: None,
+            dv_ratio: None,
+            dv_ttm: None,
+            turnover_rate: 1.0,
+            turnover_rate_float: None,
+            volume_ratio: 1.0,
+            total_mv: Yuan::from_unchecked(0.0),
+            circ_mv: Yuan::from_unchecked(0.0),
+        };
+        let ctx = ScanContext {
+            fundamentals: Some(&fund),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        detect_fundamentals(&ctx, &DetectorConfig::default(), &mut out);
+        assert!(out.iter().any(|s| matches!(s, SignalKind::PBBelowThreshold { .. })));
+    }
+
+    #[test]
+    fn detect_dragon_tiger() {
+        use crate::domain::quotes::types::StockQuote;
+        use crate::domain::shared::OccurredAt;
+        let code = StockCode::new("600519").unwrap();
+        let quote = StockQuote {
+            code: code.clone(),
+            name: "test".into(),
+            price: Some(Yuan::from_unchecked(100.0)),
+            change_percent: None,
+            change: None,
+            open: None,
+            high: None,
+            low: None,
+            previous_close: None,
+            day_volume: None,
+            day_amount: None,
+            captured_at: OccurredAt::new(0),
+            bid_levels: vec![],
+            ask_levels: vec![],
+            buy_volume: None,
+            sell_volume: None,
+            order_imbalance: None,
+        };
+        let item = TopListItem {
+            trade_date: TradeDate::from_unchecked(20260101),
+            code: code.clone(),
+            name: "test".into(),
+            close: None,
+            pct_change: None,
+            turnover_rate: None,
+            amount: None,
+            net_amount: None,
+            net_rate: None,
+            reason: String::new(),
+        };
+        let list = vec![item];
+        let ctx = ScanContext {
+            dragon_tiger_today: Some(&list),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        detect_capital_flow(Some(&quote), &ctx, &DetectorConfig::default(), &mut out);
+        assert!(out.contains(&SignalKind::OnDragonTigerList));
     }
 }

@@ -35,3 +35,6 @@ regex = "1.10"
 # Rust 端口参考：https://github.com/mootdx/mootdx-rust
 byteorder = "1.5"
 flate2 = "1.0"
+# K 线渲染——为 analyze_chart 工具生成 PNG 给 LLM vision 看
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "candlestick"] }
+png = "0.17"
