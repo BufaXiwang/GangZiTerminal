@@ -18,6 +18,7 @@ use tauri::AppHandle;
 use crate::pipeline::agent::tools::ToolRegistry;
 
 pub mod account;
+pub mod compact;
 pub mod delegate;
 pub mod expectations;
 pub mod news;
@@ -69,5 +70,7 @@ pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     reg.register(Arc::new(visual::ProposeVisualPatternTool::new(app.clone())));
     // Sub agent 派遣——researcher 调研 / bear_advocate 反方
     reg.register(Arc::new(delegate::DelegateTool::new(app.clone())));
+    // Context 自管——主动压缩历史释放 token
+    reg.register(Arc::new(compact::CompactNowTool::new(app.clone())));
     reg
 }

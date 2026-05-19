@@ -223,6 +223,33 @@ pub async fn send_chat_message_now(
         }
     }
 
+    // Context 自感知：算当前 token 估算 + 给 agent 看的余量提示。
+    // 把它附加到 messages[0]（dynamic context user 消息）末尾——本来就是每次重建的
+    // 非 cache 段，不破坏 system block 的 cache prefix。
+    // agent 看到接近 soft 上限时，可主动调 compact_now(reason) 释放空间。
+    {
+        let est = crate::pipeline::agent::context::estimate_tokens(&messages);
+        let soft = cfg.agent.context_soft_limit_tokens;
+        let hard = cfg.agent.context_hard_limit_tokens;
+        let pct = if hard > 0 { est * 100 / hard } else { 0 };
+        let level = if est >= soft {
+            "⚠️ 已超 soft 阈值，强烈建议本轮结束前调 compact_now"
+        } else if est * 100 >= soft * 80 {
+            "⚡ 接近 soft 阈值，可考虑调 compact_now 给后续 turn 腾空间"
+        } else {
+            "ok"
+        };
+        let note = format!(
+            "\n\n---\n[Context 状态] 估算 ~{est} token / soft={soft} / hard={hard}（{pct}% of hard）· {level}"
+        );
+        // append 到 messages[0] 的 text block
+        if let Some(first) = messages.first_mut() {
+            if let Some(Block::Text { text, .. }) = first.content.first_mut() {
+                text.push_str(&note);
+            }
+        }
+    }
+
     // 解析 chat pipeline 用的 (channel, model)。
     let (chat_channel_ref, chat_model_ref) =
         cfg.resolve_pipeline(PipelineKind::Chat).map_err(|e| e)?;

@@ -115,6 +115,9 @@ pub async fn run_agent(
     // Summarize tier 熔断计数——本 run 内连续失败次数。成功则归零。
     let mut summarize_consecutive_failures: u32 = 0;
     let mut summarize_burned_out: bool = false;
+    // agent 调 compact_now 工具后，下一轮 turn 强制跑 Summarize（无视 trigger_threshold）。
+    // 每跑一次 Summarize 后归位为 false。让 agent 主动管 context。
+    let mut force_summarize_next_turn: bool = false;
     let mut summary = RunSummary {
         run_id: run_id.clone(),
         turns: 0,
@@ -195,7 +198,11 @@ pub async fn run_agent(
         if let Some(sum_cfg) = summarize.as_ref() {
             if !summarize_burned_out {
                 let est = estimate_tokens(&req.messages);
-                if est > sum_cfg.trigger_threshold_tokens {
+                let should_summarize =
+                    force_summarize_next_turn || est > sum_cfg.trigger_threshold_tokens;
+                // 拿到判定后立刻 reset flag——本轮要么跑要么放弃，下轮不再强制
+                force_summarize_next_turn = false;
+                if should_summarize {
                     let messages_for_summary = std::mem::take(&mut req.messages);
                     // 摘要 provider：sum_cfg 给了就用专用渠道；没给复用主 provider
                     let summary_provider = sum_cfg.provider.as_ref().unwrap_or(&provider);
@@ -314,6 +321,16 @@ pub async fn run_agent(
 
         // 找出需要本地执行的 ToolUse
         let local_tool_uses = collect_local_tool_uses(&assistant_message);
+
+        // agent 调了 compact_now → 下一轮 turn 强制 Summarize（无视阈值）
+        if local_tool_uses.iter().any(|u| u.name == "compact_now") {
+            force_summarize_next_turn = true;
+            tracing::info!(
+                run_id = %run_id,
+                "agent 调 compact_now——下一轮 turn 强制 Summarize"
+            );
+        }
+
         // 顺带统计 server-side 工具调用次数（每个 server_side ToolUse 算一次）
         let server_tool_calls_this_turn = assistant_message
             .content
