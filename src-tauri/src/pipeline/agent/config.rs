@@ -197,13 +197,6 @@ pub struct AgentRuntimeConfig {
     pub context_summarize_threshold: u32,
     #[serde(default = "default_summarize_max_failures")]
     pub summarize_max_consecutive_failures: u32,
-    /// chat history 加载的时间窗（小时）。窗外的真实对话整条丢，由
-    /// boundary_summary 接管；窗内消息也会 strip 掉 tool_use/tool_result/thinking
-    /// blocks，只留 user/assistant 的 text + image。投资场景里"过期数据复述"
-    /// 是真正的 token 大头，**不是判断逻辑链**——丢掉这些反而能破 anchor bias，
-    /// 让 agent 每轮基于当前数据重新判断。
-    #[serde(default = "default_chat_history_window_hours")]
-    pub chat_history_window_hours: u32,
 }
 
 fn default_tool_timeout_secs() -> u32 {
@@ -217,9 +210,6 @@ fn default_summarize_max_failures() -> u32 {
 }
 fn default_thinking_budget() -> u32 {
     4_000
-}
-fn default_chat_history_window_hours() -> u32 {
-    3
 }
 
 impl Default for AgentRuntimeConfig {
@@ -235,7 +225,6 @@ impl Default for AgentRuntimeConfig {
             tool_timeout_secs: default_tool_timeout_secs(),
             context_summarize_threshold: default_summarize_threshold(),
             summarize_max_consecutive_failures: default_summarize_max_failures(),
-            chat_history_window_hours: default_chat_history_window_hours(),
         }
     }
 }

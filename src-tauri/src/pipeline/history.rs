@@ -12,9 +12,16 @@
 //!
 //! 这层 helper 是 chat pipeline 唯一从 DB 反序列化历史的入口。
 
-use crate::domain::agent::types::{Block, Message, Role};
+use crate::domain::agent::types::{Block, Message, Role, ToolResultContent};
 use serde_json::{json, Value};
 use tauri::AppHandle;
+
+/// History 加载时把 ToolResult 内容替换成的 stub 文本。
+///
+/// 30 token 占位文本——告诉 agent"这是过期数据，要新结果重新调用"。保留
+/// ToolResult 结构（id / is_error）保证 tool_use ↔ tool_result 配对完整。
+const HISTORY_TOOL_RESULT_STUB: &str =
+    "[历史工具结果已清理 — 数据过期，需要新数据请重新调用对应工具]";
 
 /// chat_messages 行里允许的 kind——和 DB schema CHECK 约束保持一致。
 /// 当前 history 只显式 match 'chat' 和 'compact_boundary'；其他 kind 在 DB schema
@@ -126,11 +133,7 @@ pub struct ChatThreadLoad {
     pub last_assistant_at_ms: Option<i64>,
 }
 
-pub fn read_recent_chat_thread(
-    app: &AppHandle,
-    exclude_id: Option<&str>,
-    window_hours: u32,
-) -> ChatThreadLoad {
+pub fn read_recent_chat_thread(app: &AppHandle, exclude_id: Option<&str>) -> ChatThreadLoad {
     // read_all_chat_messages 按 created_at desc——最新在前；无条数截断。
     let raw = crate::infrastructure::agent::repository::read_all_chat_messages(app, None)
         .unwrap_or_default();
@@ -161,7 +164,8 @@ pub fn read_recent_chat_thread(
         }
     };
 
-    // boundary 后最近一条 assistant 消息的时间戳——desc 顺序里第一条 role=assistant
+    // boundary 后最近一条 assistant 消息的时间戳——desc 顺序里第一条 role=assistant。
+    // 给 time_based_micro_clear 配合用（隔几小时再问时清易腐工具白名单结果）。
     let last_assistant_at_ms = slice.iter().find_map(|r| {
         if r.get("kind").and_then(Value::as_str) != Some(CHAT_KIND_CHAT) {
             return None;
@@ -172,29 +176,15 @@ pub fn read_recent_chat_thread(
         parse_created_at_ms(r)
     });
 
-    // 时间窗截止：window_hours 之前的真实对话整条丢，由 boundary_summary 接管。
-    // window_hours=0 等价于"不开窗"（全保留），保留这个语义方便 briefing 等非
-    // chat pipeline 复用本函数时绕过窗口（虽然当前没有，未来扩展用）。
-    let cutoff_ms = if window_hours == 0 {
-        i64::MIN
-    } else {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        now_ms - (window_hours as i64) * 3_600_000
-    };
-
-    // 反序列化 + 内容裁剪 + 反转成正序
+    // 不开时间窗——boundary 之后的真实对话全加载。strip_volatile_blocks 把
+    // ToolResult 内容换 stub（30 token/个），单条消息已经够小；进入 run_agent 后
+    // compact_if_needed 三级压缩 + reactive 兜底接管极端情况。
     let mut messages: Vec<Message> = slice
         .iter()
         // 跳过非 user/assistant 类行（kind=system / briefing / review / highlight）
         .filter(|r| {
             let kind = r.get("kind").and_then(Value::as_str).unwrap_or("");
             kind == CHAT_KIND_CHAT
-        })
-        // 时间窗外整条丢——投资场景里几小时前的数据已经过期，复述等于误导；
-        // 真正的"判断逻辑链"应该已经沉淀到 SQLite (expectations / heuristics / lessons)
-        .filter(|r| match parse_created_at_ms(r) {
-            Some(ms) => ms >= cutoff_ms,
-            None => true, // 没时间戳的兜底保留——别因为 schema 兼容问题误伤
         })
         .filter_map(|r| row_to_message(r))
         .filter_map(strip_volatile_blocks)
@@ -207,24 +197,52 @@ pub fn read_recent_chat_thread(
     }
 }
 
-/// 历史消息的内容裁剪：删 ToolUse / ToolResult / Thinking / RedactedThinking blocks，
-/// 只留 Text + Image。返回 None 表示裁剪后空消息（整条丢，避免 provider 拒收空 content）。
+/// 历史消息的内容裁剪：
 ///
-/// 为什么这么裁：
-/// - **ToolUse / ToolResult**：数据已过期；agent 复述等于误导
-/// - **Thinking / RedactedThinking**：agent 的旧推理，留着会 anchor 当前判断
-///   （"我之前说看涨，现在改主意似乎打脸"——这是 § 2 Bull/Bear Steelman 要治的偏差）
+/// - **Text / Image**：保留——对话语境 + 用户提问
+/// - **ToolUse**：**保留**——决策路径记录（"agent 当时调过哪些工具"）。token 占用极小
+///   （~50/个），但让 agent 能感知自己做过什么动作，避免重复调
+/// - **ToolResult**：**结构保留 + 内容换 stub**——数据已过期，但配对必须留全
+///   （tool_use ↔ tool_result 缺一会 protocol 拒），stub 文本告诉 agent
+///   "要新数据请重调"
+/// - **Thinking / RedactedThinking**：删——agent 旧推理留着会 anchor 当前判断
+///   （§ 2 Bull/Bear Steelman 要治的偏差），让 agent 每轮重新审视
 ///
-/// 留下的 Text/Image 保的是"对话连续性 + 用户提问语境"——agent 仍能回应"你刚才说的 X"。
+/// 返回 None 表示裁剪后空消息（整条丢，避免 provider 拒收空 content）。
 fn strip_volatile_blocks(msg: Message) -> Option<Message> {
     let kept: Vec<Block> = msg
         .content
         .into_iter()
-        .filter(|b| {
-            matches!(
-                b,
-                Block::Text { .. } | Block::Image { .. }
-            )
+        .filter_map(|b| match b {
+            Block::Text { .. } | Block::Image { .. } | Block::ToolUse { .. } => Some(b),
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                server_side,
+                cache_control,
+            } => {
+                // 已经是 stub（来自 MicroClear 或之前的 strip）→ 原样保留，幂等
+                let already_stub = content.len() == 1
+                    && matches!(content.first(), Some(ToolResultContent::Text { text })
+                        if text.starts_with("[历史工具结果已清理")
+                            || text.starts_with("[过期工具结果已清理"));
+                let new_content = if already_stub {
+                    content
+                } else {
+                    vec![ToolResultContent::Text {
+                        text: HISTORY_TOOL_RESULT_STUB.into(),
+                    }]
+                };
+                Some(Block::ToolResult {
+                    tool_use_id,
+                    content: new_content,
+                    is_error,
+                    server_side,
+                    cache_control,
+                })
+            }
+            Block::Thinking { .. } | Block::RedactedThinking { .. } => None,
         })
         .collect();
     if kept.is_empty() {
@@ -304,47 +322,110 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn strip_volatile_blocks_keeps_text_and_image_drops_rest() {
+    fn strip_volatile_keeps_text_image_tool_use_drops_thinking() {
+        // 完整的 assistant 消息：text + thinking + tool_use
         let msg = Message {
             role: Role::Assistant,
             content: vec![
                 Block::Text {
-                    text: "结论文本".into(),
+                    text: "茅台 ¥1520，趋势上行".into(),
                     cache_control: false,
                 },
                 Block::Thinking {
-                    thinking: "内部推理".into(),
+                    thinking: "我先看 K 线再做判断".into(),
                     signature: None,
                 },
                 Block::ToolUse {
-                    id: "t1".into(),
-                    name: "get_quote".into(),
-                    input: json!({}),
+                    id: "toolu_1".into(),
+                    name: "get_kline".into(),
+                    input: json!({"code": "600519"}),
                     server_side: false,
                 },
             ],
         };
         let stripped = strip_volatile_blocks(msg).expect("应该有内容残留");
-        assert_eq!(stripped.content.len(), 1);
-        match &stripped.content[0] {
-            Block::Text { text, .. } => assert_eq!(text, "结论文本"),
-            _ => panic!("应只剩 text"),
-        }
+        // 保留 text + tool_use；删 thinking
+        assert_eq!(stripped.content.len(), 2);
+        let has_text = stripped.content.iter().any(|b| matches!(b, Block::Text { text, .. } if text == "茅台 ¥1520，趋势上行"));
+        let has_tool_use = stripped.content.iter().any(|b| matches!(b, Block::ToolUse { name, .. } if name == "get_kline"));
+        let has_thinking = stripped.content.iter().any(|b| matches!(b, Block::Thinking { .. }));
+        assert!(has_text, "text 应保留");
+        assert!(has_tool_use, "tool_use 应保留（决策路径）");
+        assert!(!has_thinking, "thinking 应删（旧推理 anchor）");
     }
 
     #[test]
-    fn strip_volatile_blocks_returns_none_for_all_volatile() {
-        // 一条 user 消息只有 tool_result——strip 后空，整条丢
+    fn strip_volatile_replaces_tool_result_with_stub() {
+        // 一条 user 消息只有 tool_result（大块原始数据）——结构保留，内容换 stub
         let msg = Message {
             role: Role::User,
             content: vec![Block::ToolResult {
-                tool_use_id: "t1".into(),
+                tool_use_id: "toolu_1".into(),
                 content: vec![ToolResultContent::Text {
-                    text: "data".into(),
+                    text: "{\"code\":\"600519\",\"price\":1520.0, ...10k token JSON...}".into(),
                 }],
                 is_error: false,
                 server_side: false,
                 cache_control: false,
+            }],
+        };
+        let stripped = strip_volatile_blocks(msg).expect("整条不应被丢——结构保留");
+        match &stripped.content[0] {
+            Block::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_1", "id 必须保留以维持配对");
+                match &content[0] {
+                    ToolResultContent::Text { text } => {
+                        assert!(
+                            text.starts_with("[历史工具结果已清理"),
+                            "内容应被替换成 stub，实际：{text:.60}"
+                        );
+                    }
+                    _ => panic!("应为 text stub"),
+                }
+            }
+            _ => panic!("应仍是 tool_result"),
+        }
+    }
+
+    #[test]
+    fn strip_volatile_idempotent_on_existing_stubs() {
+        // 已经是 stub 的 tool_result 再 strip 一次不应套层
+        let msg = Message {
+            role: Role::User,
+            content: vec![Block::ToolResult {
+                tool_use_id: "toolu_a".into(),
+                content: vec![ToolResultContent::Text {
+                    text: "[过期工具结果已清理 — 需要最新数据请重新调用 `get_quote`]".into(),
+                }],
+                is_error: false,
+                server_side: false,
+                cache_control: false,
+            }],
+        };
+        let stripped = strip_volatile_blocks(msg).expect("应保留");
+        if let Block::ToolResult { content, .. } = &stripped.content[0] {
+            if let ToolResultContent::Text { text } = &content[0] {
+                // 不该出现"[历史工具结果已清理][过期工具结果已清理"嵌套
+                assert!(
+                    !text.contains("[历史工具结果已清理"),
+                    "已 stub 应原样保留，不套新 stub: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_volatile_returns_none_for_thinking_only_msg() {
+        // 只有 thinking 的消息（罕见）——strip 后空，整条丢
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![Block::Thinking {
+                thinking: "只是想想".into(),
+                signature: None,
             }],
         };
         assert!(strip_volatile_blocks(msg).is_none());

@@ -139,11 +139,7 @@ pub async fn send_chat_message_now(
         messages: history_messages,
         boundary_summary,
         last_assistant_at_ms,
-    } = read_recent_chat_thread(
-        &app,
-        Some(&user_message_id),
-        cfg.agent.chat_history_window_hours,
-    );
+    } = read_recent_chat_thread(&app, Some(&user_message_id));
     let positions = read_positions(&app).unwrap_or_default();
     let watchlist = watchlist::list_strings();
     let codes = collect_relevant_codes(&watchlist, &positions);
