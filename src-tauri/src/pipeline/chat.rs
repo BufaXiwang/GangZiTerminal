@@ -30,9 +30,7 @@ use crate::pipeline::history::{
     build_assistant_content_json, build_compact_boundary_row, build_user_content_json,
     read_recent_chat_thread,
 };
-use crate::pipeline::context::{
-    collect_relevant_codes, read_position_events_for_open, read_positions,
-};
+use crate::pipeline::context::{collect_relevant_codes, read_positions};
 use crate::pipeline::events::emit_status;
 use crate::pipeline::market::overview::fetch_market_overview;
 use crate::pipeline::quotes_fetch::fetch_quotes_with_visibility;
@@ -141,7 +139,6 @@ pub async fn send_chat_message_now(
     let (history_messages, boundary_summary) =
         read_recent_chat_thread(&app, Some(&user_message_id));
     let positions = read_positions(&app).unwrap_or_default();
-    let position_events = read_position_events_for_open(&app, &positions);
     let watchlist = watchlist::list_strings();
     let codes = collect_relevant_codes(&watchlist, &positions);
     let quotes_status = fetch_quotes_with_visibility(&app, "chat", codes).await;
@@ -155,14 +152,14 @@ pub async fn send_chat_message_now(
     // 当前 active heuristics（按 confidence + regime 过滤）+ 当前 regime
     let current_regime = crate::infrastructure::quotes::regime_detector_service::current(&app);
     let heuristics =
-        crate::infrastructure::agent::heuristic_repo::list_for_prompt(&app, current_regime, 25)
+        crate::infrastructure::agent::heuristic_repo::list_for_prompt(&app, current_regime, 15)
             .unwrap_or_default();
 
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
         market_overview: market.as_ref(),
         simulated_positions: &positions,
-        position_events: &position_events,
+        live_quotes: &quotes_status.quotes,
         active_expectations: &active_expectations,
         quotes_availability: quotes_availability.as_deref(),
     });

@@ -12,12 +12,12 @@
 
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::agent::types::ToolResultContent;
-use crate::domain::quotes::ScanFilter;
+use crate::domain::quotes::{ScanFilter, ScanItem, ScanResult};
 use crate::domain::shared::{StockCode, TradeDate};
 use crate::infrastructure::quotes::scanner;
 use crate::infrastructure::quotes::tushare::{calendar, concept, events, flow};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tauri::AppHandle;
 
 // ===== 共用 helpers =======================================================
@@ -37,6 +37,55 @@ fn parse_optional_trade_date(s: Option<&str>) -> Result<Option<TradeDate>, Strin
             }
         }
     }
+}
+
+/// 把 ScanItem 序列化成给 agent 看的精简 JSON。
+///
+/// 默认 6 个字段：rank/code/name/price/change_pct/amount——真人扫榜决策需要的核心。
+/// verbose=true 时补全 turnover_rate/volume_ratio/pe/pb/total_mv（量化筛选用）。
+/// None 字段一律 skip，减少 `"pe": null` 这种纯噪声。
+fn compact_scan_item(item: &ScanItem, verbose: bool) -> Value {
+    let mut m = Map::new();
+    m.insert("rank".into(), json!(item.rank));
+    m.insert("code".into(), json!(item.code.as_str()));
+    m.insert("name".into(), json!(item.name));
+    if let Some(p) = item.price.as_ref() {
+        m.insert("price".into(), json!(p.value()));
+    }
+    if let Some(c) = item.change_pct {
+        m.insert("change_pct".into(), json!(c));
+    }
+    if let Some(a) = item.amount.as_ref() {
+        m.insert("amount".into(), json!(a.value()));
+    }
+    if verbose {
+        if let Some(v) = item.volume.as_ref() {
+            m.insert("volume".into(), json!(v.value()));
+        }
+        if let Some(t) = item.turnover_rate {
+            m.insert("turnover_rate".into(), json!(t));
+        }
+        if let Some(vr) = item.volume_ratio {
+            m.insert("volume_ratio".into(), json!(vr));
+        }
+        if let Some(pe) = item.pe {
+            m.insert("pe".into(), json!(pe));
+        }
+        if let Some(pb) = item.pb {
+            m.insert("pb".into(), json!(pb));
+        }
+        if let Some(mv) = item.total_mv.as_ref() {
+            m.insert("total_mv".into(), json!(mv.value()));
+        }
+    }
+    Value::Object(m)
+}
+
+fn compact_scan_result(result: &ScanResult, verbose: bool) -> Value {
+    json!({
+        "trade_date": result.trade_date.to_iso(),
+        "items": result.items.iter().map(|i| compact_scan_item(i, verbose)).collect::<Vec<_>>(),
+    })
 }
 
 fn parse_scan_filter(s: &str) -> Result<ScanFilter, String> {
@@ -73,7 +122,9 @@ impl Tool for ScanMarketTool {
 
     fn description(&self) -> &'static str {
         "扫 A 股全市场榜单——上一交易日盘后落盘的数据，**不是盘中实时**。\
-        判断板块强弱 / 个股异动 / 涨停跌停分布时调。"
+        判断板块强弱 / 个股异动 / 涨停跌停分布时调。\
+        默认精简模式（rank/code/name/price/change_pct/amount）；需要 pe/pb/turnover_rate 等\
+        量化字段时传 verbose=true。"
     }
 
     fn input_schema(&self) -> Value {
@@ -85,7 +136,12 @@ impl Tool for ScanMarketTool {
                     "enum": ["limit_up", "limit_down", "top_gain", "top_loss", "top_amount", "top_volume"],
                     "description": "limit_up 涨停 / limit_down 跌停 / top_gain 涨幅榜 / top_loss 跌幅榜 / top_amount 成交额榜 / top_volume 成交量榜"
                 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+                "verbose": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "true 时额外返回 volume/turnover_rate/volume_ratio/pe/pb/total_mv（量化筛选用）"
+                }
             },
             "required": ["filter"]
         })
@@ -100,13 +156,14 @@ impl Tool for ScanMarketTool {
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
-            .unwrap_or(50)
-            .clamp(1, 200) as usize;
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
+        let verbose = input
+            .get("verbose")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         match scanner::scan_market(&self.app, filter, limit).await {
-            Ok(result) => match serde_json::to_value(&result) {
-                Ok(v) => (ok_json(v), false),
-                Err(e) => err_text(format!("序列化失败：{e}")),
-            },
+            Ok(result) => (ok_json(compact_scan_result(&result, verbose)), false),
             Err(e) => err_text(format!("scan_market 失败：{e}")),
         }
     }
@@ -132,7 +189,8 @@ impl Tool for GetTopListTool {
 
     fn description(&self) -> &'static str {
         "龙虎榜——上榜股票的成交额、净买入额、净买率、上榜原因。\
-        判断主力博弈 / 异动诱因时调。trade_date 留空 = 最近一个交易日。"
+        判断主力博弈 / 异动诱因时调。trade_date 留空 = 最近一个交易日。\
+        默认返回 top 30（按净买入额排序）。"
     }
 
     fn input_schema(&self) -> Value {
@@ -142,7 +200,8 @@ impl Tool for GetTopListTool {
                 "trade_date": {
                     "type": "string",
                     "description": "YYYYMMDD 或 YYYY-MM-DD；留空 = 最近一个交易日"
-                }
+                },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 30 }
             }
         })
     }
@@ -153,11 +212,25 @@ impl Tool for GetTopListTool {
             Ok(d) => d,
             Err(e) => return err_text(e),
         };
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(30)
+            .clamp(1, 100) as usize;
         match flow::fetch_top_list(&self.app, date).await {
-            Ok(items) => match serde_json::to_value(&items) {
-                Ok(v) => (ok_json(v), false),
-                Err(e) => err_text(format!("序列化失败：{e}")),
-            },
+            Ok(mut items) => {
+                // 按 net_amount 绝对值排序，截 top N——比按原始顺序更有信息密度
+                items.sort_by(|a, b| {
+                    let av = a.net_amount.as_ref().map(|y| y.value().abs()).unwrap_or(0.0);
+                    let bv = b.net_amount.as_ref().map(|y| y.value().abs()).unwrap_or(0.0);
+                    bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                items.truncate(limit);
+                match serde_json::to_value(&items) {
+                    Ok(v) => (ok_json(v), false),
+                    Err(e) => err_text(format!("序列化失败：{e}")),
+                }
+            }
             Err(e) => err_text(format!("get_top_list 失败：{e}")),
         }
     }
@@ -191,7 +264,7 @@ impl Tool for GetMoneyflowTool {
             "type": "object",
             "properties": {
                 "code": { "type": "string", "description": "6 位 A 股代码或中文名" },
-                "days": { "type": "integer", "minimum": 1, "maximum": 120, "default": 20 }
+                "days": { "type": "integer", "minimum": 1, "maximum": 60, "default": 10 }
             },
             "required": ["code"]
         })
@@ -217,8 +290,8 @@ impl Tool for GetMoneyflowTool {
         let days = input
             .get("days")
             .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 120) as usize;
+            .unwrap_or(10)
+            .clamp(1, 60) as usize;
         match flow::fetch_moneyflow(&self.app, &code, days).await {
             Ok(items) => match serde_json::to_value(&items) {
                 Ok(v) => (ok_json(v), false),
@@ -249,7 +322,8 @@ impl Tool for GetConceptPerformanceTool {
 
     fn description(&self) -> &'static str {
         "概念板块涨幅排行——某交易日各板块平均涨幅 / 成交额 / 成分股数。\
-        判断热点轮动 / 行业贝塔时调。trade_date 留空 = 最近一个交易日。"
+        判断热点轮动 / 行业贝塔时调。trade_date 留空 = 最近一个交易日。\
+        默认返回涨幅 top 20。"
     }
 
     fn input_schema(&self) -> Value {
@@ -259,7 +333,8 @@ impl Tool for GetConceptPerformanceTool {
                 "trade_date": {
                     "type": "string",
                     "description": "YYYYMMDD 或 YYYY-MM-DD；留空 = 最近一个交易日"
-                }
+                },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
             }
         })
     }
@@ -271,11 +346,20 @@ impl Tool for GetConceptPerformanceTool {
             Ok(None) => calendar::current_trade_date(),
             Err(e) => return err_text(e),
         };
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 100) as usize;
         match concept::fetch_concept_performance(&self.app, date).await {
-            Ok(items) => match serde_json::to_value(&items) {
-                Ok(v) => (ok_json(v), false),
-                Err(e) => err_text(format!("序列化失败：{e}")),
-            },
+            Ok(mut items) => {
+                // fetch_concept_performance 已按涨幅降序——截 top N
+                items.truncate(limit);
+                match serde_json::to_value(&items) {
+                    Ok(v) => (ok_json(v), false),
+                    Err(e) => err_text(format!("序列化失败：{e}")),
+                }
+            }
             Err(e) => err_text(format!("get_concept_performance 失败：{e}")),
         }
     }
@@ -309,7 +393,7 @@ impl Tool for GetCompanyEventsTool {
             "type": "object",
             "properties": {
                 "code": { "type": "string", "description": "6 位 A 股代码或中文名" },
-                "days_ahead": { "type": "integer", "minimum": 1, "maximum": 365, "default": 90 }
+                "days_ahead": { "type": "integer", "minimum": 1, "maximum": 180, "default": 30 }
             },
             "required": ["code"]
         })
@@ -335,8 +419,8 @@ impl Tool for GetCompanyEventsTool {
         let days = input
             .get("days_ahead")
             .and_then(Value::as_i64)
-            .unwrap_or(90)
-            .clamp(1, 365) as i32;
+            .unwrap_or(30)
+            .clamp(1, 180) as i32;
         match events::fetch_company_events(&self.app, &code, days).await {
             Ok(items) => match serde_json::to_value(&items) {
                 Ok(v) => (ok_json(v), false),

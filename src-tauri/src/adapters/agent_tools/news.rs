@@ -33,7 +33,7 @@ impl Tool for SearchNewsTool {
         "本地资讯库 FTS5 全文搜索（标题/摘要/来源）。\
         覆盖最近 30 天多源（NewsNow / 6 个财经站抽取）；trigram 索引，\
         毫秒级返回。按相关度（BM25）排序——靠前的更贴查询语义。\
-        \nlimit 默认 20，最大 50。\
+        \nlimit 默认 5，最大 30——只要 top-N 最相关条目即可，多了徒增 token。\
         \n建议先用本工具回查历史背景；找不到再考虑 web_search 求外网新信息。\
         \n例：query='光模块 北向'、'600519 分红'、'央行降准'。"
     }
@@ -43,7 +43,7 @@ impl Tool for SearchNewsTool {
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "关键词，如 '光模块' 或 '600519'" },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 30, "default": 5 }
             },
             "required": ["query"]
         })
@@ -57,8 +57,8 @@ impl Tool for SearchNewsTool {
         let limit = input
             .get("limit")
             .and_then(Value::as_u64)
-            .unwrap_or(20)
-            .clamp(1, 50);
+            .unwrap_or(5)
+            .clamp(1, 30);
         let app = self.app.clone();
         let result = tokio::task::spawn_blocking(move || query_news(app, query, limit))
             .await

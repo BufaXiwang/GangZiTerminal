@@ -7,7 +7,7 @@
 //! - build_chat_dynamic_context：user 块开头的动态上下文（市场 + 持仓 + pending expectations）
 
 use crate::domain::account::expectation::Expectation;
-use crate::domain::account::types::{Position, PositionEvent};
+use crate::domain::account::types::Position;
 use crate::domain::agent::heuristic::Heuristic;
 use crate::domain::quotes::regime::Regime;
 use crate::domain::quotes::{MarketOverview, StockQuote};
@@ -51,10 +51,13 @@ pub struct ChatSystemContextInput<'a> {
 }
 
 /// Chat 的"易变"动态上下文输入——市场快照、持仓、active theses。
+///
+/// `live_quotes`：当前 chat run 已 fetch 的实时行情；按 6 位 code 索引用于
+/// format_positions 显示当前价 + 盈亏%——比"事件链 10 条"对决策有用得多。
 pub struct ChatDynamicContextInput<'a> {
     pub market_overview: Option<&'a MarketOverview>,
     pub simulated_positions: &'a [Position],
-    pub position_events: &'a HashMap<String, Vec<PositionEvent>>,
+    pub live_quotes: &'a [StockQuote],
     pub active_expectations: &'a [Expectation],
     pub quotes_availability: Option<&'a str>,
 }
@@ -94,14 +97,14 @@ pub fn build_chat_dynamic_context(input: &ChatDynamicContextInput) -> String {
 当前市场上下文：
 {market}
 
-当前模拟账户持仓（含事件链）：
+当前模拟账户持仓（含当前价 / 盈亏；历史事件链请用 get_position(position_id) 单独拉）：
 {positions}
 
 当前 pending expectations（你正在跟踪的投资预期，可代码自动 hit/miss 判定）：
 {expectations}"#,
         quotes_availability = format_availability_block(input.quotes_availability),
         market = format_market(input.market_overview),
-        positions = format_positions(input.simulated_positions, input.position_events),
+        positions = format_positions(input.simulated_positions, input.live_quotes),
         expectations = format_active_expectations(input.active_expectations),
     )
 }
@@ -166,63 +169,65 @@ fn format_quotes(quotes: &[StockQuote]) -> String {
         .join("\n")
 }
 
-fn format_positions(
-    positions: &[Position],
-    events_by_position: &HashMap<String, Vec<PositionEvent>>,
-) -> String {
+fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> String {
     let opens: Vec<&Position> = positions.iter().filter(|p| p.status.is_open()).collect();
     if opens.is_empty() {
         return "暂无模拟持仓。".into();
     }
+    // 按 6 位 code 建索引，O(1) 查当前价
+    let quote_by_code: HashMap<&str, &StockQuote> = live_quotes
+        .iter()
+        .map(|q| (q.code.as_str(), q))
+        .collect();
     opens
         .iter()
         .take(12)
         .map(|p| {
-            let mut header = format!(
-                "{}({}) {}股 入场 ¥{}",
+            let mut line = format!(
+                "{}({}) {}股 成本 ¥{:.2}",
                 p.name,
                 p.code.as_str(),
                 p.current_shares.value(),
                 p.avg_entry_price.value()
             );
+            // 当前价 + 盈亏%——live_quotes 没拿到时（停牌/接口失败）只给空白
+            let entry = p.avg_entry_price.value();
+            if let Some(q) = quote_by_code.get(p.code.as_str()) {
+                if let Some(px) = q.price.as_ref().map(|y| y.value()) {
+                    let pnl_pct = if entry > 0.0 {
+                        (px - entry) / entry * 100.0
+                    } else {
+                        0.0
+                    };
+                    let pnl_abs = (px - entry) * p.current_shares.value() as f64;
+                    line.push_str(&format!(
+                        " → 现价 ¥{:.2}  {:+.2}% ({:+.0})",
+                        px, pnl_pct, pnl_abs
+                    ));
+                }
+            }
+            // 止损 / 止盈——相对当前/成本的距离比裸价更直观
             if let Some(sl) = p.stop_loss {
-                header.push_str(&format!(" 止损 ¥{:.2}", sl.value()));
+                let dist = if entry > 0.0 {
+                    (sl.value() - entry) / entry * 100.0
+                } else {
+                    0.0
+                };
+                line.push_str(&format!("\n  止损 ¥{:.2} ({:+.2}%)", sl.value(), dist));
             }
             if let Some(tp) = p.take_profit {
-                header.push_str(&format!(" 止盈 ¥{:.2}", tp.value()));
+                let dist = if entry > 0.0 {
+                    (tp.value() - entry) / entry * 100.0
+                } else {
+                    0.0
+                };
+                line.push_str(&format!("  止盈 ¥{:.2} ({:+.2}%)", tp.value(), dist));
             }
             if let Some(eid) = &p.expectation_id {
-                header.push_str(&format!(" expectation_id={}", eid.as_str()));
+                line.push_str(&format!("  expectation={}", eid.as_str()));
             }
-            header.push_str(&format!("\n  入场备注：{}", p.thesis));
-            let events = events_by_position
-                .get(p.id.as_str())
-                .cloned()
-                .unwrap_or_default();
-            if events.is_empty() {
-                return header;
-            }
-            let mut sorted = events;
-            sorted.sort_by(|a, b| a.occurred_at.value().cmp(&b.occurred_at.value()));
-            let chain: Vec<String> = sorted
-                .iter()
-                .rev()
-                .take(10)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|event| {
-                    let iso = event.occurred_at.to_rfc3339();
-                    let date: String = iso.chars().take(10).collect();
-                    let note = if event.agent_note_md.is_empty() {
-                        String::new()
-                    } else {
-                        format!("｜{}", truncate_chars(&event.agent_note_md, 80))
-                    };
-                    format!("    ├ {} {}{}", date, event.kind.tag(), note)
-                })
-                .collect();
-            format!("{}\n  事件链：\n{}", header, chain.join("\n"))
+            line.push_str(&format!("\n  入场理由：{}", truncate_chars(&p.thesis, 120)));
+            line
         })
         .collect::<Vec<_>>()
         .join("\n\n")
