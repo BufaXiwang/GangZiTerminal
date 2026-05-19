@@ -89,6 +89,49 @@ pub async fn run_news_refresh(app: AppHandle) -> Result<NewsRefreshResult, Strin
         {
             failures.push(format!("save_news_items: {err}"));
         }
+
+        // v3：给新入库的资讯打 tag（ticker / kind / importance）+ High importance short-circuit
+        let mut high_importance_ticker_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for item in &all_items {
+            let text = format!(
+                "{} {}",
+                item.title,
+                item.summary.clone().unwrap_or_default()
+            );
+            match crate::infrastructure::news::tagger::tag(&app, &item.id, &text) {
+                Ok(tags) => {
+                    if matches!(
+                        tags.importance,
+                        crate::domain::shared::signal::NewsImportance::High
+                    ) {
+                        for code in &tags.tickers {
+                            high_importance_ticker_set.insert(code.clone());
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(news_id = %item.id, error = %err, "news tagger 失败");
+                }
+            }
+        }
+
+        // High importance 资讯涉及的股票（且在自选股内）→ emit 事件，
+        // adapter 层的 listener 收到后构造 registry + 跑 scan::run_mini_scan
+        // （pipeline 不能直接 import adapters，所以走事件解耦）
+        if !high_importance_ticker_set.is_empty() {
+            let watchlist = crate::infrastructure::account::watchlist::list_strings();
+            let watch_set: std::collections::HashSet<String> = watchlist.into_iter().collect();
+            for code in high_importance_ticker_set {
+                if watch_set.contains(&code) {
+                    tracing::info!(code = %code, "NewsImportance=High → emit news-high-importance-detected");
+                    let _ = app.emit(
+                        "news-high-importance-detected",
+                        json!({ "code": code }),
+                    );
+                }
+            }
+        }
     }
 
     let _ = app.emit(

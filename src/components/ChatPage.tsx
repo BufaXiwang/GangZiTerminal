@@ -116,6 +116,18 @@ export function ChatPage({
     list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
   }, [timelineMessages, isChatting]);
 
+  // 监听 "agent-prefill" 事件——从 Expectations/Heuristics/Lessons/Strategies 等页面
+  // 的"问 agent"按钮跳转过来，把预填内容塞到输入框，让用户编辑后发送。
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      if (typeof detail !== "string" || detail.length === 0) return;
+      setDraft((current) => (current.length === 0 ? detail : `${current}\n${detail}`));
+    };
+    window.addEventListener("agent-prefill", handler);
+    return () => window.removeEventListener("agent-prefill", handler);
+  }, []);
+
   // 搜索：输入防抖
   // 注意：只在 searchInput 真的变化时才查——searchMessages 是 App.tsx 内联箭头函数，
   // 每次 App 渲染都是新引用；如果 effect deps 包含 searchMessages，任何无关的 App

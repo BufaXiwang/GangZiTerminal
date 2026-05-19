@@ -33,8 +33,10 @@ use crate::pipeline::agent::prompt::AGENT_IDENTITY;
 use crate::pipeline::agent::run_agent;
 use crate::pipeline::agent::tools::{ToolContext, ToolRegistry};
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
+
+pub const EVENT_SCAN_TICK_COMPLETED: &str = "scan-tick-completed";
 
 // ====== 配置 ============================================================
 
@@ -149,6 +151,17 @@ pub async fn run_tick(
         mini_scans = result.mini_scans_triggered,
         skipped = result.mini_scans_skipped_budget,
         "scan tick 完成"
+    );
+
+    let _ = app.emit(
+        EVENT_SCAN_TICK_COMPLETED,
+        serde_json::json!({
+            "tickId": result.tick_id.clone(),
+            "tickLabel": tick_label,
+            "stocksScanned": result.stocks_scanned,
+            "signalsDetected": result.signals_detected,
+            "miniScansTriggered": result.mini_scans_triggered,
+        }),
     );
 
     Ok(result)

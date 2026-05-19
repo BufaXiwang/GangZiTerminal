@@ -17,7 +17,6 @@
 
 pub mod heuristic;
 pub mod lesson;
-pub mod principle; // v2 残留，W22 下线
 pub mod strategy;
 pub mod types;
 
@@ -26,10 +25,6 @@ pub use heuristic::{
     HEURISTIC_BODY_MAX_CHARS,
 };
 pub use lesson::{Lesson, LessonId, LessonOutcome};
-pub use principle::{
-    Principle, PrincipleCategory, PrincipleId, PrincipleOrigin, PrincipleState,
-    PRINCIPLE_BODY_MAX_CHARS,
-};
 // SignalKind / NewsKind / NewsImportance / EventKind 等迁到 domain/shared::signal
 // （三个 BC 都引用——shared vocabulary）。从这里 re-export 让旧 use 路径仍可工作。
 pub use crate::domain::shared::{

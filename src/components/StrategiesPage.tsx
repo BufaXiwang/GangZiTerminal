@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
 type Strategy = {
@@ -15,11 +16,20 @@ type Strategy = {
   updatedAt: number;
 };
 
-export function StrategiesPage() {
+export function StrategiesPage({
+  onAskAgent,
+}: {
+  onAskAgent?: (prefill: string) => void;
+}) {
   const [list, setList] = useState<Strategy[]>([]);
 
   useEffect(() => {
-    void invoke<Strategy[]>("list_strategies").then(setList);
+    const load = () => void invoke<Strategy[]>("list_strategies").then(setList);
+    load();
+    const unsub = listen("strategies-changed", load);
+    return () => {
+      void unsub.then((u) => u());
+    };
   }, []);
 
   return (
@@ -68,6 +78,16 @@ export function StrategiesPage() {
             <div style={{ fontSize: 11, color: "#64748b" }}>
               target: {s.target.direction} {s.target.pctRelativeToCurrent}% / {s.target.horizonDays}d
             </div>
+            {onAskAgent && (
+              <button
+                onClick={() =>
+                  onAskAgent(`[关于 strategy "${s.name}"]: `)
+                }
+                style={{ marginTop: 6, padding: "3px 8px", fontSize: 11 }}
+              >
+                💬 问 agent
+              </button>
+            )}
           </div>
         );
       })}

@@ -148,29 +148,26 @@ pub async fn send_chat_message_now(
     let quotes_availability = quotes_status.to_prompt_section();
     let market = fetch_market_overview(&app).await.ok();
 
-    // 当前 active / drafted theses（agent 决策上下文核心之一）
-    let active_theses =
-        crate::infrastructure::account::thesis_repo::list_open_theses(&app, 20).unwrap_or_default();
+    // 当前 pending expectations（agent 决策上下文核心之一）
+    let active_expectations =
+        crate::infrastructure::account::expectation_repo::list_pending(&app, 20).unwrap_or_default();
 
-    // 当前 active principles（按 hit_count + regime 过滤）+ 当前 regime
-    let current_regime: Option<crate::domain::quotes::regime::Regime> = None; // TODO: 接 quotes 派生
-    let principles = crate::infrastructure::agent::principle_repo::list_for_prompt(
-        &app,
-        current_regime,
-        25,
-    )
-    .unwrap_or_default();
+    // 当前 active heuristics（按 confidence + regime 过滤）+ 当前 regime
+    let current_regime = crate::infrastructure::quotes::regime_detector_service::current(&app);
+    let heuristics =
+        crate::infrastructure::agent::heuristic_repo::list_for_prompt(&app, current_regime, 25)
+            .unwrap_or_default();
 
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
         market_overview: market.as_ref(),
         simulated_positions: &positions,
         position_events: &position_events,
-        active_theses: &active_theses,
+        active_expectations: &active_expectations,
         quotes_availability: quotes_availability.as_deref(),
     });
     let static_system_context = build_chat_system_context(&ChatSystemContextInput {
-        principles: &principles,
+        heuristics: &heuristics,
         current_regime,
     });
 

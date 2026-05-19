@@ -16,6 +16,7 @@ pub mod eastmoney;
 pub mod realtime;
 pub mod repository;
 pub mod scanner;
+pub mod regime_detector_service;
 pub mod signal_detector;
 pub mod snapshot;
 pub mod tdx;

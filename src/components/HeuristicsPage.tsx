@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
 type Heuristic = {
@@ -39,13 +40,24 @@ const ORIGIN_ICON: Record<Heuristic["origin"], string> = {
   agent_inferred: "🤖",
 };
 
-export function HeuristicsPage() {
+export function HeuristicsPage({
+  onAskAgent,
+}: {
+  onAskAgent?: (prefill: string) => void;
+}) {
   const [list, setList] = useState<Heuristic[]>([]);
   const [counts, setCounts] = useState<Counts | null>(null);
 
   useEffect(() => {
-    void invoke<Heuristic[]>("list_heuristics", { limit: 200 }).then(setList);
-    void invoke<Counts>("get_heuristic_counts").then(setCounts);
+    const load = () => {
+      void invoke<Heuristic[]>("list_heuristics", { limit: 200 }).then(setList);
+      void invoke<Counts>("get_heuristic_counts").then(setCounts);
+    };
+    load();
+    const unsub = listen("heuristics-changed", load);
+    return () => {
+      void unsub.then((u) => u());
+    };
   }, []);
 
   const byState = (s: Heuristic["effectiveState"]) =>
@@ -127,6 +139,18 @@ export function HeuristicsPage() {
                     <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
                       支持的 lessons: {h.supportingLessonIds.length} 条
                     </div>
+                  )}
+                  {onAskAgent && (
+                    <button
+                      onClick={() =>
+                        onAskAgent(
+                          `[关于 heuristic "${h.body.slice(0, 30)}..."]: `,
+                        )
+                      }
+                      style={{ marginTop: 6, padding: "3px 8px", fontSize: 11 }}
+                    >
+                      💬 问 agent
+                    </button>
                   )}
                 </div>
               ))}

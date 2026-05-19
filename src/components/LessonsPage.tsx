@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useState } from "react";
 
 type Lesson = {
@@ -20,11 +21,20 @@ const OUTCOME_COLORS: Record<Lesson["outcome"], string> = {
   expired: "#f59e0b",
 };
 
-export function LessonsPage() {
+export function LessonsPage({
+  onAskAgent,
+}: {
+  onAskAgent?: (prefill: string) => void;
+}) {
   const [list, setList] = useState<Lesson[]>([]);
 
   useEffect(() => {
-    void invoke<Lesson[]>("list_lessons", { limit: 200 }).then(setList);
+    const load = () => void invoke<Lesson[]>("list_lessons", { limit: 200 }).then(setList);
+    load();
+    const unsub = listen("lessons-changed", load);
+    return () => {
+      void unsub.then((u) => u());
+    };
   }, []);
 
   return (
@@ -71,6 +81,18 @@ export function LessonsPage() {
             <div style={{ fontSize: 13, color: "#475569", marginTop: 4, fontStyle: "italic" }}>
               💡 {l.takeaway}
             </div>
+          )}
+          {onAskAgent && (
+            <button
+              onClick={() =>
+                onAskAgent(
+                  `[关于 lesson #${l.id.slice(0, 8)} (${l.code} ${l.outcome})]: `,
+                )
+              }
+              style={{ marginTop: 6, padding: "3px 8px", fontSize: 11 }}
+            >
+              💬 问 agent
+            </button>
           )}
         </div>
       ))}

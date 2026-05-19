@@ -14,7 +14,6 @@ pub mod expectation_repo;
 pub mod metrics;
 pub mod repository;
 pub mod snapshot_cache;
-pub mod thesis_repo;
 pub mod valuation;
 pub mod watchlist;
 

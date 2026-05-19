@@ -14,11 +14,9 @@
 pub mod health_metrics;
 pub mod heuristic_repo;
 pub mod lesson_repo;
-pub mod principle_repo;
 pub mod provider;
 pub mod repository;
 pub mod seed_heuristics;
-pub mod seed_principles;
 pub mod seed_strategies;
 pub mod signal_detection_repo;
 pub mod strategy_repo;

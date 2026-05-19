@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
 
 type Expectation = {
@@ -111,6 +112,13 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
 
   useEffect(() => {
     void load(filter);
+    // 监听后端 expectations-changed 事件 → 自动 refetch
+    const unsubscribePromise = listen("expectations-changed", () => {
+      void load(filter);
+    });
+    return () => {
+      void unsubscribePromise.then((unlisten) => unlisten());
+    };
   }, [filter]);
 
   const themes = useMemo(() => {

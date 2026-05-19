@@ -12,8 +12,6 @@ import { useEffect, useMemo, useState } from "react";
 import { NewsPage } from "./components/NewsPage";
 import { SecondaryView } from "./components/SecondaryView";
 import { TodayPage } from "./components/TodayPage";
-import { ThesesPage } from "./components/ThesesPage";
-import { PrinciplesPage } from "./components/PrinciplesPage";
 import { ExpectationsPage } from "./components/ExpectationsPage";
 import { StrategiesPage } from "./components/StrategiesPage";
 import { LessonsPage } from "./components/LessonsPage";
@@ -217,53 +215,24 @@ function App() {
           ) : activeView === "news" ? (
             <NewsPage />
           ) : activeView === "agent" ? (
-            <div style={{ display: "flex", height: "100%", overflow: "hidden" }}>
+            <div className="agent-shell">
               {/* 左侧二级 rail — VS Code 风格：紧凑图标 + 文字 */}
-              <nav
-                style={{
-                  width: 76,
-                  flexShrink: 0,
-                  borderRight: "1px solid #e5e7eb",
-                  background: "#fafafa",
-                  display: "flex",
-                  flexDirection: "column",
-                  padding: "8px 0",
-                  gap: 2,
-                }}
-              >
-                {agentSubTabs.map((tab) => {
-                  const active = agentSubView === tab.id;
-                  return (
-                    <button
-                      key={tab.id}
-                      onClick={() => setAgentSubView(tab.id)}
-                      title={tab.hint}
-                      style={{
-                        display: "flex",
-                        flexDirection: "column",
-                        alignItems: "center",
-                        gap: 2,
-                        padding: "10px 4px",
-                        margin: "0 6px",
-                        background: active ? "#fff" : "transparent",
-                        border: active ? "1px solid #cbd5e1" : "1px solid transparent",
-                        borderRadius: 6,
-                        cursor: "pointer",
-                        color: active ? "#0f172a" : "#64748b",
-                        fontWeight: active ? 600 : 400,
-                        boxShadow: active ? "0 1px 2px rgba(0,0,0,0.04)" : "none",
-                        transition: "background 120ms, color 120ms",
-                      }}
-                    >
-                      <span style={{ fontSize: 20, lineHeight: 1 }}>{tab.icon}</span>
-                      <span style={{ fontSize: 10, marginTop: 2 }}>{tab.label}</span>
-                    </button>
-                  );
-                })}
+              <nav className="agent-rail">
+                {agentSubTabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setAgentSubView(tab.id)}
+                    title={tab.hint}
+                    className={`agent-rail-tab${agentSubView === tab.id ? " active" : ""}`}
+                  >
+                    <span className="agent-rail-icon">{tab.icon}</span>
+                    <span className="agent-rail-label">{tab.label}</span>
+                  </button>
+                ))}
               </nav>
 
               {/* 主区——根据 sub view 渲染 */}
-              <div style={{ flex: 1, overflow: "auto" }}>
+              <div className="agent-main">
                 {agentSubView === "chat" ? (
                   <SecondaryView
                     activeView="chat"
@@ -311,11 +280,32 @@ function App() {
                     }}
                   />
                 ) : agentSubView === "strategies" ? (
-                  <StrategiesPage />
+                  <StrategiesPage
+                    onAskAgent={(prefill) => {
+                      setAgentSubView("chat");
+                      window.dispatchEvent(
+                        new CustomEvent("agent-prefill", { detail: prefill }),
+                      );
+                    }}
+                  />
                 ) : agentSubView === "heuristics" ? (
-                  <HeuristicsPage />
+                  <HeuristicsPage
+                    onAskAgent={(prefill) => {
+                      setAgentSubView("chat");
+                      window.dispatchEvent(
+                        new CustomEvent("agent-prefill", { detail: prefill }),
+                      );
+                    }}
+                  />
                 ) : (
-                  <LessonsPage />
+                  <LessonsPage
+                    onAskAgent={(prefill) => {
+                      setAgentSubView("chat");
+                      window.dispatchEvent(
+                        new CustomEvent("agent-prefill", { detail: prefill }),
+                      );
+                    }}
+                  />
                 )}
               </div>
             </div>

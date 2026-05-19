@@ -7,7 +7,9 @@ use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::{OccurredAt, StockCode};
 use crate::infrastructure::db::{migrate, open_database};
 use rusqlite::{params, OptionalExtension};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
+
+pub const EVENT_LESSONS_CHANGED: &str = "lessons-changed";
 
 pub fn create(app: &AppHandle, l: &Lesson) -> Result<(), String> {
     let conn = open_database(app)?;
@@ -33,6 +35,7 @@ pub fn create(app: &AppHandle, l: &Lesson) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("插入 lesson 失败：{err}"))?;
+    let _ = app.emit(EVENT_LESSONS_CHANGED, serde_json::json!({}));
     Ok(())
 }
 

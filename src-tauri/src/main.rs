@@ -21,10 +21,6 @@ pub fn run() {
             // 自选股 watchlist：从 KV 恢复到内存（account 模块）
             infrastructure::account::watchlist::hydrate(&handle);
 
-            // Seed principles（v2 残留，W23 删 principle 代码时一起去掉）
-            if let Err(e) = infrastructure::agent::seed_principles::seed_if_empty(&handle) {
-                tracing::warn!(error = %e, "seed principles 失败（跳过，不阻塞启动）");
-            }
             // Seed v3 heuristics + strategies：表为空时注入
             // 见 docs/design/agent-v3-expectation-driven.md § 4 + § 9.6
             if let Err(e) = infrastructure::agent::seed_heuristics::seed_if_empty(&handle) {
@@ -41,6 +37,8 @@ pub fn run() {
             adapters::reflection_scheduler::spawn(app.handle().clone());
             // Scan tick（9 ticks/天）—— v3 expectation-driven 自驱观察循环
             adapters::scan_scheduler::spawn(app.handle().clone());
+            // 高重要度新闻 → 即时 mini-scan listener
+            adapters::news_high_importance_listener::spawn(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。
@@ -109,13 +107,7 @@ pub fn run() {
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,
             adapters::proxy_commands::get_realtime_health,
-            // Agent v2 重构：Thesis / Principle / Episode 只读 + 健康度 + 手动 reflection
-            adapters::thesis_commands::list_theses,
-            adapters::thesis_commands::get_thesis,
-            adapters::thesis_commands::list_thesis_events,
-            adapters::principle_commands::list_principles,
-            adapters::principle_commands::get_health_metrics,
-            adapters::principle_commands::trigger_reflection_now,
+            // Agent v3 expectation-driven commands
             adapters::episode_commands::list_agent_episodes,
             adapters::episode_commands::get_account_metrics,
             // v3 expectation-driven commands

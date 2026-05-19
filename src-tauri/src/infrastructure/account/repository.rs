@@ -50,7 +50,7 @@ struct DbPosition {
     last_acquisition_at: Option<String>,
     /// 关联的 Thesis aggregate id（v2 新增）。
     #[serde(default)]
-    thesis_id: Option<String>,
+    expectation_id: Option<String>,
 }
 
 impl DbPosition {
@@ -234,9 +234,9 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
         take_profit: row.take_profit.and_then(|v| Yuan::new(v).ok()),
         time_stop_at: row.time_stop_at.as_deref().map(parse_rfc3339),
         thesis: row.thesis,
-        thesis_id: row
-            .thesis_id
-            .map(crate::domain::account::thesis::ThesisId::from_string),
+        expectation_id: row
+            .expectation_id
+            .map(crate::domain::account::expectation::ExpectationId::from_string),
         source_analysis_id: row.source_analysis_id,
         entered_at,
         last_acquisition_at,
@@ -279,7 +279,7 @@ fn domain_to_db_position(p: &Position) -> DbPosition {
         current_shares: Some(p.current_shares.value()),
         avg_entry_price: Some(p.avg_entry_price.value()),
         last_acquisition_at: Some(occurred_at_to_rfc3339(p.last_acquisition_at)),
-        thesis_id: p.thesis_id.as_ref().map(|t| t.as_str().to_string()),
+        expectation_id: p.expectation_id.as_ref().map(|t| t.as_str().to_string()),
     }
 }
 
@@ -557,7 +557,7 @@ mod tests {
             take_profit: Some(Yuan::new(1900.0).unwrap()),
             time_stop_at: None,
             thesis: "技术面突破".into(),
-            thesis_id: None,
+            expectation_id: None,
             source_analysis_id: "a1".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
             last_acquisition_at: OccurredAt::new(1_700_000_000_000),
@@ -759,18 +759,18 @@ fn replace_simulated_positions_tx(
         let status = required_json_string(&position, "/status", "模拟持仓缺少 status")?;
         let created_at = json_string(&position, "/entryAt").unwrap_or_else(|| now.clone());
         let updated_at = json_string(&position, "/exitAt").unwrap_or_else(|| now.clone());
-        // thesis_id 是行级列（v2 重构）——位置的"为什么"关联到 Thesis 聚合根
-        let thesis_id = json_string(&position, "/thesisId");
+        // expectation_id 是行级列（v2 重构）——位置的"为什么"关联到 Thesis 聚合根
+        let expectation_id = json_string(&position, "/thesisId");
         tx.execute(
             "insert into simulated_positions
-                (id, code, source_analysis_id, status, thesis_id, payload_json, created_at, updated_at)
+                (id, code, source_analysis_id, status, expectation_id, payload_json, created_at, updated_at)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 code,
                 source_analysis_id,
                 status,
-                thesis_id,
+                expectation_id,
                 position.to_string(),
                 created_at,
                 updated_at

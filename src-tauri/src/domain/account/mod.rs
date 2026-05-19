@@ -30,9 +30,6 @@ pub mod position;
 pub mod rules;
 pub mod sizing;
 pub mod snapshot;
-// 注：v2 `thesis` 模块在 W22 schema 升级到 v3 后整体下线（被 expectation 取代）。
-//     新代码请用 expectation；不要再依赖 thesis。
-pub mod thesis;
 pub mod types;
 
 pub use aggregate::{
@@ -42,10 +39,8 @@ pub use aggregate::{
 pub use errors::{AccountError, RuleError};
 pub use events::{EventSource, PositionEvent, PositionEventKind, PositionSignalKind};
 pub use expectation::{
-    judge_outcome, Direction, Expectation, ExpectationEvent, ExpectationEventRecord,
+    judge_outcome, Conviction, Direction, Expectation, ExpectationEvent, ExpectationEventRecord,
     ExpectationId, ExpectationState, OutcomeJudgment,
 };
 pub use position::{CloseReason, Position, PositionId, PositionStatus, Side};
 pub use snapshot::AccountSnapshot;
-// thesis re-exports 保留到 W22 一起删
-pub use thesis::{Thesis, ThesisEvent, ThesisEventRecord, ThesisId, ThesisState};

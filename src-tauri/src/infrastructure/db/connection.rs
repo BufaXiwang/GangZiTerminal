@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// SQLite 初始化的返回值——给前端 hydrate path + schema 版本号。
 #[derive(Debug, Serialize)]

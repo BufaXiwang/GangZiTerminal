@@ -4,9 +4,8 @@
 //! 然后再 open_position 关联 current_expectation_id。
 
 use crate::domain::account::expectation::{
-    Direction, Expectation, ExpectationEvent, ExpectationId, ExpectationState,
+    Conviction, Direction, Expectation, ExpectationEvent, ExpectationId, ExpectationState,
 };
-use crate::domain::account::thesis::Conviction;
 use crate::domain::agent::types::ToolResultContent;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{OccurredAt, StockCode, Yuan};

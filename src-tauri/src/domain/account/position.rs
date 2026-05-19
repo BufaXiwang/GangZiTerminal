@@ -1,6 +1,6 @@
 //! Position entity and position identity.
 
-use crate::domain::account::thesis::ThesisId;
+use crate::domain::account::expectation::ExpectationId;
 use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
 use serde::{Deserialize, Serialize};
 
@@ -46,13 +46,13 @@ pub struct Position {
     pub stop_loss: Option<Yuan>,
     pub take_profit: Option<Yuan>,
     pub time_stop_at: Option<OccurredAt>,
-    /// 简短论点摘要（≤120 字）—— v2 重构后只是 thesis 的展示用副本，
-    /// 真正的"为什么"在 thesis_id 引用的 Thesis aggregate 里。
+    /// 简短论点摘要（≤120 字）—— 真正的结构化"为什么"在 expectation_id 引用的
+    /// Expectation aggregate 里。
     pub thesis: String,
-    /// 关联的 Thesis 聚合根 id（v2 新增）。
-    /// `None` 表示这是用户直接命令建仓没绑 thesis 的特殊情况；agent 主动建仓必须设。
+    /// 关联的 Expectation 聚合根 id（v3 expectation-driven）。
+    /// `None` 表示用户直接命令建仓没绑 expectation 的情况；agent 主动建仓必须设。
     #[serde(default)]
-    pub thesis_id: Option<ThesisId>,
+    pub expectation_id: Option<ExpectationId>,
     pub source_analysis_id: String,
     /// 首次开仓时间——审计 / UI 展示用。
     pub entered_at: OccurredAt,

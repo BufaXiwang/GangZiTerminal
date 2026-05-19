@@ -21,10 +21,8 @@ pub mod account;
 pub mod expectations;
 pub mod news;
 pub mod positions;
-pub mod principles;
 pub mod quotes;
 pub mod research;
-pub mod theses;
 
 /// Chat pipeline 工具注册表——chat / reflection 共用。
 ///
@@ -60,15 +58,7 @@ pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     reg.register(Arc::new(account::ClosePositionTool::new(app.clone())));
     reg.register(Arc::new(account::ScalePositionTool::new(app.clone())));
     reg.register(Arc::new(account::AdjustStopsTool::new(app.clone())));
-    // Thesis 写——agent 显式管理投资论点
-    reg.register(Arc::new(theses::CreateThesisTool::new(app.clone())));
-    reg.register(Arc::new(theses::UpdateThesisStateTool::new(app.clone())));
-    reg.register(Arc::new(theses::AttachThesisFeedbackTool::new(app.clone())));
-    // Principle 写——结构化投资原则 / 已知偏差 / 风险偏好（v2 残留，W23 末删）
-    reg.register(Arc::new(principles::ProposePrincipleTool::new(app.clone())));
-    reg.register(Arc::new(principles::ConfirmPrincipleTool::new(app.clone())));
-    reg.register(Arc::new(principles::RetirePrincipleTool::new(app.clone())));
-    // Expectation 写（v3 核心实体）
+    // Expectation 写（v3 核心实体——取代旧 thesis / principle 写工具）
     reg.register(Arc::new(expectations::CreateExpectationTool::new(app.clone())));
     reg.register(Arc::new(expectations::UpdateExpectationTool::new(app.clone())));
     reg.register(Arc::new(expectations::CancelExpectationTool::new(app.clone())));

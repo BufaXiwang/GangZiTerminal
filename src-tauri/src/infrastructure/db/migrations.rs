@@ -73,14 +73,12 @@ create table if not exists simulated_positions (
     code text not null,
     source_analysis_id text not null,
     status text not null,
-    thesis_id text,                       -- v2 兼容列，W24 删
-    current_expectation_id text,          -- v3 新增：关联 expectations 表
+    current_expectation_id text,          -- v3：关联 expectations 表
     payload_json text not null,
     created_at text not null,
     updated_at text not null
 );
 create index if not exists idx_simulated_positions_code_status on simulated_positions(code, status);
-create index if not exists idx_simulated_positions_thesis on simulated_positions(thesis_id);
 create index if not exists idx_simulated_positions_expectation on simulated_positions(current_expectation_id);
 
 create table if not exists position_events (
@@ -95,37 +93,6 @@ create table if not exists position_events (
     created_at text not null
 );
 create index if not exists idx_position_events_pos_time on position_events(position_id, occurred_at);
-
--- Thesis 一等聚合根（agent-redesign.md § 3.1）
-create table if not exists theses (
-    id text primary key,
-    hypothesis text not null,
-    invalidation text not null,
-    validation_checks text,               -- JSON array
-    conviction text not null check (conviction in ('low', 'medium', 'high')),
-    state text not null check (state in ('drafted', 'active', 'validated', 'drifted', 'invalidated', 'abandoned')),
-    regime_at_creation text,              -- bull / bear / choppy
-    created_at text not null,
-    updated_at text not null,
-    closed_at text
-);
-create index if not exists idx_theses_state on theses(state, updated_at desc);
-
-create table if not exists thesis_codes (
-    thesis_id text not null,
-    code text not null,
-    primary key (thesis_id, code)
-);
-create index if not exists idx_thesis_codes_code on thesis_codes(code);
-
-create table if not exists thesis_events (
-    id integer primary key autoincrement,
-    thesis_id text not null,
-    kind text not null,
-    payload text,                         -- JSON
-    occurred_at text not null
-);
-create index if not exists idx_thesis_events_id_time on thesis_events(thesis_id, occurred_at);
 
 -- ===== Agent BC =====
 create table if not exists chat_messages (
@@ -161,8 +128,7 @@ create table if not exists agent_episodes (
     stop_reason text,
     error text,
     trigger_message_id text,
-    thesis_ids text,                      -- v2 兼容列（JSON array），W24 删
-    expectation_ids text,                 -- v3 新增（JSON array）
+    expectation_ids text,                 -- v3：JSON array of ExpectationId
     outcome_summary text,
     parent_episode_id text                -- 因果链
 );
@@ -184,21 +150,6 @@ create table if not exists agent_episode_turns (
     primary key (run_id, turn)
 );
 create index if not exists idx_agent_episode_turns_run on agent_episode_turns(run_id, turn);
-
--- Principles：结构化投资原则 / 已知偏差 / 风险偏好
-create table if not exists principles (
-    id text primary key,
-    body text not null,
-    category text not null check (category in ('principle', 'known_bias', 'risk_preference')),
-    origin text not null check (origin in ('user_stated', 'agent_inferred')),
-    state text not null check (state in ('proposed', 'active', 'dormant', 'retired')),
-    regime_tags text,                     -- JSON array of regime strings
-    hit_count integer not null default 0,
-    last_applied_at text,
-    created_at text not null
-);
-create index if not exists idx_principles_state_hit on principles(state, hit_count desc);
-create index if not exists idx_principles_origin on principles(origin, state);
 
 -- ===== Quotes BC =====
 create table if not exists stocks (

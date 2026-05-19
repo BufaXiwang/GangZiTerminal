@@ -46,7 +46,7 @@ pub struct OpenRequest {
     pub name: String,
     pub thesis: String,
     /// 关联 Thesis aggregate id（v2 新增）；agent 主动建仓必须设。
-    pub thesis_id: Option<crate::domain::account::thesis::ThesisId>,
+    pub expectation_id: Option<crate::domain::account::expectation::ExpectationId>,
     pub stop_loss: Option<Yuan>,
     pub take_profit: Option<Yuan>,
     /// 留空则自动算 entered_at + 7 日历日
@@ -113,7 +113,7 @@ impl AccountService {
             shares: req.shares,
             name: req.name,
             thesis: req.thesis,
-            thesis_id: req.thesis_id,
+            expectation_id: req.expectation_id,
             stop_loss: req.stop_loss,
             take_profit: req.take_profit,
             time_stop_at: req.time_stop_at,

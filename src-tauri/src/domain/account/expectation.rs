@@ -17,9 +17,32 @@ use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::{OccurredAt, StockCode, Yuan};
 use serde::{Deserialize, Serialize};
 
-// 沿用 thesis 模块定义的 Conviction（v2 的）。W22 schema 升级删除 thesis 时，
-// 把 Conviction 的定义搬到本文件，所有 import 同步切换。
-pub use crate::domain::account::thesis::Conviction;
+/// 预期把握度——影响仓位 sizing 和 strategy 标记升级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Conviction {
+    Low,
+    Medium,
+    High,
+}
+
+impl Conviction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
 
 // ====== ID ==============================================================
 

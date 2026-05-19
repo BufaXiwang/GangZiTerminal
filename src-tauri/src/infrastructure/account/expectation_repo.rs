@@ -11,13 +11,19 @@ use crate::domain::account::expectation::{
     Direction, Expectation, ExpectationEvent, ExpectationEventRecord, ExpectationId,
     ExpectationState,
 };
-use crate::domain::account::thesis::Conviction;
+use crate::domain::account::expectation::Conviction;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::{OccurredAt, StockCode, Yuan};
 use crate::infrastructure::db::{migrate, open_database};
 use rusqlite::{params, OptionalExtension};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
+
+pub const EVENT_EXPECTATIONS_CHANGED: &str = "expectations-changed";
+
+fn emit_changed(app: &AppHandle) {
+    let _ = app.emit(EVENT_EXPECTATIONS_CHANGED, serde_json::json!({}));
+}
 
 // ====== 写入 ============================================================
 
@@ -71,6 +77,7 @@ pub fn create(app: &AppHandle, exp: &Expectation) -> Result<(), String> {
     .map_err(|err| format!("写 expectation_events(created) 失败：{err}"))?;
     tx.commit()
         .map_err(|err| format!("提交事务失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -111,6 +118,7 @@ pub fn transition(
     .map_err(|err| format!("写 expectation_events 失败：{err}"))?;
     tx.commit()
         .map_err(|err| format!("提交事务失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -131,6 +139,7 @@ pub fn append_event(
         params![id.as_str(), event.kind_str(), payload, now.to_rfc3339()],
     )
     .map_err(|err| format!("写 expectation_events 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -179,6 +188,7 @@ pub fn update_fields(
     binds.push(Value::Text(id.as_str().to_string()));
     conn.execute(&sql, rusqlite::params_from_iter(binds))
         .map_err(|err| format!("更新 expectation 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 

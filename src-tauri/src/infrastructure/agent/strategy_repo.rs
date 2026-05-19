@@ -7,7 +7,13 @@ use crate::domain::shared::OccurredAt;
 use crate::infrastructure::db::{migrate, open_database};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
+
+pub const EVENT_STRATEGIES_CHANGED: &str = "strategies-changed";
+
+fn emit_changed(app: &AppHandle) {
+    let _ = app.emit(EVENT_STRATEGIES_CHANGED, serde_json::json!({}));
+}
 
 /// 落库形态：除统计列外，其他字段全压进 config_json。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +54,7 @@ pub fn create(app: &AppHandle, s: &Strategy) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("插入 strategy 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -64,6 +71,7 @@ pub fn set_enabled(
         params![id.as_str(), if enabled { 1i64 } else { 0i64 }, now.to_rfc3339()],
     )
     .map_err(|err| format!("更新 strategy enabled 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -75,6 +83,7 @@ pub fn increment_applied(app: &AppHandle, id: &StrategyId) -> Result<(), String>
         params![id.as_str()],
     )
     .map_err(|err| format!("递增 applied_count 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -92,6 +101,7 @@ pub fn record_outcome(
     );
     conn.execute(&sql, params![id.as_str()])
         .map_err(|err| format!("记录 strategy outcome 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 

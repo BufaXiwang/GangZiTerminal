@@ -13,7 +13,13 @@ use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::OccurredAt;
 use crate::infrastructure::db::{migrate, open_database};
 use rusqlite::{params, OptionalExtension};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
+
+pub const EVENT_HEURISTICS_CHANGED: &str = "heuristics-changed";
+
+fn emit_changed(app: &AppHandle) {
+    let _ = app.emit(EVENT_HEURISTICS_CHANGED, serde_json::json!({}));
+}
 
 pub fn create(app: &AppHandle, h: &Heuristic) -> Result<(), String> {
     let conn = open_database(app)?;
@@ -55,6 +61,7 @@ pub fn create(app: &AppHandle, h: &Heuristic) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("插入 heuristic 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
@@ -90,6 +97,7 @@ pub fn record_application_outcome(
     );
     conn.execute(&sql, params![id.as_str(), now.to_rfc3339()])
         .map_err(|err| format!("更新 heuristic outcome 失败：{err}"))?;
+    emit_changed(app);
     Ok(true)
 }
 
@@ -108,6 +116,7 @@ pub fn retire(
         params![id.as_str(), now.to_rfc3339(), reason],
     )
     .map_err(|err| format!("retire heuristic 失败：{err}"))?;
+    emit_changed(app);
     Ok(())
 }
 
