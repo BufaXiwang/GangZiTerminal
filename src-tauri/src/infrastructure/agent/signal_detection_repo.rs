@@ -75,6 +75,37 @@ pub fn list_for_tick(
     Ok(out)
 }
 
+/// 列出某 code 自 `since` 之后的所有 detection（升序）——
+/// expectation review 时拿来匹配 invalidation_signals 用。
+pub fn list_for_code_since(
+    app: &AppHandle,
+    code: &str,
+    since: OccurredAt,
+) -> Result<Vec<(SignalKind, OccurredAt)>, String> {
+    let conn = open_database(app)?;
+    migrate(&conn)?;
+    let mut stmt = conn
+        .prepare(
+            "select signal_json, detected_at from signal_detections
+             where code = ?1 and detected_at >= ?2 order by detected_at",
+        )
+        .map_err(|err| format!("准备 list_for_code_since 失败：{err}"))?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![code, since.to_rfc3339()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|err| format!("query 失败：{err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("collect 失败：{err}"))?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (json, ts) in rows {
+        let signal: SignalKind = serde_json::from_str(&json)
+            .map_err(|err| format!("反序列化 signal 失败：{err}"))?;
+        out.push((signal, parse_occurred(&ts)?));
+    }
+    Ok(out)
+}
+
 /// 给定 signal family 在最近 N 天的触发次数 + 命中率 — 用于 health metrics。
 pub fn signal_family_stats(
     app: &AppHandle,

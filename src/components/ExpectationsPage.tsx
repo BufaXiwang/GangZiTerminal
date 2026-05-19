@@ -10,7 +10,7 @@ type Lesson = {
   code: string;
   observation: string;
   takeaway: string;
-  outcome: "hit" | "miss" | "expired";
+  outcome: "hit" | "partial_hit" | "miss" | "expired";
   createdAt: number;
 };
 
@@ -26,7 +26,8 @@ type Expectation = {
   conviction: "low" | "medium" | "high";
   theme: string | null;
   supersedes: string | null;
-  state: "pending" | "hit" | "missed" | "expired" | "cancelled" | "superseded";
+  state: "pending" | "hit" | "partial_hit" | "missed" | "expired" | "cancelled" | "superseded";
+  referencePrice: number | null;
   regimeAtCreation: string | null;
   createdAt: number;
   expiresAt: number;
@@ -43,6 +44,7 @@ type ExpectationSummary = {
 const STATE_LABEL: Record<Expectation["state"], string> = {
   pending: "进行中",
   hit: "命中",
+  partial_hit: "部分命中",
   missed: "未中",
   expired: "到期",
   cancelled: "已撤",
@@ -52,6 +54,7 @@ const STATE_LABEL: Record<Expectation["state"], string> = {
 const STATE_BADGE: Record<Expectation["state"], "brand" | "good" | "danger" | "warn" | "neutral"> = {
   pending: "brand",
   hit: "good",
+  partial_hit: "warn",
   missed: "danger",
   expired: "warn",
   cancelled: "neutral",
@@ -60,12 +63,14 @@ const STATE_BADGE: Record<Expectation["state"], "brand" | "good" | "danger" | "w
 
 const LESSON_BADGE: Record<Lesson["outcome"], "good" | "danger" | "warn"> = {
   hit: "good",
+  partial_hit: "warn",
   miss: "danger",
   expired: "warn",
 };
 
 const LESSON_LABEL: Record<Lesson["outcome"], string> = {
   hit: "命中",
+  partial_hit: "部分命中",
   miss: "未中",
   expired: "到期",
 };
@@ -73,6 +78,7 @@ const LESSON_LABEL: Record<Lesson["outcome"], string> = {
 const FILTER_OPTIONS: Array<{ id: Expectation["state"]; label: string }> = [
   { id: "pending", label: "进行中" },
   { id: "hit", label: "命中" },
+  { id: "partial_hit", label: "部分命中" },
   { id: "missed", label: "未中" },
   { id: "expired", label: "到期" },
   { id: "cancelled", label: "已撤" },

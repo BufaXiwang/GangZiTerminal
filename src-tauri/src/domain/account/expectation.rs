@@ -4,11 +4,13 @@
 //!
 //! 一个 Expectation = 一次可量化、可代码自动验证的押注：
 //! - code + direction + target_price + horizon_days：核心预测
+//! - reference_price：创建时市价快照——用来算 partial_hit 的实际涨幅
 //! - signals_used：触发本预期的结构化信号列表（驱动 hit/miss 时反向打标）
 //! - reasoning：叙事 / 决策上下文（原 v2 Thesis.hypothesis 的角色）
 //! - theme：跨股聚合标签（"光模块算力" / "新能源补涨"）
 //! - supersedes：链向上一个 expectation，形成滚动跟踪时间序列
-//! - 状态机：pending → hit / missed / expired / cancelled / superseded
+//! - 状态机：pending → hit / partial_hit / missed / expired / cancelled / superseded
+//!     - partial_hit：到期方向对（current 在 reference 与 target 之间）——"目标定高了" vs "彻底错"
 //!
 //! 自动 review：每个 tick / 盘后 reflection 拿 quote 算 `judge_outcome`，纯函数判定。
 
@@ -114,6 +116,9 @@ pub enum ExpectationState {
     Pending,
     /// 命中（横坐标可在 expires 之前到价）
     Hit,
+    /// 到期方向对但未达 target——current 与 reference 同向但未触达 target
+    /// （"目标定高了 / 节奏慢了" vs "彻底错"）
+    PartialHit,
     /// 到期未触达 target
     Missed,
     /// 到期但 direction=RangeBound 时算 hit；其他 direction 等同 missed
@@ -130,6 +135,7 @@ impl ExpectationState {
         match self {
             Self::Pending => "pending",
             Self::Hit => "hit",
+            Self::PartialHit => "partial_hit",
             Self::Missed => "missed",
             Self::Expired => "expired",
             Self::Cancelled => "cancelled",
@@ -140,6 +146,7 @@ impl ExpectationState {
         match s {
             "pending" => Some(Self::Pending),
             "hit" => Some(Self::Hit),
+            "partial_hit" => Some(Self::PartialHit),
             "missed" => Some(Self::Missed),
             "expired" => Some(Self::Expired),
             "cancelled" => Some(Self::Cancelled),
@@ -152,7 +159,9 @@ impl ExpectationState {
         !matches!(self, Self::Pending)
     }
 
-    /// hit/miss 累积到关联 signals 的 heuristics 时调；expired/cancelled/superseded 不计入。
+    /// hit/miss 累积到关联 signals 的 heuristics 时调；
+    /// partial_hit / expired / cancelled / superseded 不计入——
+    /// partial_hit 方向对但目标偏离，对 heuristic 是中性证据。
     pub fn counts_for_signal_outcome(self) -> Option<bool> {
         match self {
             Self::Hit => Some(true),
@@ -175,11 +184,17 @@ pub struct Expectation {
     pub target_price: Option<Yuan>,
     /// 区间预期的上沿（仅 RangeBound 使用）
     pub target_price_ceiling: Option<Yuan>,
+    /// 创建瞬间的市价快照——用于 judge_outcome 判定 partial_hit 时算实际涨幅 / 跌幅。
+    /// 老 expectation（v3 早期）可能没有；缺失时 partial_hit 判定退化为 missed。
+    pub reference_price: Option<Yuan>,
     pub horizon_days: u32,
     /// 自然语言决策上下文——叙事 / 这次为什么押
     pub reasoning: String,
     /// 触发本预期的结构化信号列表——hit/miss 时反向打标
     pub signals_used: Vec<SignalKind>,
+    /// 失效条件信号——review 时若 code 触发了任一 family，提前判 Missed（不等 horizon）
+    /// 例如：Up 预期带 "BreakoutBelow20MA / VolumeShrink / LimitDown" → 任一命中即止损
+    pub invalidation_signals: Vec<SignalKind>,
     pub conviction: Conviction,
     /// 跨股聚合标签（"光模块算力" / null）
     pub theme: Option<String>,
@@ -200,6 +215,14 @@ pub enum ExpectationEvent {
     Created,
     Hit {
         actual_price: Yuan,
+        reason: String,
+    },
+    /// 到期方向对但未达 target——actual_gain_pct 是相对 reference_price 的实际变化
+    /// （Up 为正、Down 取绝对值后正向表示"已经向下走了多少"），target_gain_pct 同理。
+    PartialHit {
+        actual_price: Yuan,
+        actual_gain_pct: f64,
+        target_gain_pct: f64,
         reason: String,
     },
     Missed {
@@ -228,6 +251,7 @@ impl ExpectationEvent {
         match self {
             Self::Created => "created",
             Self::Hit { .. } => "hit",
+            Self::PartialHit { .. } => "partial_hit",
             Self::Missed { .. } => "missed",
             Self::Expired { .. } => "expired",
             Self::Cancelled { .. } => "cancelled",
@@ -258,6 +282,14 @@ pub enum OutcomeJudgment {
         actual_price: Yuan,
         reason: String,
     },
+    /// 到期方向对但未达 target——current 在 reference 与 target 之间。
+    /// 仅 Up / Down 触发，且 reference_price 已知；RangeBound 不存在 partial 状态。
+    PartialHit {
+        actual_price: Yuan,
+        actual_gain_pct: f64,
+        target_gain_pct: f64,
+        reason: String,
+    },
     Missed {
         actual_price: Yuan,
         reason: String,
@@ -265,6 +297,20 @@ pub enum OutcomeJudgment {
     Expired {
         reason: String,
     },
+}
+
+/// 相对 reference_price 的"达成度"——正数表示朝目标方向走了多少 %。
+/// Up: (current - reference) / reference
+/// Down: (reference - current) / reference
+fn directional_pct(direction: Direction, reference: f64, current: f64) -> f64 {
+    if reference.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    match direction {
+        Direction::Up => (current - reference) / reference * 100.0,
+        Direction::Down => (reference - current) / reference * 100.0,
+        Direction::RangeBound => 0.0,
+    }
 }
 
 pub fn judge_outcome(
@@ -298,6 +344,26 @@ pub fn judge_outcome(
                     ),
                 }
             } else if expired {
+                // 到期未达——检查方向是否对（current > reference）→ partial_hit
+                if let Some(reference) = exp.reference_price {
+                    let actual = directional_pct(Direction::Up, reference.value(), current_price.value());
+                    let target_pct = directional_pct(Direction::Up, reference.value(), target.value());
+                    if actual > 0.0 && actual < target_pct {
+                        return OutcomeJudgment::PartialHit {
+                            actual_price: current_price,
+                            actual_gain_pct: actual,
+                            target_gain_pct: target_pct,
+                            reason: format!(
+                                "到期方向对未达 up target：reference {} → current {} (+{:.2}%) vs target {} (+{:.2}%)",
+                                reference.value(),
+                                current_price.value(),
+                                actual,
+                                target.value(),
+                                target_pct,
+                            ),
+                        };
+                    }
+                }
                 OutcomeJudgment::Missed {
                     actual_price: current_price,
                     reason: format!(
@@ -321,6 +387,26 @@ pub fn judge_outcome(
                     ),
                 }
             } else if expired {
+                // 到期未破——检查方向是否对（current < reference）→ partial_hit
+                if let Some(reference) = exp.reference_price {
+                    let actual = directional_pct(Direction::Down, reference.value(), current_price.value());
+                    let target_pct = directional_pct(Direction::Down, reference.value(), target.value());
+                    if actual > 0.0 && actual < target_pct {
+                        return OutcomeJudgment::PartialHit {
+                            actual_price: current_price,
+                            actual_gain_pct: actual,
+                            target_gain_pct: target_pct,
+                            reason: format!(
+                                "到期方向对未破 down target：reference {} → current {} (-{:.2}%) vs target {} (-{:.2}%)",
+                                reference.value(),
+                                current_price.value(),
+                                actual,
+                                target.value(),
+                                target_pct,
+                            ),
+                        };
+                    }
+                }
                 OutcomeJudgment::Missed {
                     actual_price: current_price,
                     reason: format!(
@@ -382,14 +468,17 @@ pub fn judge_outcome(
 // ====== 构造辅助 ========================================================
 
 impl Expectation {
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         code: StockCode,
         direction: Direction,
         target_price: Option<Yuan>,
         target_price_ceiling: Option<Yuan>,
+        reference_price: Option<Yuan>,
         horizon_days: u32,
         reasoning: String,
         signals_used: Vec<SignalKind>,
+        invalidation_signals: Vec<SignalKind>,
         conviction: Conviction,
         theme: Option<String>,
         supersedes: Option<ExpectationId>,
@@ -403,9 +492,11 @@ impl Expectation {
             direction,
             target_price,
             target_price_ceiling,
+            reference_price,
             horizon_days,
             reasoning,
             signals_used,
+            invalidation_signals,
             conviction,
             theme,
             supersedes,
@@ -428,6 +519,15 @@ mod tests {
         target: Option<Yuan>,
         expires_offset_ms: i64,
     ) -> Expectation {
+        make_expectation_with_ref(direction, target, None, expires_offset_ms)
+    }
+
+    fn make_expectation_with_ref(
+        direction: Direction,
+        target: Option<Yuan>,
+        reference: Option<Yuan>,
+        expires_offset_ms: i64,
+    ) -> Expectation {
         let now = OccurredAt::new(1_700_000_000_000);
         let expires = OccurredAt::new(1_700_000_000_000 + expires_offset_ms);
         Expectation::create(
@@ -435,8 +535,10 @@ mod tests {
             direction,
             target,
             None,
+            reference,
             5,
             "test".into(),
+            vec![],
             vec![],
             Conviction::Medium,
             None,
@@ -465,10 +567,65 @@ mod tests {
 
     #[test]
     fn judge_up_missed_when_expired_below_target() {
+        // 没传 reference_price——退化为 missed（即使方向"对"也无法证明）
         let exp = make_expectation(Direction::Up, Some(Yuan::new(110.0).unwrap()), 86_400_000);
         let now = OccurredAt::new(1_700_000_000_000 + 86_400_001);
         let outcome = judge_outcome(&exp, Yuan::new(108.0).unwrap(), now);
         assert!(matches!(outcome, OutcomeJudgment::Missed { .. }));
+    }
+
+    #[test]
+    fn judge_up_partial_hit_when_expired_with_direction_correct() {
+        // reference=100, target=110, current=105 → +5% 但未到 +10% → partial_hit
+        let exp = make_expectation_with_ref(
+            Direction::Up,
+            Some(Yuan::new(110.0).unwrap()),
+            Some(Yuan::new(100.0).unwrap()),
+            86_400_000,
+        );
+        let now = OccurredAt::new(1_700_000_000_000 + 86_400_001);
+        let outcome = judge_outcome(&exp, Yuan::new(105.0).unwrap(), now);
+        match outcome {
+            OutcomeJudgment::PartialHit { actual_gain_pct, target_gain_pct, .. } => {
+                assert!((actual_gain_pct - 5.0).abs() < 0.01);
+                assert!((target_gain_pct - 10.0).abs() < 0.01);
+            }
+            other => panic!("expected PartialHit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn judge_up_missed_when_expired_with_direction_wrong() {
+        // reference=100, target=110, current=95 → 反向 → missed（不是 partial_hit）
+        let exp = make_expectation_with_ref(
+            Direction::Up,
+            Some(Yuan::new(110.0).unwrap()),
+            Some(Yuan::new(100.0).unwrap()),
+            86_400_000,
+        );
+        let now = OccurredAt::new(1_700_000_000_000 + 86_400_001);
+        let outcome = judge_outcome(&exp, Yuan::new(95.0).unwrap(), now);
+        assert!(matches!(outcome, OutcomeJudgment::Missed { .. }));
+    }
+
+    #[test]
+    fn judge_down_partial_hit_when_expired_partially_dropped() {
+        // reference=100, target=90, current=95 → 跌了 5%，未到 -10% → partial_hit
+        let exp = make_expectation_with_ref(
+            Direction::Down,
+            Some(Yuan::new(90.0).unwrap()),
+            Some(Yuan::new(100.0).unwrap()),
+            86_400_000,
+        );
+        let now = OccurredAt::new(1_700_000_000_000 + 86_400_001);
+        let outcome = judge_outcome(&exp, Yuan::new(95.0).unwrap(), now);
+        match outcome {
+            OutcomeJudgment::PartialHit { actual_gain_pct, target_gain_pct, .. } => {
+                assert!((actual_gain_pct - 5.0).abs() < 0.01);
+                assert!((target_gain_pct - 10.0).abs() < 0.01);
+            }
+            other => panic!("expected PartialHit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -500,9 +657,20 @@ mod tests {
     fn state_terminal_check() {
         assert!(!ExpectationState::Pending.is_terminal());
         assert!(ExpectationState::Hit.is_terminal());
+        assert!(ExpectationState::PartialHit.is_terminal());
         assert!(ExpectationState::Missed.is_terminal());
         assert_eq!(ExpectationState::Hit.counts_for_signal_outcome(), Some(true));
         assert_eq!(ExpectationState::Missed.counts_for_signal_outcome(), Some(false));
         assert_eq!(ExpectationState::Expired.counts_for_signal_outcome(), None);
+        // partial_hit 不计入 heuristic hit/miss——方向对但目标偏离是中性证据
+        assert_eq!(ExpectationState::PartialHit.counts_for_signal_outcome(), None);
+    }
+
+    #[test]
+    fn state_round_trip_includes_partial_hit() {
+        assert_eq!(
+            ExpectationState::parse(ExpectationState::PartialHit.as_str()),
+            Some(ExpectationState::PartialHit)
+        );
     }
 }

@@ -5,12 +5,14 @@
 //! 这里的类型是**纯 domain**——无 I/O、无 Tauri、无外部 crate（除 serde / chrono / thiserror）。
 //! 任何 crate::* 内部模块可以 `use crate::domain::shared::*` 引入。
 
+pub mod board;
 pub mod ids;
 pub mod money;
 pub mod shares;
 pub mod signal;
 pub mod time;
 
+pub use board::{classify as classify_board, Board};
 pub use ids::{IdError, StockCode, TsCode};
 pub use money::{KYuan, MoneyError, Yuan};
 pub use shares::{Lots, Shares, SharesError};

@@ -276,13 +276,17 @@ create table if not exists expectations (
     direction text not null check (direction in ('up', 'down', 'range_bound')),
     target_price real,
     target_price_ceiling real,
+    -- v6：创建瞬间的市价快照（用于 partial_hit 判定算实际涨幅 vs 目标涨幅）
+    reference_price real,
     horizon_days integer not null,
     reasoning text not null,
     signals_used text not null,            -- JSON array of SignalKind
+    -- v6：失效条件信号——review 时若任一 family 命中，提前判 Missed
+    invalidation_signals text,             -- JSON array of SignalKind (null = 无失效条件)
     conviction text not null check (conviction in ('low', 'medium', 'high')),
     theme text,
     supersedes_expectation_id text,
-    state text not null check (state in ('pending', 'hit', 'missed', 'expired', 'cancelled', 'superseded')),
+    state text not null check (state in ('pending', 'hit', 'partial_hit', 'missed', 'expired', 'cancelled', 'superseded')),
     regime_at_creation text,
     -- v5 审计字段：追溯到生成这条预期的 scan tick + 主信号家族（用于快速 group by）
     trigger_signal_family text,
@@ -338,7 +342,7 @@ create table if not exists lessons (
     code text not null,
     observation text not null,
     takeaway text not null,
-    outcome text not null check (outcome in ('hit', 'miss', 'expired')),
+    outcome text not null check (outcome in ('hit', 'partial_hit', 'miss', 'expired')),
     regime_at_close text,
     signals_in_play text,                  -- JSON array
     pnl_pct real,
@@ -369,6 +373,15 @@ create table if not exists heuristics (
 create index if not exists idx_heuristics_origin on heuristics(origin);
 create index if not exists idx_heuristics_retired on heuristics(retired_at);
 create index if not exists idx_heuristics_emerged on heuristics(last_emerged_at desc);
+
+-- Expectation ↔ Heuristic link：精确归因 expectation 终态影响哪些 heuristic 的 track record。
+-- v6 引入——取代之前"所有 agent_inferred + 有 lessons 支持的 heuristic 都给计数"的粗暴聚合。
+create table if not exists expectation_heuristic_links (
+    expectation_id text not null,
+    heuristic_id text not null,
+    primary key (expectation_id, heuristic_id)
+);
+create index if not exists idx_ehl_heuristic on expectation_heuristic_links(heuristic_id);
 
 -- Signal detection log（per-tick 检测结果，审计 + 命中率统计）
 create table if not exists signal_detections (

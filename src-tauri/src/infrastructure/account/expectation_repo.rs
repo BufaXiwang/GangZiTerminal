@@ -36,21 +36,31 @@ pub fn create(app: &AppHandle, exp: &Expectation) -> Result<(), String> {
         .map_err(|err| format!("开启事务失败：{err}"))?;
     let signals_json = serde_json::to_string(&exp.signals_used)
         .map_err(|err| format!("序列化 signals_used 失败：{err}"))?;
+    let invalidation_json = if exp.invalidation_signals.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&exp.invalidation_signals)
+                .map_err(|err| format!("序列化 invalidation_signals 失败：{err}"))?,
+        )
+    };
     tx.execute(
         "insert into expectations
-            (id, code, direction, target_price, target_price_ceiling, horizon_days,
-             reasoning, signals_used, conviction, theme, supersedes_expectation_id,
+            (id, code, direction, target_price, target_price_ceiling, reference_price, horizon_days,
+             reasoning, signals_used, invalidation_signals, conviction, theme, supersedes_expectation_id,
              state, regime_at_creation, created_at, expires_at, closed_at)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             exp.id.as_str(),
             exp.code.as_str(),
             exp.direction.as_str(),
             exp.target_price.as_ref().map(|y| y.value()),
             exp.target_price_ceiling.as_ref().map(|y| y.value()),
+            exp.reference_price.as_ref().map(|y| y.value()),
             exp.horizon_days as i64,
             exp.reasoning,
             signals_json,
+            invalidation_json,
             exp.conviction.as_str(),
             exp.theme,
             exp.supersedes.as_ref().map(|i| i.as_str().to_string()),
@@ -199,8 +209,8 @@ pub fn get(app: &AppHandle, id: &ExpectationId) -> Result<Option<Expectation>, S
     migrate(&conn)?;
     let row = conn
         .query_row(
-            "select code, direction, target_price, target_price_ceiling, horizon_days,
-                    reasoning, signals_used, conviction, theme, supersedes_expectation_id,
+            "select code, direction, target_price, target_price_ceiling, reference_price, horizon_days,
+                    reasoning, signals_used, invalidation_signals, conviction, theme, supersedes_expectation_id,
                     state, regime_at_creation, created_at, expires_at, closed_at
              from expectations where id = ?1",
             params![id.as_str()],
@@ -219,8 +229,8 @@ pub fn list_pending_for_code(
     migrate(&conn)?;
     let mut stmt = conn
         .prepare(
-            "select id, code, direction, target_price, target_price_ceiling, horizon_days,
-                    reasoning, signals_used, conviction, theme, supersedes_expectation_id,
+            "select id, code, direction, target_price, target_price_ceiling, reference_price, horizon_days,
+                    reasoning, signals_used, invalidation_signals, conviction, theme, supersedes_expectation_id,
                     state, regime_at_creation, created_at, expires_at, closed_at
              from expectations
              where state = 'pending' and code = ?1
@@ -240,8 +250,8 @@ pub fn list_pending(app: &AppHandle, limit: i64) -> Result<Vec<Expectation>, Str
     migrate(&conn)?;
     let mut stmt = conn
         .prepare(
-            "select id, code, direction, target_price, target_price_ceiling, horizon_days,
-                    reasoning, signals_used, conviction, theme, supersedes_expectation_id,
+            "select id, code, direction, target_price, target_price_ceiling, reference_price, horizon_days,
+                    reasoning, signals_used, invalidation_signals, conviction, theme, supersedes_expectation_id,
                     state, regime_at_creation, created_at, expires_at, closed_at
              from expectations
              where state = 'pending'
@@ -265,8 +275,8 @@ pub fn list_by_state(
     migrate(&conn)?;
     let mut stmt = conn
         .prepare(
-            "select id, code, direction, target_price, target_price_ceiling, horizon_days,
-                    reasoning, signals_used, conviction, theme, supersedes_expectation_id,
+            "select id, code, direction, target_price, target_price_ceiling, reference_price, horizon_days,
+                    reasoning, signals_used, invalidation_signals, conviction, theme, supersedes_expectation_id,
                     state, regime_at_creation, created_at, expires_at, closed_at
              from expectations where state = ?1
              order by created_at desc limit ?2",
@@ -325,26 +335,30 @@ fn row_to_expectation_with_id(
         let direction: String = row.get(1)?;
         let target_price: Option<f64> = row.get(2)?;
         let target_price_ceiling: Option<f64> = row.get(3)?;
-        let horizon_days: i64 = row.get(4)?;
-        let reasoning: String = row.get(5)?;
-        let signals_used: String = row.get(6)?;
-        let conviction: String = row.get(7)?;
-        let theme: Option<String> = row.get(8)?;
-        let supersedes: Option<String> = row.get(9)?;
-        let state: String = row.get(10)?;
-        let regime: Option<String> = row.get(11)?;
-        let created_at: String = row.get(12)?;
-        let expires_at: String = row.get(13)?;
-        let closed_at: Option<String> = row.get(14)?;
+        let reference_price: Option<f64> = row.get(4)?;
+        let horizon_days: i64 = row.get(5)?;
+        let reasoning: String = row.get(6)?;
+        let signals_used: String = row.get(7)?;
+        let invalidation_signals: Option<String> = row.get(8)?;
+        let conviction: String = row.get(9)?;
+        let theme: Option<String> = row.get(10)?;
+        let supersedes: Option<String> = row.get(11)?;
+        let state: String = row.get(12)?;
+        let regime: Option<String> = row.get(13)?;
+        let created_at: String = row.get(14)?;
+        let expires_at: String = row.get(15)?;
+        let closed_at: Option<String> = row.get(16)?;
         Ok(build_expectation(
             id.clone(),
             code,
             direction,
             target_price,
             target_price_ceiling,
+            reference_price,
             horizon_days,
             reasoning,
             signals_used,
+            invalidation_signals,
             conviction,
             theme,
             supersedes,
@@ -366,26 +380,30 @@ fn row_to_expectation_full(
     let direction: String = row.get(2)?;
     let target_price: Option<f64> = row.get(3)?;
     let target_price_ceiling: Option<f64> = row.get(4)?;
-    let horizon_days: i64 = row.get(5)?;
-    let reasoning: String = row.get(6)?;
-    let signals_used: String = row.get(7)?;
-    let conviction: String = row.get(8)?;
-    let theme: Option<String> = row.get(9)?;
-    let supersedes: Option<String> = row.get(10)?;
-    let state: String = row.get(11)?;
-    let regime: Option<String> = row.get(12)?;
-    let created_at: String = row.get(13)?;
-    let expires_at: String = row.get(14)?;
-    let closed_at: Option<String> = row.get(15)?;
+    let reference_price: Option<f64> = row.get(5)?;
+    let horizon_days: i64 = row.get(6)?;
+    let reasoning: String = row.get(7)?;
+    let signals_used: String = row.get(8)?;
+    let invalidation_signals: Option<String> = row.get(9)?;
+    let conviction: String = row.get(10)?;
+    let theme: Option<String> = row.get(11)?;
+    let supersedes: Option<String> = row.get(12)?;
+    let state: String = row.get(13)?;
+    let regime: Option<String> = row.get(14)?;
+    let created_at: String = row.get(15)?;
+    let expires_at: String = row.get(16)?;
+    let closed_at: Option<String> = row.get(17)?;
     Ok(build_expectation(
         id,
         code,
         direction,
         target_price,
         target_price_ceiling,
+        reference_price,
         horizon_days,
         reasoning,
         signals_used,
+        invalidation_signals,
         conviction,
         theme,
         supersedes,
@@ -404,9 +422,11 @@ fn build_expectation(
     direction: String,
     target_price: Option<f64>,
     target_price_ceiling: Option<f64>,
+    reference_price: Option<f64>,
     horizon_days: i64,
     reasoning: String,
     signals_used: String,
+    invalidation_signals: Option<String>,
     conviction: String,
     theme: Option<String>,
     supersedes: Option<String>,
@@ -418,6 +438,11 @@ fn build_expectation(
 ) -> Result<Expectation, String> {
     let signals: Vec<SignalKind> = serde_json::from_str(&signals_used)
         .map_err(|err| format!("反序列化 signals_used 失败：{err}"))?;
+    let invalidation: Vec<SignalKind> = match invalidation_signals {
+        Some(json) if !json.trim().is_empty() => serde_json::from_str(&json)
+            .map_err(|err| format!("反序列化 invalidation_signals 失败：{err}"))?,
+        _ => Vec::new(),
+    };
     Ok(Expectation {
         id,
         code: StockCode::new(&code).map_err(|e| format!("非法 code {code}: {e:?}"))?,
@@ -427,9 +452,11 @@ fn build_expectation(
             .map(Yuan::from_unchecked),
         target_price_ceiling: target_price_ceiling
             .map(Yuan::from_unchecked),
+        reference_price: reference_price.map(Yuan::from_unchecked),
         horizon_days: horizon_days as u32,
         reasoning,
         signals_used: signals,
+        invalidation_signals: invalidation,
         conviction: Conviction::parse(&conviction)
             .ok_or_else(|| format!("未知 conviction: {conviction}"))?,
         theme,

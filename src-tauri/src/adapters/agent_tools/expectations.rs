@@ -9,7 +9,10 @@ use crate::domain::account::expectation::{
 use crate::domain::agent::types::ToolResultContent;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{OccurredAt, StockCode, Yuan};
+use crate::domain::agent::heuristic::HeuristicId;
 use crate::infrastructure::account::expectation_repo;
+use crate::infrastructure::agent::expectation_heuristic_link_repo;
+use crate::infrastructure::quotes::snapshot::market_snapshot;
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -42,6 +45,20 @@ fn parse_signals(input: &Value) -> Result<Vec<SignalKind>, String> {
     Ok(out)
 }
 
+/// 解析可选 `invalidation_signals` 数组——缺失或非数组返回空 Vec（不视为错误）。
+fn parse_invalidation_signals(input: &Value) -> Result<Vec<SignalKind>, String> {
+    let Some(arr) = input.get("invalidation_signals").and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s: SignalKind = serde_json::from_value(item.clone())
+            .map_err(|e| format!("反序列化 invalidation signal 失败：{e}"))?;
+        out.push(s);
+    }
+    Ok(out)
+}
+
 // ====== create_expectation ==============================================
 
 pub struct CreateExpectationTool {
@@ -62,7 +79,8 @@ impl Tool for CreateExpectationTool {
 
     fn description(&self) -> &'static str {
         "创建可量化 expectation——agent 主动开仓前必先调拿 id 传给 open_position。\
-        返回 expectation_id。supersedes_expectation_id 用于替换同方向旧预期。"
+        返回 expectation_id。supersedes_expectation_id 用于替换同方向旧预期。\
+        reference_price 不传时自动取当前市价快照——用于到期判定 partial_hit。"
     }
 
     fn input_schema(&self) -> Value {
@@ -73,12 +91,22 @@ impl Tool for CreateExpectationTool {
                 "direction": {"type": "string", "enum": ["up", "down", "range_bound"]},
                 "target_price": {"type": "number"},
                 "target_price_ceiling": {"type": "number"},
+                "reference_price": {"type": "number", "description": "决策当下的参考价；省略时取 market_snapshot 当前价"},
                 "horizon_days": {"type": "integer", "minimum": 1},
                 "reasoning": {"type": "string"},
                 "signals_used": {"type": "array"},
+                "invalidation_signals": {
+                    "type": "array",
+                    "description": "失效条件信号数组：review 时若任一 family 命中，提前判 Missed（不等 horizon）。例如 Up 预期可填 BreakoutBelow20MA / VolumeShrink / LimitDown。"
+                },
                 "conviction": {"type": "string", "enum": ["low", "medium", "high"]},
                 "theme": {"type": "string"},
-                "supersedes_expectation_id": {"type": "string"}
+                "supersedes_expectation_id": {"type": "string"},
+                "applied_heuristic_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "本预期实际依赖的 heuristic id 列表（按 system prompt 给出的 id 复制）；review 时按此精确给对应 heuristic 计 hit/miss。不依赖任何 heuristic 就别填。"
+                }
             },
             "required": ["code", "direction", "horizon_days", "reasoning", "signals_used", "conviction"]
         })
@@ -113,6 +141,10 @@ impl Tool for CreateExpectationTool {
             Ok(s) => s,
             Err(e) => return err_text(e),
         };
+        let invalidation_signals = match parse_invalidation_signals(&input) {
+            Ok(s) => s,
+            Err(e) => return err_text(e),
+        };
         let conviction_str = match parse_required_string(&input, "conviction") {
             Ok(s) => s,
             Err(e) => return err_text(e),
@@ -123,9 +155,29 @@ impl Tool for CreateExpectationTool {
         };
         let target_price = input.get("target_price").and_then(|v| v.as_f64()).map(Yuan::from_unchecked);
         let target_price_ceiling = input.get("target_price_ceiling").and_then(|v| v.as_f64()).map(Yuan::from_unchecked);
+        // reference_price：用户传 > snapshot 当前价 > None。
+        let reference_price = input
+            .get("reference_price")
+            .and_then(|v| v.as_f64())
+            .map(Yuan::from_unchecked)
+            .or_else(|| {
+                market_snapshot::get(&code.to_ts_code())
+                    .and_then(|q| q.price)
+            });
         let theme = parse_optional_string(&input, "theme");
         let supersedes = parse_optional_string(&input, "supersedes_expectation_id")
             .map(ExpectationId::from_string);
+        let applied_heuristic_ids: Vec<HeuristicId> = input
+            .get("applied_heuristic_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| HeuristicId::from_string(s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let now = OccurredAt::now();
         // expires_at = now + horizon_days 自然日（Phase 1 简化，不接交易日历）
@@ -135,9 +187,11 @@ impl Tool for CreateExpectationTool {
             direction,
             target_price,
             target_price_ceiling,
+            reference_price,
             horizon_days,
             reasoning,
             signals_used,
+            invalidation_signals,
             conviction,
             theme,
             supersedes,
@@ -148,11 +202,21 @@ impl Tool for CreateExpectationTool {
         if let Err(e) = expectation_repo::create(&self.app, &exp) {
             return err_text(format!("创建 expectation 失败：{e}"));
         }
+        let linked_count = applied_heuristic_ids.len();
+        if !applied_heuristic_ids.is_empty() {
+            if let Err(e) =
+                expectation_heuristic_link_repo::record(&self.app, &exp.id, &applied_heuristic_ids)
+            {
+                // 不阻断主流程——expectation 已写入，link 失败只影响后续归因
+                tracing::warn!(error = %e, expectation = %exp.id, "写 expectation_heuristic_links 失败");
+            }
+        }
         (
             ok_json(json!({
                 "ok": true,
                 "expectation_id": exp.id.as_str(),
                 "expires_at_ms": exp.expires_at.value(),
+                "linked_heuristics": linked_count,
             })),
             false,
         )

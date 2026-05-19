@@ -2,15 +2,21 @@
 //!
 //! 见 docs/design/agent-v3-expectation-driven.md § 8.2。
 //!
-//! 算法（Phase 1 简化）：
-//! 1. 拉最近 N 条 lessons（默认 50）
-//! 2. 按 takeaway 文本 token jaccard 相似度（≥0.6）聚类
-//! 3. cluster.size ≥ 2 且 takeaway 不为空 → emerge 一条 Heuristic
-//! 4. 检查是否已有 supporting_lesson_ids 大量重叠的 heuristic → 跳过避免重复
-//! 5. category 取该 cluster lessons 涉及最多的（默认 Principle）；regime_tags 来自 lessons.regime_at_close
+//! 算法（v6 结构化聚类）：
+//! 1. 拉最近 N 条 lessons（默认 50，takeaway 非空）
+//! 2. 按 **结构化特征** 聚类——key = (signal_family_set 排序后, regime, outcome_bucket)
+//!    - signal_family_set：lesson.signals_in_play 的 family_str 去重排序串接
+//!    - outcome_bucket：hit / partial_hit / miss / expired（精确分桶，不合并）
+//!    - 解决"放量突破失败 / 高位放量诱多 / 板块退潮冲高回落"字面不同但语义相关的 case
+//! 3. cluster.size ≥ 2 → emerge 一条 Heuristic
+//! 4. 文本 jaccard 作 **tiebreaker**：cluster 内挑出与其他 takeaways 平均相似度最高的
+//!    那条作为 body（"最典型"那条，比最长那条更有代表性）
+//! 5. 检查是否已有 supporting_lesson_ids 大量重叠的 heuristic → 跳过避免重复
+//! 6. category 由 outcome 主导：miss/expired → KnownBias；hit/partial_hit → Principle
 
 use crate::domain::agent::heuristic::{Heuristic, HeuristicCategory};
-use crate::domain::agent::lesson::Lesson;
+use crate::domain::agent::lesson::{Lesson, LessonOutcome};
+use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::OccurredAt;
 use crate::infrastructure::agent::{heuristic_repo, lesson_repo};
 use std::collections::{HashMap, HashSet};
@@ -23,7 +29,6 @@ pub struct EmergeResult {
     pub skipped_duplicates: usize,
 }
 
-const JACCARD_THRESHOLD: f32 = 0.6;
 const MIN_CLUSTER_SIZE: usize = 2;
 const RECENT_LESSONS_WINDOW: i64 = 50;
 
@@ -42,7 +47,7 @@ pub fn run(app: &AppHandle) -> Result<EmergeResult, String> {
         return Ok(result);
     }
 
-    let clusters = cluster_by_takeaway(&usable);
+    let clusters = cluster_by_structured_feature(&usable);
     result.clusters_found = clusters.len();
     let existing = heuristic_repo::list_all(app, 500)?;
 
@@ -55,11 +60,8 @@ pub fn run(app: &AppHandle) -> Result<EmergeResult, String> {
             result.skipped_duplicates += 1;
             continue;
         }
-        // 生成 heuristic body：取 cluster 里 takeaway 最长的那条（信息最多）
-        let representative = cluster
-            .iter()
-            .max_by_key(|l| l.takeaway.chars().count())
-            .unwrap();
+        // body：cluster 内挑"最典型"的 takeaway——与其他 takeaways 平均 jaccard 最高
+        let representative = pick_representative_takeaway(&cluster);
         let body = representative.takeaway.clone();
         let category = pick_dominant_category(&cluster);
         let regime_tags = collect_regime_tags(&cluster);
@@ -84,27 +86,68 @@ pub fn run(app: &AppHandle) -> Result<EmergeResult, String> {
     Ok(result)
 }
 
-// ====== cluster 算法 ====================================================
+// ====== 结构化 cluster 算法（v6） =========================================
 
-fn cluster_by_takeaway(lessons: &[Lesson]) -> Vec<Vec<Lesson>> {
-    let mut clusters: Vec<Vec<Lesson>> = Vec::new();
+/// 聚类 key：signal_family_set 排序串接 + regime（None 也是一类）+ outcome 精确分桶。
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+struct FeatureKey {
+    family_signature: String,
+    regime: Option<Regime>,
+    outcome: LessonOutcome,
+}
+
+fn feature_key(lesson: &Lesson) -> FeatureKey {
+    let mut families: Vec<&'static str> = lesson
+        .signals_in_play
+        .iter()
+        .map(|s| s.family_str())
+        .collect();
+    families.sort();
+    families.dedup();
+    FeatureKey {
+        family_signature: families.join("|"),
+        regime: lesson.regime_at_close,
+        outcome: lesson.outcome,
+    }
+}
+
+fn cluster_by_structured_feature(lessons: &[Lesson]) -> Vec<Vec<Lesson>> {
+    let mut buckets: HashMap<FeatureKey, Vec<Lesson>> = HashMap::new();
     for lesson in lessons {
-        let tokens = tokenize(&lesson.takeaway);
-        let mut joined = false;
-        for cluster in clusters.iter_mut() {
-            // 跟 cluster 第一条比相似度（粗暴但够用 Phase 1）
-            let head_tokens = tokenize(&cluster[0].takeaway);
-            if jaccard(&tokens, &head_tokens) >= JACCARD_THRESHOLD {
-                cluster.push(lesson.clone());
-                joined = true;
-                break;
-            }
+        // 没 signals_in_play 的 lesson 没法用 family 聚类——单独成一类（也不会和别人配对）
+        let key = feature_key(lesson);
+        if key.family_signature.is_empty() {
+            continue;
         }
-        if !joined {
-            clusters.push(vec![lesson.clone()]);
+        buckets.entry(key).or_default().push(lesson.clone());
+    }
+    buckets.into_values().collect()
+}
+
+/// cluster 内挑出与其他 takeaways 平均 jaccard 最高的那条——"最典型"那条。
+/// cluster.len() == 1 时直接返回第一条；==2 时两条互相计算选高分（实际 jaccard 对称，任选一条）。
+fn pick_representative_takeaway(cluster: &[Lesson]) -> &Lesson {
+    if cluster.len() == 1 {
+        return &cluster[0];
+    }
+    let tokens: Vec<HashSet<String>> = cluster.iter().map(|l| tokenize(&l.takeaway)).collect();
+    let mut best_idx = 0;
+    let mut best_score = -1.0_f32;
+    for i in 0..cluster.len() {
+        let mut sum = 0.0_f32;
+        for j in 0..cluster.len() {
+            if i == j {
+                continue;
+            }
+            sum += jaccard(&tokens[i], &tokens[j]);
+        }
+        let avg = sum / (cluster.len() - 1) as f32;
+        if avg > best_score {
+            best_score = avg;
+            best_idx = i;
         }
     }
-    clusters
+    &cluster[best_idx]
 }
 
 fn tokenize(text: &str) -> HashSet<String> {
@@ -140,14 +183,20 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f32 {
 
 fn has_duplicate_in_existing(cluster: &[Lesson], existing: &[Heuristic]) -> bool {
     let cluster_lesson_ids: HashSet<&str> = cluster.iter().map(|l| l.id.as_str()).collect();
+    // 取 cluster 的 representative takeaway 用于 body 字面去重
+    let rep_body = pick_representative_takeaway(cluster).takeaway.trim();
     for h in existing {
+        // 1. body 字面相同直接判重——防止反复 emerge 同句话
+        if h.retired_at.is_none() && !rep_body.is_empty() && h.body.trim() == rep_body {
+            return true;
+        }
+        // 2. supporting lesson 比例重叠 ≥50% 判重——比绝对数阈值更稳，cluster 变大也成比例
         let overlap = h
             .supporting_lesson_ids
             .iter()
             .filter(|l| cluster_lesson_ids.contains(l.as_str()))
             .count();
-        // 一半以上 lesson 已经被某个 heuristic 收录 → 算重复，跳过
-        if overlap >= cluster.len().max(1) / 2 + 1 {
+        if cluster.len() > 0 && overlap * 2 >= cluster.len() {
             return true;
         }
     }
@@ -155,13 +204,14 @@ fn has_duplicate_in_existing(cluster: &[Lesson], existing: &[Heuristic]) -> bool
 }
 
 fn pick_dominant_category(cluster: &[Lesson]) -> HeuristicCategory {
-    // Phase 1：Lesson 自身没 category 字段；按 outcome 启发性映射——
-    // miss outcome 倾向 KnownBias / RiskPreference；hit outcome 倾向 Principle
-    let miss_count = cluster
+    // Lesson 自身没 category 字段；按 outcome 启发性映射——
+    // Miss/Expired → KnownBias（"信号失效"类教训）
+    // Hit/PartialHit → Principle（"信号有效"类经验）
+    let negative_count = cluster
         .iter()
-        .filter(|l| matches!(l.outcome, crate::domain::agent::lesson::LessonOutcome::Miss))
+        .filter(|l| matches!(l.outcome, LessonOutcome::Miss | LessonOutcome::Expired))
         .count();
-    if miss_count > cluster.len() / 2 {
+    if negative_count > cluster.len() / 2 {
         HeuristicCategory::KnownBias
     } else {
         HeuristicCategory::Principle
@@ -175,11 +225,12 @@ fn collect_regime_tags(cluster: &[Lesson]) -> Vec<crate::domain::quotes::regime:
             *counter.entry(r).or_insert(0) += 1;
         }
     }
-    // 出现 ≥ cluster size 一半的 regime 算这个 heuristic 的 regime tag
-    let threshold = (cluster.len() / 2).max(1);
+    // 严格过半（>50%）的 regime 才算 heuristic 的 regime tag——
+    // 防止 len=2 时单条噪声 regime 被升级为整 cluster 的 tag。
+    let threshold = cluster.len() / 2 + 1;
     counter
         .into_iter()
-        .filter(|(_, n)| *n as usize >= threshold)
+        .filter(|(_, n)| (*n as usize) >= threshold)
         .map(|(r, _)| r)
         .collect()
 }
@@ -187,6 +238,10 @@ fn collect_regime_tags(cluster: &[Lesson]) -> Vec<crate::domain::quotes::regime:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::agent::lesson::{Lesson, LessonId};
+    use crate::domain::account::expectation::ExpectationId;
+    use crate::domain::shared::signal::SignalKind;
+    use crate::domain::shared::{OccurredAt, StockCode};
 
     #[test]
     fn jaccard_identical_sets() {
@@ -210,5 +265,74 @@ mod tests {
         // 应该包含 "光模", "模块", "块板", "板块"
         assert!(t.contains("光模"));
         assert!(t.contains("模块"));
+    }
+
+    fn make_lesson(takeaway: &str, signals: Vec<SignalKind>, outcome: LessonOutcome) -> Lesson {
+        Lesson {
+            id: LessonId::new(),
+            expectation_id: ExpectationId::new(),
+            code: StockCode::new("600519").unwrap(),
+            observation: "obs".into(),
+            takeaway: takeaway.into(),
+            outcome,
+            regime_at_close: None,
+            signals_in_play: signals,
+            pnl_pct: None,
+            created_at: OccurredAt::new(0),
+        }
+    }
+
+    #[test]
+    fn structured_clustering_groups_by_signal_family_not_text() {
+        // 三条 takeaway 文字面差异大，但 signals_in_play 共享 volume_spike + breakout_above_20ma
+        // 旧算法 jaccard 文字会分成三类；新算法按 (signal_families, regime=None, outcome=Miss) 聚成一类。
+        let signals = vec![
+            SignalKind::VolumeSpike { ratio: 2.0 },
+            SignalKind::BreakoutAbove20MA,
+        ];
+        let lessons = vec![
+            make_lesson("放量突破失败", signals.clone(), LessonOutcome::Miss),
+            make_lesson("高位放量诱多", signals.clone(), LessonOutcome::Miss),
+            make_lesson("板块退潮后冲高回落", signals.clone(), LessonOutcome::Miss),
+        ];
+        let clusters = cluster_by_structured_feature(&lessons);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].len(), 3);
+    }
+
+    #[test]
+    fn outcome_separates_otherwise_identical_lessons() {
+        // 信号集相同但一条 Hit / 一条 Miss → 不能聚在一起
+        let signals = vec![SignalKind::MACDGoldenCross];
+        let lessons = vec![
+            make_lesson("金叉成功上涨", signals.clone(), LessonOutcome::Hit),
+            make_lesson("金叉失败回落", signals.clone(), LessonOutcome::Miss),
+        ];
+        let clusters = cluster_by_structured_feature(&lessons);
+        assert_eq!(clusters.len(), 2);
+    }
+
+    #[test]
+    fn empty_signals_lesson_excluded_from_clustering() {
+        // 没 signals_in_play 的 lesson 无法 family 聚类——直接忽略
+        let lessons = vec![
+            make_lesson("空信号 lesson", vec![], LessonOutcome::Miss),
+        ];
+        let clusters = cluster_by_structured_feature(&lessons);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn representative_picks_most_typical_takeaway() {
+        // 4 条 takeaway，其中 3 条共享大量 token，1 条偏离——最典型的应该来自前 3 条
+        let signals = vec![SignalKind::LimitUp];
+        let cluster = vec![
+            make_lesson("放量突破后回落", signals.clone(), LessonOutcome::Miss),
+            make_lesson("放量突破回落", signals.clone(), LessonOutcome::Miss),
+            make_lesson("放量突破之后回落", signals.clone(), LessonOutcome::Miss),
+            make_lesson("完全无关的语句", signals.clone(), LessonOutcome::Miss),
+        ];
+        let rep = pick_representative_takeaway(&cluster);
+        assert!(rep.takeaway.contains("放量突破"));
     }
 }

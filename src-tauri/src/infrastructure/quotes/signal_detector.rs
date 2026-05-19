@@ -16,6 +16,7 @@
 //! - ✅ A 股特殊（3）：基于 quote 完整实现
 //! - 🚧 资金 / 板块 / 因子 / Upcoming Event：留 W23 scan 集成时按需调用专用 worker
 
+use crate::domain::shared::board::classify;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::indicators::IndicatorSnapshot;
 use crate::domain::quotes::types::{
@@ -228,12 +229,16 @@ fn detect_volume(
 // ====== A 股特殊（3 个 detector） =======================================
 
 fn detect_a_share_special(quote: &StockQuote, out: &mut Vec<SignalKind>) {
-    // 涨跌停判定：基于 change_percent 接近 ±10% / 20% / 30%（按 market_prefix 区分）
-    // Phase 1 简化：>9.9% 算涨停，<-9.9% 算跌停。后续按 code 前缀细化（创业板/科创/北交所）
+    // 按 board 推阈值：主板 10 / 创业板科创板 20 / 北交所 30 / ST 5
+    // 触发阈值 = limit_pct - 0.1pct（容忍报价末位四舍五入误差但比 0.99×limit 严苛）
     let Some(change_pct) = quote.change_percent else {
         return;
     };
-    if change_pct >= 9.9 {
+    let board = classify(&quote.code, &quote.name);
+    let limit_pct = board.price_limit_pct();
+    let trigger = limit_pct - 0.1;
+
+    if change_pct >= trigger {
         out.push(SignalKind::LimitUp);
         // 一字板：开 = 高 = 低 = 收 = 涨停价（量能小）
         if let (Some(open), Some(high), Some(low), Some(close)) =
@@ -246,7 +251,7 @@ fn detect_a_share_special(quote: &StockQuote, out: &mut Vec<SignalKind>) {
                 out.push(SignalKind::LimitUpFlooded);
             }
         }
-    } else if change_pct <= -9.9 {
+    } else if change_pct <= -trigger {
         out.push(SignalKind::LimitDown);
     }
 }
@@ -439,6 +444,102 @@ mod tests {
         let mut out = Vec::new();
         detect_fundamentals(&ctx, &DetectorConfig::default(), &mut out);
         assert!(out.iter().any(|s| matches!(s, SignalKind::PBBelowThreshold { .. })));
+    }
+
+    fn make_quote(code_str: &str, name: &str, change_pct: f64) -> crate::domain::quotes::types::StockQuote {
+        use crate::domain::quotes::types::StockQuote;
+        use crate::domain::shared::OccurredAt;
+        StockQuote {
+            code: StockCode::new(code_str).unwrap(),
+            name: name.into(),
+            price: Some(Yuan::from_unchecked(10.0)),
+            change_percent: Some(change_pct),
+            change: None,
+            open: None,
+            high: None,
+            low: None,
+            previous_close: None,
+            day_volume: None,
+            day_amount: None,
+            captured_at: OccurredAt::new(0),
+            bid_levels: vec![],
+            ask_levels: vec![],
+            buy_volume: None,
+            sell_volume: None,
+            order_imbalance: None,
+        }
+    }
+
+    #[test]
+    fn limit_up_main_board_at_10pct() {
+        let mut out = Vec::new();
+        let q = make_quote("600519", "贵州茅台", 9.95);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitUp));
+    }
+
+    #[test]
+    fn limit_up_chinext_needs_20pct() {
+        let mut out = Vec::new();
+        // 创业板 11% 不算涨停（旧逻辑会误判）
+        let q = make_quote("300750", "宁德时代", 11.0);
+        detect_a_share_special(&q, &mut out);
+        assert!(!out.contains(&SignalKind::LimitUp));
+        // 19.9% 才算
+        out.clear();
+        let q = make_quote("300750", "宁德时代", 19.9);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitUp));
+    }
+
+    #[test]
+    fn limit_up_star_needs_20pct() {
+        let mut out = Vec::new();
+        let q = make_quote("688981", "中芯国际", 12.0);
+        detect_a_share_special(&q, &mut out);
+        assert!(!out.contains(&SignalKind::LimitUp));
+        out.clear();
+        let q = make_quote("688981", "中芯国际", 19.9);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitUp));
+    }
+
+    #[test]
+    fn limit_up_beijing_needs_30pct() {
+        let mut out = Vec::new();
+        let q = make_quote("832149", "翰博高新", 25.0);
+        detect_a_share_special(&q, &mut out);
+        assert!(!out.contains(&SignalKind::LimitUp));
+        out.clear();
+        let q = make_quote("832149", "翰博高新", 29.9);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitUp));
+    }
+
+    #[test]
+    fn limit_up_st_only_5pct() {
+        let mut out = Vec::new();
+        // ST 主板股票 5% 就涨停
+        let q = make_quote("600519", "*ST 茅台", 4.95);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitUp));
+        // 非 ST 主板 5% 远没到涨停
+        out.clear();
+        let q = make_quote("600519", "贵州茅台", 4.95);
+        detect_a_share_special(&q, &mut out);
+        assert!(!out.contains(&SignalKind::LimitUp));
+    }
+
+    #[test]
+    fn limit_down_uses_same_board_threshold() {
+        let mut out = Vec::new();
+        let q = make_quote("300750", "宁德时代", -15.0);
+        detect_a_share_special(&q, &mut out);
+        assert!(!out.contains(&SignalKind::LimitDown));
+        out.clear();
+        let q = make_quote("300750", "宁德时代", -19.9);
+        detect_a_share_special(&q, &mut out);
+        assert!(out.contains(&SignalKind::LimitDown));
     }
 
     #[test]

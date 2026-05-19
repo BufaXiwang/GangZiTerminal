@@ -21,7 +21,9 @@ use crate::domain::account::position::CloseReason;
 use crate::domain::agent::lesson::{Lesson, LessonOutcome};
 use crate::domain::shared::OccurredAt;
 use crate::infrastructure::account::{expectation_repo, repository::PositionRepo};
-use crate::infrastructure::agent::{heuristic_repo, lesson_repo};
+use crate::infrastructure::agent::{
+    expectation_heuristic_link_repo, heuristic_repo, lesson_repo, signal_detection_repo,
+};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
 use crate::pipeline::account::AccountService;
 use tauri::AppHandle;
@@ -30,8 +32,11 @@ use tauri::AppHandle;
 pub struct ReviewResult {
     pub examined: usize,
     pub hit: usize,
+    pub partial_hit: usize,
     pub missed: usize,
     pub expired: usize,
+    /// 因 invalidation_signal 命中提前判 Missed 的条数（计入 missed 总数）
+    pub invalidated_by_signal: usize,
     pub lessons_written: usize,
     pub heuristic_applications_recorded: usize,
     pub positions_auto_closed: usize,
@@ -49,8 +54,10 @@ pub async fn run(
     let mut result = ReviewResult {
         examined: pending.len(),
         hit: 0,
+        partial_hit: 0,
         missed: 0,
         expired: 0,
+        invalidated_by_signal: 0,
         lessons_written: 0,
         heuristic_applications_recorded: 0,
         positions_auto_closed: 0,
@@ -59,15 +66,48 @@ pub async fn run(
     let position_repo = PositionRepo::new(app.clone());
 
     for exp in pending {
-        let Some(quote) = market_snapshot::get(exp.code.as_str()) else {
+        // snapshot key 是 ts_code（带 SH/SZ/BJ 后缀避歧义），不是 6 位裸 code
+        let ts_code = exp.code.to_ts_code();
+        let Some(quote) = market_snapshot::get(&ts_code) else {
             // 行情没拿到——这条留到下次 review 再判
-            tracing::debug!(code = %exp.code, "review: 跳过未拿到 quote 的 expectation");
+            tracing::debug!(code = %exp.code, ts_code, "review: 跳过未拿到 quote 的 expectation");
             continue;
         };
         let Some(price) = quote.price else {
             continue;
         };
         let now = OccurredAt::now();
+
+        // 优先级 1：invalidation_signals 提前止损（早于价格判定）
+        if let Some(triggered_family) = check_invalidation(app, &exp)? {
+            let reason = format!(
+                "invalidation_signal 命中：family={triggered_family}（创建后 {} 起检测）",
+                exp.created_at.to_rfc3339()
+            );
+            let event = ExpectationEvent::Missed {
+                actual_price: price,
+                reason: reason.clone(),
+            };
+            expectation_repo::transition(app, &exp.id, ExpectationState::Missed, event, now)?;
+            result.missed += 1;
+            result.invalidated_by_signal += 1;
+            if write_lesson(app, &exp, LessonOutcome::Miss, &reason, now).is_ok() {
+                result.lessons_written += 1;
+            }
+            result.heuristic_applications_recorded +=
+                record_signal_outcomes(app, &exp, false, now)?;
+            let closed = auto_close_linked_positions(
+                &account_service,
+                &position_repo,
+                &exp.id,
+                reflection_episode_id.as_deref(),
+                CloseReason::Invalidated,
+            )
+            .await;
+            result.positions_auto_closed += closed;
+            continue;
+        }
+
         let outcome = judge_outcome(&exp, price, now);
         match outcome {
             OutcomeJudgment::StillPending => continue,
@@ -83,6 +123,41 @@ pub async fn run(
                 }
                 result.heuristic_applications_recorded +=
                     record_signal_outcomes(app, &exp, true, now)?;
+            }
+            OutcomeJudgment::PartialHit {
+                actual_price,
+                actual_gain_pct,
+                target_gain_pct,
+                reason,
+            } => {
+                let event = ExpectationEvent::PartialHit {
+                    actual_price,
+                    actual_gain_pct,
+                    target_gain_pct,
+                    reason: reason.clone(),
+                };
+                expectation_repo::transition(
+                    app,
+                    &exp.id,
+                    ExpectationState::PartialHit,
+                    event,
+                    now,
+                )?;
+                result.partial_hit += 1;
+                if write_lesson(app, &exp, LessonOutcome::PartialHit, &reason, now).is_ok() {
+                    result.lessons_written += 1;
+                }
+                // PartialHit 不影响 heuristic hit/miss（中性证据），
+                // 但仍触发关联 position 自动平仓——按 TimeStop 语义（方向对但节奏没跟上）。
+                let closed = auto_close_linked_positions(
+                    &account_service,
+                    &position_repo,
+                    &exp.id,
+                    reflection_episode_id.as_deref(),
+                    CloseReason::TimeStop,
+                )
+                .await;
+                result.positions_auto_closed += closed;
             }
             OutcomeJudgment::Missed { actual_price, reason } => {
                 let event = ExpectationEvent::Missed {
@@ -102,6 +177,7 @@ pub async fn run(
                     &position_repo,
                     &exp.id,
                     reflection_episode_id.as_deref(),
+                    CloseReason::Invalidated,
                 )
                 .await;
                 result.positions_auto_closed += closed;
@@ -156,53 +232,137 @@ fn write_lesson(
     Ok(())
 }
 
+/// 检查 expectation 创建后是否有任一 invalidation_signal family 在 signal_detections 命中。
+/// 返回触发的 family（命中即返回 Some，不需要遍历完所有）。
+fn check_invalidation(
+    app: &AppHandle,
+    exp: &Expectation,
+) -> Result<Option<String>, String> {
+    if exp.invalidation_signals.is_empty() {
+        return Ok(None);
+    }
+    let want: std::collections::HashSet<&str> = exp
+        .invalidation_signals
+        .iter()
+        .map(|s| s.family_str())
+        .collect();
+    let detections = signal_detection_repo::list_for_code_since(
+        app,
+        exp.code.as_str(),
+        exp.created_at,
+    )?;
+    for (sig, _ts) in detections {
+        if want.contains(sig.family_str()) {
+            return Ok(Some(sig.family_str().to_string()));
+        }
+    }
+    Ok(None)
+}
+
 /// 把 expectation 终态反向打到关联 Heuristics 的 application_count + hit/miss_count。
 ///
-/// Phase 1 简化策略：用 expectation 触发时记录的 `signals_used`，匹配最近的
-/// `origin=agent_inferred` 且 supporting_lesson_ids 共享同一 signal_family 的 heuristic。
-/// 若关联不到现成 heuristic（常见——刚开始没 heuristic）→ 静默跳过，等 heuristic_emerge 后续 emerge。
+/// v6 主路径：用 `expectation_heuristic_links` 表精确归因（agent 在 create_expectation 时
+/// 显式声明 applied_heuristic_ids）——取代 Phase 1 的"所有 agent_inferred 都给计数"。
+///
+/// **回落策略**：当 expectation **没有** link 记录（LLM 早期还没学会填 applied_heuristic_ids）
+/// 时，按 `expectation.signals_used` 的 family 集合，与 heuristic 的 supporting_lesson_ids
+/// 关联 lessons 的 `signals_in_play` family 集合做交集——有交集才计数。比旧的"全部累加"
+/// 精确（不会无差别误伤所有 agent_inferred heuristic），又能让早期 heuristic 不至于永远
+/// 没证据卡在 probationary。
 fn record_signal_outcomes(
     app: &AppHandle,
     exp: &Expectation,
     outcome_hit: bool,
     now: OccurredAt,
 ) -> Result<usize, String> {
-    // Phase 1：粗暴聚合——找所有 supporting_lesson_ids 关联任意 exp 同 signal_family 的 heuristic
-    // 给它们 +1 application。Phase 2 可以更精细（按 lesson 的 signals_in_play 精确匹配）。
+    let linked = expectation_heuristic_link_repo::list_for_expectation(app, &exp.id)?;
+    if !linked.is_empty() {
+        // 主路径：精确归因
+        let mut counted = 0;
+        for hid in &linked {
+            match heuristic_repo::record_application_outcome(app, hid, outcome_hit, now) {
+                Ok(true) => counted += 1,
+                Ok(false) => {} // seed/user_stated 拒绝自动注水
+                Err(e) => tracing::warn!(
+                    expectation = %exp.id,
+                    heuristic = %hid,
+                    error = %e,
+                    "record_application_outcome 失败"
+                ),
+            }
+        }
+        return Ok(counted);
+    }
+    // 回落：按 signal_family 交集匹配
+    record_signal_outcomes_by_family_intersect(app, exp, outcome_hit, now)
+}
+
+/// 回落归因：找所有 origin=agent_inferred + 未 retired + 至少一条 supporting lesson 的
+/// signals_in_play 与本 expectation.signals_used 有 family 交集的 heuristic 给计数。
+fn record_signal_outcomes_by_family_intersect(
+    app: &AppHandle,
+    exp: &Expectation,
+    outcome_hit: bool,
+    now: OccurredAt,
+) -> Result<usize, String> {
+    use std::collections::HashSet;
+
+    let exp_families: HashSet<&str> = exp.signals_used.iter().map(|s| s.family_str()).collect();
+    if exp_families.is_empty() {
+        // expectation 自己没 signals 就别瞎归因
+        return Ok(0);
+    }
     let all = heuristic_repo::list_all(app, 200)?;
     let mut counted = 0;
     for h in all {
         if h.origin != crate::domain::agent::heuristic::HeuristicOrigin::AgentInferred {
             continue;
         }
-        if h.retired_at.is_some() {
+        if h.retired_at.is_some() || h.supporting_lesson_ids.is_empty() {
             continue;
         }
-        // 简化：暂时只对 supporting_lesson_ids 非空的 agent_inferred heuristic 累计
-        // （表示这是 emerge 出来的有支持的 heuristic）
-        if h.supporting_lesson_ids.is_empty() {
+        // 检查 supporting lessons 的 signals_in_play family 集是否与本 exp 有交集
+        let mut hit_family = false;
+        for lid in &h.supporting_lesson_ids {
+            let Ok(Some(lesson)) = lesson_repo::get(app, lid) else {
+                continue;
+            };
+            if lesson
+                .signals_in_play
+                .iter()
+                .any(|s| exp_families.contains(s.family_str()))
+            {
+                hit_family = true;
+                break;
+            }
+        }
+        if !hit_family {
             continue;
         }
-        // 这里如果想精细匹配，需要 join lessons.signals_in_play
-        // Phase 1 简化：所有 agent_inferred + 有 lessons 支持的都给计数
-        let recorded = heuristic_repo::record_application_outcome(app, &h.id, outcome_hit, now)?;
-        if recorded {
-            counted += 1;
+        match heuristic_repo::record_application_outcome(app, &h.id, outcome_hit, now) {
+            Ok(true) => counted += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                heuristic = %h.id,
+                error = %e,
+                "fallback record_application_outcome 失败"
+            ),
         }
     }
-    let _ = exp;
     Ok(counted)
 }
 
-/// 把所有 `current_expectation_id == exp_id` 的活仓位强平掉——expectation 被判定 Missed
-/// 时调。事件源标 Reflection（如果有 episode_id），CloseReason::Invalidated。
+/// 把所有 `current_expectation_id == exp_id` 的活仓位强平掉——
+/// expectation 被判定 Missed/PartialHit 时调。Missed 用 Invalidated，PartialHit 用 TimeStop。
 ///
+/// 事件源标 Reflection（如果有 episode_id），否则 System。
 /// 异常单条 close 失败不阻断其它仓位 close；返回成功 close 的条数。
 async fn auto_close_linked_positions(
     service: &AccountService,
     repo: &PositionRepo,
     exp_id: &ExpectationId,
     reflection_episode_id: Option<&str>,
+    close_reason: CloseReason,
 ) -> usize {
     let Ok(positions) = repo.list_all() else {
         return 0;
@@ -225,11 +385,12 @@ async fn auto_close_linked_positions(
             None => EventSource::System,
         };
         let note = format!(
-            "auto-close: expectation {} 判定 missed，按 v3 spec § 5.4 自动平仓",
-            exp_id.as_str()
+            "auto-close: expectation {} 判定 {}，按 v3 spec § 5.4 自动平仓",
+            exp_id.as_str(),
+            close_reason.as_str(),
         );
         match service
-            .close_position(&p.id, CloseReason::Invalidated, source, note)
+            .close_position(&p.id, close_reason, source, note)
             .await
         {
             Ok(_) => {
@@ -237,7 +398,8 @@ async fn auto_close_linked_positions(
                 tracing::info!(
                     expectation = %exp_id,
                     position = %p.id.as_str(),
-                    "expectation missed → auto close position"
+                    reason = %close_reason.as_str(),
+                    "expectation terminal → auto close position"
                 );
             }
             Err(err) => {

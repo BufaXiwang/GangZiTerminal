@@ -53,6 +53,8 @@ impl Default for LessonId {
 pub enum LessonOutcome {
     /// expectation 命中
     Hit,
+    /// 到期方向对但未达 target——"目标定高了 / 节奏慢"
+    PartialHit,
     /// 到期未达 target
     Miss,
     /// 观察型到期或区间预期到期（既未命中也未明确证伪节奏）
@@ -63,6 +65,7 @@ impl LessonOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Hit => "hit",
+            Self::PartialHit => "partial_hit",
             Self::Miss => "miss",
             Self::Expired => "expired",
         }
@@ -70,6 +73,7 @@ impl LessonOutcome {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "hit" => Some(Self::Hit),
+            "partial_hit" => Some(Self::PartialHit),
             "miss" => Some(Self::Miss),
             "expired" => Some(Self::Expired),
             _ => None,
@@ -131,7 +135,12 @@ mod tests {
 
     #[test]
     fn outcome_round_trip() {
-        for o in [LessonOutcome::Hit, LessonOutcome::Miss, LessonOutcome::Expired] {
+        for o in [
+            LessonOutcome::Hit,
+            LessonOutcome::PartialHit,
+            LessonOutcome::Miss,
+            LessonOutcome::Expired,
+        ] {
             let s = o.as_str();
             assert_eq!(LessonOutcome::parse(s), Some(o));
         }
