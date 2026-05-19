@@ -7,7 +7,8 @@
 
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::adapters::quotes_commands::StockQuoteDto;
-use crate::domain::agent::types::ToolResultContent;
+use crate::domain::agent::types::{PipelineKind, ToolResultContent};
+use crate::domain::agent::ProviderKind;
 use crate::domain::quotes::types::KlinePoint;
 use crate::domain::quotes::KlinePeriod;
 use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
@@ -15,11 +16,27 @@ use crate::infrastructure::quotes::chart_renderer::{
     klinerow_to_point, render_kline_png, ChartRenderOptions,
 };
 use crate::infrastructure::quotes::snapshot::market_snapshot;
+use crate::pipeline::agent::config::read_agent_config;
 use crate::pipeline::market::overview as market_overview;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use tauri::AppHandle;
+
+/// 当前 chat channel 是否支持 tool_result 含 Image block？
+/// - Anthropic：原生支持，agent 能看到图
+/// - OpenAI Chat Completions：不支持，provider 把 Image 降级为 `"[image omitted]"`
+/// - OpenAI Responses：tool 消息里也不支持 Image
+///
+/// get_kline 在 chart 模式前调一下这个——非 Anthropic 时自动 fallback 到 data 模式，
+/// 避免给非 Anthropic 用户 agent 看不到图却以为看到了的 bug。
+fn current_chat_supports_vision_in_tool_result(app: &AppHandle) -> bool {
+    let cfg = read_agent_config(app);
+    match cfg.resolve_pipeline(PipelineKind::Chat) {
+        Ok((channel, _)) => matches!(channel.wire_format, ProviderKind::Anthropic),
+        Err(_) => false, // 解析失败保守降级
+    }
+}
 
 // ===== 输入校验 ==========================================================
 
@@ -153,7 +170,8 @@ impl Tool for GetKlineTool {
 
     fn description(&self) -> &'static str {
         "K 线。默认 mode=chart 返 PNG（蜡烛 + MA20 + 量，红涨绿跌），最适合判断趋势 / 形态。\
-        需要精确数值传 mode=data 拿 OHLC 表；mode=both 两者都返。"
+        需要精确数值传 mode=data 拿 OHLC 表；mode=both 两者都返。\
+        chart/both 仅 Anthropic 渠道有效，OpenAI 渠道自动降级 data。"
     }
 
     fn input_schema(&self) -> Value {
@@ -192,10 +210,26 @@ impl Tool for GetKlineTool {
             .map(|n| n as usize)
             .unwrap_or(120)
             .clamp(30, 800);
-        let mode = input
+        let requested_mode = input
             .get("mode")
             .and_then(Value::as_str)
             .unwrap_or("chart");
+        // chart 模式仅 Anthropic 渠道有效——OpenAI Chat / Responses 在 tool_result
+        // 里不支持 Image block，给它返图就是给 agent 一个"[image omitted]"占位，
+        // agent 看不到图却以为能看到，会出乱判断。非 Anthropic 时静默降级到 data。
+        let mode = if requested_mode == "chart" || requested_mode == "both" {
+            if current_chat_supports_vision_in_tool_result(&self.app) {
+                requested_mode
+            } else {
+                tracing::debug!(
+                    requested_mode,
+                    "get_kline: 当前渠道 tool_result 不支持 Image，降级到 data 模式"
+                );
+                "data"
+            }
+        } else {
+            requested_mode
+        };
         let ts_code = match resolve_stock_ts_code(&self.app, &code) {
             Some(ts) => ts,
             None => {

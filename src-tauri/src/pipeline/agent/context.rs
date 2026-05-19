@@ -589,14 +589,31 @@ mod tests {
         let last_at = now_ms - 90 * 60_000; // 90 分钟前
         let cleared = time_based_micro_clear(&mut msgs, Some(last_at), now_ms, 60, 1);
         assert_eq!(cleared, 3);
-        // 末位的 q4 应仍是原始 big 内容
-        let q4_kept = msgs.iter().any(|m| {
-            m.content.iter().any(|b| matches!(b,
-                Block::ToolResult { tool_use_id, content, .. }
-                if tool_use_id == "q4" && content.iter().any(|c| matches!(c, ToolResultContent::Text { text } if text.starts_with("xxx")))
-            ))
-        });
-        assert!(q4_kept, "最末一条 q4 应保留原始内容");
+        // 末位的 q4 应仍是原始 big 内容——断言"内容长度未被截短到 stub 大小"
+        let q4_text = msgs
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                Block::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "q4" => content.first().and_then(|c| match c {
+                    ToolResultContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .expect("q4 tool_result 应存在");
+        assert!(
+            !q4_text.starts_with("[过期工具结果已清理"),
+            "q4 不应被清理，实际：{q4_text:.80}..."
+        );
+        assert!(
+            q4_text.len() > 500,
+            "q4 应保留原始大块内容，长度 {}",
+            q4_text.len()
+        );
     }
 
     #[test]
