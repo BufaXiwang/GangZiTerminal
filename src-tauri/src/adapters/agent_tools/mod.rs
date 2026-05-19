@@ -18,6 +18,7 @@ use tauri::AppHandle;
 use crate::pipeline::agent::tools::ToolRegistry;
 
 pub mod account;
+pub mod delegate;
 pub mod expectations;
 pub mod news;
 pub mod positions;
@@ -66,5 +67,7 @@ pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     // 视觉——LLM 看 K 线图 → 形态识别 → 落 SignalDetection
     reg.register(Arc::new(visual::AnalyzeChartTool::new(app.clone())));
     reg.register(Arc::new(visual::ProposeVisualPatternTool::new(app.clone())));
+    // Sub agent 派遣——researcher 调研 / bear_advocate 反方
+    reg.register(Arc::new(delegate::DelegateTool::new(app.clone())));
     reg
 }

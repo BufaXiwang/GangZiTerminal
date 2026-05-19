@@ -20,6 +20,8 @@ pub mod observer;
 pub mod prompt;
 pub mod reflect;
 pub mod scan;
+pub mod subagent;
 pub mod tools;
 
 pub use loop_::{run_agent, RunSummary, SummarizeOptions};
+pub use subagent::{run_subagent, SubAgentError, SubAgentResult, SubAgentType};
