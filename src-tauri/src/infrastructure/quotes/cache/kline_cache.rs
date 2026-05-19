@@ -10,9 +10,10 @@
 //! - adapter `fetch_a_share_klines`（前端 KlineChart）
 //! - pipeline `kline_warm`（启动后预热 Account subscriptions）
 
-use crate::domain::quotes::{AdjMode, KlinePeriod, KlineSeries};
-use crate::domain::shared::StockCode;
+use crate::domain::quotes::{AdjMode, KlinePeriod, KlineSeries, QuotesError};
+use crate::domain::shared::{StockCode, TsCode};
 use crate::infrastructure::db::{migrate, open_database};
+use crate::infrastructure::quotes::tdx::bars as tdx_bars;
 use crate::infrastructure::quotes::tushare::{
     fund as ts_fund, index as ts_index, stock as ts_stock,
 };
@@ -142,7 +143,9 @@ pub async fn ensure_klines(
         return Ok(());
     }
 
-    // 3. upsert klines
+    // 3. upsert klines——source 字段反映真实来源（tushare / tdx / eastmoney），
+    // 之前写死 "tushare" 导致 TDX 兜底的数据在审计上看起来像 TuShare 数据。
+    let source_label = series.source.as_str().to_string();
     let rows: Vec<KlineRow> = series
         .points
         .iter()
@@ -157,7 +160,7 @@ pub async fn ensure_klines(
             low: p.low.value(),
             volume: Some(p.volume.value() as f64),
             amount: Some(p.amount.value()),
-            source: "tushare".to_string(),
+            source: source_label.clone(),
         })
         .collect();
     upsert_klines(app, &rows)?;
@@ -225,7 +228,7 @@ async fn fetch_from_remote(
                 .next()
                 .ok_or_else(|| format!("非法 ts_code: {ts_code}"))?;
             let stock_code = StockCode::new(code).map_err(|e| e.to_string())?;
-            ts_stock::fetch_klines_in_range(
+            let primary = ts_stock::fetch_klines_in_range(
                 app,
                 &stock_code,
                 period,
@@ -234,8 +237,41 @@ async fn fetch_from_remote(
                 start_date,
                 end_date.as_deref(),
             )
-            .await
-            .map_err(|e| e.to_string())
+            .await;
+            match primary {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    // P3：TuShare 不可用（无 token / 网络挂 / 限流 / 配额耗尽）→ TDX 兜底。
+                    // TDX **不支持北交所**、**不支持复权**——兜底返不复权数据，但写入了 warning，
+                    // 前端可读到提示用户。SQLite 缓存层落库时 source 字段标 "tdx"，下次 TuShare
+                    // 恢复了会被增量覆盖。
+                    let should_fallback = matches!(
+                        e,
+                        QuotesError::MissingToken
+                            | QuotesError::Network(_)
+                            | QuotesError::RateLimited
+                            | QuotesError::QuotaExceeded
+                    );
+                    if should_fallback {
+                        if let Ok(ts) = TsCode::new(ts_code) {
+                            if ts.market() != "BJ" {
+                                tracing::info!(
+                                    ts_code,
+                                    ?period,
+                                    ?adj,
+                                    reason = %e,
+                                    "TuShare 失败，尝试 TDX 日 K 兜底（不复权）"
+                                );
+                                match tdx_bars::fetch_daily_klines(&ts, period, limit).await {
+                                    Ok(s) => return Ok(s),
+                                    Err(te) => tracing::warn!(ts_code, err = %te, "TDX 兜底也失败"),
+                                }
+                            }
+                        }
+                    }
+                    Err(e.to_string())
+                }
+            }
         }
         Category::Index => ts_index::fetch_index_klines_in_range(
             app,

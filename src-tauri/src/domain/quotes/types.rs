@@ -628,6 +628,8 @@ pub enum HistorySource {
     Tushare,
     /// Eastmoney ulist.np（实时报价）/ push2his trends2（分时）
     Eastmoney,
+    /// 通达信（私有 TCP，K 线 + 分时主路径；不复权）
+    Tdx,
     /// 远端全部失败，返回的是过期缓存
     StaleCache,
 }
@@ -637,6 +639,7 @@ impl HistorySource {
         match self {
             Self::Tushare => "tushare",
             Self::Eastmoney => "eastmoney",
+            Self::Tdx => "tdx",
             Self::StaleCache => "cache:stale",
         }
     }

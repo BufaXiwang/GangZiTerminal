@@ -29,11 +29,15 @@ export function useNewsRefresh() {
     setLastUpdated(new Date().toISOString());
   }, []);
 
-  // 监听后端推送
+  // mount 立刻从 SQLite hydrate 一次——NewsPage 是条件渲染（切 tab 会 unmount），
+  // 不在 mount 时主动读会让用户看到一瞬间的空列表，等下一次 news-refreshed 事件
+  // 才填回（数据其实早就在 DB 里）。
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
+    void reloadFromDb();
     listen("news-refreshed", () => {
+      if (cancelled) return;
       void reloadFromDb();
     })
       .then((handler) => {

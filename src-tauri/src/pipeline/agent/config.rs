@@ -203,7 +203,7 @@ fn default_tool_timeout_secs() -> u32 {
     30
 }
 fn default_summarize_threshold() -> u32 {
-    120_000
+    150_000
 }
 fn default_summarize_max_failures() -> u32 {
     3
@@ -217,8 +217,10 @@ impl Default for AgentRuntimeConfig {
         Self {
             max_turns_per_run: 12,
             max_search_calls_per_run: 5,
-            context_soft_limit_tokens: 80_000,
-            context_hard_limit_tokens: 160_000,
+            // 主流 Claude 4.x / GPT-5 / 国内强模型基本都 ≥ 200k context；之前 80k/160k
+            // 是 Sonnet 3.5 时代留下的保守值。提到 130k/190k 给响应留 ~10k buffer。
+            context_soft_limit_tokens: 130_000,
+            context_hard_limit_tokens: 190_000,
             compact_keep_last_n_turns: 6,
             tool_timeout_secs: default_tool_timeout_secs(),
             context_summarize_threshold: default_summarize_threshold(),

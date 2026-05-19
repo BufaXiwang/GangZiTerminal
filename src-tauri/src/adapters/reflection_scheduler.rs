@@ -44,14 +44,27 @@ async fn close_reflection_loop(app: AppHandle) {
             let app_clone = app.clone();
             tauri::async_runtime::spawn(async move {
                 let registry = Arc::new(build_chat_registry(&app_clone));
-                match run_close_reflection(app_clone, registry).await {
-                    Ok(res) => tracing::info!(
-                        run_id = %res.run_id,
-                        thesis_count = res.thesis_count,
-                        outcome_len = res.outcome_summary.chars().count(),
-                        "Close reflection 完成"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "Close reflection 失败"),
+                match run_close_reflection(app_clone.clone(), registry).await {
+                    Ok(res) => {
+                        tracing::info!(
+                            run_id = %res.run_id,
+                            thesis_count = res.thesis_count,
+                            outcome_len = res.outcome_summary.chars().count(),
+                            "Close reflection 完成"
+                        );
+                        crate::infrastructure::scheduler_heartbeat::record_ok(
+                            &app_clone,
+                            crate::infrastructure::scheduler_heartbeat::LOOP_REFLECTION,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Close reflection 失败");
+                        crate::infrastructure::scheduler_heartbeat::record_err(
+                            &app_clone,
+                            crate::infrastructure::scheduler_heartbeat::LOOP_REFLECTION,
+                            &e,
+                        );
+                    }
                 }
             });
             *LAST_FIRED_DATE.lock().unwrap() = Some(today);

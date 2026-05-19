@@ -116,6 +116,8 @@ export function SettingsPage({
 
       <ChannelsAndAssignmentsBlock />
 
+      <AgentBudgetBlock />
+
       <div className="settings-section">
         <div className="settings-section-head">
           <h3>资讯</h3>
@@ -144,6 +146,8 @@ export function SettingsPage({
 
       <NetworkBlock />
 
+      <AgentHealthBlock />
+
       <div className="settings-section">
         <div className="settings-section-head">
           <h3>系统</h3>
@@ -163,6 +167,205 @@ export function SettingsPage({
       </div>
     </section>
   );
+}
+
+// ============================================================================
+// Agent Health：自迭代健康度面板
+//
+// 直接对应 docs/architecture.md 的"5 秒确认自迭代在工作"几条审计 SQL。每个卡
+// 片只盯一个关键信号——红色阈值是"环已经断了或没在跑"，黄色是"应注意"。
+// ============================================================================
+
+type HeartbeatRow = {
+  loopName: string;
+  lastOkAt: string | null;
+  lastErrAt: string | null;
+  lastErrMsg: string | null;
+  consecutiveErr: number;
+  updatedAt: string;
+};
+
+type AgentHealthDto = {
+  expectationCompletenessRate: number | null;
+  totalExpectations: number;
+  totalClosedExpectations: number;
+  reflectionEpisodeCount7d: number;
+  scanTickCount7d: number;
+  lessonsCount7d: number;
+  heuristicCounts: { seed: number; userStated: number; agentInferred: number; retired: number };
+  heuristicOriginShare: { seed: number; userStated: number; agentInferred: number; agentInferredShare: number | null };
+  scanTicksToday: number;
+  expectationsCreatedToday: number;
+  lessonsCreatedToday: number;
+  lessonsEmptyTakeaway7d: number;
+  heuristicsEmerged7d: number;
+  heartbeats: HeartbeatRow[];
+};
+
+function AgentHealthBlock() {
+  const [data, setData] = useState<AgentHealthDto | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      const res = await invoke<AgentHealthDto>("get_agent_health");
+      setData(res);
+      setErr(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  return (
+    <div className="settings-section">
+      <div className="settings-section-head">
+        <h3>Agent 自迭代健康度</h3>
+        <p>每项对应一条审计 SQL；点击「刷新」重拉。红字 = 环断了或 loop 卡死，橙字 = 需关注。</p>
+      </div>
+      <div className="settings-rows">
+        <Row title="刷新" hint="拉取最新指标 + loop 心跳">
+          <button
+            type="button"
+            className="settings-save-btn"
+            onClick={() => void refresh()}
+            disabled={loading}
+          >
+            {loading ? "刷新中…" : "刷新"}
+          </button>
+        </Row>
+        {err && (
+          <Row title="错误" hint="后端 get_agent_health 返回错误">
+            <span className="settings-readonly health-stat-red">{err}</span>
+          </Row>
+        )}
+        {data && (
+          <>
+            <HealthRow
+              title="今日 scan ticks"
+              hint="9 个时刻表，盘中应 ≥ 6；周末 / 盘外为 0"
+              value={data.scanTicksToday}
+              level={pickLevel(data.scanTicksToday, { red: -1, yellow: 3 })}
+            />
+            <HealthRow
+              title="今日新建 expectation"
+              hint="连续多日为 0 → agent 没在产出新预期"
+              value={data.expectationsCreatedToday}
+              level={pickLevel(data.expectationsCreatedToday, { red: -1, yellow: 0 })}
+            />
+            <HealthRow
+              title="今日 lesson"
+              hint="reflection 复盘产物——交易日盘后应有"
+              value={data.lessonsCreatedToday}
+            />
+            <HealthRow
+              title="近 7 天空 takeaway lesson"
+              hint="> 0 说明 LLM provider 没接通 / takeaway fill 失败——自迭代环断点"
+              value={data.lessonsEmptyTakeaway7d}
+              level={data.lessonsEmptyTakeaway7d > 0 ? "red" : "ok"}
+            />
+            <HealthRow
+              title="近 7 天新 emerge heuristic"
+              hint="连续 2 周为 0 → emerge 链路死了"
+              value={data.heuristicsEmerged7d}
+              level={pickLevel(data.heuristicsEmerged7d, { red: -1, yellow: 0 })}
+            />
+            <HealthRow
+              title="Heuristic 原创占比"
+              hint={`agent ${data.heuristicOriginShare.agentInferred} · user ${data.heuristicOriginShare.userStated} · seed ${data.heuristicOriginShare.seed}`}
+              value={
+                data.heuristicOriginShare.agentInferredShare != null
+                  ? `${Math.round(data.heuristicOriginShare.agentInferredShare * 100)}%`
+                  : "—"
+              }
+            />
+            <Row title="后台 loop 心跳" hint="每个 loop 的上次成功 / 连续失败计数">
+              <div className="heartbeat-list">
+                {data.heartbeats.length === 0 ? (
+                  <span className="settings-readonly">暂无——loop 还没跑过 / schema 刚建</span>
+                ) : (
+                  data.heartbeats.map((h) => {
+                    const isStale =
+                      h.consecutiveErr >= 3 || (h.lastOkAt == null && h.lastErrAt != null);
+                    return (
+                      <div key={h.loopName} className="heartbeat-row">
+                        <span className="heartbeat-name">{h.loopName}</span>
+                        <span className={`heartbeat-ok ${isStale ? "health-stat-red" : ""}`}>
+                          {relativeTime(h.lastOkAt)}
+                        </span>
+                        <span
+                          className={`heartbeat-err-count ${
+                            h.consecutiveErr > 0 ? "health-stat-red" : ""
+                          }`}
+                        >
+                          {h.consecutiveErr > 0 ? `${h.consecutiveErr}× 连失` : "—"}
+                        </span>
+                        <span className="heartbeat-msg" title={h.lastErrMsg ?? ""}>
+                          {h.lastErrMsg ?? "—"}
+                        </span>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </Row>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+type HealthLevel = "ok" | "yellow" | "red";
+
+/// value 落 (yellow, +∞] = ok；(red, yellow] = yellow；≤ red = red。
+/// 用 -1 做"任何 0 都算 yellow / red"的语义。
+function pickLevel(value: number, thresholds: { red: number; yellow: number }): HealthLevel {
+  if (value <= thresholds.red) return "red";
+  if (value <= thresholds.yellow) return "yellow";
+  return "ok";
+}
+
+function HealthRow({
+  title,
+  hint,
+  value,
+  level = "ok",
+}: {
+  title: string;
+  hint: string;
+  value: number | string;
+  level?: HealthLevel;
+}) {
+  const cls =
+    level === "red"
+      ? "settings-readonly health-stat health-stat-red"
+      : level === "yellow"
+        ? "settings-readonly health-stat health-stat-yellow"
+        : "settings-readonly health-stat";
+  return (
+    <Row title={title} hint={hint}>
+      <span className={cls}>{value}</span>
+    </Row>
+  );
+}
+
+function relativeTime(iso: string | null): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso;
+  const deltaSec = Math.floor((Date.now() - t) / 1000);
+  if (deltaSec < 60) return `${deltaSec}s 前`;
+  if (deltaSec < 3600) return `${Math.floor(deltaSec / 60)}min 前`;
+  if (deltaSec < 86400) return `${Math.floor(deltaSec / 3600)}h 前`;
+  return `${Math.floor(deltaSec / 86400)}d 前`;
 }
 
 function TriggerReflectionButton() {
@@ -196,6 +399,151 @@ function TriggerReflectionButton() {
 // ============================================================================
 // 渠道管理 + 模型分配（两块各自独立保存）
 // ============================================================================
+
+// ============================================================================
+// Agent 行为预算——上下文 / turn / web 搜索次数等运行时上限
+//
+// 这些之前都是 hard-coded 默认值，没 UI 调。结果用户灌一篇大文章 + agent 拉了
+// 几十条 quote 就轻松撞 hard_limit_tokens=160k 报错。提到 UI 让用户能调，且
+// 默认值已经升到 190k（Claude 4.x 都 200k context）。
+// ============================================================================
+
+function AgentBudgetBlock() {
+  const [agent, setAgent] = useState<AgentConfigPayload["agent"] | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState<string | null>(null);
+
+  const refresh = async () => {
+    const cfg = await invoke<AgentConfigPayload>("get_agent_config").catch(() => null);
+    setAgent(cfg?.agent ?? null);
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const updateField = <K extends keyof AgentConfigPayload["agent"]>(
+    key: K,
+    value: AgentConfigPayload["agent"][K],
+  ) => {
+    setAgent((prev) => (prev ? { ...prev, [key]: value } : prev));
+    setFeedback(null);
+  };
+
+  const save = async () => {
+    if (!agent) return;
+    setSaving(true);
+    setFeedback(null);
+    try {
+      const cfg = await invoke<AgentConfigPayload>("get_agent_config");
+      const merged: AgentConfigPayload = { ...cfg, agent };
+      await invoke("set_agent_config", { config: merged });
+      setFeedback("已保存");
+      window.setTimeout(() => setFeedback(null), 1800);
+    } catch (e) {
+      setFeedback(`保存失败：${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="settings-section">
+      <div className="settings-section-head">
+        <h3>Agent 行为预算</h3>
+        <p>
+          上下文窗口、单次 run 的轮数 / 搜索次数。默认值适合 Claude 4.x / GPT-5（200k 窗口）；
+          换更小的模型时调低，免得撞模型自身上限。
+        </p>
+      </div>
+      <div className="settings-rows">
+        {!agent ? (
+          <Row title="加载中" hint="">
+            <span className="settings-readonly">读取 agent 配置…</span>
+          </Row>
+        ) : (
+          <>
+            <Row
+              title="上下文 hard 限制"
+              hint="超过此值压缩仍不够时 → agent 终止报错。建议留 ~10k 给模型响应。Claude 4.x / GPT-5 200k context → 设 190k"
+            >
+              <NumberInput
+                value={agent.contextHardLimitTokens}
+                min={20000}
+                max={1000000}
+                step={10000}
+                suffix="tokens"
+                onChange={(v) => updateField("contextHardLimitTokens", v)}
+              />
+            </Row>
+            <Row
+              title="上下文 soft 限制"
+              hint="超过此值会触发 compact 工具压缩历史（保留最近 N 轮 + 摘要中段）。一般设 hard 的 70%"
+            >
+              <NumberInput
+                value={agent.contextSoftLimitTokens}
+                min={10000}
+                max={agent.contextHardLimitTokens}
+                step={10000}
+                suffix="tokens"
+                onChange={(v) => updateField("contextSoftLimitTokens", v)}
+              />
+            </Row>
+            <Row
+              title="单次 run 最大轮数"
+              hint="一条用户消息触发 agent 最多 turn 数（每 turn = 一次 LLM 调用 + 工具调用）。过高浪费 token，过低 agent 跑不完任务"
+            >
+              <NumberInput
+                value={agent.maxTurnsPerRun}
+                min={3}
+                max={50}
+                step={1}
+                onChange={(v) => updateField("maxTurnsPerRun", v)}
+              />
+            </Row>
+            <Row
+              title="单次 run 最大 web 搜索次数"
+              hint="模型原生 web_search 次数上限（开关在每个渠道里）。每次搜索是真金白银"
+            >
+              <NumberInput
+                value={agent.maxSearchCallsPerRun}
+                min={0}
+                max={20}
+                step={1}
+                onChange={(v) => updateField("maxSearchCallsPerRun", v)}
+              />
+            </Row>
+            <Row
+              title="工具调用超时"
+              hint="单个本地工具（quote/news/account 等）超过此秒数视为失败"
+            >
+              <NumberInput
+                value={agent.toolTimeoutSecs ?? 30}
+                min={5}
+                max={180}
+                step={5}
+                suffix="秒"
+                onChange={(v) => updateField("toolTimeoutSecs", v)}
+              />
+            </Row>
+            <Row title="" hint="">
+              <button
+                type="button"
+                className="settings-save-btn"
+                disabled={saving}
+                onClick={() => void save()}
+              >
+                {saving ? <Loader2 size={14} className="spin" /> : <Save size={14} />}
+                保存预算
+              </button>
+              {feedback && <span className="settings-feedback">{feedback}</span>}
+            </Row>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function ChannelsAndAssignmentsBlock() {
   const [config, setConfig] = useState<AgentConfigPayload | null>(null);

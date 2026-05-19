@@ -120,7 +120,62 @@ pub fn search_news_items(
     }
     let connection = open_database(&app)?;
     migrate(&connection)?;
-    let pattern = format!("%{}%", q.replace('%', "\\%").replace('_', "\\_"));
+    let lim = limit.unwrap_or(20).clamp(1, 50);
+
+    // 优先走 FTS5——trigram tokenizer 对中文按 3 字符窗口索引，性能 + 召回都比
+    // payload_json LIKE '%q%' 强一大截。FTS 失败（极少数情况：query 含 FTS 元字符
+    // 触发 syntax error）时静默回退到老 LIKE 路径，保证可用性。
+    if let Ok(rows) = search_news_items_fts(&connection, q, lim) {
+        return Ok(rows);
+    }
+    search_news_items_like(&connection, q, lim)
+}
+
+/// 基于 news_fts 的 LIKE 搜索——配合 trigram 索引，**任意长度**查询都被加速。
+///
+/// 为什么不用 MATCH：trigram tokenizer 的 MATCH 严格要求 3+ 字符短语，"美股"
+/// "央行" "白酒" 等 2 字常见中文短词全部 0 命中。SQLite 官方文档点明 trigram
+/// 同时加速 LIKE / GLOB——LIKE '%X%' 内部用 trigram 索引精准跳跃，无需全表扫。
+/// 我们牺牲 BM25 排序换通用性：按 published desc 排（新闻场景下时间优先于相关度）。
+fn search_news_items_fts(
+    connection: &rusqlite::Connection,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<NewsItem>, String> {
+    let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
+    let mut stmt = connection
+        .prepare(
+            "select ni.payload_json
+             from news_fts f
+             join news_items ni on ni.id = f.news_id
+             where f.title like ?1 escape '\\'
+                or f.summary like ?1 escape '\\'
+                or f.source like ?1 escape '\\'
+             order by coalesce(ni.published, ni.updated_at) desc
+             limit ?2",
+        )
+        .map_err(|err| format!("FTS5 查询资讯失败：{err}"))?;
+    let rows = stmt
+        .query_map(params![pattern, limit], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("FTS5 查询资讯失败：{err}"))?
+        .map(|raw| {
+            raw.map_err(|err| format!("FTS5 查询资讯失败：{err}"))
+                .and_then(|payload| {
+                    serde_json::from_str::<NewsItem>(&payload)
+                        .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
+                })
+        })
+        .collect();
+    rows
+}
+
+/// 老 LIKE 回退——payload_json 整字段子串匹配。FTS 路径失败时兜底。
+fn search_news_items_like(
+    connection: &rusqlite::Connection,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<NewsItem>, String> {
+    let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let mut stmt = connection
         .prepare(
             "select payload_json from news_items
@@ -128,14 +183,12 @@ pub fn search_news_items(
              order by coalesce(published, updated_at) desc
              limit ?2",
         )
-        .map_err(|err| format!("查询资讯失败：{err}"))?;
+        .map_err(|err| format!("LIKE 查询资讯失败：{err}"))?;
     let rows = stmt
-        .query_map(params![pattern, limit.unwrap_or(20).clamp(1, 50)], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|err| format!("查询资讯失败：{err}"))?
+        .query_map(params![pattern, limit], |row| row.get::<_, String>(0))
+        .map_err(|err| format!("LIKE 查询资讯失败：{err}"))?
         .map(|raw| {
-            raw.map_err(|err| format!("查询资讯失败：{err}"))
+            raw.map_err(|err| format!("LIKE 查询资讯失败：{err}"))
                 .and_then(|payload| {
                     serde_json::from_str::<NewsItem>(&payload)
                         .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
@@ -233,6 +286,41 @@ pub fn load_article_content(app: AppHandle, url: String) -> Result<Option<Value>
         serde_json::from_str(&text).map_err(|err| format!("正文缓存 JSON 解析失败：{err}"))
     })
     .transpose()
+}
+
+/// 删除 `published` 字段早于 cutoff（RFC3339 字符串）的 news_items + 级联清孤儿。
+///
+/// `published` 是 RSS/NewsNow 给的发布时间；`updated_at` 是入库时间。优先按 `published`
+/// 卡，没值的回落到 `updated_at`——保证早期没 published 字段的源也会被清。
+///
+/// 同时清理：
+/// - news_tags / news_tickers 中孤儿（关联的 news_id 已不存在）
+/// - article_contents 中孤儿（item_id 不在 news_items）
+pub fn purge_old_news(app: &AppHandle, cutoff_rfc3339: &str) -> Result<u64, String> {
+    let connection = open_database(app)?;
+    migrate(&connection)?;
+    let deleted_items: usize = connection
+        .execute(
+            "delete from news_items
+             where coalesce(published, updated_at) < ?1",
+            params![cutoff_rfc3339],
+        )
+        .map_err(|err| format!("清理旧资讯失败：{err}"))?;
+    // 级联：tags / tickers / article_contents 中孤儿
+    let _ = connection.execute(
+        "delete from news_tags where news_id not in (select id from news_items)",
+        [],
+    );
+    let _ = connection.execute(
+        "delete from news_tickers where news_id not in (select id from news_items)",
+        [],
+    );
+    let _ = connection.execute(
+        "delete from article_contents
+         where item_id is not null and item_id not in (select id from news_items)",
+        [],
+    );
+    Ok(deleted_items as u64)
 }
 
 pub fn save_article_content(

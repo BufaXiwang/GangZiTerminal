@@ -65,15 +65,30 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#039;");
 }
 
+// App 是否已经成功挂载——决定后续 window error 是当"启动失败"满屏处理，还是
+// 当"运行时错误"只打日志。之前不区分，导致点击全屏按钮等任意运行时 throw
+// 都被当成启动失败，覆盖整个 UI。
+let appMounted = false;
+
 window.addEventListener("error", (event) => {
   if (isBenignTauriUnlistenError(event.error ?? event.message)) {
     event.preventDefault();
+    return;
+  }
+  if (appMounted) {
+    // App 已挂载——交给 BootErrorBoundary 或具体组件处理，全局只 log
+    console.error("[runtime error]", event.error ?? event.message);
     return;
   }
   showBootError(event.error ?? event.message);
 });
 window.addEventListener("unhandledrejection", (event) => {
   if (isBenignTauriUnlistenError(event.reason)) {
+    event.preventDefault();
+    return;
+  }
+  if (appMounted) {
+    console.warn("[unhandled rejection]", event.reason);
     event.preventDefault();
     return;
   }
@@ -118,6 +133,7 @@ if (!rootEl) {
           </BootErrorBoundary>
         </React.StrictMode>,
       );
+      appMounted = true;
     })
     .catch(showBootError);
 }

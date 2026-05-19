@@ -1,7 +1,11 @@
-//! search_news——已落库资讯按 LIKE 模糊搜索（标题/摘要/来源）。
+//! search_news——本地资讯库 FTS5 全文搜索（标题/摘要/来源）。
 //!
-//! 仅查询本地缓存。远端搜索（Eastmoney 公告、CLS 电报、Anthropic web_search）
-//! 是另一组工具，本文件不涉及。
+//! 数据范围：最近 30 天，多源（NewsNow / RSS / 6 个站点抽取器）汇总。
+//! 索引：trigram tokenizer，对中文按 3 字符窗口建索引——「光模块」「北向资金」
+//! 这种短词命中精确，毫秒级。FTS 失败时自动回退到 LIKE 子串匹配。
+//!
+//! 远端 web 搜索（Anthropic web_search / OpenAI Responses）是 server-side
+//! 工具，由 provider 自己注入，不在本文件。
 
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use crate::domain::agent::types::ToolResultContent;
@@ -26,8 +30,12 @@ impl Tool for SearchNewsTool {
     }
 
     fn description(&self) -> &'static str {
-        "已落库资讯全文搜索（按 LIKE 匹配标题/摘要/来源）。limit 默认 20，最大 50。\
-        按发布时间倒序。回查历史背景、印证当前事件时调用。"
+        "本地资讯库 FTS5 全文搜索（标题/摘要/来源）。\
+        覆盖最近 30 天多源（NewsNow / 6 个财经站抽取）；trigram 索引，\
+        毫秒级返回。按相关度（BM25）排序——靠前的更贴查询语义。\
+        \nlimit 默认 20，最大 50。\
+        \n建议先用本工具回查历史背景；找不到再考虑 web_search 求外网新信息。\
+        \n例：query='光模块 北向'、'600519 分红'、'央行降准'。"
     }
 
     fn input_schema(&self) -> Value {

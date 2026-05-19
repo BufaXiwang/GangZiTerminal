@@ -103,6 +103,7 @@ pub fn run() {
             adapters::agent_commands::get_agent_config,
             adapters::agent_commands::set_agent_config,
             adapters::agent_commands::verify_provider_model,
+            adapters::agent_commands::get_agent_health,
             // 实时报价代理池 + 三源健康度（SettingsPage → 网络 tab）
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,

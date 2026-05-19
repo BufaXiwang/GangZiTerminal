@@ -1380,6 +1380,12 @@ a {
   min-height: 0;
 }
 
+/* single-stream 修饰符——旧布局右边有 320px 侧栏（用于显示 run 详情/工具卡），
+   后来移除了第二列内容但 grid 模板没改 → 右边一直空着一条。这里收成单列。 */
+.chat-layout.single-stream {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .chat-main {
   min-height: 0;
   display: grid;
@@ -3221,17 +3227,31 @@ a {
 .chat-composer {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px 18px 16px;
+  gap: 8px;
+  padding: 12px 18px 14px;
   border-top: 1px solid var(--border-soft);
   background: var(--bg-card);
+}
+
+/* textarea + actions 同一行；align-end 让按钮锚在 textarea 底缘 */
+.chat-composer-bottom {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.chat-composer-bottom textarea {
+  flex: 1;
+  min-width: 0;
 }
 
 .chat-composer-actions {
   display: flex;
   gap: 8px;
-  justify-content: flex-end;
   align-items: center;
+  flex-shrink: 0;
+  /* 跟 textarea 底缘对齐时多收 2px，视觉上更平 */
+  padding-bottom: 2px;
 }
 
 .chat-composer-image-btn {
@@ -3360,14 +3380,14 @@ a {
   resize: none;
   color: var(--fg-default);
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   background: var(--bg-card);
   font: inherit;
   font-size: 14.5px;
-  line-height: 1.65;
-  min-height: 60px;
+  line-height: 1.6;
+  min-height: 44px;
   max-height: 200px;
-  padding: 14px 16px;
+  padding: 11px 14px;
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
 
@@ -4813,6 +4833,18 @@ a {
   overflow: hidden;
 }
 
+/* CSS-based 全屏兜底——Tauri 2 macOS WKWebView 不支持 native requestFullscreen
+   API，handleFullscreen 失败时 toggle 这个 class，直接占满整个 app 窗口。 */
+.kline-panel.kline-panel-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  margin: 0;
+  border-radius: 0;
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-elevated);
+}
+
 .selected-position-kline .kline-panel {
   flex: 0 0 auto;
   margin-bottom: 0;
@@ -4890,6 +4922,27 @@ a {
 .kline-toolbar-btn:hover {
   background: var(--bg-hover);
   border-color: #c4baa9;
+}
+
+/* 截图反馈——按钮旁边出一个短暂提示，自动消失 */
+.kline-toolbar-hint {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  height: 28px;
+  border-radius: 6px;
+  background: var(--brand-soft);
+  color: var(--brand-text);
+  font-size: 12px;
+  font-weight: 500;
+  animation: kline-hint-pop 1.8s ease-out forwards;
+}
+
+@keyframes kline-hint-pop {
+  0% { opacity: 0; transform: translateX(-4px); }
+  10% { opacity: 1; transform: translateX(0); }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
 }
 
 /* 指标下拉菜单 */
@@ -5702,65 +5755,441 @@ a {
   text-decoration: underline;
 }
 
-/* ===== Agent shell (sub-nav rail + main pane) ===== */
+/* ===== Agent shell (top tab bar + main pane) ===== */
 .agent-shell {
   display: flex;
+  flex-direction: column;
   height: 100%;
   overflow: hidden;
 }
 
-.agent-rail {
-  width: 100px;
+/* 顶部横向 tab bar——下边线分隔，hover/active 用 brand-text 下划线，
+   不开框、不堆 padding，跟编辑器风格保持简洁。 */
+.agent-tabbar {
+  display: flex;
+  gap: 2px;
+  padding: 8px 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-app);
   flex-shrink: 0;
-  border-right: 1px solid var(--border-soft, #e5e7eb);
-  background: #fafafa;
-  display: flex;
-  flex-direction: column;
-  padding: 8px 0;
-  gap: 2px;
 }
 
-.agent-rail-tab {
-  display: flex;
-  flex-direction: column;
+.agent-tabbar-btn {
+  display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 10px 4px;
-  margin: 0 6px;
+  gap: 6px;
+  height: 34px;
+  padding: 0 14px;
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-muted);
+  font-size: 13px;
+  font-weight: 500;
   cursor: pointer;
-  color: #64748b;
-  font-weight: 400;
-  transition: background 120ms, color 120ms, border-color 120ms, box-shadow 120ms;
+  transition: color 120ms, border-color 120ms;
+  margin-bottom: -1px; /* 让 active 下划线与容器 border-bottom 完美重合 */
 }
 
-.agent-rail-tab:hover {
-  background: #f1f5f9;
-  color: #0f172a;
+.agent-tabbar-btn:hover {
+  color: var(--fg-strong);
 }
 
-.agent-rail-tab.active {
-  background: #fff;
-  border-color: #cbd5e1;
-  color: #0f172a;
-  font-weight: 600;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-}
-
-.agent-rail-icon {
-  font-size: 20px;
-  line-height: 1;
-}
-
-.agent-rail-label {
-  font-size: 10px;
-  margin-top: 2px;
-  white-space: nowrap;
+.agent-tabbar-btn.active {
+  color: var(--brand-text);
+  border-bottom-color: var(--brand);
 }
 
 .agent-main {
   flex: 1;
+  /* flex 列容器——让子页面（chat-page 的 flex:1 / page-shell 的 min-height
+     calc）能正常撑满。不写 display:flex 时 agent-main 是 block，子元素 flex:1
+     无效，chat 会被压成内容高度，下方留大段空白。 */
+  display: flex;
+  flex-direction: column;
   overflow: auto;
+  min-width: 0;
+}
+
+/* ===== Agent Health 面板（Settings 内） =====
+   每条 KPI 走 .settings-row 排版，只在数值上加色阶；心跳表用纵向 grid
+   而不是 <table>，避免 SettingsPage 容器窄时列宽错乱。 */
+.health-stat {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--fg-strong);
+}
+
+.health-stat-red {
+  color: #b91c1c;
+}
+
+.health-stat-yellow {
+  color: #b45309;
+}
+
+.heartbeat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+
+.heartbeat-row {
+  display: grid;
+  grid-template-columns: 140px 96px 96px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.heartbeat-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.heartbeat-ok {
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.heartbeat-err-count {
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.heartbeat-msg {
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== Agent 子页面（Expectations / Strategies / Heuristics / Lessons） =====
+   四个页面统一外观：page-shell 白卡 + section-head 衬线大标题 + 横向 stats 条
+   + 软色筛选 chip + 行卡片。完全走 brand / fg / border token，不再出现裸 hex。 */
+
+.agent-subpage {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* 顶部统计条——无独立背景框，靠下方分隔线和留白和正文区分 */
+.agent-stats-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 28px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.agent-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 70px;
+}
+
+.agent-stat-label {
+  font-size: 12px;
+  letter-spacing: 0.01em;
+  color: var(--fg-muted);
+}
+
+.agent-stat-value {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--fg-strong);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-stat-value.muted {
+  color: var(--fg-faint);
+}
+
+.agent-stat-value.warn {
+  color: #b45309;
+}
+
+.agent-stat-value.danger {
+  color: var(--chart-up);
+}
+
+.agent-stat-value.good {
+  color: var(--chart-down);
+}
+
+.agent-stat-hint {
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  line-height: 1.4;
+}
+
+/* 筛选 chip 行 */
+.agent-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agent-chip {
+  padding: 6px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+
+.agent-chip:hover {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+
+.agent-chip.active {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand-text);
+}
+
+/* 列表卡片——更编辑性的版式：无重边框，靠 hairline + 留白排版。
+   hover 时整张轻微提亮，actions 才出现，平时静态读起来不杂乱。 */
+.agent-card-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.agent-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 4px 18px 0;
+  border-bottom: 1px solid var(--border-soft);
+  transition: background 120ms;
+}
+
+.agent-card:last-child {
+  border-bottom: 0;
+}
+
+.agent-card:hover {
+  background: var(--bg-hover);
+}
+
+.agent-card.dim {
+  opacity: 0.55;
+}
+
+.agent-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.agent-card-title {
+  font-weight: 600;
+  font-size: 14.5px;
+  color: var(--fg-strong);
+}
+
+/* 右侧 meta——次要元数据，弱色单点字号，绑住卡片右边 */
+.agent-card-meta {
+  margin-left: auto;
+  display: flex;
+  gap: 14px;
+  font-size: 11.5px;
+  color: var(--fg-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.agent-card-body {
+  font-size: 14px;
+  color: var(--fg-default);
+  line-height: 1.6;
+  /* 跟卡片头有一行留白，但不再额外开框 */
+}
+
+.agent-card-sub {
+  font-size: 12px;
+  color: var(--fg-muted);
+  line-height: 1.5;
+}
+
+/* 操作按钮——平常半透明，hover 卡片时整组变实色，避免静态浏览时被按钮干扰 */
+.agent-card-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  opacity: 0.55;
+  transition: opacity 120ms;
+}
+
+.agent-card:hover .agent-card-actions {
+  opacity: 1;
+}
+
+/* badge——状态/分类小标签 */
+.agent-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1.4;
+}
+
+.agent-badge.brand {
+  background: var(--brand-soft);
+  color: var(--brand-text);
+}
+
+.agent-badge.neutral {
+  background: var(--bg-card);
+  color: var(--fg-muted);
+  border-color: var(--border-soft);
+}
+
+.agent-badge.good {
+  background: rgba(45, 122, 74, 0.12);
+  color: var(--chart-down);
+}
+
+.agent-badge.danger {
+  background: rgba(200, 54, 47, 0.10);
+  color: var(--chart-up);
+}
+
+.agent-badge.warn {
+  background: rgba(180, 83, 9, 0.10);
+  color: #b45309;
+}
+
+.agent-badge.dot::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* 小型 ghost 按钮（"问 agent" / retire） */
+.agent-mini-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-card);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+
+.agent-mini-btn:hover {
+  border-color: var(--brand);
+  color: var(--brand-text);
+}
+
+.agent-mini-btn.danger {
+  color: var(--chart-up);
+}
+
+.agent-mini-btn.danger:hover {
+  border-color: var(--chart-up);
+}
+
+/* group section 标题（Heuristics 按 state 分组） */
+.agent-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-group-head {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--fg-strong);
+  letter-spacing: -0.005em;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.agent-group-head small {
+  color: var(--fg-faint);
+  font-family: var(--font-body);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+/* 空态——一张柔和的解释卡，居中放在子页面正文区。
+   不再是"暂无 X"一行字飘在空白里，而是告诉用户：
+   1) 这个页面平常会显示什么
+   2) 数据什么时候会来 / 怎么触发
+   3) （可选）一个去对话页的入口 */
+.agent-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin: 8vh auto 0;
+  max-width: 460px;
+  padding: 28px 32px;
+  text-align: center;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-soft);
+}
+
+.agent-empty-state .agent-empty-icon {
+  color: var(--fg-faint);
+  margin-bottom: 4px;
+}
+
+.agent-empty-state h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--fg-strong);
+  letter-spacing: -0.005em;
+}
+
+.agent-empty-state p {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 13.5px;
+  line-height: 1.6;
+}
+
+.agent-empty-state .agent-empty-hint {
+  color: var(--fg-faint);
+  font-size: 12px;
+  line-height: 1.55;
+  margin-top: 4px;
 }

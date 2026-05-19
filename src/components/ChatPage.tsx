@@ -231,42 +231,44 @@ export function ChatPage({
                 ))}
               </div>
             )}
-            <textarea
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submit();
-              }}
-              onPaste={(event) => void onPaste(event)}
-              placeholder="问市场、聊判断、复盘想法...（支持粘贴 / 拖拽图片）"
-              value={draft}
-            />
-            <div className="chat-composer-actions">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif"
-                multiple
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  void ingestFiles(e.target.files);
-                  if (e.target) e.target.value = "";
+            <div className="chat-composer-bottom">
+              <textarea
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submit();
                 }}
+                onPaste={(event) => void onPaste(event)}
+                placeholder="问市场、聊判断、复盘想法...（支持粘贴 / 拖拽图片）"
+                value={draft}
               />
-              <button
-                type="button"
-                className="chat-composer-image-btn"
-                title="选择图片附件"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <ImagePlus size={16} />
-              </button>
-              <button
-                disabled={(!draft.trim() && pendingImages.length === 0) || isChatting}
-                onClick={submit}
-              >
-                <Send size={16} />
-                {isChatting ? "思考中" : "发送"}
-              </button>
+              <div className="chat-composer-actions">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif"
+                  multiple
+                  style={{ display: "none" }}
+                  onChange={(e) => {
+                    void ingestFiles(e.target.files);
+                    if (e.target) e.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  className="chat-composer-image-btn"
+                  title="选择图片附件"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <ImagePlus size={16} />
+                </button>
+                <button
+                  disabled={(!draft.trim() && pendingImages.length === 0) || isChatting}
+                  onClick={submit}
+                >
+                  <Send size={16} />
+                  {isChatting ? "思考中" : "发送"}
+                </button>
+              </div>
             </div>
           </div>
         </div>

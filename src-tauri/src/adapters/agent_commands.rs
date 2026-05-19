@@ -9,10 +9,18 @@
 //! 结构）在 `pipeline::agent::config`，这里只做 IPC 边界专属处理：token mask、
 //! 未编辑回退、参数命名（camelCase）等。
 
+use crate::infrastructure::agent::health_metrics::{compute, HealthMetrics};
 use crate::infrastructure::agent::provider::models::verify_model;
 use crate::pipeline::agent::config::{read_agent_config, write_agent_config, AgentConfig};
 use serde_json::Value;
 use tauri::AppHandle;
+
+/// 暴露 agent 自迭代健康度——Settings → Agent 健康面板用。
+/// 把 v3 expectation-driven 几条关键审计 SQL 一次性返回，前端不用拼。
+#[tauri::command]
+pub fn get_agent_health(app: AppHandle) -> Result<HealthMetrics, String> {
+    compute(&app)
+}
 
 #[tauri::command]
 pub fn get_agent_config(app: AppHandle) -> Value {

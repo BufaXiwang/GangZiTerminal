@@ -21,6 +21,7 @@ use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
 use crate::infrastructure::quotes::eastmoney::kline as em_kline;
 use crate::infrastructure::quotes::realtime::dispatch;
 use crate::infrastructure::quotes::scanner as quotes_scanner;
+use crate::infrastructure::quotes::tdx::bars as tdx_bars;
 use crate::infrastructure::quotes::tushare::probe::ProbeResult;
 use crate::infrastructure::quotes::tushare::{concept, events, flow, stock as ts_stock};
 use serde::Serialize;
@@ -128,9 +129,8 @@ pub async fn fetch_a_share_minutes(
     };
     let days = days.unwrap_or(1);
 
-    let points = em_kline::fetch_minutes_intraday(&ts_code, days)
-        .await
-        .map_err(String::from)?;
+    // TDX 主 + EM 兜底。SH/SZ 先试 TDX；BJ 或 TDX 失败/空 → EM。
+    let points = fetch_minutes_with_fallback(&ts_code, days).await?;
 
     Ok(points
         .into_iter()
@@ -142,6 +142,28 @@ pub async fn fetch_a_share_minutes(
             amount: p.amount.map(|v| v.value()),
         })
         .collect())
+}
+
+/// 分时数据 TDX 主 + EM 兜底——同 minute_kline 路径策略。
+/// 用 String 错误是因为这是 adapter 层；上游 caller 直接面向前端。
+async fn fetch_minutes_with_fallback(
+    ts_code: &TsCode,
+    days: usize,
+) -> Result<Vec<crate::domain::quotes::MinutePoint>, String> {
+    let is_bj = ts_code.market() == "BJ";
+    if !is_bj {
+        match tdx_bars::fetch_minutes_intraday(ts_code, days).await {
+            Ok(pts) if !pts.is_empty() => {
+                tracing::debug!(ts_code = %ts_code.as_str(), source = "tdx", "分时命中");
+                return Ok(pts);
+            }
+            Ok(_) => tracing::debug!(ts_code = %ts_code.as_str(), "tdx 分时返 0，回退 EM"),
+            Err(e) => tracing::warn!(ts_code = %ts_code.as_str(), err = %e, "tdx 分时失败，回退 EM"),
+        }
+    }
+    em_kline::fetch_minutes_intraday(ts_code, days)
+        .await
+        .map_err(String::from)
 }
 
 // ============================================================================

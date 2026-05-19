@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Target } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { EmptyState, Stat } from "./LessonsPage";
 
 type Lesson = {
   id: string;
@@ -10,12 +12,6 @@ type Lesson = {
   takeaway: string;
   outcome: "hit" | "miss" | "expired";
   createdAt: number;
-};
-
-const OUTCOME_COLOR: Record<Lesson["outcome"], string> = {
-  hit: "#10b981",
-  miss: "#ef4444",
-  expired: "#f59e0b",
 };
 
 type Expectation = {
@@ -37,23 +33,51 @@ type Expectation = {
   closedAt: number | null;
 };
 
-const STATE_LABELS: Record<Expectation["state"], string> = {
-  pending: "Pending（进行中）",
-  hit: "Hit（命中）",
-  missed: "Missed（未达 target）",
-  expired: "Expired（到期未达）",
-  cancelled: "Cancelled（主动撤）",
-  superseded: "Superseded（被替换）",
+type ExpectationSummary = {
+  totalExpectations: number;
+  totalClosedExpectations: number;
+  expectationsCreatedToday: number;
+  expectationCompletenessRate: number | null;
 };
 
-const STATE_COLORS: Record<Expectation["state"], string> = {
-  pending: "#3b82f6",
-  hit: "#10b981",
-  missed: "#ef4444",
-  expired: "#f59e0b",
-  cancelled: "#6b7280",
-  superseded: "#9ca3af",
+const STATE_LABEL: Record<Expectation["state"], string> = {
+  pending: "进行中",
+  hit: "命中",
+  missed: "未中",
+  expired: "到期",
+  cancelled: "已撤",
+  superseded: "已替换",
 };
+
+const STATE_BADGE: Record<Expectation["state"], "brand" | "good" | "danger" | "warn" | "neutral"> = {
+  pending: "brand",
+  hit: "good",
+  missed: "danger",
+  expired: "warn",
+  cancelled: "neutral",
+  superseded: "neutral",
+};
+
+const LESSON_BADGE: Record<Lesson["outcome"], "good" | "danger" | "warn"> = {
+  hit: "good",
+  miss: "danger",
+  expired: "warn",
+};
+
+const LESSON_LABEL: Record<Lesson["outcome"], string> = {
+  hit: "命中",
+  miss: "未中",
+  expired: "到期",
+};
+
+const FILTER_OPTIONS: Array<{ id: Expectation["state"]; label: string }> = [
+  { id: "pending", label: "进行中" },
+  { id: "hit", label: "命中" },
+  { id: "missed", label: "未中" },
+  { id: "expired", label: "到期" },
+  { id: "cancelled", label: "已撤" },
+  { id: "superseded", label: "已替换" },
+];
 
 function formatTime(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN");
@@ -82,164 +106,125 @@ function ExpectationCard({
     setShowLessons(true);
     if (lessons === null && !lessonsLoading) {
       setLessonsLoading(true);
-      void invoke<Lesson[]>("list_lessons_for_expectation", {
-        expectationId: exp.id,
-      })
+      void invoke<Lesson[]>("list_lessons_for_expectation", { expectationId: exp.id })
         .then((res) => setLessons(res))
         .catch(() => setLessons([]))
         .finally(() => setLessonsLoading(false));
     }
   };
+
   return (
-    <div
-      id={`exp-${exp.id}`}
-      style={{
-        border: `1px solid ${STATE_COLORS[exp.state]}`,
-        borderRadius: 8,
-        padding: 12,
-        marginBottom: 8,
-        background: "#fff",
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-        <span
-          style={{
-            background: STATE_COLORS[exp.state],
-            color: "white",
-            padding: "2px 8px",
-            borderRadius: 4,
-            fontSize: 11,
-          }}
-        >
-          {STATE_LABELS[exp.state]}
+    <article id={`exp-${exp.id}`} className={`agent-card${terminal ? " dim" : ""}`}>
+      <div className="agent-card-head">
+        <span className={`agent-badge ${STATE_BADGE[exp.state]} dot`}>{STATE_LABEL[exp.state]}</span>
+        <span className="agent-card-title">{exp.code}</span>
+        <span className="agent-card-sub">
+          {exp.direction} · {exp.conviction} · {exp.horizonDays}d
         </span>
-        <span style={{ fontSize: 12, color: "#64748b" }}>
-          {exp.code} · {exp.direction} · {exp.conviction} · {exp.horizonDays}d
-        </span>
-        {exp.theme && (
-          <span style={{ fontSize: 11, color: "#0ea5e9", background: "#dbeafe", padding: "1px 6px", borderRadius: 3 }}>
-            #{exp.theme}
-          </span>
-        )}
-        <span style={{ marginLeft: "auto", fontSize: 11, color: "#94a3b8" }}>
-          {formatTime(exp.createdAt)} · 到期 {formatTime(exp.expiresAt)}
+        {exp.theme && <span className="agent-badge brand">#{exp.theme}</span>}
+        <span className="agent-card-meta">
+          <span>建仓 {formatTime(exp.createdAt)}</span>
+          <span>到期 {formatTime(exp.expiresAt)}</span>
         </span>
       </div>
-      <div style={{ marginBottom: 4 }}>
-        Target: <strong>{exp.targetPrice ?? "（观察型）"}</strong>
-        {exp.targetPriceCeiling && ` ~ ${exp.targetPriceCeiling}`}
+      <div className="agent-card-body">
+        目标 ·{" "}
+        <strong style={{ color: "var(--fg-strong)" }}>
+          {exp.targetPrice ?? "（观察型）"}
+          {exp.targetPriceCeiling && ` ~ ${exp.targetPriceCeiling}`}
+        </strong>
+        <br />
+        {exp.reasoning}
       </div>
-      <div style={{ fontSize: 13, color: "#475569" }}>{exp.reasoning}</div>
-      <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
-        signals: {exp.signalsUsed.map((s) => s.kind).join(", ") || "（无）"}
+      <div className="agent-card-sub">
+        信号 · {exp.signalsUsed.map((s) => s.kind).join("，") || "（无）"}
       </div>
       {exp.supersedes && (
-        <div style={{ fontSize: 11, marginTop: 4 }}>
-          replaces:{" "}
+        <div className="agent-card-sub">
+          替换了 ·{" "}
           <button
+            type="button"
+            className="agent-mini-btn"
+            style={{ fontFamily: "var(--font-mono)" }}
             onClick={() => onJumpToSupersedes(exp.supersedes!)}
-            style={{
-              padding: "1px 6px",
-              fontSize: 11,
-              background: "transparent",
-              border: "1px dashed #94a3b8",
-              color: "#0ea5e9",
-              cursor: "pointer",
-              fontFamily: "monospace",
-            }}
             title="跳转到被替换的 expectation"
           >
             #{exp.supersedes.slice(0, 8)} ↗
           </button>
         </div>
       )}
-      <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
-        <button
-          onClick={() => onAsk(askPrefill)}
-          style={{ padding: "3px 8px", fontSize: 11 }}
-        >
-          💬 问 agent
+      <div className="agent-card-actions">
+        <button type="button" className="agent-mini-btn" onClick={() => onAsk(askPrefill)}>
+          问 agent
         </button>
         {terminal && (
-          <button
-            onClick={toggleLessons}
-            style={{ padding: "3px 8px", fontSize: 11 }}
-          >
-            {showLessons ? "▾ 收起 lessons" : "▸ 查看 lessons"}
+          <button type="button" className="agent-mini-btn" onClick={toggleLessons}>
+            {showLessons ? "收起 lessons" : "查看 lessons"}
           </button>
         )}
       </div>
       {terminal && showLessons && (
         <div
           style={{
-            marginTop: 6,
-            padding: 8,
-            background: "#f8fafc",
-            border: "1px solid #e5e7eb",
-            borderRadius: 4,
-            fontSize: 12,
+            marginTop: 4,
+            padding: 12,
+            background: "var(--bg-card)",
+            border: "1px solid var(--border-soft)",
+            borderRadius: "var(--radius-sm)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
           }}
         >
-          {lessonsLoading && <div style={{ color: "#94a3b8" }}>加载中…</div>}
+          {lessonsLoading && <div className="agent-card-sub">加载中…</div>}
           {!lessonsLoading && lessons !== null && lessons.length === 0 && (
-            <div style={{ color: "#94a3b8" }}>没有关联 lesson</div>
+            <div className="agent-card-sub">没有关联 lesson</div>
           )}
           {!lessonsLoading &&
             lessons?.map((l) => (
-              <div
-                key={l.id}
-                style={{
-                  borderLeft: `3px solid ${OUTCOME_COLOR[l.outcome]}`,
-                  paddingLeft: 8,
-                  marginBottom: 6,
-                }}
-              >
-                <div>
-                  <span
-                    style={{
-                      background: OUTCOME_COLOR[l.outcome],
-                      color: "white",
-                      padding: "0 6px",
-                      borderRadius: 3,
-                      fontSize: 10,
-                      marginRight: 6,
-                    }}
-                  >
-                    {l.outcome}
+              <div key={l.id} style={{ borderLeft: "2px solid var(--border-default)", paddingLeft: 10 }}>
+                <div className="agent-card-head" style={{ gap: 6, marginBottom: 2 }}>
+                  <span className={`agent-badge ${LESSON_BADGE[l.outcome]}`}>
+                    {LESSON_LABEL[l.outcome]}
                   </span>
-                  {l.observation}
+                  <span className="agent-card-sub">{l.observation}</span>
                 </div>
                 {l.takeaway && (
-                  <div style={{ marginTop: 2, fontStyle: "italic", color: "#475569" }}>
-                    💡 {l.takeaway}
+                  <div className="agent-card-sub" style={{ fontStyle: "italic" }}>
+                    takeaway · {l.takeaway}
                   </div>
                 )}
               </div>
             ))}
         </div>
       )}
-    </div>
+    </article>
   );
 }
 
 export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) => void }) {
   const [list, setList] = useState<Expectation[]>([]);
-  const [filter, setFilter] = useState<string>("pending");
+  const [filter, setFilter] = useState<Expectation["state"]>("pending");
   const [themeFilter, setThemeFilter] = useState<string>("");
+  const [summary, setSummary] = useState<ExpectationSummary | null>(null);
 
   const load = async (s: string) => {
-    const result = await invoke<Expectation[]>("list_expectations", {
-      state: s,
-      limit: 200,
-    });
+    const result = await invoke<Expectation[]>("list_expectations", { state: s, limit: 200 });
     setList(result);
+  };
+
+  const refreshSummary = () => {
+    void invoke<ExpectationSummary>("get_agent_health")
+      .then((h) => setSummary(h))
+      .catch(() => setSummary(null));
   };
 
   useEffect(() => {
     void load(filter);
-    // 监听后端 expectations-changed 事件 → 自动 refetch
+    refreshSummary();
     const unsubscribePromise = listen("expectations-changed", () => {
       void load(filter);
+      refreshSummary();
     });
     return () => {
       void unsubscribePromise.then((unlisten) => unlisten());
@@ -252,12 +237,10 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
     return Array.from(set);
   }, [list]);
 
-  const filtered = themeFilter
-    ? list.filter((e) => e.theme === themeFilter)
-    : list;
+  const filtered = themeFilter ? list.filter((e) => e.theme === themeFilter) : list;
 
   const jumpToSupersedes = async (id: string) => {
-    // 若被替换条不在当前过滤集合里，先把过滤切换到 superseded，再滚动
+    // 若被替换条不在当前过滤集合里，先把过滤切到 superseded，再滚动
     if (!list.some((e) => e.id === id)) {
       const all = await invoke<Expectation[]>("list_expectations", {
         state: "superseded",
@@ -266,12 +249,11 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
       setList(all);
       setFilter("superseded");
     }
-    // 等下一帧渲染完再 scroll
     requestAnimationFrame(() => {
       const el = document.getElementById(`exp-${id}`);
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
-        el.style.outline = "2px solid #0ea5e9";
+        el.style.outline = "2px solid var(--brand)";
         setTimeout(() => {
           el.style.outline = "";
         }, 1500);
@@ -280,70 +262,98 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
   };
 
   return (
-    <div style={{ padding: 20 }}>
-      <h1>Expectations</h1>
-      <p style={{ color: "#64748b" }}>
-        Agent 当前跟踪的投资预期——可量化、可代码自动验证。
-      </p>
-
-      <div style={{ marginBottom: 16 }}>
-        {["pending", "hit", "missed", "expired", "cancelled", "superseded"].map((s) => (
-          <button
-            key={s}
-            onClick={() => setFilter(s)}
-            style={{
-              marginRight: 6,
-              padding: "4px 10px",
-              background: filter === s ? "#3b82f6" : "transparent",
-              color: filter === s ? "white" : "#64748b",
-              border: "1px solid #e5e7eb",
-              borderRadius: 4,
-              cursor: "pointer",
-            }}
-          >
-            {s}
-          </button>
-        ))}
-      </div>
-
-      {themes.length > 0 && (
-        <div style={{ marginBottom: 12, fontSize: 12 }}>
-          theme 过滤：
-          <button
-            onClick={() => setThemeFilter("")}
-            style={{ marginLeft: 6, padding: "2px 6px", fontSize: 11 }}
-          >
-            全部
-          </button>
-          {themes.map((t) => (
-            <button
-              key={t}
-              onClick={() => setThemeFilter(t)}
-              style={{
-                marginLeft: 4,
-                padding: "2px 6px",
-                fontSize: 11,
-                background: themeFilter === t ? "#dbeafe" : "transparent",
-              }}
-            >
-              #{t}
-            </button>
-          ))}
+    <section className="page-shell agent-subpage">
+      <header className="section-head">
+        <div>
+          <h2>预期</h2>
+          <p>Agent 当前跟踪的投资预期——可量化、可代码自动验证。</p>
         </div>
-      )}
+      </header>
 
-      {filtered.length === 0 ? (
-        <p style={{ color: "#94a3b8" }}>暂无 expectation</p>
+      {summary && summary.totalExpectations === 0 ? (
+        <EmptyState
+          icon={<Target size={28} strokeWidth={1.4} />}
+          title="还没有投资预期"
+          body="预期是 agent 跟踪的「这只票在 N 天内会涨到 X / 跌到 Y」一类可验证判断。每个预期到期或命中后会自动生成一条 lesson，沉淀成可复用的启发式。"
+          hint="去「对话」让 agent 帮你建第一个 expectation——也可以让它扫盘后自己 propose。"
+        />
       ) : (
-        filtered.map((e) => (
-          <ExpectationCard
-            key={e.id}
-            exp={e}
-            onAsk={(msg) => onAskAgent?.(msg)}
-            onJumpToSupersedes={(id) => void jumpToSupersedes(id)}
-          />
-        ))
+        <>
+          {summary && (
+            <div className="agent-stats-strip">
+              <Stat label="累计" value={summary.totalExpectations} />
+              <Stat label="已关闭" value={summary.totalClosedExpectations} />
+              <Stat
+                label="今日新建"
+                value={summary.expectationsCreatedToday}
+                tone={summary.expectationsCreatedToday === 0 ? "muted" : undefined}
+              />
+              <Stat
+                label="完整度"
+                value={
+                  summary.expectationCompletenessRate != null
+                    ? `${Math.round(summary.expectationCompletenessRate * 100)}%`
+                    : "—"
+                }
+                hint="同时含 signals + target + reasoning"
+              />
+              <Stat label="当前显示" value={filtered.length} />
+            </div>
+          )}
+
+          <div className="agent-filter-row">
+            {FILTER_OPTIONS.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => setFilter(opt.id)}
+                className={`agent-chip${filter === opt.id ? " active" : ""}`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
+          {themes.length > 0 && (
+            <div className="agent-filter-row">
+              <button
+                type="button"
+                onClick={() => setThemeFilter("")}
+                className={`agent-chip${themeFilter === "" ? " active" : ""}`}
+              >
+                所有 theme
+              </button>
+              {themes.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setThemeFilter(t)}
+                  className={`agent-chip${themeFilter === t ? " active" : ""}`}
+                >
+                  #{t}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {filtered.length === 0 ? (
+            <p className="agent-empty-state" style={{ background: "transparent", border: 0 }}>
+              当前筛选下没有 expectation，换个 state 试试。
+            </p>
+          ) : (
+            <div className="agent-card-list">
+              {filtered.map((e) => (
+                <ExpectationCard
+                  key={e.id}
+                  exp={e}
+                  onAsk={(msg) => onAskAgent?.(msg)}
+                  onJumpToSupersedes={(id) => void jumpToSupersedes(id)}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
-    </div>
+    </section>
   );
 }

@@ -13,8 +13,8 @@
 //! 不直接 import `adapters::agent_tools`——遵循 pipeline → adapter 单向规则。
 
 use crate::domain::agent::types::{
-    AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
-    SystemBlock,
+    AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind,
+    ProviderKind, Role, ServerSideTool, SystemBlock, ToolDef,
 };
 use crate::domain::quotes::indicators::{compute_indicators, IndicatorConfig};
 use crate::domain::quotes::regime::Regime;
@@ -25,7 +25,9 @@ use crate::infrastructure::account::watchlist;
 use crate::infrastructure::agent::signal_detection_repo;
 use crate::infrastructure::news::news_tag_repo;
 use crate::infrastructure::quotes::cache::kline_cache;
-use crate::infrastructure::quotes::signal_detector::{self, DetectorConfig};
+use crate::infrastructure::quotes::signal_detector::{self, DetectorConfig, ScanContext};
+use crate::infrastructure::quotes::tushare::flow as ts_flow;
+use crate::domain::quotes::{NorthMoneyFlow, TopListItem};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
 use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config};
 use crate::pipeline::agent::observer;
@@ -98,6 +100,10 @@ pub async fn run_tick(
     let codes = watchlist::list_strings();
     let now = OccurredAt::now();
 
+    // 一次性拉本 tick 的资金面 context——top_list 和 north_flow 都是当日全局数据，
+    // 同一 tick 内每只股共享。失败时降级到空 context（detector 自动跳过资金面信号）。
+    let (north_flow, dragon_tiger) = prefetch_capital_context(&app).await;
+
     // 阶段 1：纯规则扫描
     let mut all_detections: Vec<(String, SignalKind, OccurredAt)> = Vec::new();
     let mut triggered_per_stock: Vec<(StockCode, Vec<SignalKind>)> = Vec::new();
@@ -106,7 +112,13 @@ pub async fn run_tick(
             continue;
         };
         result.stocks_scanned += 1;
-        let signals = scan_one_stock(&app, &code, now);
+        let signals = scan_one_stock_with_capital(
+            &app,
+            &code,
+            now,
+            north_flow.as_deref(),
+            dragon_tiger.as_deref(),
+        );
         if signals.is_empty() {
             continue;
         }
@@ -167,8 +179,44 @@ pub async fn run_tick(
     Ok(result)
 }
 
-/// 给单只股票跑信号检测——pure code，组合 signal_detector + news tagger 输出。
+/// 在 tick 开始时一次性拉资金面数据——返回 (北向 10 日序列, 今日龙虎榜)。
+/// 都失败时返 (None, None)，detector 会跳过资金面信号——降级行为符合"detector 字段 None 跳过"的约定。
+pub async fn prefetch_capital_context(
+    app: &AppHandle,
+) -> (Option<Vec<NorthMoneyFlow>>, Option<Vec<TopListItem>>) {
+    let north = match ts_flow::fetch_north_flow(app, 10).await {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "scan tick: 拉北向资金失败，资金面信号本轮跳过");
+            None
+        }
+    };
+    let dragon = match ts_flow::fetch_top_list(app, None).await {
+        Ok(v) if !v.is_empty() => Some(v),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "scan tick: 拉龙虎榜失败，OnDragonTigerList 本轮跳过");
+            None
+        }
+    };
+    (north, dragon)
+}
+
+/// 给单只股票跑信号检测——纯技术面 + news（不含资金面）。保留为兼容入口；
+/// 调用方若想要资金面，请用 [`scan_one_stock_with_capital`]。
 pub fn scan_one_stock(app: &AppHandle, code: &StockCode, now: OccurredAt) -> Vec<SignalKind> {
+    scan_one_stock_with_capital(app, code, now, None, None)
+}
+
+/// 带资金面 context 的扫描——`north_flow` / `dragon_tiger` 由 tick 顶层一次性拉好后注入。
+pub fn scan_one_stock_with_capital(
+    app: &AppHandle,
+    code: &StockCode,
+    now: OccurredAt,
+    north_flow: Option<&[NorthMoneyFlow]>,
+    dragon_tiger: Option<&[TopListItem]>,
+) -> Vec<SignalKind> {
     let mut out = Vec::new();
 
     // 拉 K 线（近 60 日）+ indicators
@@ -191,12 +239,18 @@ pub fn scan_one_stock(app: &AppHandle, code: &StockCode, now: OccurredAt) -> Vec
                 None
             };
             let quote = market_snapshot::get(&ts_code);
-            let signals = signal_detector::scan_one(
+            let ctx = ScanContext {
+                north_flow,
+                dragon_tiger_today: dragon_tiger,
+                ..ScanContext::default()
+            };
+            let signals = signal_detector::scan_one_with_context(
                 &klines,
                 &snap,
                 prev_snap.as_ref(),
                 quote.as_ref(),
                 &DetectorConfig::default(),
+                &ctx,
             );
             out.extend(signals);
         }
@@ -297,7 +351,22 @@ pub async fn run_mini_scan(
     let model = model_ref.to_string();
 
     let context_text = build_mini_scan_context(&app, &code, &signals);
-    let tools = registry.to_tool_defs(true);
+    let mut tools = registry.to_tool_defs(true);
+    // 跟 chat pipeline 同样的 server-side web_search 注入逻辑——9 tick 自驱
+    // mini-scan 看到异动时也能 web 查最新消息（否则 agent 只看技术信号会瞎判）。
+    let want_web_search = match channel.wire_format {
+        ProviderKind::Anthropic => channel.enable_native_web_search,
+        ProviderKind::OpenAIResponses => channel.enable_web_search,
+        ProviderKind::OpenAIChatCompletions => false,
+    };
+    if want_web_search {
+        tools.push(ToolDef::ServerSide(ServerSideTool::AnthropicWebSearch {
+            name: "web_search".into(),
+            max_uses: Some(cfg.agent.max_search_calls_per_run),
+            allowed_domains: vec![],
+            blocked_domains: vec![],
+        }));
+    }
 
     let req = AgentRequest {
         system: vec![

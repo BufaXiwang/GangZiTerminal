@@ -143,6 +143,7 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
   const [subIndicators, setSubIndicators] = useState<Set<string>>(DEFAULT_SUB);
   const [indicatorMenuOpen, setIndicatorMenuOpen] = useState(false);
   const [drawingMenuOpen, setDrawingMenuOpen] = useState(false);
+  const [screenshotHint, setScreenshotHint] = useState<string | null>(null);
   // chart 重建次数——onChartReady 触发时递增；让"画线 load/save"effect 在每次 chart
   // 重建后重新跑。chart 实例本身在 ref 里，不能放 effect deps。
   const [chartReadyTick, setChartReadyTick] = useState(0);
@@ -308,21 +309,51 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
   async function handleFullscreen() {
     const el = panelRef.current;
     if (!el) return;
-    if (document.fullscreenElement) {
-      await document.exitFullscreen();
-    } else {
-      await el.requestFullscreen();
+    // Tauri 2 的 macOS WKWebView 不开启 requestFullscreen API——直接调会 reject
+    // 一个 "Fullscreen request denied" 错。改用 CSS-based 全屏（panelRef 切 class，
+    // position:fixed 占满整个 app 窗口）。原生 API 能用就先用，不能用走 CSS 兜底。
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+        return;
+      }
+      // 优先试原生
+      if (typeof el.requestFullscreen === "function") {
+        await el.requestFullscreen();
+        return;
+      }
+      throw new Error("no native fullscreen");
+    } catch {
+      // CSS 兜底——toggle 一个 class，由 styles.css 用 position:fixed 占满窗口
+      el.classList.toggle("kline-panel-fullscreen");
     }
   }
 
-  function handleScreenshot() {
+  async function handleScreenshot() {
     const chart = chartHandleRef.current;
     if (!chart) return;
-    const url = chart.getConvertPictureUrl(true, "png", "#ffffff");
-    const a = document.createElement("a");
-    a.download = `${code}-${period}-${Date.now()}.png`;
-    a.href = url;
-    a.click();
+    const dataUrl = chart.getConvertPictureUrl(true, "png", "#ffffff");
+    // 之前用 <a download> 触发下载——Tauri 2 的 macOS WKWebView 对这种伪下载
+    // 链接 click() 有时静默失败（用户报告"截图不行了"）。改成剪贴板优先：
+    // 1) 截了直接 Cmd+V 能粘到 chat 输入框 / 别的 app，体验更顺
+    // 2) 剪贴板失败再回退到 download path 兜底
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      // Clipboard API 写图片需要 secure context 和支持的浏览器——WKWebView 16+ OK
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      setScreenshotHint("已复制到剪贴板");
+      window.setTimeout(() => setScreenshotHint(null), 1800);
+    } catch (e) {
+      console.warn("剪贴板写入失败，回退到下载", e);
+      const a = document.createElement("a");
+      a.download = `${code}-${period}-${Date.now()}.png`;
+      a.href = dataUrl;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setScreenshotHint("已下载到 Downloads");
+      window.setTimeout(() => setScreenshotHint(null), 1800);
+    }
   }
 
   function handleStartDrawing(tool: string) {
@@ -410,9 +441,15 @@ export function KlineChart({ code, tsCode, name, category = "stock", meta }: Pro
                 <PenLine size={14} /> <ChevronDown size={12} />
               </button>
             )}
-            <button type="button" className="kline-toolbar-btn" onClick={handleScreenshot} title="截图">
+            <button
+              type="button"
+              className="kline-toolbar-btn"
+              onClick={() => void handleScreenshot()}
+              title="截图（保存到剪贴板，Cmd+V 直接粘）"
+            >
               <Camera size={14} />
             </button>
+            {screenshotHint && <span className="kline-toolbar-hint">{screenshotHint}</span>}
             <button type="button" className="kline-toolbar-btn" onClick={handleFullscreen} title="全屏">
               <Maximize2 size={14} />
             </button>

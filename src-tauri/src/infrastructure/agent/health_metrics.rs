@@ -15,6 +15,7 @@
 
 use crate::infrastructure::agent::heuristic_repo::count_by_state;
 use crate::infrastructure::db::{migrate, open_database};
+use crate::infrastructure::scheduler_heartbeat::{list_heartbeats, HeartbeatRow};
 use serde::Serialize;
 use tauri::AppHandle;
 
@@ -29,6 +30,20 @@ pub struct HealthMetrics {
     pub lessons_count_7d: u32,
     pub heuristic_counts: HeuristicCountsDto,
     pub heuristic_origin_share: HeuristicOriginShare,
+
+    // v5 自迭代审计字段——直接对应 docs/architecture.md 里 "5 秒确认查询" 的几条
+    /// 今天（北京时间 0 点起）的 scan tick 数；0 说明 scan_scheduler 没在跑
+    pub scan_ticks_today: u32,
+    /// 今天新生成的 expectation 数；连续多日为 0 → agent 没在产出预期
+    pub expectations_created_today: u32,
+    /// 今天 reflection 写入的 lesson 数
+    pub lessons_created_today: u32,
+    /// 最近 7 天 takeaway 仍为空的 lesson 数——> 0 说明 LLM provider 没接通或 takeaway fill 在失败
+    pub lessons_empty_takeaway_7d: u32,
+    /// 7 天内新 emerge 的 heuristic 数；连续 2 周为 0 → emerge 链路死了
+    pub heuristics_emerged_7d: u32,
+    /// 各 loop 心跳——直接展示给用户看哪条卡了
+    pub heartbeats: Vec<HeartbeatRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -118,6 +133,61 @@ pub fn compute(app: &AppHandle) -> Result<HealthMetrics, String> {
         None
     };
 
+    // 北京时间 0 点的 RFC3339 等价（UTC = 北京时间 - 8h）—— start_of_today_utc
+    let beijing_now = chrono::Utc::now() + chrono::Duration::hours(8);
+    let today_start_beijing = beijing_now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight always valid");
+    // 转回 UTC（北京 0 点 = 前一天 UTC 16:00），SQLite 表里时间戳都是 UTC RFC3339
+    let today_start_utc = today_start_beijing - chrono::Duration::hours(8);
+    let today_cutoff = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        today_start_utc,
+        chrono::Utc,
+    )
+    .to_rfc3339();
+
+    let scan_ticks_today: u32 = conn
+        .query_row(
+            "select count(*) from agent_episodes where trigger_kind='scan' and started_at >= ?1",
+            rusqlite::params![today_cutoff],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let expectations_created_today: u32 = conn
+        .query_row(
+            "select count(*) from expectations where created_at >= ?1",
+            rusqlite::params![today_cutoff],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let lessons_created_today: u32 = conn
+        .query_row(
+            "select count(*) from lessons where created_at >= ?1",
+            rusqlite::params![today_cutoff],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let lessons_empty_takeaway_7d: u32 = conn
+        .query_row(
+            "select count(*) from lessons where takeaway='' and created_at >= ?1",
+            rusqlite::params![cutoff_7d],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    // 7 天内 emerge——优先看 last_emerged_at，没有就回落 created_at + origin=agent_inferred
+    let heuristics_emerged_7d: u32 = conn
+        .query_row(
+            "select count(*) from heuristics
+             where (last_emerged_at is not null and last_emerged_at >= ?1)
+                or (last_emerged_at is null and origin='agent_inferred' and created_at >= ?1)",
+            rusqlite::params![cutoff_7d],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let heartbeats = list_heartbeats(app).unwrap_or_default();
+
     Ok(HealthMetrics {
         expectation_completeness_rate,
         total_expectations,
@@ -137,5 +207,11 @@ pub fn compute(app: &AppHandle) -> Result<HealthMetrics, String> {
             agent_inferred: counts.agent_inferred,
             agent_inferred_share,
         },
+        scan_ticks_today,
+        expectations_created_today,
+        lessons_created_today,
+        lessons_empty_takeaway_7d,
+        heuristics_emerged_7d,
+        heartbeats,
     })
 }

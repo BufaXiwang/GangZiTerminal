@@ -2,10 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   BarChart3,
+  BookOpen,
   Brain,
+  Layers,
+  Lightbulb,
   MessageSquare,
   Newspaper,
   Settings,
+  Target,
   WalletCards,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
@@ -51,18 +55,18 @@ const navItems: Array<{ id: ViewId; label: string; icon: typeof BarChart3 }> = [
   { id: "settings", label: "设置", icon: Settings },
 ];
 
-/// Agent 内子 nav——左侧 rail 显示
+/// Agent 内子 nav——左侧 rail，跟主 nav 一套视觉系（lucide 图标 + 中文 label）。
 const agentSubTabs: Array<{
   id: AgentSubView;
-  icon: string;
+  icon: typeof MessageSquare;
   label: string;
   hint: string;
 }> = [
-  { id: "chat", icon: "💬", label: "Chat", hint: "和 agent 对话——决策入口" },
-  { id: "expectations", icon: "📊", label: "Expectations", hint: "agent 当前跟踪的投资预期" },
-  { id: "strategies", icon: "🎯", label: "Strategies", hint: "触发 expectation 的规则集" },
-  { id: "heuristics", icon: "🧠", label: "Heuristics", hint: "agent 学到的启发式规则" },
-  { id: "lessons", icon: "📝", label: "Lessons", hint: "每次复盘的原子观察" },
+  { id: "chat", icon: MessageSquare, label: "对话", hint: "和 agent 实时对话——决策入口" },
+  { id: "expectations", icon: Target, label: "预期", hint: "agent 当前跟踪的投资预期" },
+  { id: "strategies", icon: Layers, label: "策略", hint: "触发 expectation 的规则集" },
+  { id: "heuristics", icon: Lightbulb, label: "启发式", hint: "agent 学到的启发式规则" },
+  { id: "lessons", icon: BookOpen, label: "复盘", hint: "每次复盘的原子观察" },
 ];
 
 function App() {
@@ -216,19 +220,23 @@ function App() {
             <NewsPage />
           ) : activeView === "agent" ? (
             <div className="agent-shell">
-              {/* 左侧二级 rail — VS Code 风格：紧凑图标 + 文字 */}
-              <nav className="agent-rail">
-                {agentSubTabs.map((tab) => (
-                  <button
-                    key={tab.id}
-                    onClick={() => setAgentSubView(tab.id)}
-                    title={tab.hint}
-                    className={`agent-rail-tab${agentSubView === tab.id ? " active" : ""}`}
-                  >
-                    <span className="agent-rail-icon">{tab.icon}</span>
-                    <span className="agent-rail-label">{tab.label}</span>
-                  </button>
-                ))}
+              {/* 顶部横向 tabs——之前是左侧 rail，但 5 个 tab 撑不满全高、
+                  竖条上下大段空白，挤占内容横向空间。改成顶栏更紧凑。 */}
+              <nav className="agent-tabbar">
+                {agentSubTabs.map((tab) => {
+                  const Icon = tab.icon;
+                  return (
+                    <button
+                      key={tab.id}
+                      onClick={() => setAgentSubView(tab.id)}
+                      title={tab.hint}
+                      className={`agent-tabbar-btn${agentSubView === tab.id ? " active" : ""}`}
+                    >
+                      <Icon size={14} />
+                      <span>{tab.label}</span>
+                    </button>
+                  );
+                })}
               </nav>
 
               {/* 主区——根据 sub view 渲染 */}
@@ -259,8 +267,10 @@ function App() {
                         content,
                         images: images ?? [],
                       })
+                        // agent 错误后端会推到 chat stream（以 system/assistant 消息形式），
+                        // 这里不再 setStatus 避免侧栏 + 气泡重复展示。只打 console。
                         .catch((err) =>
-                          setStatus(err instanceof Error ? err.message : String(err)),
+                          console.warn("send_chat_message_now 失败:", err),
                         )
                         .finally(() => {
                           window.clearTimeout(timeoutId);
@@ -331,7 +341,8 @@ function App() {
                   setStatus("对话超时（5 分钟）。Agent 可能仍在后台运行，请稍后查看对话流。");
                 }, 5 * 60 * 1000);
                 void invoke("send_chat_message_now", { content, images: images ?? [] })
-                  .catch((err) => setStatus(err instanceof Error ? err.message : String(err)))
+                  // agent 错误后端会推到 chat stream（系统消息形式）；侧栏不重复展示
+                  .catch((err) => console.warn("send_chat_message_now 失败:", err))
                   .finally(() => {
                     window.clearTimeout(timeoutId);
                     setIsChatting(false);

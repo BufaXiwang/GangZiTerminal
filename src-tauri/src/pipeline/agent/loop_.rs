@@ -536,6 +536,11 @@ async fn execute_single_tool(
         ),
     };
     let duration_ms = start.elapsed().as_millis() as u64;
+    // **关键：入口级 tool result 截断**——单条工具输出不能撑爆 context。
+    // 之前一次 scan_market 可能返 30k chars，10 轮就 300k+ → 即使 compact 想清也清不
+    // 干净，因为单条 result 还在 working set 里。这里在写进 messages 前先截断，
+    // agent 看到 truncation marker 会重新调参/缩小查询。
+    let content = cap_tool_result_size(content, &name);
     let _ = event_tx.send(AgentEvent::ToolEnd {
         run_id: run_id.into(),
         tool_use_id: id.clone(),
@@ -550,6 +555,54 @@ async fn execute_single_tool(
         content,
         is_error,
     }
+}
+
+/// 单条 tool result 文本上限——超过此字符数即截断 + 加 marker。
+/// 6000 chars ≈ 1500-3000 tokens（中英混合），多数 list-style 工具够用；
+/// agent 看到 marker 会缩小 limit / 改查询。
+const TOOL_RESULT_TEXT_CHAR_CAP: usize = 6000;
+const TOOL_RESULT_JSON_CHAR_CAP: usize = 8000;
+
+/// 截断超长 tool result——text/json 各自卡上限。保留前 70% + 后 20% + 中间 marker，
+/// 这样 agent 既能看到列表头（命中的最相关项），也能瞄一眼尾部（是否有 cutoff）。
+fn cap_tool_result_size(
+    content: Vec<ToolResultContent>,
+    tool_name: &str,
+) -> Vec<ToolResultContent> {
+    content
+        .into_iter()
+        .map(|c| match c {
+            ToolResultContent::Text { text } if text.chars().count() > TOOL_RESULT_TEXT_CHAR_CAP => {
+                ToolResultContent::Text {
+                    text: truncate_with_marker(&text, TOOL_RESULT_TEXT_CHAR_CAP, tool_name),
+                }
+            }
+            ToolResultContent::Json { raw } if raw.to_string().len() > TOOL_RESULT_JSON_CHAR_CAP => {
+                // JSON 太大——压成截断后的 Text，给 agent 一个清晰提示
+                let s = raw.to_string();
+                ToolResultContent::Text {
+                    text: truncate_with_marker(&s, TOOL_RESULT_JSON_CHAR_CAP, tool_name),
+                }
+            }
+            other => other,
+        })
+        .collect()
+}
+
+fn truncate_with_marker(s: &str, cap_chars: usize, tool_name: &str) -> String {
+    let total = s.chars().count();
+    if total <= cap_chars {
+        return s.to_string();
+    }
+    let head_n = (cap_chars * 7) / 10;
+    let tail_n = cap_chars / 5;
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(total - tail_n).collect();
+    let omitted = total - head_n - tail_n;
+    format!(
+        "{head}\n\n[... 输出过长，省略中间 {omitted} 字符。\
+         如需完整结果，缩小 `{tool_name}` 的 limit / 时间窗 / 关键词范围再调一次 ...]\n\n{tail}"
+    )
 }
 
 /// 扫一遍 messages，做双向 tool_use ↔ tool_result 配对修复：

@@ -71,7 +71,7 @@ async fn scan_loop(app: AppHandle) {
                     tauri::async_runtime::spawn(async move {
                         let registry = Arc::new(build_chat_registry(&app_clone));
                         match run_tick(
-                            app_clone,
+                            app_clone.clone(),
                             registry,
                             "scan",
                             &label_owned,
@@ -79,16 +79,29 @@ async fn scan_loop(app: AppHandle) {
                         )
                         .await
                         {
-                            Ok(r) => tracing::info!(
-                                tick = %label_owned,
-                                tick_id = %r.tick_id,
-                                stocks = r.stocks_scanned,
-                                signals = r.signals_detected,
-                                mini_scans = r.mini_scans_triggered,
-                                skipped = r.mini_scans_skipped_budget,
-                                "Scan tick 完成"
-                            ),
-                            Err(e) => tracing::warn!(tick = %label_owned, error = %e, "Scan tick 失败"),
+                            Ok(r) => {
+                                tracing::info!(
+                                    tick = %label_owned,
+                                    tick_id = %r.tick_id,
+                                    stocks = r.stocks_scanned,
+                                    signals = r.signals_detected,
+                                    mini_scans = r.mini_scans_triggered,
+                                    skipped = r.mini_scans_skipped_budget,
+                                    "Scan tick 完成"
+                                );
+                                crate::infrastructure::scheduler_heartbeat::record_ok(
+                                    &app_clone,
+                                    crate::infrastructure::scheduler_heartbeat::LOOP_SCAN,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(tick = %label_owned, error = %e, "Scan tick 失败");
+                                crate::infrastructure::scheduler_heartbeat::record_err(
+                                    &app_clone,
+                                    crate::infrastructure::scheduler_heartbeat::LOOP_SCAN,
+                                    &e,
+                                );
+                            }
                         }
                     });
                     let mut map = last_fired.lock().unwrap();

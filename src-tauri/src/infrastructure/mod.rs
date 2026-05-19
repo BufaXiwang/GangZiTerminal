@@ -14,4 +14,5 @@ pub mod db;
 pub mod logging;
 pub mod news;
 pub mod quotes;
+pub mod scheduler_heartbeat;
 pub mod security;

@@ -56,6 +56,20 @@ async fn market_universe_loop(app: AppHandle) {
         let started = std::time::Instant::now();
         let summary = crate::pipeline::market::universe::run_universe_refresh(&app).await;
         let elapsed_ms = started.elapsed().as_millis();
+        // universe.run 不返回 Result——只要 tick 跑到这就算 ok（内部 per-source 失败已经吞了）。
+        // 但若 stock_count 全 0 就当本轮失败。
+        if summary.stock_count == 0 && summary.index_count == 0 && summary.fund_count == 0 {
+            crate::infrastructure::scheduler_heartbeat::record_err(
+                &app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_MARKET_UNIVERSE,
+                "universe refresh returned zero rows",
+            );
+        } else {
+            crate::infrastructure::scheduler_heartbeat::record_ok(
+                &app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_MARKET_UNIVERSE,
+            );
+        }
         tracing::info!(
             stocks = summary.stock_count,
             indexes = summary.index_count,
@@ -131,9 +145,18 @@ async fn refresh_account_snapshot(app: &AppHandle) {
                 crate::pipeline::account::service::EVENT_ACCOUNT_SNAPSHOT_UPDATED,
                 serde_json::json!({}),
             );
+            crate::infrastructure::scheduler_heartbeat::record_ok(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_ACCOUNT,
+            );
         }
         Err(e) => {
             tracing::warn!(error = %e, "account snapshot 刷新失败");
+            crate::infrastructure::scheduler_heartbeat::record_err(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_ACCOUNT,
+                &e.to_string(),
+            );
         }
     }
 }
@@ -145,14 +168,24 @@ async fn refresh_account_snapshot(app: &AppHandle) {
 
 async fn kline_warm_loop(app: AppHandle) {
     tokio::time::sleep(Duration::from_secs(30)).await;
-    crate::pipeline::market::kline_warm::warm_klines_once(&app).await;
+    run_kline_warm_tick(&app).await;
 
     loop {
         let wait = duration_until_next_16_beijing();
         tracing::info!(secs = wait.as_secs(), "下一次 K 线预热等待");
         tokio::time::sleep(wait).await;
-        crate::pipeline::market::kline_warm::warm_klines_once(&app).await;
+        run_kline_warm_tick(&app).await;
     }
+}
+
+async fn run_kline_warm_tick(app: &AppHandle) {
+    // warm_klines_once 自身吞错误，这里把"跑完了"当 ok——目的是让 heartbeat 表
+    // 能反映 loop 还活着（卡死时 last_ok_at 会停在很久以前）。
+    crate::pipeline::market::kline_warm::warm_klines_once(app).await;
+    crate::infrastructure::scheduler_heartbeat::record_ok(
+        app,
+        crate::infrastructure::scheduler_heartbeat::LOOP_KLINE_WARM,
+    );
 }
 
 fn duration_until_next_16_beijing() -> Duration {
@@ -230,12 +263,34 @@ async fn market_quote_loop(app: AppHandle) {
     loop {
         // 先跑一次
         match crate::pipeline::market::refresh::run_market_quote_refresh(&app).await {
-            Ok(summary) => tracing::info!(
-                total = summary.total,
-                success = summary.success,
-                "订阅集行情刷新完成"
-            ),
-            Err(e) => tracing::warn!(error = %e, "订阅集行情刷新失败"),
+            Ok(summary) => {
+                tracing::info!(
+                    total = summary.total,
+                    success = summary.success,
+                    "订阅集行情刷新完成"
+                );
+                // success=0 但 total>0 视作整轮失败（远端全挂），其余视作 ok
+                if summary.total > 0 && summary.success == 0 {
+                    crate::infrastructure::scheduler_heartbeat::record_err(
+                        &app,
+                        crate::infrastructure::scheduler_heartbeat::LOOP_MARKET_QUOTE,
+                        "all quotes failed",
+                    );
+                } else {
+                    crate::infrastructure::scheduler_heartbeat::record_ok(
+                        &app,
+                        crate::infrastructure::scheduler_heartbeat::LOOP_MARKET_QUOTE,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "订阅集行情刷新失败");
+                crate::infrastructure::scheduler_heartbeat::record_err(
+                    &app,
+                    crate::infrastructure::scheduler_heartbeat::LOOP_MARKET_QUOTE,
+                    &e.to_string(),
+                );
+            }
         }
 
         // 等下一轮
@@ -264,17 +319,19 @@ fn market_quote_interval() -> Duration {
 
 // ====== 资讯自动刷新 ======
 
+/// 资讯保留天数——超过该天数的 news_items + 级联表会被每天清一次。
+/// 30 天足够 agent 跨周复盘，又不会让单机 SQLite 无限膨胀。
+const NEWS_RETENTION_DAYS: i64 = 30;
+
+/// 每多少秒尝试一次 retention（实际只有当距上次成功 ≥ 24h 时才真跑）。
+/// 写在常量是为了让 news_refresh_loop 主循环里挂个轻量探测，不用单独开 task。
+const NEWS_RETENTION_CHECK_INTERVAL_SEC: i64 = 24 * 3600;
+
 async fn news_refresh_loop(app: AppHandle) {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let mut counter = FailureCounter::new("news_refresh");
     if read_bool(&app, KEY_AUTO_REFRESH, true) {
-        match pipeline::news::run_news_refresh(app.clone()).await {
-            Ok(_) => counter.success(),
-            Err(e) => {
-                tracing::warn!(error = %e, "首次 news refresh 失败");
-                counter.fail(&app).await;
-            }
-        }
+        run_news_tick(&app, &mut counter).await;
     }
 
     loop {
@@ -285,12 +342,71 @@ async fn news_refresh_loop(app: AppHandle) {
         if !read_bool(&app, KEY_AUTO_REFRESH, true) {
             continue;
         }
-        match pipeline::news::run_news_refresh(app.clone()).await {
-            Ok(_) => counter.success(),
-            Err(e) => {
-                tracing::warn!(error = %e, consecutive = counter.count(), "news refresh 失败");
-                counter.fail(&app).await;
-            }
+        run_news_tick(&app, &mut counter).await;
+        // 每轮 refresh 后顺便检查一次 retention——内部会自己控频（≥24h 才真跑）
+        maybe_run_news_retention(&app).await;
+    }
+}
+
+async fn run_news_tick(app: &AppHandle, counter: &mut FailureCounter) {
+    match pipeline::news::run_news_refresh(app.clone()).await {
+        Ok(_) => {
+            counter.success();
+            crate::infrastructure::scheduler_heartbeat::record_ok(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS,
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, consecutive = counter.count(), "news refresh 失败");
+            crate::infrastructure::scheduler_heartbeat::record_err(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS,
+                &e.to_string(),
+            );
+            counter.fail(app).await;
+        }
+    }
+}
+
+const KEY_NEWS_RETENTION_LAST: &str = "gangzi-terminal.news-retention-last-run";
+
+/// 距上次跑 retention ≥ 24h 时执行一次清理。失败不阻断 refresh loop。
+async fn maybe_run_news_retention(app: &AppHandle) {
+    let last_run: Option<chrono::DateTime<chrono::Utc>> =
+        crate::infrastructure::app_state::load_app_state_value(app, KEY_NEWS_RETENTION_LAST)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+    let now = chrono::Utc::now();
+    if let Some(prev) = last_run {
+        if now.signed_duration_since(prev).num_seconds() < NEWS_RETENTION_CHECK_INTERVAL_SEC {
+            return;
+        }
+    }
+    let cutoff = (now - chrono::Duration::days(NEWS_RETENTION_DAYS)).to_rfc3339();
+    match crate::infrastructure::news::repository::purge_old_news(app, &cutoff) {
+        Ok(deleted) => {
+            tracing::info!(deleted, cutoff = %cutoff, "news retention 清理完成");
+            crate::infrastructure::scheduler_heartbeat::record_ok(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS_RETENTION,
+            );
+            let _ = crate::infrastructure::app_state::save_app_state_value(
+                app,
+                KEY_NEWS_RETENTION_LAST,
+                &serde_json::json!(now.to_rfc3339()),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "news retention 清理失败");
+            crate::infrastructure::scheduler_heartbeat::record_err(
+                app,
+                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS_RETENTION,
+                &e,
+            );
         }
     }
 }

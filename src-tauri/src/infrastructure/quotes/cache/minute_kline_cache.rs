@@ -3,13 +3,15 @@
 //! 与日 K cache 的差别：
 //! - TTL 短：盘中 30s（每分钟新增一根），盘外 5min
 //! - 时间维度是 unix ms（分钟级），不是日期字符串
-//! - 全部走 EM push2his klt 端点（TuShare 分钟 K 5000+ 积分门槛）
+//! - **数据源策略**：TDX 主路径（无风控 / 私有 TCP / 更快），EM 兜底
+//!   （TDX 不支持北交所 → BJ 直接走 EM；TDX 网络失败 → EM 兜底）
 //! - 不做复权（分钟级数据复权不实用）
 
-use crate::domain::quotes::{is_a_share_trading_hours, MinutePeriod};
+use crate::domain::quotes::{is_a_share_trading_hours, MinuteKlineSeries, MinutePeriod, QuotesError};
 use crate::domain::shared::TsCode;
 use crate::infrastructure::db::{migrate, open_database};
 use crate::infrastructure::quotes::eastmoney::kline as em_kline;
+use crate::infrastructure::quotes::tdx::bars as tdx_bars;
 use rusqlite::{params, OptionalExtension};
 use tauri::AppHandle;
 
@@ -72,11 +74,12 @@ pub fn check_meta(
 }
 
 /// 拉远端 → upsert DB → 更新 meta。
+///
+/// 路径：TDX 主（SH/SZ）→ 失败/BJ 时 EM 兜底。
+/// 落库的每一行 `source` 字段记真实路径（"tdx" / "em"），方便后续诊断。
 pub async fn ensure(app: &AppHandle, ts_code: &str, period: MinutePeriod) -> Result<(), String> {
     let parsed_ts = TsCode::new(ts_code).map_err(|e| e.to_string())?;
-    let series = em_kline::fetch_minute_klines(&parsed_ts, period, DEFAULT_LIMIT)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (series, source) = fetch_with_fallback(&parsed_ts, period).await?;
     if series.points.is_empty() {
         return Ok(());
     }
@@ -93,7 +96,7 @@ pub async fn ensure(app: &AppHandle, ts_code: &str, period: MinutePeriod) -> Res
             low: p.low.value(),
             volume: p.volume.value(),
             amount: p.amount.value(),
-            source: "em".to_string(),
+            source: source.to_string(),
         })
         .collect();
     upsert_minute_klines(app, &rows)?;
@@ -106,6 +109,38 @@ pub async fn ensure(app: &AppHandle, ts_code: &str, period: MinutePeriod) -> Res
         &chrono::Utc::now().to_rfc3339(),
     )?;
     Ok(())
+}
+
+/// TDX 主 + EM 兜底——返回 (series, source_name)。
+/// - SH/SZ：先 TDX，失败/空回退 EM
+/// - BJ：直接 EM（TDX 不支持北交所）
+async fn fetch_with_fallback(
+    ts_code: &TsCode,
+    period: MinutePeriod,
+) -> Result<(MinuteKlineSeries, &'static str), String> {
+    let is_bj = ts_code.market() == "BJ";
+    if !is_bj {
+        match tdx_bars::fetch_minute_klines(ts_code, period, DEFAULT_LIMIT).await {
+            Ok(s) if !s.points.is_empty() => {
+                tracing::debug!(ts_code = %ts_code.as_str(), ?period, "tdx 分钟 K 命中");
+                return Ok((s, "tdx"));
+            }
+            Ok(_) => {
+                tracing::debug!(ts_code = %ts_code.as_str(), ?period, "tdx 分钟 K 返 0 行，回退 EM");
+            }
+            Err(QuotesError::InvalidInput(_)) => {
+                // 通常是 BJ——上面已经判过，理论不会到这；保险起见也回退
+                tracing::debug!(ts_code = %ts_code.as_str(), "tdx 拒绝（BJ），回退 EM");
+            }
+            Err(e) => {
+                tracing::warn!(ts_code = %ts_code.as_str(), ?period, err = %e, "tdx 分钟 K 失败，回退 EM");
+            }
+        }
+    }
+    let s = em_kline::fetch_minute_klines(ts_code, period, DEFAULT_LIMIT)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((s, "em"))
 }
 
 /// 一次性 API——adapter / agent 直接调：TTL 命中读 DB，否则阻塞 ensure 后读。
