@@ -84,3 +84,37 @@ pub enum ProviderError {
     #[error("provider config error: {0}")]
     Config(String),
 }
+
+impl ProviderError {
+    /// 判断该错误是否属于"prompt too long / context length exceeded"——
+    /// 各家 provider 报错文案不一致，统一在这里 string-match。
+    /// loop 命中后跑 reactive compact 丢老 round 重试一次。
+    ///
+    /// Anthropic 形态："prompt is too long: 343158 tokens > 200000 maximum"
+    /// OpenAI 形态："This model's maximum context length is 200000 tokens..."
+    /// 413 Request Too Large（Anthropic 的 request_too_large 错误类型）也算
+    pub fn is_context_too_long(&self) -> bool {
+        let body = match self {
+            ProviderError::Request {
+                status: 413,
+                body: _,
+            } => return true,
+            ProviderError::Request { body, .. } => body.as_str(),
+            _ => return false,
+        };
+        let lower = body.to_ascii_lowercase();
+        [
+            "prompt is too long",
+            "prompt_too_long",
+            "input is too long",
+            "input_too_long",
+            "request_too_large",
+            "context length",
+            "context_length_exceeded",
+            "maximum context length",
+            "string too long",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+}

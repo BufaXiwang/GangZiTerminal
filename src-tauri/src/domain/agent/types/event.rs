@@ -78,8 +78,11 @@ pub enum CompactTier {
     MicroClear,
     /// 调便宜模型把老对话压成一段中文摘要 + 边界 user 消息。
     Summarize,
-    /// 直接丢弃最老消息——兜底。
+    /// 直接丢弃最老消息——proactive 兜底。
     Drop,
+    /// Reactive 兜底——provider 返 prompt_too_long 后丢最老 API round 重试。
+    /// 触发说明 token 估算 + proactive compact 仍不够；只在 provider 真实拒绝时跑。
+    Reactive,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

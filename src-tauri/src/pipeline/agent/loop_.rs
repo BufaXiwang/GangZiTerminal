@@ -275,7 +275,34 @@ pub async fn run_agent(
             sanitize_orphan_tool_uses(&mut req.messages);
         }
 
-        let outcome = run_one_turn(&provider, &run_id, &req, &event_tx, &mut summary).await?;
+        // Reactive compact 兜底：provider 返 prompt_too_long 时丢最老一个 API round 重试一次。
+        // 触发条件：token 估算 ±15% 误差时——proactive compact 已经按 hard_limit 跑过仍被 provider 拒。
+        // 重试 1 次仍失败则把 error 真实传出去，不无限循环。
+        let outcome = match run_one_turn(&provider, &run_id, &req, &event_tx, &mut summary).await {
+            Ok(o) => o,
+            Err(AgentError::Provider(pe)) if pe.is_context_too_long() => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %pe,
+                    "provider 返 context-too-long——尝试 reactive compact 丢最老 API round 重试"
+                );
+                let dropped = reactive_drop_oldest_round(&mut req.messages);
+                if dropped == 0 {
+                    // 没东西可丢——把原 error 抛出
+                    return Err(AgentError::Provider(pe));
+                }
+                sanitize_orphan_tool_uses(&mut req.messages);
+                let _ = event_tx.send(AgentEvent::Compacted {
+                    run_id: run_id.clone(),
+                    tier: CompactTier::Reactive,
+                    dropped_messages: dropped,
+                    summary_tokens: 0,
+                });
+                // 重试同 turn——再失败就让 ? 把 error 抛出
+                run_one_turn(&provider, &run_id, &req, &event_tx, &mut summary).await?
+            }
+            Err(e) => return Err(e),
+        };
         let TurnOutcome {
             assistant_message,
             stop_reason,
@@ -698,12 +725,155 @@ fn sanitize_orphan_tool_uses(messages: &mut Vec<Message>) {
     });
 }
 
+/// 丢最老的一个 API round——一个 round = `Assistant` + 紧跟的 `User` (tool_results)。
+///
+/// 找到第一个 `Role::Assistant` 的位置，丢从它开始到下一个 `Assistant`（或 messages 结尾）
+/// 之间的所有消息。这等于丢一整轮"agent 回答 + 工具结果"，比按 token 估算砍精确。
+///
+/// 保护：
+/// - 没有任何 assistant 消息时返 0（不动）
+/// - messages 长度 ≤ 3（dynamic + 当前 user + 至多 1 个 assistant）时返 0
+///   避免丢掉当前提问的语境
+/// - 调用方应在丢完后跑 [`sanitize_orphan_tool_uses`] 修补可能的孤儿配对
+///
+/// 返回值：丢了多少条消息。0 = 没动。
+fn reactive_drop_oldest_round(messages: &mut Vec<Message>) -> u32 {
+    let Some(first_asst) = messages.iter().position(|m| m.role == Role::Assistant) else {
+        return 0;
+    };
+    if messages.len() <= 3 {
+        return 0;
+    }
+    let next_asst = messages
+        .iter()
+        .enumerate()
+        .skip(first_asst + 1)
+        .find(|(_, m)| m.role == Role::Assistant)
+        .map(|(i, _)| i);
+    let end = next_asst.unwrap_or(messages.len());
+    // 不允许把"当前 user 提问"也丢掉——end 不能等于 messages.len() 除非确实有下一个 assistant
+    // 如果 next_asst.is_none() 说明 first_asst 之后只剩 user（可能就是当前提问 + tool_results）
+    // 这时只丢 first_asst 自己 + 它紧跟的 tool_result 那批（不丢最末一条 user）
+    let safe_end = if next_asst.is_none() {
+        // 找 first_asst 之后第一个"非 tool_result" 的 user 消息（那是当前提问）
+        let mut cursor = first_asst + 1;
+        while cursor < messages.len() {
+            let is_pure_tool_result = !messages[cursor].content.is_empty()
+                && messages[cursor].content.iter().all(|b| {
+                    matches!(b, crate::domain::agent::types::Block::ToolResult { .. })
+                });
+            if !is_pure_tool_result {
+                break;
+            }
+            cursor += 1;
+        }
+        cursor
+    } else {
+        end
+    };
+    if safe_end <= first_asst {
+        return 0;
+    }
+    let dropped = (safe_end - first_asst) as u32;
+    messages.drain(first_asst..safe_end);
+    dropped
+}
+
 // ===== 单元测试 ==========================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn user_text(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![Block::Text {
+                text: text.into(),
+                cache_control: false,
+            }],
+        }
+    }
+    fn asst_text(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![Block::Text {
+                text: text.into(),
+                cache_control: false,
+            }],
+        }
+    }
+    fn tool_result_msg(tool_use_id: &str, text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![Block::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                content: vec![crate::domain::agent::types::ToolResultContent::Text {
+                    text: text.into(),
+                }],
+                is_error: false,
+                server_side: false,
+                cache_control: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn reactive_drop_oldest_round_basic() {
+        // [dyn, user, asst, tool_result, asst, user] —— 应该丢老 asst + 老 tool_result
+        let mut msgs = vec![
+            user_text("dyn ctx"),
+            user_text("查茅台"),
+            asst_text("调用 get_quote"),
+            tool_result_msg("t1", "¥1520"),
+            asst_text("茅台 ¥1520..."),
+            user_text("再看下平安"),
+        ];
+        let before = msgs.len();
+        let dropped = reactive_drop_oldest_round(&mut msgs);
+        assert_eq!(dropped, 2, "应丢 1 个 asst + 1 个 tool_result");
+        assert_eq!(msgs.len(), before - 2);
+        // 当前提问 "再看下平安" 必须保留在末尾
+        match &msgs.last().unwrap().content[0] {
+            Block::Text { text, .. } => assert_eq!(text, "再看下平安"),
+            _ => panic!("末尾应是当前 user 提问"),
+        }
+    }
+
+    #[test]
+    fn reactive_drop_oldest_round_protects_when_too_short() {
+        // 短消息列表——不动
+        let mut msgs = vec![user_text("a"), asst_text("b"), user_text("c")];
+        let dropped = reactive_drop_oldest_round(&mut msgs);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn reactive_drop_oldest_round_no_assistant() {
+        // 没 assistant—没东西可丢
+        let mut msgs = vec![user_text("a"), user_text("b"), user_text("c"), user_text("d")];
+        let dropped = reactive_drop_oldest_round(&mut msgs);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn reactive_drop_oldest_round_protects_current_user_question() {
+        // 单一 assistant 之后跟着 tool_result + 当前 user 提问——只丢 asst + tool_result
+        let mut msgs = vec![
+            user_text("dyn ctx"),
+            user_text("查茅台"),
+            asst_text("调 get_quote"),
+            tool_result_msg("t1", "¥1520"),
+            user_text("当前提问：现在怎么看"),
+        ];
+        let dropped = reactive_drop_oldest_round(&mut msgs);
+        assert_eq!(dropped, 2, "asst + 1 tool_result 丢了，当前 user 留住");
+        match &msgs.last().unwrap().content[0] {
+            Block::Text { text, .. } => assert!(text.contains("当前提问")),
+            _ => panic!("当前提问应保留"),
+        }
+    }
 
     #[test]
     fn sanitize_inserts_stub_for_orphan_tool_use() {
