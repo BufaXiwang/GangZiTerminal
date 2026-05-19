@@ -56,17 +56,26 @@ export function StrategiesPage({
           >
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <strong>{s.name}</strong>
-              <span
+              <button
+                onClick={() =>
+                  void invoke("set_strategy_enabled", {
+                    strategyId: s.id,
+                    enabled: !s.enabled,
+                  }).catch((err) => window.alert(`toggle 失败：${err}`))
+                }
+                title={s.enabled ? "点击 disable" : "点击 enable"}
                 style={{
                   background: s.enabled ? "#10b981" : "#9ca3af",
                   color: "white",
-                  padding: "2px 6px",
+                  padding: "2px 8px",
                   borderRadius: 3,
                   fontSize: 11,
+                  cursor: "pointer",
+                  border: "none",
                 }}
               >
-                {s.enabled ? "enabled" : "disabled"}
-              </span>
+                {s.enabled ? "● enabled" : "○ disabled"}
+              </button>
               <span style={{ marginLeft: "auto", fontSize: 12, color: "#64748b" }}>
                 applied={s.appliedCount} | hit/miss={s.hitCount}/{s.missCount} | conf={conf}
               </span>

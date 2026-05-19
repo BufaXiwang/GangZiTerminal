@@ -1,6 +1,9 @@
 //! Tauri IPC——Expectation / Strategy / Lesson / Heuristic 只读查询（前端 v3 页面用）。
 
 use crate::domain::account::expectation::{Expectation, ExpectationId, ExpectationState};
+use crate::domain::agent::heuristic::HeuristicId;
+use crate::domain::agent::strategy::StrategyId;
+use crate::domain::shared::OccurredAt;
 use crate::infrastructure::account::expectation_repo;
 use crate::infrastructure::agent::{heuristic_repo, lesson_repo, strategy_repo};
 use serde_json::{json, Value};
@@ -51,8 +54,28 @@ pub async fn list_strategies(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
+pub async fn set_strategy_enabled(
+    app: AppHandle,
+    strategy_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let id = StrategyId::from_string(strategy_id);
+    strategy_repo::set_enabled(&app, &id, enabled, OccurredAt::now())
+}
+
+#[tauri::command]
 pub async fn list_lessons(app: AppHandle, limit: Option<i64>) -> Result<Value, String> {
     let lessons = lesson_repo::list_recent(&app, limit.unwrap_or(100))?;
+    Ok(serde_json::to_value(lessons).map_err(|e| format!("序列化失败：{e}"))?)
+}
+
+#[tauri::command]
+pub async fn list_lessons_for_expectation(
+    app: AppHandle,
+    expectation_id: String,
+) -> Result<Value, String> {
+    let id = ExpectationId::from_string(expectation_id);
+    let lessons = lesson_repo::list_for_expectation(&app, &id)?;
     Ok(serde_json::to_value(lessons).map_err(|e| format!("序列化失败：{e}"))?)
 }
 
@@ -82,6 +105,19 @@ pub async fn list_heuristics(app: AppHandle, limit: Option<i64>) -> Result<Value
         })
         .collect();
     Ok(json!(dtos))
+}
+
+#[tauri::command]
+pub async fn retire_heuristic_cmd(
+    app: AppHandle,
+    heuristic_id: String,
+    reason: String,
+) -> Result<(), String> {
+    if reason.trim().is_empty() {
+        return Err("reason 不能为空".into());
+    }
+    let id = HeuristicId::from_string(heuristic_id);
+    heuristic_repo::retire(&app, &id, reason, OccurredAt::now())
 }
 
 #[tauri::command]

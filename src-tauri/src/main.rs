@@ -115,9 +115,12 @@ pub fn run() {
             adapters::expectation_commands::get_expectation,
             adapters::expectation_commands::list_expectation_events,
             adapters::expectation_commands::list_strategies,
+            adapters::expectation_commands::set_strategy_enabled,
             adapters::expectation_commands::list_lessons,
+            adapters::expectation_commands::list_lessons_for_expectation,
             adapters::expectation_commands::list_heuristics,
             adapters::expectation_commands::get_heuristic_counts,
+            adapters::expectation_commands::retire_heuristic_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

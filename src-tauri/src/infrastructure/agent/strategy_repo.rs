@@ -15,6 +15,37 @@ fn emit_changed(app: &AppHandle) {
     let _ = app.emit(EVENT_STRATEGIES_CHANGED, serde_json::json!({}));
 }
 
+/// 写一条 strategy_events 审计行——所有写操作配套调一次，便于追溯。
+fn write_event(
+    app: &AppHandle,
+    strategy_id: &str,
+    kind: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let conn = open_database(app)?;
+    migrate(&conn)?;
+    let payload_str = payload
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    conn.execute(
+        "insert into strategy_events (strategy_id, kind, payload, occurred_at)
+         values (?1, ?2, ?3, ?4)",
+        params![
+            strategy_id,
+            kind,
+            if payload_str.is_empty() {
+                None
+            } else {
+                Some(payload_str)
+            },
+            OccurredAt::now().to_rfc3339(),
+        ],
+    )
+    .map_err(|err| format!("写 strategy_events 失败：{err}"))?;
+    Ok(())
+}
+
 /// 落库形态：除统计列外，其他字段全压进 config_json。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +85,12 @@ pub fn create(app: &AppHandle, s: &Strategy) -> Result<(), String> {
         ],
     )
     .map_err(|err| format!("插入 strategy 失败：{err}"))?;
+    write_event(
+        app,
+        s.id.as_str(),
+        "created",
+        Some(serde_json::json!({ "name": s.name, "enabled": s.enabled })),
+    )?;
     emit_changed(app);
     Ok(())
 }
@@ -71,6 +108,12 @@ pub fn set_enabled(
         params![id.as_str(), if enabled { 1i64 } else { 0i64 }, now.to_rfc3339()],
     )
     .map_err(|err| format!("更新 strategy enabled 失败：{err}"))?;
+    write_event(
+        app,
+        id.as_str(),
+        if enabled { "enabled" } else { "disabled" },
+        None,
+    )?;
     emit_changed(app);
     Ok(())
 }
@@ -101,6 +144,12 @@ pub fn record_outcome(
     );
     conn.execute(&sql, params![id.as_str()])
         .map_err(|err| format!("记录 strategy outcome 失败：{err}"))?;
+    write_event(
+        app,
+        id.as_str(),
+        "outcome",
+        Some(serde_json::json!({ "hit": outcome })),
+    )?;
     emit_changed(app);
     Ok(())
 }

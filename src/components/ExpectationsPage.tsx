@@ -2,6 +2,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useState } from "react";
 
+type Lesson = {
+  id: string;
+  expectationId: string;
+  code: string;
+  observation: string;
+  takeaway: string;
+  outcome: "hit" | "miss" | "expired";
+  createdAt: number;
+};
+
+const OUTCOME_COLOR: Record<Lesson["outcome"], string> = {
+  hit: "#10b981",
+  miss: "#ef4444",
+  expired: "#f59e0b",
+};
+
 type Expectation = {
   id: string;
   code: string;
@@ -43,10 +59,40 @@ function formatTime(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN");
 }
 
-function ExpectationCard({ exp, onAsk }: { exp: Expectation; onAsk: (msg: string) => void }) {
+function ExpectationCard({
+  exp,
+  onAsk,
+  onJumpToSupersedes,
+}: {
+  exp: Expectation;
+  onAsk: (msg: string) => void;
+  onJumpToSupersedes: (id: string) => void;
+}) {
   const askPrefill = `[关于 expectation ${exp.id} (${exp.code} ${exp.direction})]: `;
+  const terminal = exp.state !== "pending";
+  const [showLessons, setShowLessons] = useState(false);
+  const [lessons, setLessons] = useState<Lesson[] | null>(null);
+  const [lessonsLoading, setLessonsLoading] = useState(false);
+
+  const toggleLessons = () => {
+    if (showLessons) {
+      setShowLessons(false);
+      return;
+    }
+    setShowLessons(true);
+    if (lessons === null && !lessonsLoading) {
+      setLessonsLoading(true);
+      void invoke<Lesson[]>("list_lessons_for_expectation", {
+        expectationId: exp.id,
+      })
+        .then((res) => setLessons(res))
+        .catch(() => setLessons([]))
+        .finally(() => setLessonsLoading(false));
+    }
+  };
   return (
     <div
+      id={`exp-${exp.id}`}
       style={{
         border: `1px solid ${STATE_COLORS[exp.state]}`,
         borderRadius: 8,
@@ -87,12 +133,91 @@ function ExpectationCard({ exp, onAsk }: { exp: Expectation; onAsk: (msg: string
       <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
         signals: {exp.signalsUsed.map((s) => s.kind).join(", ") || "（无）"}
       </div>
-      <button
-        onClick={() => onAsk(askPrefill)}
-        style={{ marginTop: 6, padding: "3px 8px", fontSize: 11 }}
-      >
-        💬 问 agent
-      </button>
+      {exp.supersedes && (
+        <div style={{ fontSize: 11, marginTop: 4 }}>
+          replaces:{" "}
+          <button
+            onClick={() => onJumpToSupersedes(exp.supersedes!)}
+            style={{
+              padding: "1px 6px",
+              fontSize: 11,
+              background: "transparent",
+              border: "1px dashed #94a3b8",
+              color: "#0ea5e9",
+              cursor: "pointer",
+              fontFamily: "monospace",
+            }}
+            title="跳转到被替换的 expectation"
+          >
+            #{exp.supersedes.slice(0, 8)} ↗
+          </button>
+        </div>
+      )}
+      <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+        <button
+          onClick={() => onAsk(askPrefill)}
+          style={{ padding: "3px 8px", fontSize: 11 }}
+        >
+          💬 问 agent
+        </button>
+        {terminal && (
+          <button
+            onClick={toggleLessons}
+            style={{ padding: "3px 8px", fontSize: 11 }}
+          >
+            {showLessons ? "▾ 收起 lessons" : "▸ 查看 lessons"}
+          </button>
+        )}
+      </div>
+      {terminal && showLessons && (
+        <div
+          style={{
+            marginTop: 6,
+            padding: 8,
+            background: "#f8fafc",
+            border: "1px solid #e5e7eb",
+            borderRadius: 4,
+            fontSize: 12,
+          }}
+        >
+          {lessonsLoading && <div style={{ color: "#94a3b8" }}>加载中…</div>}
+          {!lessonsLoading && lessons !== null && lessons.length === 0 && (
+            <div style={{ color: "#94a3b8" }}>没有关联 lesson</div>
+          )}
+          {!lessonsLoading &&
+            lessons?.map((l) => (
+              <div
+                key={l.id}
+                style={{
+                  borderLeft: `3px solid ${OUTCOME_COLOR[l.outcome]}`,
+                  paddingLeft: 8,
+                  marginBottom: 6,
+                }}
+              >
+                <div>
+                  <span
+                    style={{
+                      background: OUTCOME_COLOR[l.outcome],
+                      color: "white",
+                      padding: "0 6px",
+                      borderRadius: 3,
+                      fontSize: 10,
+                      marginRight: 6,
+                    }}
+                  >
+                    {l.outcome}
+                  </span>
+                  {l.observation}
+                </div>
+                {l.takeaway && (
+                  <div style={{ marginTop: 2, fontStyle: "italic", color: "#475569" }}>
+                    💡 {l.takeaway}
+                  </div>
+                )}
+              </div>
+            ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -130,6 +255,29 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
   const filtered = themeFilter
     ? list.filter((e) => e.theme === themeFilter)
     : list;
+
+  const jumpToSupersedes = async (id: string) => {
+    // 若被替换条不在当前过滤集合里，先把过滤切换到 superseded，再滚动
+    if (!list.some((e) => e.id === id)) {
+      const all = await invoke<Expectation[]>("list_expectations", {
+        state: "superseded",
+        limit: 200,
+      }).catch(() => [] as Expectation[]);
+      setList(all);
+      setFilter("superseded");
+    }
+    // 等下一帧渲染完再 scroll
+    requestAnimationFrame(() => {
+      const el = document.getElementById(`exp-${id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.style.outline = "2px solid #0ea5e9";
+        setTimeout(() => {
+          el.style.outline = "";
+        }, 1500);
+      }
+    });
+  };
 
   return (
     <div style={{ padding: 20 }}>
@@ -192,6 +340,7 @@ export function ExpectationsPage({ onAskAgent }: { onAskAgent?: (msg: string) =>
             key={e.id}
             exp={e}
             onAsk={(msg) => onAskAgent?.(msg)}
+            onJumpToSupersedes={(id) => void jumpToSupersedes(id)}
           />
         ))
       )}

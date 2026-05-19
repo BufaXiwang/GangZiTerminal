@@ -172,8 +172,8 @@ impl Tool for OpenPositionTool {
             "properties": {
                 "code": { "type": "string", "description": "A 股 6 位代码或可解析的中文名" },
                 "shares": { "type": "integer", "description": "股数，必须 100 的整数倍（最小 1 手）" },
-                "thesis": { "type": "string", "description": "开仓逻辑摘要（必填，UI 快速展示用；详细论点请用 create_thesis）" },
-                "expectation_id": { "type": "string", "description": "（强烈建议）关联的 Thesis id；agent 主动开仓必须先 create_thesis 拿到这个 id" },
+                "thesis": { "type": "string", "description": "开仓备注（≤120 字，UI 快速展示用；结构化的为什么写在 Expectation 里）" },
+                "expectation_id": { "type": "string", "description": "（强烈建议）关联的 Expectation id；agent 主动开仓必须先 create_expectation 拿到这个 id" },
                 "stop_loss": { "type": "number", "description": "止损价（可选，元）" },
                 "take_profit": { "type": "number", "description": "止盈价（可选，元）" },
                 "name": { "type": "string", "description": "公司名（可省略，会自动从行情拉取）" },

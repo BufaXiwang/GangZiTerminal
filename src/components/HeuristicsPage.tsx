@@ -60,6 +60,18 @@ export function HeuristicsPage({
     };
   }, []);
 
+  const handleRetire = (h: Heuristic) => {
+    const reason = window.prompt(
+      `Retire heuristic "${h.body.slice(0, 60)}…"\n请输入退役原因（>=4 字）：`,
+      "",
+    );
+    if (!reason || reason.trim().length < 4) return;
+    void invoke("retire_heuristic_cmd", {
+      heuristicId: h.id,
+      reason: reason.trim(),
+    }).catch((err) => window.alert(`retire 失败：${err}`));
+  };
+
   const byState = (s: Heuristic["effectiveState"]) =>
     list.filter((h) => h.effectiveState === s);
 
@@ -140,18 +152,33 @@ export function HeuristicsPage({
                       支持的 lessons: {h.supportingLessonIds.length} 条
                     </div>
                   )}
-                  {onAskAgent && (
-                    <button
-                      onClick={() =>
-                        onAskAgent(
-                          `[关于 heuristic "${h.body.slice(0, 30)}..."]: `,
-                        )
-                      }
-                      style={{ marginTop: 6, padding: "3px 8px", fontSize: 11 }}
-                    >
-                      💬 问 agent
-                    </button>
-                  )}
+                  <div style={{ marginTop: 6, display: "flex", gap: 6 }}>
+                    {onAskAgent && (
+                      <button
+                        onClick={() =>
+                          onAskAgent(
+                            `[关于 heuristic "${h.body.slice(0, 30)}..."]: `,
+                          )
+                        }
+                        style={{ padding: "3px 8px", fontSize: 11 }}
+                      >
+                        💬 问 agent
+                      </button>
+                    )}
+                    {h.effectiveState !== "retired" && (
+                      <button
+                        onClick={() => handleRetire(h)}
+                        style={{
+                          padding: "3px 8px",
+                          fontSize: 11,
+                          color: "#b91c1c",
+                          borderColor: "#fecaca",
+                        }}
+                      >
+                        ⏏ retire
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </section>

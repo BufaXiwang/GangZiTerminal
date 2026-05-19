@@ -16,11 +16,14 @@
 use crate::domain::account::expectation::{
     judge_outcome, Expectation, ExpectationEvent, ExpectationId, ExpectationState, OutcomeJudgment,
 };
+use crate::domain::account::events::EventSource;
+use crate::domain::account::position::CloseReason;
 use crate::domain::agent::lesson::{Lesson, LessonOutcome};
 use crate::domain::shared::OccurredAt;
-use crate::infrastructure::account::expectation_repo;
+use crate::infrastructure::account::{expectation_repo, repository::PositionRepo};
 use crate::infrastructure::agent::{heuristic_repo, lesson_repo};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
+use crate::pipeline::account::AccountService;
 use tauri::AppHandle;
 
 #[derive(Debug, Clone)]
@@ -31,10 +34,17 @@ pub struct ReviewResult {
     pub expired: usize,
     pub lessons_written: usize,
     pub heuristic_applications_recorded: usize,
+    pub positions_auto_closed: usize,
 }
 
 /// 跑一次 review——扫所有 pending expectations，自动推进状态机。
-pub fn run(app: &AppHandle) -> Result<ReviewResult, String> {
+///
+/// `reflection_episode_id`：当 expectation 判定为 Missed 触发自动平仓时，事件源标成
+/// `EventSource::Reflection`，便于审计；None 则用 System。
+pub async fn run(
+    app: &AppHandle,
+    reflection_episode_id: Option<String>,
+) -> Result<ReviewResult, String> {
     let pending = expectation_repo::list_pending(app, 500)?;
     let mut result = ReviewResult {
         examined: pending.len(),
@@ -43,7 +53,10 @@ pub fn run(app: &AppHandle) -> Result<ReviewResult, String> {
         expired: 0,
         lessons_written: 0,
         heuristic_applications_recorded: 0,
+        positions_auto_closed: 0,
     };
+    let account_service = AccountService::new(app.clone());
+    let position_repo = PositionRepo::new(app.clone());
 
     for exp in pending {
         let Some(quote) = market_snapshot::get(exp.code.as_str()) else {
@@ -84,12 +97,14 @@ pub fn run(app: &AppHandle) -> Result<ReviewResult, String> {
                 result.heuristic_applications_recorded +=
                     record_signal_outcomes(app, &exp, false, now)?;
                 // 自动平仓——v3 spec § 19 FAQ：agent 主动建仓 → 关联 position 在 Missed 时自动平
-                // Phase 1 实现：标记 + 日志；真正写 close 路径在 W24 wire 到 AccountService 时补
-                tracing::info!(
-                    expectation = %exp.id,
-                    code = %exp.code,
-                    "expectation missed → TODO 自动平仓（W24 接 AccountService 后实现）"
-                );
+                let closed = auto_close_linked_positions(
+                    &account_service,
+                    &position_repo,
+                    &exp.id,
+                    reflection_episode_id.as_deref(),
+                )
+                .await;
+                result.positions_auto_closed += closed;
             }
             OutcomeJudgment::Expired { reason } => {
                 let event = ExpectationEvent::Expired {
@@ -177,4 +192,63 @@ fn record_signal_outcomes(
     }
     let _ = exp;
     Ok(counted)
+}
+
+/// 把所有 `current_expectation_id == exp_id` 的活仓位强平掉——expectation 被判定 Missed
+/// 时调。事件源标 Reflection（如果有 episode_id），CloseReason::Invalidated。
+///
+/// 异常单条 close 失败不阻断其它仓位 close；返回成功 close 的条数。
+async fn auto_close_linked_positions(
+    service: &AccountService,
+    repo: &PositionRepo,
+    exp_id: &ExpectationId,
+    reflection_episode_id: Option<&str>,
+) -> usize {
+    let Ok(positions) = repo.list_all() else {
+        return 0;
+    };
+    let mut closed = 0;
+    for p in positions {
+        if !matches!(
+            p.status,
+            crate::domain::account::position::PositionStatus::Open
+        ) {
+            continue;
+        }
+        if p.expectation_id.as_ref().map(|e: &ExpectationId| e.as_str()) != Some(exp_id.as_str()) {
+            continue;
+        }
+        let source = match reflection_episode_id {
+            Some(eid) => EventSource::Reflection {
+                episode_id: eid.to_string(),
+            },
+            None => EventSource::System,
+        };
+        let note = format!(
+            "auto-close: expectation {} 判定 missed，按 v3 spec § 5.4 自动平仓",
+            exp_id.as_str()
+        );
+        match service
+            .close_position(&p.id, CloseReason::Invalidated, source, note)
+            .await
+        {
+            Ok(_) => {
+                closed += 1;
+                tracing::info!(
+                    expectation = %exp_id,
+                    position = %p.id.as_str(),
+                    "expectation missed → auto close position"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    expectation = %exp_id,
+                    position = %p.id.as_str(),
+                    error = %err,
+                    "auto close position 失败——可能在非交易时段，等下一轮 review 重试"
+                );
+            }
+        }
+    }
+    closed
 }

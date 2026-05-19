@@ -1,16 +1,16 @@
-//! Chat reply 流水线——v2 重构后的 agent loop 入口。
+//! Chat reply 流水线——v3 expectation-driven agent loop 入口。
 //!
 //! 流程：
 //! 1. 立刻写 user message（emit chat-message-appended，UI 即刻渲染）
-//! 2. 读上下文（active principles / active theses / 行情 / 持仓 / 最近消息）
+//! 2. 读上下文（active heuristics by regime / pending expectations / 行情 / 持仓 / 最近消息）
 //! 3. 构 AgentRequest（identity + instructions 进 system，上下文 + 用户输入进 user）
 //! 4. 启 episode（agent_episodes 表先插一行）
 //! 5. spawn forwarder：把 AgentEvent 流转发给前端 + 累计文本
 //! 6. await run_agent → 拿 RunSummary + 最终文本
 //! 7. 写 assistant message + finalize agent_episodes
 //!
-//! Principle / Thesis 更新由 agent 通过 propose_principle / create_thesis 等
-//! 工具自己写——pipeline 不再 parse JSON。
+//! Expectation / Heuristic 更新由 agent 通过 create_expectation / propose_heuristic
+//! 等工具自己写——pipeline 不再 parse JSON。
 
 use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
@@ -232,7 +232,7 @@ pub async fn send_chat_message_now(
     let req = AgentRequest {
         // system 三段：identity → 指令 → 半静态投资上下文。
         // cache_control 只打在最后一段末尾——整段 system 形成一个 cache prefix，
-        // 跨多轮 chat 复用（直到 propose/confirm/retire principle 改变 active 集合才失效）。
+        // 跨多轮 chat 复用（直到 propose/retire heuristic 改变 active 集合才失效）。
         system: vec![
             SystemBlock {
                 text: AGENT_IDENTITY.to_string(),

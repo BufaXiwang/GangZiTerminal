@@ -39,6 +39,42 @@ pub fn create(app: &AppHandle, l: &Lesson) -> Result<(), String> {
     Ok(())
 }
 
+/// 拉最近 N 条 takeaway 为空的 lesson——供 reflect Phase 2 LLM 批量填 takeaway。
+pub fn list_recent_with_empty_takeaway(
+    app: &AppHandle,
+    limit: i64,
+) -> Result<Vec<Lesson>, String> {
+    let all = list_recent(app, limit * 3)?; // 拉多点过滤
+    Ok(all
+        .into_iter()
+        .filter(|l| l.takeaway.trim().is_empty())
+        .take(limit as usize)
+        .collect())
+}
+
+/// 仅当当前 takeaway 为空时填充——避免覆盖之前已经写过的（agent 多次 reflect 时幂等）。
+pub fn fill_takeaway_if_empty(
+    app: &AppHandle,
+    id: &LessonId,
+    takeaway: &str,
+) -> Result<bool, String> {
+    if takeaway.trim().is_empty() {
+        return Ok(false);
+    }
+    let conn = open_database(app)?;
+    migrate(&conn)?;
+    let rows = conn
+        .execute(
+            "update lessons set takeaway = ?2 where id = ?1 and (takeaway is null or takeaway = '')",
+            rusqlite::params![id.as_str(), takeaway],
+        )
+        .map_err(|err| format!("更新 lesson takeaway 失败：{err}"))?;
+    if rows > 0 {
+        let _ = app.emit(EVENT_LESSONS_CHANGED, serde_json::json!({}));
+    }
+    Ok(rows > 0)
+}
+
 pub fn list_recent(app: &AppHandle, limit: i64) -> Result<Vec<Lesson>, String> {
     let conn = open_database(app)?;
     migrate(&conn)?;

@@ -53,8 +53,8 @@ pub enum CompactAction {
 /// agent 真要决策会重新调用。
 ///
 /// **不在白名单**的工具：
-/// - `propose_principle` / `confirm_principle` / `retire_principle` / `create_thesis` /
-///   `update_thesis_state` / `attach_thesis_feedback`：mutation 工具，结果是确认文本，
+/// - `propose_heuristic` / `apply_heuristic` / `retire_heuristic` / `create_expectation` /
+///   `update_expectation_state` / `cancel_expectation`：mutation 工具，结果是确认文本，
 ///   清掉反而让 agent 怀疑"我刚才存进去了吗"。
 /// - `list_positions`：状态快照但本来就短，不浪费 token；agent 也可能依赖
 ///   "上一轮看到的持仓状态" 做对比，清掉破坏因果链。
@@ -368,13 +368,13 @@ mod tests {
 
     #[test]
     fn micro_clear_skips_non_volatile_tools() {
-        // propose_principle 的 ToolResult 不在白名单——不应被清理
+        // propose_heuristic 的 ToolResult 不在白名单——不应被清理
         let big = "x".repeat(4000);
         let mut msgs = Vec::new();
         msgs.extend(tool_call_pair(
             "toolu_pri",
-            "propose_principle",
-            "principle proposed ok",
+            "propose_heuristic",
+            "heuristic proposed ok",
         ));
         msgs.push(text_msg(Role::User, &big));
         msgs.push(text_msg(Role::Assistant, &big));
@@ -389,7 +389,7 @@ mod tests {
                 && content.first().map(|c| matches!(c, ToolResultContent::Text { text } if text.starts_with("[过期工具结果"))).unwrap_or(false)
             ))
         });
-        assert!(!any_stub, "propose_principle 的 tool_result 不该被 micro_clear");
+        assert!(!any_stub, "propose_heuristic 的 tool_result 不该被 micro_clear");
     }
 
     #[test]
