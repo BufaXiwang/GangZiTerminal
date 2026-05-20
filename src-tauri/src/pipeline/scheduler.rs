@@ -29,7 +29,8 @@ const KEY_REFRESH_INTERVAL: &str = "gangzi-terminal.refresh-interval";
 
 pub fn spawn_all(app: AppHandle) {
     tauri::async_runtime::spawn(news_refresh_loop(app.clone()));
-    tauri::async_runtime::spawn(pipeline::news::batch_loop::news_batch_loop(app.clone()));
+    // 注：news 的攒批分析 loop 在 adapters::news_batch_scheduler——它要构造 ToolRegistry
+    // （pipeline 不允许 use adapters），由 main.rs 直接 spawn。
     tauri::async_runtime::spawn(stocks_refresh_loop(app.clone()));
     tauri::async_runtime::spawn(market_quote_loop(app.clone()));
     tauri::async_runtime::spawn(market_universe_loop(app.clone()));
@@ -356,8 +357,8 @@ async fn run_news_tick(app: &AppHandle, counter: &mut FailureCounter) {
                 app,
                 crate::infrastructure::scheduler_heartbeat::LOOP_NEWS,
             );
-            // 刚入库一批新闻——如果累计 pending 已经超过 M 立即触发 batch，不等 timer
-            pipeline::news::batch_loop::check_buffer_overflow(app).await;
+            // emit news-refreshed event 让下游消费者（adapters/news_batch_scheduler）
+            // 自己决定要不要触发 buffer overflow 分析——News BC 不感知 agent。
         }
         Err(e) => {
             tracing::warn!(error = %e, consecutive = counter.count(), "news refresh 失败");

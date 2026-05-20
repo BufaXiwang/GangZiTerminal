@@ -84,7 +84,6 @@ pub async fn fetch_newsnow_source(
                 source: source_name.clone(),
                 published,
                 summary,
-                analysis_status: None,
             }
         })
         .collect())

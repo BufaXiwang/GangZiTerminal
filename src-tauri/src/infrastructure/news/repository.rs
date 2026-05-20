@@ -1,45 +1,21 @@
 //! News 子域 DB 访问——news_items + article_contents 表的 CRUD。
 //!
-//! 表设计（v8）：
-//! - `news_items`：资讯条目（id PK / source / published / **analysis_status 行级列** / processing_started_at / payload_json）
-//! - `article_contents`：文章正文缓存（url PK / item_id / payload_json）
-//!
-//! analysis_status 提升到行级列后，并发批量 claim 由 `infrastructure/news/batch.rs` 处理
-//! （UPDATE ... RETURNING 单语句原子化）。本文件只管基础 CRUD + search。
-//!
-//! 写路径：scheduler::news_refresh_loop 周期调 save_news_items；fetch_article_content 调 save_article_content。
-//! 读路径：list/get/search 给 adapter + agent SearchNewsTool 用——读取时把 column 里的 status 填回 NewsItem。
+//! News 模块只提供"拉取 + 存储 + 查询"：分析消费状态由 Agent BC 自管
+//! （见 `infrastructure/agent/news_analysis_repo.rs`）。本文件不感知任何
+//! 下游消费者，只负责基础数据层。
 
-use crate::domain::news::{NewsItem, NewsStatus};
+use crate::domain::news::NewsItem;
 use crate::infrastructure::db::{json_string, migrate, now, open_database, required_json_string};
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 use tauri::AppHandle;
-
-/// 行级 status 反序列化。
-fn parse_status(s: &str) -> NewsStatus {
-    match s {
-        "processing" => NewsStatus::Processing,
-        "consumed" => NewsStatus::Consumed,
-        "failed" => NewsStatus::Failed,
-        _ => NewsStatus::Pending,
-    }
-}
-
-/// 从 (payload_json, analysis_status) 重建 NewsItem——把行级 status 填回 domain 字段。
-fn hydrate(payload: &str, status_col: &str) -> Result<NewsItem, String> {
-    let mut item: NewsItem =
-        serde_json::from_str(payload).map_err(|err| format!("资讯 JSON 解析失败：{err}"))?;
-    item.analysis_status = Some(parse_status(status_col));
-    Ok(item)
-}
 
 pub fn list_news_items(app: AppHandle, limit: Option<i64>) -> Result<Vec<NewsItem>, String> {
     let connection = open_database(&app)?;
     migrate(&connection)?;
     let mut statement = connection
         .prepare(
-            "select payload_json, analysis_status
+            "select payload_json
              from news_items
              order by coalesce(published, updated_at) desc
              limit ?1",
@@ -47,18 +23,21 @@ pub fn list_news_items(app: AppHandle, limit: Option<i64>) -> Result<Vec<NewsIte
         .map_err(|err| format!("读取资讯缓存失败：{err}"))?;
     let items = statement
         .query_map(params![limit.unwrap_or(300).clamp(1, 1000)], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            row.get::<_, String>(0)
         })
         .map_err(|err| format!("读取资讯缓存失败：{err}"))?
         .map(|raw| {
             raw.map_err(|err| format!("读取资讯缓存失败：{err}"))
-                .and_then(|(payload, status)| hydrate(&payload, &status))
+                .and_then(|payload| {
+                    serde_json::from_str::<NewsItem>(&payload)
+                        .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
+                })
         })
         .collect();
     items
 }
 
-/// 入库——默认 analysis_status='pending'，重复 id 走 upsert 更新内容但**不重置 status**。
+/// 入库——重复 id 走 upsert 更新内容。
 pub fn save_news_items(app: AppHandle, items: Vec<NewsItem>) -> Result<usize, String> {
     let mut connection = open_database(&app)?;
     migrate(&connection)?;
@@ -72,15 +51,12 @@ pub fn save_news_items(app: AppHandle, items: Vec<NewsItem>) -> Result<usize, St
         let id = item.id.clone();
         let source = item.source.clone();
         let published = item.published.clone();
-        // 序列化时清掉 analysis_status——避免 JSON 与行级列两处不一致。读时从列恢复。
-        let mut payload_item = item.clone();
-        payload_item.analysis_status = None;
-        let payload = serde_json::to_string(&payload_item)
+        let payload = serde_json::to_string(&item)
             .map_err(|err| format!("资讯 JSON 序列化失败：{err}"))?;
         tx.execute(
             "insert into news_items
-                (id, source, published, analysis_status, payload_json, created_at, updated_at)
-             values (?1, ?2, ?3, 'pending', ?4, ?5, ?5)
+                (id, source, published, payload_json, created_at, updated_at)
+             values (?1, ?2, ?3, ?4, ?5, ?5)
              on conflict(id) do update set
                 source = excluded.source,
                 published = excluded.published,
@@ -105,7 +81,7 @@ pub fn get_news_items_by_ids(app: AppHandle, ids: Vec<String>) -> Result<Vec<New
     migrate(&connection)?;
     let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "select payload_json, analysis_status from news_items
+        "select payload_json from news_items
          where id in ({})
          order by coalesce(published, updated_at) desc",
         placeholders
@@ -115,12 +91,15 @@ pub fn get_news_items_by_ids(app: AppHandle, ids: Vec<String>) -> Result<Vec<New
         .map_err(|err| format!("查询资讯失败：{err}"))?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            row.get::<_, String>(0)
         })
         .map_err(|err| format!("查询资讯失败：{err}"))?
         .map(|raw| {
             raw.map_err(|err| format!("查询资讯失败：{err}"))
-                .and_then(|(payload, status)| hydrate(&payload, &status))
+                .and_then(|payload| {
+                    serde_json::from_str::<NewsItem>(&payload)
+                        .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
+                })
         })
         .collect::<Result<Vec<NewsItem>, String>>()?;
     Ok(rows)
@@ -154,7 +133,7 @@ fn search_news_items_fts(
     let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let mut stmt = connection
         .prepare(
-            "select ni.payload_json, ni.analysis_status
+            "select ni.payload_json
              from news_fts f
              join news_items ni on ni.id = f.news_id
              where f.title like ?1 escape '\\'
@@ -165,13 +144,14 @@ fn search_news_items_fts(
         )
         .map_err(|err| format!("FTS5 查询资讯失败：{err}"))?;
     let rows = stmt
-        .query_map(params![pattern, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(params![pattern, limit], |row| row.get::<_, String>(0))
         .map_err(|err| format!("FTS5 查询资讯失败：{err}"))?
         .map(|raw| {
             raw.map_err(|err| format!("FTS5 查询资讯失败：{err}"))
-                .and_then(|(payload, status)| hydrate(&payload, &status))
+                .and_then(|payload| {
+                    serde_json::from_str::<NewsItem>(&payload)
+                        .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
+                })
         })
         .collect();
     rows
@@ -185,20 +165,21 @@ fn search_news_items_like(
     let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
     let mut stmt = connection
         .prepare(
-            "select payload_json, analysis_status from news_items
+            "select payload_json from news_items
              where payload_json like ?1 escape '\\'
              order by coalesce(published, updated_at) desc
              limit ?2",
         )
         .map_err(|err| format!("LIKE 查询资讯失败：{err}"))?;
     let rows = stmt
-        .query_map(params![pattern, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(params![pattern, limit], |row| row.get::<_, String>(0))
         .map_err(|err| format!("LIKE 查询资讯失败：{err}"))?
         .map(|raw| {
             raw.map_err(|err| format!("LIKE 查询资讯失败：{err}"))
-                .and_then(|(payload, status)| hydrate(&payload, &status))
+                .and_then(|payload| {
+                    serde_json::from_str::<NewsItem>(&payload)
+                        .map_err(|err| format!("资讯 JSON 解析失败：{err}"))
+                })
         })
         .collect();
     rows
@@ -222,7 +203,8 @@ pub fn load_article_content(app: AppHandle, url: String) -> Result<Option<Value>
     .transpose()
 }
 
-/// 删除 `published` 字段早于 cutoff（RFC3339）的 news_items + 级联清 article_contents 孤儿。
+/// 删除 `published` 早于 cutoff（RFC3339）的 news_items + 级联清 article_contents 孤儿。
+/// 同时清 agent_news_analysis_state 表里指向已删 news 的孤儿（防止该表无限增长）。
 pub fn purge_old_news(app: &AppHandle, cutoff_rfc3339: &str) -> Result<u64, String> {
     let connection = open_database(app)?;
     migrate(&connection)?;
@@ -236,6 +218,11 @@ pub fn purge_old_news(app: &AppHandle, cutoff_rfc3339: &str) -> Result<u64, Stri
     let _ = connection.execute(
         "delete from article_contents
          where item_id is not null and item_id not in (select id from news_items)",
+        [],
+    );
+    let _ = connection.execute(
+        "delete from agent_news_analysis_state
+         where news_id not in (select id from news_items)",
         [],
     );
     Ok(deleted_items as u64)

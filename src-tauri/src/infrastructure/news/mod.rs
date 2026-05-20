@@ -8,7 +8,6 @@
 //! 错误 map 成 `NewsError`。
 
 pub mod article;
-pub mod batch;
 pub mod newsnow;
 pub mod repository;
 pub mod rss;

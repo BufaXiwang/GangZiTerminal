@@ -62,7 +62,6 @@ pub async fn fetch_rss(url: String, source: String) -> Result<Vec<NewsItem>, New
                 source: source.clone(),
                 published,
                 summary,
-                analysis_status: None,
             }
         })
         .collect())

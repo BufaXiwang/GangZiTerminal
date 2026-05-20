@@ -12,7 +12,7 @@ pub mod chat_commands;
 pub mod episode_commands;
 pub mod expectation_commands;
 pub mod market_commands;
-pub mod news_batch_listener;
+pub mod news_batch_scheduler;
 pub mod news_commands;
 pub mod proxy_commands;
 pub mod quotes_commands;

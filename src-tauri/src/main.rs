@@ -37,8 +37,8 @@ pub fn run() {
             adapters::reflection_scheduler::spawn(app.handle().clone());
             // Scan tick（9 ticks/天）—— 自驱观察循环
             adapters::scan_scheduler::spawn(app.handle().clone());
-            // News batch listener：监听 news-batch-ready → 跑 news_review agent run
-            adapters::news_batch_listener::spawn(app.handle().clone());
+            // Agent 对 news 的批量分析调度（timer + buffer overflow listener）
+            adapters::news_batch_scheduler::spawn(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。

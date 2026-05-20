@@ -82,6 +82,12 @@ pub async fn list_market_instruments(app: AppHandle) -> Result<Vec<MarketInstrum
     Ok(all)
 }
 
+/// Unified market-list entrypoint. Prefer this from new UI code.
+#[tauri::command]
+pub async fn list_market(app: AppHandle) -> Result<Vec<MarketInstrumentDto>, String> {
+    list_market_instruments(app).await
+}
+
 #[tauri::command]
 pub async fn run_market_quote_refresh_cmd(app: AppHandle) -> Result<MarketRefreshSummary, String> {
     crate::pipeline::market::refresh::run_market_quote_refresh(&app).await

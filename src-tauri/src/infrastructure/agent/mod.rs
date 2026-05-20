@@ -14,6 +14,7 @@
 pub mod health_metrics;
 pub mod heuristic_repo;
 pub mod lesson_repo;
+pub mod news_analysis_repo;
 pub mod position_heuristic_link_repo;
 pub mod provider;
 pub mod repository;

@@ -420,30 +420,36 @@ pub fn rebuild_snapshot(app: &AppHandle) -> Result<(), AccountError>;
 
 ### 2.3 News — 资讯流
 
-**责任**：feed 拉取 + 入库 + 状态机 + 搜索 + 文章抽取。
+**责任**：feed 拉取 + 入库 + 搜索 + 文章抽取。**只提供"获取资讯的能力"**——任何分析 / 消费状态 / 调度都属于 Agent BC。
 
 ```rust
 // === 读 ===
-pub fn list_pending(limit: usize) -> Vec<NewsItem>;
-pub fn list_recent(limit: usize, status: Option<NewsStatus>) -> Vec<NewsItem>;
-pub fn count_pending() -> i64;
-pub fn search(query: &str, limit: usize) -> Vec<NewsItem>;
-pub async fn get_article(app: &AppHandle, news_id: &NewsId) -> Result<Option<ArticleContent>, NewsError>;
+pub fn list_news_items(app, limit) -> Result<Vec<NewsItem>, String>;
+pub fn get_news_items_by_ids(app, ids) -> Result<Vec<NewsItem>, String>;
+pub fn search_news_items(app, query, limit) -> Result<Vec<NewsItem>, String>;
+pub fn load_article_content(app, url) -> Result<Option<Value>, String>;
 
-// === 写（mutation——future agent workflow / pipeline 调）===
-pub fn claim_pending(app: &AppHandle, ids: &[NewsId]) -> Result<usize, NewsError>;   // pending → processing
-pub fn mark_consumed(app: &AppHandle, ids: &[NewsId]) -> Result<usize, NewsError>;   // processing → consumed
-pub fn revert_claim(app: &AppHandle, ids: &[NewsId]) -> Result<usize, NewsError>;    // processing → pending
+// === 写 ===
+pub fn save_news_items(app, items) -> Result<usize, String>;
+pub fn save_article_content(app, item_id, article) -> Result<(), String>;
+pub fn purge_old_news(app, cutoff_rfc3339) -> Result<u64, String>;
 
-// === 维护（scheduler 调）===
-pub async fn refresh_feeds(app: &AppHandle) -> Result<RefreshResult, NewsError>;
-pub fn recover_stale_processing(app: &AppHandle) -> Result<usize, NewsError>;
+// === 编排 ===
+pub async fn run_news_refresh(app) -> Result<NewsRefreshResult, String>;
+//   一轮拉取完成后 emit "news-refreshed" Tauri Event（下游消费者监听）
 ```
 
+**News BC 完全不感知下游**——通过 Tauri Event `"news-refreshed"` 通知更新，谁听不关心。
+Agent 自己用 `pipeline/agent/news_batch` + `infrastructure/agent/news_analysis_repo`
+管理分析状态，详见 [docs/design/news-module.md](design/news-module.md) +
+[learning-loop.md](design/learning-loop.md)。
+
 **News 不做**：
-- NLP / 情感分析（agent 的事）
-- 关联股票自动识别（见 § 10 Q3）
-- LLM 调用
+- 分析状态机（pending / processing / ...）
+- 攒批调度（M / N）
+- NLP / 关键词分类 / 情感分析
+- 关联股票识别
+- 任何下游 RPC 调用
 
 ### 2.4 Agent — 决策引擎
 

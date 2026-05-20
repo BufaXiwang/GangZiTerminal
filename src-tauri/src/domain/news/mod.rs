@@ -11,4 +11,4 @@ pub mod errors;
 pub mod types;
 
 pub use errors::NewsError;
-pub use types::{ArticleContent, NewsId, NewsItem, NewsStatus};
+pub use types::{ArticleContent, NewsId, NewsItem};

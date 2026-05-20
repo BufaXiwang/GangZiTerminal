@@ -214,55 +214,65 @@ async fn run_review_for_position(app: &AppHandle, trigger: ReviewTrigger) {
 
 ---
 
-## News Review 详细
+## Agent News 分析详细
+
+> News BC 只提供数据（[news-module.md](./news-module.md)）；分析逻辑全部属于 Agent。
+> 状态机表 `agent_news_analysis_state` 在 agent BC，News 模块不感知本节内容。
 
 ### 两档触发
-| 触发器 | 时机 | 用途 |
+| 触发器 | 来源 | 用途 |
 |---|---|---|
-| `news_review` 攒批 | refresh tick 末尾发现 pending ≥ M=20 立即触发 | 突发某板块多消息汇集 |
-| `news_review` 定时 | 每 N=15 分钟兜底（默认，SettingsPage 可调 1–60 min） | 平稳期也按节奏复盘 |
+| `news_batch` 定时 | adapters/news_batch_scheduler tokio timer | 每 N=15 分钟兜底（默认，SettingsPage 可调 1–60 min）|
+| `news_batch` buffer overflow | adapter 监听 News BC 发的 `news-refreshed` event；pending ≥ M=20 时触发 | 突发某板块多消息汇集 |
 
 **不筛 importance**——agent 自己判断哪些是 actionable（原 tagger 关键词分级已删，规则不准）。
 
+### 状态机（agent_news_analysis_state 表）
+
+```
+   pending     ──claim_batch(M)──►   processing
+   processing  ──mark_consumed────►  consumed     (agent run 成功)
+   processing  ──revert──────────►   pending      (agent run 失败 → 等下次重试)
+   processing  ──watchdog 30min──►   pending      (孤儿回收)
+   processing  ──mark_failed─────►   failed       (预留：agent 显式拒绝)
+```
+
+LEFT JOIN news_items 找出"还没注册过 state 或仍 pending"的 news——这样 News 表入库后，agent 自己在下一次 tick 注册到自己的 state 表里，News 模块不感知。
+
 ### 并发安全
-- `batch::claim_batch` 用 `UPDATE...RETURNING` 原子取走 + 标 processing（同语句持写锁）
-- 进程级 `REVIEW_IN_FLIGHT` AtomicBool 防多 batch 在 listener 排队——batch_loop **claim 之前**就 check，已在 flight 则 skip 本轮
-- listener RAII Drop guard 保证 agent run 成功/失败/panic 都释放锁
-- 30min watchdog 兜底回收 processing 孤儿（进程崩或 emit 失败的极端情况）
+- `news_analysis_repo::claim_batch` 用 `INSERT ... SELECT LEFT JOIN ... ON CONFLICT DO UPDATE RETURNING` 单语句原子取走 + 标 processing
+- 进程级 `REVIEW_IN_FLIGHT` AtomicBool（在 `pipeline/agent/news_batch.rs`）防多 tick 撞——run_once 一开始 `try_mark`，上一轮没结束就 skip 本轮
+- RAII Drop guard 保证成功 / 失败 / panic 都释放锁
+- 30min watchdog 兜底回收 processing 孤儿（进程崩 / 进入死循环的极端情况）
 - 失败一律 `revert_processing_to_pending`（不写 failed，防瞬时故障永久漏分析）
 
 ### prompt 喂的数据
 | 段 | 内容 |
 |---|---|
-| 触发上下文 | "本次触发：buffer 满 / 定时；窗口期 X 分钟；新增 N 条" |
-| 新增 news | 自上次 review 起的所有 news（title + summary + tickers + sectors + time）|
-| 持仓 | open positions（含 live + watch）+ watchlist |
-| 历史 lessons | 与本批 news 涉及 tickers / sectors 相关的近 7 天 lessons |
+| 触发上下文 | "本次触发：buffer 满 / 定时；本批 N 条；队列剩余 X 条" |
+| 新增 news | 本批 news 全量（title + summary + source + published）|
+| 持仓 | open positions（含 live + watch）|
+| 自选股 | 当前 watchlist |
 | 当前 heuristics | top-N by confidence + regime match |
-| 市场状态 | MarketOverview + 主要板块涨跌榜 |
 
 ### agent 任务
 1. 识别有 actionable insight 的 news（不是所有都值得操作）
 2. 对相关 watchlist / open positions 评估影响
-3. 决定 `open_position(kind=live/watch)` / `adjust_position` / `no_action`
+3. 决定 `open_position(kind=live/watch)` / `adjust_position` / `add_to_watchlist` / `no_action`
 
 输出：一段总结 + 0-N 个工具调用。
 
-### NewsSignal 变体（合入 SignalKind 枚举）
+### 文件结构
 
-```rust
-enum SignalKind {
-    // ...现有 24 个
-    NewsPolicyTailwind { topic: String },      // 政策利好
-    NewsPolicyHeadwind { topic: String },      // 政策利空
-    NewsEarningsBeat { period: String },        // 业绩超预期
-    NewsEarningsMiss,                           // 业绩低于预期
-    NewsSectorTailwind { sector: String },     // 板块利好
-    NewsCompanyEvent { kind: String },         // 公司事件（并购/减持/中标）
-}
 ```
-
-让 agent 在 open_position 时把对应 NewsSignal 填进 `signals_used`，learning loop 自然涵盖资讯归因。
+domain/agent/news_analysis.rs        NewsAnalysisStatus enum
+infrastructure/agent/news_analysis_repo.rs
+                                     claim_batch / mark_consumed / mark_failed /
+                                     revert_* / reclaim_stale / count_pending
+pipeline/agent/news_batch.rs         REVIEW_IN_FLIGHT 锁 + run_once + maybe_buffer_overflow
+pipeline/agent/news_review.rs        构 prompt + 跑 agent run
+adapters/news_batch_scheduler.rs     timer loop + news-refreshed listener
+```
 
 ---
 
@@ -279,7 +289,9 @@ enum SignalKind {
 | **sector** | SectorStrengthAbove / SectorWeaknessBelow |
 | **factor** | PESampleLow / TurnoverRateHigh |
 | **visual** | VisualPatternRead { pattern, confidence } |
-| **news**（本次新增）| NewsPolicyTailwind / NewsPolicyHeadwind / NewsEarningsBeat / NewsEarningsMiss / NewsSectorTailwind / NewsCompanyEvent |
+
+> 资讯不再通过 `SignalKind` 表达——agent 看 news 直接做出 open / adjust 决策，
+> 自己写 reasoning 关联回 lesson。news → signal 的强类型映射被证明过度设计已删。
 
 ---
 

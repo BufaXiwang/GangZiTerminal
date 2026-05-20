@@ -79,25 +79,18 @@ create table if not exists app_state (
 );
 
 -- ===== News BC =====
--- analysis_status 在行级列——agent 批量 claim 时用 UPDATE ... RETURNING 原子化
--- 状态机：pending → processing → consumed / failed → pending(revert by watchdog)
+-- News 模块只提供"拉取 + 存储 + 查询"——任何分析 / 消费状态 / 调度都属于 Agent BC，
+-- 见 agent_news_analysis_state 表与 pipeline/agent/news_batch_loop。
 create table if not exists news_items (
     id text primary key,
     source text not null,
     published text,
-    analysis_status text not null default 'pending'
-        check (analysis_status in ('pending', 'processing', 'consumed', 'failed')),
-    processing_started_at text,            -- 进 processing 时戳；watchdog 用来回收孤儿
     payload_json text not null,
     created_at text not null,
     updated_at text not null
 );
-create index if not exists idx_news_items_status_published
-    on news_items(analysis_status, published);
--- 部分索引：只索引 processing 状态的，watchdog 扫超时孤儿用
-create index if not exists idx_news_items_processing_at
-    on news_items(processing_started_at)
-    where analysis_status = 'processing';
+create index if not exists idx_news_items_published
+    on news_items(published desc);
 
 create table if not exists article_contents (
     url text primary key,
@@ -340,6 +333,21 @@ create index if not exists idx_heuristics_origin on heuristics(origin);
 create index if not exists idx_heuristics_retired on heuristics(retired_at);
 create index if not exists idx_heuristics_emerged on heuristics(last_emerged_at desc);
 
+-- Agent 对 news 的分析状态机——News BC 只存 news 内容，分析状态由 Agent 自管。
+-- 状态：pending → processing → consumed / failed → pending(revert by watchdog)
+create table if not exists agent_news_analysis_state (
+    news_id text primary key,
+    status text not null default 'pending'
+        check (status in ('pending', 'processing', 'consumed', 'failed')),
+    processing_started_at text,            -- 进 processing 时戳；watchdog 用来回收孤儿
+    updated_at text not null
+);
+create index if not exists idx_ana_status on agent_news_analysis_state(status);
+-- 部分索引：只索引 processing 状态的，watchdog 扫超时孤儿用
+create index if not exists idx_ana_processing_at
+    on agent_news_analysis_state(processing_started_at)
+    where status = 'processing';
+
 -- Position ↔ Heuristic link：精确归因 position close 影响哪些 heuristic 的 track record。
 -- agent 在 open_position 时显式声明 applied_heuristic_ids → 写入此表。
 -- close 时按 CloseReason 反向打标 → heuristic.application_count / hit_count / miss_count。
@@ -508,8 +516,6 @@ mod tests {
                 id text primary key,
                 source text not null,
                 published text,
-                analysis_status text not null default 'pending',
-                processing_started_at text,
                 payload_json text not null,
                 created_at text not null,
                 updated_at text not null

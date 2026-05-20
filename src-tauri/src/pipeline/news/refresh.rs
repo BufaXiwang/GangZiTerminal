@@ -89,7 +89,7 @@ pub async fn run_news_refresh(app: AppHandle) -> Result<NewsRefreshResult, Strin
         {
             failures.push(format!("save_news_items: {err}"));
         }
-        // 新入库的 news 默认 analysis_status='pending'——由 news batch_loop 攒批触发 agent review
+        // 新入库的 news 由 agent 模块自己决定何时分析（监听 news-refreshed event）
     }
 
     let _ = app.emit(

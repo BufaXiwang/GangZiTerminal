@@ -15,6 +15,7 @@ pub mod compact;
 pub mod config;
 pub mod context;
 pub mod heuristic_emerge;
+pub mod news_batch;
 pub mod news_review;
 pub mod loop_;
 pub mod observer;

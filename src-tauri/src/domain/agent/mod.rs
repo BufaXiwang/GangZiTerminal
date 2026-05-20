@@ -17,6 +17,7 @@
 
 pub mod heuristic;
 pub mod lesson;
+pub mod news_analysis;
 pub mod strategy;
 pub mod types;
 
@@ -25,6 +26,7 @@ pub use heuristic::{
     HEURISTIC_BODY_MAX_CHARS,
 };
 pub use lesson::{Lesson, LessonId, LessonOutcome};
+pub use news_analysis::NewsAnalysisStatus;
 // SignalKind / EventKind 等迁到 domain/shared::signal
 // （三个 BC 都引用——shared vocabulary）。从这里 re-export 让旧 use 路径仍可工作。
 pub use crate::domain::shared::{EventKind, SignalDetection, SignalKind};
