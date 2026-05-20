@@ -1,155 +1,304 @@
 # News 模块 Spec
 
-> News 模块只提供**获取资讯的能力**。任何"分析" / 消费状态 / 调度都属于 Agent 模块。
-> 本文档只记录**当前已实现**的功能。
+> 本文档是 News 模块的设计契约。模块边界 / 依赖方向以 `docs/architecture.md` 为准。
+>
+> 所有实现均以本文档的最新设计为准；不保留旧接口、旧表结构或兼容路径作为设计目标。
 
 ## 一句话定位
 
-**纯数据层**——定时从远端拉资讯入 SQLite，对外提供 list / search / get / fetch_article 同步只读 API。News 模块不知道下游消费者是谁，也不关心他们怎么用。
+**资讯本地读模型**：后台任务持续从多源资讯 provider 拉取新闻和正文，落入 SQLite；UI 和 Agent 只读取本地 news snapshot / DB。
+
+News 只负责“获取、存储、检索资讯”。新闻分析、影响判断、消费状态、交易决策都属于 Agent。
 
 ---
 
-## 1. 责任清单
+## 1. 责任边界
 
-| 责任 | 实现 |
-|---|---|
-| **拉取** | NewsNow 多源 + 自定义 RSS（chinanews 等），scheduler 每 N 秒一刷 |
-| **入库** | upsert `news_items` 表（id 去重） |
-| **基础查询** | `list_news_items` / `get_news_items_by_ids` / `search_news_items`（FTS5 trigram + LIKE 回退） |
-| **正文抽取** | `article::fetch_article_remote` + `article_contents` 缓存 |
-| **保留期清理** | 30 天前的 news_items 自动 purge（含级联 article_contents 孤儿，并清 agent_news_analysis_state 孤儿） |
-| **通知** | 刷新成功后 emit `"news-refreshed"` Tauri Event（不知道谁听） |
+News 模块负责：
 
-**明确不做**：
-- ❌ 关键词分类 / Importance 分级
-- ❌ 自动识别影响哪些股票
-- ❌ 任何分析状态机（pending / processing / consumed / ...）
-- ❌ 直接调用任何下游模块
+- 多源资讯拉取。
+- 资讯去重、入库、更新时间维护。
+- 正文抽取与正文缓存。
+- 基础查询：列表、按 ID 获取、全文搜索、按股票/关键词过滤。
+- 保留期清理。
+- 刷新完成事件通知。
+
+News 模块不负责：
+
+- 判断资讯重要性。
+- 判断资讯利好 / 利空。
+- 自动识别影响哪些股票。
+- 管理 pending / processing / consumed 等分析状态。
+- 触发 Agent run。
+- 调用 Quotes / Account / Agent 代码。
 
 ---
 
-## 2. DB schema（news 模块拥有的表）
+## 2. 数据模型
+
+### `news_items`
+
+资讯主表只存原始资讯和基础索引字段，不存分析状态。
 
 ```sql
--- 资讯主表——只存 news 内容，无任何消费/分析字段
 create table news_items (
     id text primary key,
     source text not null,
-    published text,
-    payload_json text not null,            -- 完整 NewsItem JSON
+    title text not null,
+    summary text,
+    url text,
+    published_at text,
+    payload_json text not null,
     created_at text not null,
     updated_at text not null
 );
-create index idx_news_items_published on news_items(published desc);
 
--- 正文缓存（按 url）
+create index idx_news_items_published_at on news_items(published_at desc);
+create index idx_news_items_source on news_items(source);
+```
+
+### `article_contents`
+
+正文缓存按 URL 去重。
+
+```sql
 create table article_contents (
     url text primary key,
-    item_id text,
+    news_id text,
+    title text,
+    content text,
     payload_json text not null,
     fetched_at text not null
 );
 
--- FTS5 全文索引（trigram tokenizer 支持中文 LIKE 加速）
+create index idx_article_contents_news_id on article_contents(news_id);
+```
+
+### `news_fts`
+
+全文检索索引由 `news_items` 同步维护。
+
+```sql
 create virtual table news_fts using fts5(
-    news_id UNINDEXED, title, summary, source,
+    news_id unindexed,
+    title,
+    summary,
+    source,
     tokenize = 'trigram'
 );
--- news_items 写入/修改/删除时触发器同步 news_fts
 ```
 
-完整 schema 单一来源：`src-tauri/src/infrastructure/db/migrations.rs::SCHEMA_SQL`。
+### 可选：`news_mentions`
+
+如果后续需要按股票过滤新闻，可新增“轻量 mention 索引”。这仍然不是影响判断，只是文本命中。
+
+```sql
+create table news_mentions (
+    news_id text not null,
+    ts_code text not null,
+    mention text not null,
+    source text not null,        -- rule / provider
+    created_at text not null,
+    primary key (news_id, ts_code, mention)
+);
+
+create index idx_news_mentions_ts_code on news_mentions(ts_code);
+```
 
 ---
 
-## 3. 对外接口
+## 3. UI Command 目标
 
-### Rust API（同模块 import 使用）
+### `fetch_news`
 
-```rust
-// infrastructure/news/repository.rs
-pub fn list_news_items(app, limit) -> Result<Vec<NewsItem>, String>;
-pub fn save_news_items(app, items) -> Result<usize, String>;
-pub fn get_news_items_by_ids(app, ids) -> Result<Vec<NewsItem>, String>;
-pub fn search_news_items(app, query, limit) -> Result<Vec<NewsItem>, String>;
-pub fn load_article_content(app, url) -> Result<Option<Value>, String>;
-pub fn save_article_content(app, item_id, article) -> Result<(), String>;
-pub fn purge_old_news(app, cutoff_rfc3339) -> Result<u64, String>;
+统一资讯读取入口。UI 不需要知道底层 provider。
 
-// pipeline/news/refresh.rs
-pub async fn run_news_refresh(app) -> Result<NewsRefreshResult, String>;
+```ts
+type FetchNewsRequest = {
+  ids?: string[];
+  query?: string;
+  tsCodes?: string[];
+  sources?: string[];
+  publishedFrom?: string;
+  publishedTo?: string;
+  includeArticle?: boolean;
+  limit?: number;
+  offset?: number;
+};
 ```
 
-### Tauri Event
+```ts
+type FetchNewsResponse = {
+  items: Array<{
+    id: string;
+    source: string;
+    title: string;
+    summary?: string;
+    url?: string;
+    publishedAt?: string;
+    article?: {
+      title?: string;
+      content: string;
+      fetchedAt: string;
+    };
+    mentions?: Array<{
+      tsCode: string;
+      mention: string;
+    }>;
+    freshness?: {
+      ageMs?: number;
+      articleFetchedAt?: string;
+    };
+    warnings?: string[];
+    errors?: string[];
+  }>;
+  page: {
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+  };
+};
+```
 
-| Event | 何时 emit | Payload |
-|---|---|---|
-| `news-refreshed` | 一轮拉取完成（成功或部分成功）| `{ fetchedCount, failedCount, firstFailure }` |
+默认行为：
 
-下游消费者监听这个事件自行决策——News 模块不知道有谁在听。
+- 只读本地 DB / cache。
+- 不在 UI 热路径直接请求远端资讯 provider。
+- `includeArticle = true` 时优先读 `article_contents`，缺失则返回 warning；是否 lazy fetch 由单独参数或后台任务决定。
 
-### Tauri Command（前端 IPC）
+### `refresh_news`
 
-| Command | 用途 |
+手动触发刷新。它是维护入口，不是常规 UI 读取路径。
+
+```ts
+type RefreshNewsRequest = {
+  sources?: string[];
+  force?: boolean;
+};
+```
+
+```ts
+type RefreshNewsResponse = {
+  fetchedCount: number;
+  savedCount: number;
+  failedCount: number;
+  firstFailure?: string;
+};
+```
+
+---
+
+## 4. Agent 工具目标
+
+Agent 不直接使用多组 news command。建议暴露一个工具：
+
+### `fetch_news`
+
+和 UI 的 `fetch_news` 复用同一套本地 query，但默认输出更精简，避免 token 爆炸。
+
+```ts
+type FetchNewsToolInput = {
+  query?: string;
+  tsCodes?: string[];
+  ids?: string[];
+  includeArticle?: boolean;
+  limit?: number;
+};
+```
+
+Agent 只拿资讯内容。是否重要、影响哪些持仓、是否需要交易动作，都由 Agent 自己判断，并落到 Agent 自己的 episode / memory / analysis 表中。
+
+---
+
+## 5. Provider 策略
+
+News provider 是 infrastructure 细节，不进入 UI / Agent API。
+
+目标策略：
+
+- 支持多个 provider 并行或顺序拉取。
+- 每个 provider 输出统一 `NewsItem` wire-independent domain 类型。
+- 入库以稳定 ID 去重。
+- 单个 provider 失败不影响其他 provider。
+- provider 原始 payload 保存在 `payload_json`，便于审计和后续补字段。
+
+Provider 输出至少包含：
+
+```ts
+type ProviderNewsItem = {
+  id: string;
+  source: string;
+  title: string;
+  summary?: string;
+  url?: string;
+  publishedAt?: string;
+  payload: unknown;
+};
+```
+
+---
+
+## 6. 后台刷新策略
+
+资讯刷新由 News 自己的 scheduler 维护。
+
+| 任务 | 频率 | 说明 |
+|---|---:|---|
+| news refresh | 用户配置，默认 60s | 多源拉取、去重、入库 |
+| article warm | 低频 / 按需队列 | 对重点新闻或最近新闻抽正文 |
+| retention | 每日 | 清理过期 news / article cache |
+
+刷新完成后 emit 事件：
+
+| Event | Payload |
 |---|---|
-| `news_commands::*` | 前端 NewsPage 渲染列表 / 搜索 / 看详情 |
+| `news-refreshed` | `{ fetchedCount, savedCount, failedCount, firstFailure }` |
+
+事件只表示数据变化。News 不关心谁监听，也不直接调用下游模块。
 
 ---
 
-## 4. 配置（用户可调）
+## 7. 保留期策略
 
-| 配置 | Key | 默认 | 范围 | UI |
-|---|---|---|---|---|
-| 自动刷新 | `gangzi-terminal.auto-refresh` | true | — | SettingsPage › 资讯 |
-| 刷新间隔 | `gangzi-terminal.refresh-interval` | 60s | 15s / 30s / 1m / 5m | SettingsPage › 资讯 |
-| 保留期 | `NEWS_RETENTION_DAYS` 常量 | 30 天 | — | 代码常量 |
+默认保留 30 天资讯。
 
----
+保留期清理目标：
 
-## 5. 文件结构
-
-```
-domain/news/
-  types.rs               NewsItem / NewsId / ArticleContent
-  errors.rs              NewsError
-  mod.rs
-
-infrastructure/news/
-  newsnow/               NewsNow API client
-  rss/                   RSS feed parser
-  article/               文章正文抽取
-  repository.rs          news_items + article_contents CRUD + 搜索
-  mod.rs
-
-pipeline/news/
-  refresh.rs             编排：feed pull → save_news_items → emit news-refreshed
-  mod.rs
-
-adapters/
-  news_commands.rs       Tauri IPC（前端调用）
-```
-
-**硬约束**（grep 自检全空）：
-- `domain/news` / `infrastructure/news` / `pipeline/news` 任何文件**不 import** `crate::*agent*` / `crate::*account*` / `crate::*quotes*`
-- News 模块**不直接调任何下游函数**——一切跨 BC 接口走 Tauri Event 或 Rust 函数被下游 import
+- 删除过期 `news_items`。
+- 删除孤儿 `article_contents`。
+- 删除孤儿 `news_mentions`。
+- 不删除 Agent 自己的 episode / analysis 记录；Agent 若需要长期引用新闻，应保存引用摘要或快照。
 
 ---
 
-## 6. 故意不做的设计
+## 8. 依赖约束
 
-| 没做 | 理由 |
-|---|---|
-| News 分析状态机（pending / processing / ...）| 属于 Agent 范畴——见 `infrastructure/agent/news_analysis_repo.rs` |
-| 攒批 / 定时调度（M / N）| 属于 Agent 范畴——见 `pipeline/agent/news_batch.rs` |
-| Importance / sentiment 关键词分级 | 准确率低；让 agent 自判 |
-| 模块内消费者注册 / 回调 | 全走 Tauri Event；消费者完全可替换 |
+News BC 必须保持独立：
+
+- `domain/news` 不依赖 Tauri / SQLite / HTTP / infrastructure / pipeline / adapters。
+- `infrastructure/news` 可以依赖 DB / HTTP provider，但不依赖 pipeline / adapters。
+- `pipeline/news` 负责编排 refresh / retention，不依赖 adapters。
+- `adapters/news_commands` 只做 IPC DTO 转换。
+- News 任一层不 import Agent / Account / Quotes 代码。
+
+跨模块交互：
+
+- UI 通过 Tauri command 读 news。
+- Agent 通过 adapter tool 读 news。
+- 下游监听 `news-refreshed` 后自行决定是否处理。
+- News 不反向调用下游。
 
 ---
 
-## 7. 与其他文档的关系
+## 9. 暂不纳入
 
-- 模块边界 / 依赖方向 → [architecture.md § 1](../architecture.md)
-- News BC 在 4 模块中的定位 → [architecture.md § 2.3](../architecture.md)
-- 完整 DB schema 单一来源 → `src-tauri/src/infrastructure/db/migrations.rs::SCHEMA_SQL`
-- **Agent 怎么消费 news**（攒批 / 状态机 / news_review）→ [learning-loop.md § News 分析章节](./learning-loop.md)
-- 本文档：News 模块自身的实现 spec
+这些能力不属于 News 模块：
+
+- 新闻重要性评分。
+- 利好 / 利空情绪判断。
+- 自动生成股票标签或行业标签。
+- 持仓影响判断。
+- 分析状态机。
+- Agent run 调度。
+
+这些属于 Agent 或独立 research pipeline，不属于 News 数据模块。
