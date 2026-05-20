@@ -43,13 +43,20 @@ impl Drop for ReviewDoneGuard {
 pub fn spawn(app: AppHandle) {
     let app_for_handler = app.clone();
     app.listen("news-batch-ready", move |event| {
+        // 注：batch_loop 在 emit 前已经 try_mark_review_starting 持有 REVIEW_IN_FLIGHT
+        // 锁——本闭包**任何 early-return 路径**都必须释放它，否则锁永远泄露。
+        // RAII guard 在 spawn 内部的 async block 才创建，所以 spawn 之前 return
+        // 的两条路径在此处显式释放。
         let raw = event.payload();
         let parsed: Option<Payload> = serde_json::from_str(raw).ok();
         let Some(payload) = parsed else {
-            tracing::warn!(payload = raw, "news-batch-ready payload 解析失败");
+            tracing::warn!(payload = raw, "news-batch-ready payload 解析失败 → 释放锁");
+            batch_loop::mark_review_done();
             return;
         };
         if payload.news_ids.is_empty() {
+            tracing::warn!(batch_id = %payload.batch_id, "news-batch-ready news_ids 为空 → 释放锁");
+            batch_loop::mark_review_done();
             return;
         }
         let app_clone = app_for_handler.clone();
