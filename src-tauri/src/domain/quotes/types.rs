@@ -1,6 +1,6 @@
 //! Quotes 模块的核心数据类型。
 //!
-//! 全部按 architecture.md § 3.3 数据契约定义，使用 newtype（Yuan / Lots / TradeDate ...）
+//! Quotes 数据契约使用 newtype（Yuan / Lots / TradeDate ...）
 //! 编译期防单位混淆。Five 个分组：
 //!
 //! 1. 实时报价（StockQuote + 五档盘口）

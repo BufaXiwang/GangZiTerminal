@@ -5,7 +5,7 @@
 //! 定位：**模拟交易终端的训练场**。提供类真实账户的开仓 / 平仓 / 加减仓 / 调止损能力，
 //! 由 Agent 自驱动；用户只读 + 管自选股 + 一键重置。
 //!
-//! 设计原则（per architecture.md § 1）：
+//! 设计原则（per docs/design/architecture.md）：
 //! - **持久化先 event 后 state**：所有写动作 append `PositionEvent`，状态从事件链派生
 //! - **派生 over 存储**：cash / realized_pnl / unrealized_pnl 全从事件 + MARKET_SNAPSHOT 算
 //! - **模块边界单向**：Account → Quotes（估值读 MARKET_SNAPSHOT）；Quotes 不知 Account

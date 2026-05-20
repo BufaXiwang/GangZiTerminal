@@ -1,6 +1,6 @@
 # AGENTS.md
 
-> 这是给"读代码的 agent"的入口页。保持短——所有详细规约在 `docs/architecture.md` 里。
+> 这是给"读代码的 agent"的入口页。保持短——所有详细规约在 `docs/design/architecture.md` 里。
 
 ## Project
 
@@ -10,9 +10,23 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 
 ## Read First
 
-- **[docs/architecture.md](docs/architecture.md)** ← **权威设计基线**。模块边界 / 数据模型 / Agent 输出协议 / 数据流 / DDD-lite 结构 / 7 项核心哲学
+- **[docs/design/architecture.md](docs/design/architecture.md)** ← 整体设计入口。模块级领域契约以 `docs/design/*-module.md` 为准
+- [docs/design/](docs/design/) — 各模块 spec。写实现前先确认对应 spec；spec 只写最新设计契约
 - [docs/provider-design.md](docs/provider-design.md) — Provider 抽象（wire format 不是厂商）
 - [docs/development.md](docs/development.md) — 开发命令 / Tauri runtime / 配置
+
+## Spec Docs
+
+新增 / 修改模块级 spec 时，放在 `docs/design/<bc>-module.md`。每个 spec 对应一个 bounded context 的**领域模型契约**，不是实现现状说明，也不是接口流水账。
+
+推荐结构：**定位 → 责任边界 → 领域模型 → 数据流 → 对外接口 → 模块独有功能 → 验收标准 / 例子 → 不纳入范围**。
+
+- **领域模型** 写核心概念、状态、规则、不变量，以及必要的 domain 类型 / SQLite 读模型。
+- **对外接口** 拆成前端展示接口、Agent 调用方法、内部 Rust API。
+- **模块独有功能** 按该 BC 特性描述 scheduler、provider、snapshot/cache、事件、学习闭环等；没有就省略。
+- **验收标准 / 例子** 用可检查场景说明 spec 是否满足；不要展开到文件级代码结构。
+
+Spec 是实现依据：所有实现均以最新 spec 为准；实现计划和任务可以从 spec 派生，但 spec 本身保持在领域模型、行为契约、验收标准这一层。
 
 ## Stack
 
@@ -70,7 +84,7 @@ domain/          纯类型 + 规则（无 I/O、无 Tauri、无 SQLite、无网�
    - {quotes,account,news} 任何一层 不允许 use crate::*agent*
 ```
 
-完整规则见 [architecture.md § 1.3](docs/architecture.md) 跨模块依赖矩阵。
+完整规则见 [docs/design/architecture.md](docs/design/architecture.md) 模块关系与分层约束。
 
 ## Code Map（current state）
 
@@ -128,7 +142,7 @@ npm run tmux:logs / restart / stop
 
 ## Key Rules (Non-Negotiable)
 
-参见 architecture.md § 1 完整 7 条。简短版：
+参见 [docs/design/architecture.md](docs/design/architecture.md) 的整体约束。简短版：
 
 1. **DDD-driven** — 新代码先选 BC + 选层；不允许跨层 / 反向依赖（本节顶部判断流程）
 2. **Agent Notify Mode** — 决策即执行，chat 是事后通知
@@ -155,8 +169,8 @@ cargo check --manifest-path src-tauri/Cargo.toml && \
 cargo test  --manifest-path src-tauri/Cargo.toml
 ```
 
-新增 / 修改 spec 内容 → 先改 `docs/architecture.md` 再改代码。
+新增 / 修改模块行为或接口 → 先改 `docs/design/<bc>-module.md` 再改代码；跨模块架构原则再同步 `docs/design/architecture.md`。
 
 ---
 
-**This file**：本文档保持 ~150 行作为入口页。**任何架构 / 接口 / 数据模型规约都不写在这里**——写到 architecture.md。
+**This file**：本文档保持 ~150 行作为入口页。**任何详细架构 / 接口 / 数据模型规约都不写在这里**——写到 `docs/design/architecture.md` 或 `docs/design/`。

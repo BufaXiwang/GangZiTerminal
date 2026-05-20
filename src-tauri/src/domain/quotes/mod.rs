@@ -12,7 +12,7 @@
 //! I/O 实现在 `crate::infrastructure::*`——HTTP client 适配 TuShare / EM，SQLite
 //! repository 适配本地缓存，snapshot 模块维护内存状态。
 //!
-//! 依赖单向（per architecture.md § 1.3）：
+//! 依赖单向（per docs/design/architecture.md）：
 //! - quotes 模块**不**引用 agent / account / news / pipeline / infrastructure
 //! - 只引用 `crate::domain::shared::*`
 

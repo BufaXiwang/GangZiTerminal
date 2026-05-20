@@ -1,6 +1,6 @@
 //! Domain 层——纯 domain 模型，无 I/O，无 Tauri，无外部副作用。
 //!
-//! 按 architecture.md § 9.1 DDD-lite 结构：
+//! 按 docs/design/architecture.md DDD-lite 结构：
 //! - `shared/`：跨 Bounded Context 复用的 newtype + value object
 //! - `quotes/`：市场数据 BC
 //! - `account/`：模拟账户 BC（aggregate / events / cash / rules / sizing / snapshot / thesis）
