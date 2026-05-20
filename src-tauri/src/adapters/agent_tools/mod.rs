@@ -1,15 +1,13 @@
 //! LLM 本地工具的具体实现 + 组装入口（chat registry）。
 //!
 //! 抽象（`Tool` trait / `ToolRegistry` / `ToolContext` / `ok_json` / `err_text`）
-//! 在 [`crate::pipeline::agent::tools`]——pipeline 只依赖那层抽象，不知道这里的具体
-//! tool 是谁。本层做"LLM tool 协议 ↔ 领域 use case"的反腐层（anti-corruption）。
+//! 在 [`crate::pipeline::agent::tools`]——pipeline 只依赖那层抽象。
 //!
 //! 各 tool 文件按业务归类：
 //! - `quotes`：行情查询
 //! - `research`：龙虎榜 / 资金流 / 板块涨幅 / 扫盘 / 公司事件
 //! - `news`：资讯检索
-//! - `account` / `positions`：账户读 + 写（open / close / scale / adjust_stops）
-//! - `expectations`：v3 核心实体——create / update / cancel
+//! - `account` / `positions`：账户读 + 写（open / close / scale / adjust_position）
 //! - `visual`：analyze_chart / propose_visual_pattern
 //! - `delegate`：派 researcher / bear_advocate 子 agent
 //! - `compact`：compact_now 主动压缩 context
@@ -22,7 +20,6 @@ use crate::pipeline::agent::tools::ToolRegistry;
 pub mod account;
 pub mod compact;
 pub mod delegate;
-pub mod expectations;
 pub mod news;
 pub mod positions;
 pub mod quotes;
@@ -30,51 +27,35 @@ pub mod research;
 pub mod visual;
 
 /// Chat pipeline 工具注册表——chat / reflection 共用。
-///
-/// 含：
-/// - quotes 系（get_quote / get_kline / get_market_overview）只读
-/// - research（scan_market / get_top_list / get_moneyflow / get_concept_performance /
-///   get_company_events）只读
-/// - news（search_news）只读
-/// - account 读（get_account / get_position）+ 写（open / close / scale / adjust_stops）
-/// - expectations 写（create / update / cancel）——v3 核心实体
-/// - visual（analyze_chart 读 + propose_visual_pattern 写）
-/// - delegate（派 researcher / bear_advocate 子 agent）
-/// - compact_now（主动压缩 context）
 pub fn build_chat_registry(app: &AppHandle) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     // 行情
     reg.register(Arc::new(quotes::GetQuoteTool::new(app.clone())));
     reg.register(Arc::new(quotes::GetKlineTool::new(app.clone())));
     reg.register(Arc::new(quotes::GetMarketOverviewTool::new(app.clone())));
-    // 研究——龙虎榜 / 资金流 / 板块涨幅 / 扫盘 / 公司事件
+    // 研究
     reg.register(Arc::new(research::ScanMarketTool::new(app.clone())));
     reg.register(Arc::new(research::GetTopListTool::new(app.clone())));
     reg.register(Arc::new(research::GetMoneyflowTool::new(app.clone())));
-    reg.register(Arc::new(research::GetConceptPerformanceTool::new(
-        app.clone(),
-    )));
+    reg.register(Arc::new(research::GetConceptPerformanceTool::new(app.clone())));
     reg.register(Arc::new(research::GetCompanyEventsTool::new(app.clone())));
     // 资讯
     reg.register(Arc::new(news::SearchNewsTool::new(app.clone())));
     // 账户读
     reg.register(Arc::new(account::GetAccountTool::new(app.clone())));
     reg.register(Arc::new(positions::GetPositionTool::new(app.clone())));
-    // 账户写——chat 中 agent mid-loop 直接下单
+    reg.register(Arc::new(positions::AddToWatchlistTool::new(app.clone())));
+    // 账户写——v4 合并 Expectation 后 4 个写工具：open / close / scale / adjust
     reg.register(Arc::new(account::OpenPositionTool::new(app.clone())));
     reg.register(Arc::new(account::ClosePositionTool::new(app.clone())));
     reg.register(Arc::new(account::ScalePositionTool::new(app.clone())));
-    reg.register(Arc::new(account::AdjustStopsTool::new(app.clone())));
-    // Expectation 写（v3 核心实体——取代旧 thesis / principle 写工具）
-    reg.register(Arc::new(expectations::CreateExpectationTool::new(app.clone())));
-    reg.register(Arc::new(expectations::UpdateExpectationTool::new(app.clone())));
-    reg.register(Arc::new(expectations::CancelExpectationTool::new(app.clone())));
-    // 视觉——LLM 看 K 线图 → 形态识别 → 落 SignalDetection
+    reg.register(Arc::new(account::AdjustPositionTool::new(app.clone())));
+    // 视觉
     reg.register(Arc::new(visual::AnalyzeChartTool::new(app.clone())));
     reg.register(Arc::new(visual::ProposeVisualPatternTool::new(app.clone())));
-    // Sub agent 派遣——researcher 调研 / bear_advocate 反方
+    // Sub agent 派遣
     reg.register(Arc::new(delegate::DelegateTool::new(app.clone())));
-    // Context 自管——主动压缩历史释放 token
+    // Context 自管
     reg.register(Arc::new(compact::CompactNowTool::new(app.clone())));
     reg
 }

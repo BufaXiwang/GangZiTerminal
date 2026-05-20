@@ -16,7 +16,5 @@ pub use board::{classify as classify_board, Board};
 pub use ids::{IdError, StockCode, TsCode};
 pub use money::{KYuan, MoneyError, Yuan};
 pub use shares::{Lots, Shares, SharesError};
-pub use signal::{
-    EventKind, NewsImportance, NewsKind, SignalDetection, SignalKind,
-};
+pub use signal::{EventKind, SignalDetection, SignalKind};
 pub use time::{OccurredAt, TimeError, TradeDate};

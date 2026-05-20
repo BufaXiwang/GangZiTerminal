@@ -8,9 +8,10 @@
 
 use crate::domain::account::errors::AccountError;
 use crate::domain::account::types::{
-    CloseReason, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
-    PositionSignalKind, PositionStatus,
+    CloseReason, Direction, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
+    PositionKind, PositionSignalKind, PositionStatus,
 };
+use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{OccurredAt, Shares, StockCode, Yuan};
 use crate::infrastructure::db::{
     json_string, list_json_payloads, migrate, now, open_database, required_json_string,
@@ -26,41 +27,29 @@ struct DbPosition {
     id: String,
     code: String,
     name: String,
-    entry_price: f64,
-    shares: i64,
+    #[serde(default)]
+    kind: Option<String>,
+    avg_entry_price: f64,
+    current_shares: i64,
     entry_at: String,
     exit_price: Option<f64>,
     exit_at: Option<String>,
     close_reason: Option<String>,
-    thesis: String,
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
     #[serde(default)]
     time_stop_at: Option<String>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    invalidation_signals: Vec<SignalKind>,
+    #[serde(default)]
+    signals_used: Vec<SignalKind>,
+    #[serde(default)]
+    reasoning: String,
     source_analysis_id: String,
     status: String,
-    #[serde(default)]
-    original_shares: Option<i64>,
-    #[serde(default)]
-    current_shares: Option<i64>,
-    #[serde(default)]
-    avg_entry_price: Option<f64>,
-    /// 最近一次买入时间——T+1 判定基准。老数据缺这个字段时回退到 `entry_at`。
-    #[serde(default)]
-    last_acquisition_at: Option<String>,
-    /// 关联的 Thesis aggregate id（v2 新增）。
-    #[serde(default)]
-    expectation_id: Option<String>,
-}
-
-impl DbPosition {
-    fn current_shares(&self) -> i64 {
-        self.current_shares.unwrap_or(self.shares)
-    }
-
-    fn avg_entry_price(&self) -> f64 {
-        self.avg_entry_price.unwrap_or(self.entry_price)
-    }
+    last_acquisition_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,25 +175,18 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
     let code = StockCode::new(&row.code)
         .map_err(|e| AccountError::Io(format!("非法 code {}: {e}", row.code)))?;
 
-    let avg_value = row.avg_entry_price();
-    let avg_entry_price =
-        Yuan::new(avg_value).map_err(|e| AccountError::Io(format!("非法均价 {avg_value}: {e}")))?;
+    let avg_entry_price = Yuan::new(row.avg_entry_price)
+        .map_err(|e| AccountError::Io(format!("非法均价 {}: {e}", row.avg_entry_price)))?;
 
-    // current_shares 不强校验整百——DB 里可能有历史违规值
-    let current_shares = Shares::from_unchecked(row.current_shares());
-
+    let current_shares = Shares::from_unchecked(row.current_shares);
     let entered_at = parse_rfc3339(&row.entry_at);
-    // 老 schema 没 last_acquisition_at——回退到 entered_at（首次开仓即首次买入）
-    let last_acquisition_at = row
-        .last_acquisition_at
-        .as_deref()
-        .map(parse_rfc3339)
-        .unwrap_or(entered_at);
+    let last_acquisition_at = parse_rfc3339(&row.last_acquisition_at);
 
     let status = match row.status.as_str() {
         "open" => PositionStatus::Open,
         "closed" => {
-            let exit_price = Yuan::new(row.exit_price.unwrap_or(avg_value))
+            let exit_value = row.exit_price.unwrap_or(row.avg_entry_price);
+            let exit_price = Yuan::new(exit_value)
                 .map_err(|e| AccountError::Io(format!("非法 exit_price: {e}")))?;
             let exit_at = row
                 .exit_at
@@ -223,20 +205,32 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
         }
     };
 
+    let kind = row
+        .kind
+        .as_deref()
+        .and_then(PositionKind::parse)
+        .unwrap_or(PositionKind::Live);
+    let direction = row
+        .direction
+        .as_deref()
+        .and_then(Direction::parse)
+        .unwrap_or(Direction::Up);
+
     Ok(Position {
         id: PositionId::from_string(row.id),
         code,
         name: row.name,
+        kind,
         avg_entry_price,
         current_shares,
         status,
         stop_loss: row.stop_loss.and_then(|v| Yuan::new(v).ok()),
         take_profit: row.take_profit.and_then(|v| Yuan::new(v).ok()),
         time_stop_at: row.time_stop_at.as_deref().map(parse_rfc3339),
-        thesis: row.thesis,
-        expectation_id: row
-            .expectation_id
-            .map(crate::domain::account::expectation::ExpectationId::from_string),
+        direction,
+        invalidation_signals: row.invalidation_signals,
+        signals_used: row.signals_used,
+        reasoning: row.reasoning,
         source_analysis_id: row.source_analysis_id,
         entered_at,
         last_acquisition_at,
@@ -262,24 +256,23 @@ fn domain_to_db_position(p: &Position) -> DbPosition {
         id: p.id.as_str().to_string(),
         code: p.code.as_str().to_string(),
         name: p.name.clone(),
-        entry_price: p.avg_entry_price.value(),
-        shares: p.current_shares.value(),
+        kind: Some(p.kind.as_str().to_string()),
+        avg_entry_price: p.avg_entry_price.value(),
+        current_shares: p.current_shares.value(),
         entry_at: occurred_at_to_rfc3339(p.entered_at),
         exit_price,
         exit_at,
         close_reason,
-        thesis: p.thesis.clone(),
         stop_loss: p.stop_loss.map(|y| y.value()),
         take_profit: p.take_profit.map(|y| y.value()),
         time_stop_at: p.time_stop_at.map(occurred_at_to_rfc3339),
+        direction: Some(p.direction.as_str().to_string()),
+        invalidation_signals: p.invalidation_signals.clone(),
+        signals_used: p.signals_used.clone(),
+        reasoning: p.reasoning.clone(),
         source_analysis_id: p.source_analysis_id.clone(),
         status: status_str,
-        // original_shares 暂存当前股数；要"真正首次股数"需查事件链
-        original_shares: Some(p.current_shares.value()),
-        current_shares: Some(p.current_shares.value()),
-        avg_entry_price: Some(p.avg_entry_price.value()),
-        last_acquisition_at: Some(occurred_at_to_rfc3339(p.last_acquisition_at)),
-        expectation_id: p.expectation_id.as_ref().map(|t| t.as_str().to_string()),
+        last_acquisition_at: occurred_at_to_rfc3339(p.last_acquisition_at),
     }
 }
 
@@ -550,14 +543,17 @@ mod tests {
             id: PositionId::from_string("p1".into()),
             code: StockCode::new("600519").unwrap(),
             name: "贵州茅台".into(),
+            kind: PositionKind::Live,
             avg_entry_price: Yuan::new(1789.5).unwrap(),
             current_shares: Shares::new(100).unwrap(),
             status: PositionStatus::Open,
             stop_loss: Some(Yuan::new(1700.0).unwrap()),
             take_profit: Some(Yuan::new(1900.0).unwrap()),
             time_stop_at: None,
-            thesis: "技术面突破".into(),
-            expectation_id: None,
+            direction: Direction::Up,
+            invalidation_signals: vec![],
+            signals_used: vec![],
+            reasoning: "技术面突破".into(),
             source_analysis_id: "a1".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
             last_acquisition_at: OccurredAt::new(1_700_000_000_000),
@@ -759,18 +755,17 @@ fn replace_simulated_positions_tx(
         let status = required_json_string(&position, "/status", "模拟持仓缺少 status")?;
         let created_at = json_string(&position, "/entryAt").unwrap_or_else(|| now.clone());
         let updated_at = json_string(&position, "/exitAt").unwrap_or_else(|| now.clone());
-        // expectation_id 是行级列（v2 重构）——位置的"为什么"关联到 Thesis 聚合根
-        let expectation_id = json_string(&position, "/thesisId");
+        let kind = json_string(&position, "/kind").unwrap_or_else(|| "live".to_string());
         tx.execute(
             "insert into simulated_positions
-                (id, code, source_analysis_id, status, expectation_id, payload_json, created_at, updated_at)
+                (id, code, source_analysis_id, status, kind, payload_json, created_at, updated_at)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 code,
                 source_analysis_id,
                 status,
-                expectation_id,
+                kind,
                 position.to_string(),
                 created_at,
                 updated_at

@@ -10,7 +10,6 @@
 //!
 //! 依赖单向：account → quotes（valuation 读 MARKET_SNAPSHOT），spec § 1.3 允许。
 
-pub mod expectation_repo;
 pub mod metrics;
 pub mod repository;
 pub mod snapshot_cache;

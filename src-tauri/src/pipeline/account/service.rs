@@ -17,6 +17,7 @@
 
 use crate::domain::account::cash::reduce_events_to_cash_delta;
 use crate::domain::account::errors::{AccountError, RuleError};
+use crate::domain::account::position::{Direction, PositionKind};
 use crate::domain::account::types::{
     AccountSnapshot, CloseReason, EventSource, Position, PositionId,
 };
@@ -24,6 +25,7 @@ use crate::domain::account::{
     Account, AdjustStopsCommand, ClosePositionCommand, OpenPositionCommand, ScalePositionCommand,
     TradeQuote,
 };
+use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::StockQuote;
 use crate::domain::shared::{Lots, OccurredAt, Shares, Yuan};
 use crate::infrastructure::account::{
@@ -44,9 +46,12 @@ pub struct OpenRequest {
     pub shares: Shares,
     /// 留空则用 quote.name
     pub name: String,
-    pub thesis: String,
-    /// 关联 Thesis aggregate id（v2 新增）；agent 主动建仓必须设。
-    pub expectation_id: Option<crate::domain::account::expectation::ExpectationId>,
+    /// Live = 真持仓；Watch = "看好但不买"
+    pub kind: PositionKind,
+    pub direction: Direction,
+    pub reasoning: String,
+    pub signals_used: Vec<SignalKind>,
+    pub invalidation_signals: Vec<SignalKind>,
     pub stop_loss: Option<Yuan>,
     pub take_profit: Option<Yuan>,
     /// 留空则自动算 entered_at + 7 日历日
@@ -112,8 +117,11 @@ impl AccountService {
             code: req.code,
             shares: req.shares,
             name: req.name,
-            thesis: req.thesis,
-            expectation_id: req.expectation_id,
+            kind: req.kind,
+            direction: req.direction,
+            reasoning: req.reasoning,
+            signals_used: req.signals_used,
+            invalidation_signals: req.invalidation_signals,
             stop_loss: req.stop_loss,
             take_profit: req.take_profit,
             time_stop_at: req.time_stop_at,
@@ -152,10 +160,19 @@ impl AccountService {
             .find(|p| p.id == *position_id)
             .cloned()
             .ok_or_else(|| RuleError::PositionNotFound(position_id.as_str().to_string()))?;
-        let quote = self.fetch_quote(target.code.as_str()).await?;
-        let exit_price = quote_price_yuan(&quote, target.code.as_str())?;
+
+        let is_watch = matches!(target.kind, PositionKind::Watch);
+        // Watch 拿不到 quote 也能 close（无 PnL 影响）
+        let (exit_price, bid_top) = match self.fetch_quote(target.code.as_str()).await {
+            Ok(q) => {
+                let price =
+                    quote_price_yuan(&q, target.code.as_str()).unwrap_or(target.avg_entry_price);
+                (price, bid_top_volume(&q))
+            }
+            Err(_) if is_watch => (target.avg_entry_price, None),
+            Err(e) => return Err(e),
+        };
         let mut account = Account::new(positions);
-        let bid_top = bid_top_volume(&quote);
         let mutation = account.close_position(ClosePositionCommand {
             position_id: position_id.clone(),
             exit_price,
@@ -163,7 +180,7 @@ impl AccountService {
             reason,
             source,
             agent_note_md,
-            unchecked: false,
+            unchecked: is_watch, // Watch 跳过 T+1 / 盘口 / 交易时段（domain 层也判过，这里加保险）
         })?;
         self.repo
             .commit_event_and_positions(&mutation.event, &mutation.positions)?;

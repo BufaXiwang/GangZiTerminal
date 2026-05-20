@@ -11,10 +11,10 @@
 //! LLM tool registry 属于外部协议适配边界，放在 `adapters::agent_tools`，避免
 //! infrastructure 反向依赖 pipeline / adapters。
 
-pub mod expectation_heuristic_link_repo;
 pub mod health_metrics;
 pub mod heuristic_repo;
 pub mod lesson_repo;
+pub mod position_heuristic_link_repo;
 pub mod provider;
 pub mod repository;
 pub mod seed_heuristics;

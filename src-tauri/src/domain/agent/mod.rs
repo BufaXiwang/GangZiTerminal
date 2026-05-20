@@ -3,7 +3,7 @@
 //! Domain `agent`——Agent 决策子域。
 //!
 //! v3 设计（见 docs/design/agent-v3-expectation-driven.md）核心实体：
-//! - `signal`：SignalKind 24 枚举 + NewsKind / NewsImportance / EventKind / SignalDetection
+//! - `signal`：SignalKind 24 枚举 + EventKind / SignalDetection
 //! - `strategy`：Strategy DSL（trigger_when + target_rule + track record）
 //! - `lesson`：每个 expectation 终态自动生成的原子观察
 //! - `types`：Block / Message / AgentEvent / AgentRequest 等 wire canonical 形态
@@ -25,13 +25,11 @@ pub use heuristic::{
     HEURISTIC_BODY_MAX_CHARS,
 };
 pub use lesson::{Lesson, LessonId, LessonOutcome};
-// SignalKind / NewsKind / NewsImportance / EventKind 等迁到 domain/shared::signal
+// SignalKind / EventKind 等迁到 domain/shared::signal
 // （三个 BC 都引用——shared vocabulary）。从这里 re-export 让旧 use 路径仍可工作。
-pub use crate::domain::shared::{
-    EventKind, NewsImportance, NewsKind, SignalDetection, SignalKind,
-};
+pub use crate::domain::shared::{EventKind, SignalDetection, SignalKind};
 pub use strategy::{
-    ConvictionRule, SignalCondition, Strategy, StrategyEvent, StrategyEventRecord, StrategyId,
-    TargetRule, TriggerLogic,
+    SignalCondition, Strategy, StrategyEvent, StrategyEventRecord, StrategyId, TargetRule,
+    TriggerLogic,
 };
 pub use types::ProviderKind;

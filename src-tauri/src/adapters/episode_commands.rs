@@ -17,7 +17,7 @@ struct EpisodeDto {
     local_tool_calls: u32,
     stop_reason: Option<String>,
     error: Option<String>,
-    thesis_ids: Vec<String>,
+    position_ids: Vec<String>,
     outcome_summary: Option<String>,
     parent_episode_id: Option<String>,
 }
@@ -34,15 +34,15 @@ pub async fn list_agent_episodes(
         .prepare(
             "select run_id, trigger_kind, trigger_ref, started_at, ended_at,
                     turns, local_tool_calls, stop_reason, error,
-                    thesis_ids, outcome_summary, parent_episode_id
+                    position_ids, outcome_summary, parent_episode_id
              from agent_episodes
              order by started_at desc limit ?1",
         )
         .map_err(|err| format!("准备查询失败：{err}"))?;
     let rows: Vec<EpisodeDto> = stmt
         .query_map(rusqlite::params![limit], |row| {
-            let thesis_ids_json: Option<String> = row.get(9)?;
-            let thesis_ids: Vec<String> = thesis_ids_json
+            let position_ids_json: Option<String> = row.get(9)?;
+            let pos_ids: Vec<String> = position_ids_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
@@ -56,7 +56,7 @@ pub async fn list_agent_episodes(
                 local_tool_calls: row.get(6)?,
                 stop_reason: row.get(7)?,
                 error: row.get(8)?,
-                thesis_ids,
+                position_ids: pos_ids,
                 outcome_summary: row.get(10)?,
                 parent_episode_id: row.get(11)?,
             })

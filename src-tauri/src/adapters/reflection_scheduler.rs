@@ -48,7 +48,7 @@ async fn close_reflection_loop(app: AppHandle) {
                     Ok(res) => {
                         tracing::info!(
                             run_id = %res.run_id,
-                            thesis_count = res.thesis_count,
+                            positions_reviewed = res.positions_reviewed,
                             outcome_len = res.outcome_summary.chars().count(),
                             "Close reflection 完成"
                         );

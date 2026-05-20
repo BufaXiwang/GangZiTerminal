@@ -5,9 +5,9 @@
 //! 触发：scheduler 每交易日 15:30 调一次 / Settings 立即触发按钮调一次。
 //!
 //! 流程：
-//! 1. `expectation_review::run` 自动判定所有 pending expectations 的 hit/miss/expired
+//! 1. `pipeline::account::auto_review::run` 自动判定所有 open positions
 //!    + 写 lessons（observation 由代码生成，takeaway 留空）+ heuristics application_count 累加
-//!    + missed → 自动平仓关联 position
+//!    + 触发条件命中 → 自动平仓
 //! 2. `heuristic_emerge::run` 尝试从最近 lessons emerge 新 heuristics
 //! 3. **Phase 2 LLM takeaway 填充**——若 provider 可用，对当天新生成且 takeaway 为空
 //!    的 lessons 调一轮 LLM 批量给出 takeaway（一句话，可反复应用的判断）
@@ -19,10 +19,11 @@ use crate::domain::agent::types::{
     StopReason, SystemBlock,
 };
 use crate::infrastructure::agent::lesson_repo;
+use crate::pipeline::agent::auto_review;
 use crate::pipeline::agent::config::{build_provider_for_channel, read_agent_config};
 use crate::pipeline::agent::loop_::run_agent;
 use crate::pipeline::agent::tools::{ToolContext, ToolRegistry};
-use crate::pipeline::agent::{expectation_review, heuristic_emerge, observer};
+use crate::pipeline::agent::{heuristic_emerge, observer};
 use serde_json::Value;
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -32,7 +33,7 @@ use tokio::sync::mpsc;
 pub struct ReflectionResult {
     pub run_id: String,
     pub outcome_summary: String,
-    pub thesis_count: usize, // 保留字段名兼容旧前端；语义改为 expectations_reviewed
+    pub positions_reviewed: usize,
 }
 
 /// 触发一次收盘复盘——可由 scheduler 15:30 tick / Settings 立即按钮调。
@@ -54,8 +55,8 @@ pub async fn run_close_reflection(
         None,
     );
 
-    // 1. 自动 review pending expectations（missed 自动平仓事件源带本次 episode_id）
-    let review = expectation_review::run(&app, Some(run_id.clone())).await?;
+    // 1. 自动 review open positions（命中触发条件 → 自动平仓 + 写 lesson + 反向打标 heuristic）
+    let review = auto_review::run(&app, Some(run_id.clone())).await?;
 
     // 2. 尝试 emerge 新 heuristic
     let emerge = heuristic_emerge::run(&app)?;
@@ -109,7 +110,7 @@ pub async fn run_close_reflection(
     Ok(ReflectionResult {
         run_id,
         outcome_summary: outcome,
-        thesis_count: review.examined,
+        positions_reviewed: review.examined,
     })
 }
 

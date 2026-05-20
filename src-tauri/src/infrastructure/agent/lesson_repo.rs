@@ -1,9 +1,9 @@
-//! Lesson 持久化——每个 expectation 终态自动生成。
+//! Lesson 持久化——每个 Position close 自动生成。
 
-use crate::domain::account::expectation::ExpectationId;
+use crate::domain::account::position::PositionId;
 use crate::domain::agent::lesson::{Lesson, LessonId, LessonOutcome};
-use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::regime::Regime;
+use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{OccurredAt, StockCode};
 use crate::infrastructure::db::{migrate, open_database};
 use rusqlite::{params, OptionalExtension};
@@ -18,12 +18,12 @@ pub fn create(app: &AppHandle, l: &Lesson) -> Result<(), String> {
         .map_err(|err| format!("序列化 signals_in_play 失败：{err}"))?;
     conn.execute(
         "insert into lessons
-            (id, expectation_id, code, observation, takeaway, outcome,
+            (id, position_id, code, observation, takeaway, outcome,
              regime_at_close, signals_in_play, pnl_pct, created_at)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             l.id.as_str(),
-            l.expectation_id.as_str(),
+            l.position_id.as_str(),
             l.code.as_str(),
             l.observation,
             l.takeaway,
@@ -44,7 +44,7 @@ pub fn list_recent_with_empty_takeaway(
     app: &AppHandle,
     limit: i64,
 ) -> Result<Vec<Lesson>, String> {
-    let all = list_recent(app, limit * 3)?; // 拉多点过滤
+    let all = list_recent(app, limit * 3)?;
     Ok(all
         .into_iter()
         .filter(|l| l.takeaway.trim().is_empty())
@@ -80,7 +80,7 @@ pub fn list_recent(app: &AppHandle, limit: i64) -> Result<Vec<Lesson>, String> {
     migrate(&conn)?;
     let mut stmt = conn
         .prepare(
-            "select id, expectation_id, code, observation, takeaway, outcome,
+            "select id, position_id, code, observation, takeaway, outcome,
                     regime_at_close, signals_in_play, pnl_pct, created_at
              from lessons order by created_at desc limit ?1",
         )
@@ -93,19 +93,19 @@ pub fn list_recent(app: &AppHandle, limit: i64) -> Result<Vec<Lesson>, String> {
     rows.into_iter().collect::<Result<Vec<_>, _>>()
 }
 
-pub fn list_for_expectation(
+pub fn list_for_position(
     app: &AppHandle,
-    id: &ExpectationId,
+    id: &PositionId,
 ) -> Result<Vec<Lesson>, String> {
     let conn = open_database(app)?;
     migrate(&conn)?;
     let mut stmt = conn
         .prepare(
-            "select id, expectation_id, code, observation, takeaway, outcome,
+            "select id, position_id, code, observation, takeaway, outcome,
                     regime_at_close, signals_in_play, pnl_pct, created_at
-             from lessons where expectation_id = ?1 order by created_at",
+             from lessons where position_id = ?1 order by created_at",
         )
-        .map_err(|err| format!("准备 list_for_expectation 失败：{err}"))?;
+        .map_err(|err| format!("准备 list_for_position 失败：{err}"))?;
     let rows = stmt
         .query_map(params![id.as_str()], row_to_lesson)
         .map_err(|err| format!("query 失败：{err}"))?
@@ -119,7 +119,7 @@ pub fn get(app: &AppHandle, id: &LessonId) -> Result<Option<Lesson>, String> {
     migrate(&conn)?;
     let row = conn
         .query_row(
-            "select id, expectation_id, code, observation, takeaway, outcome,
+            "select id, position_id, code, observation, takeaway, outcome,
                     regime_at_close, signals_in_play, pnl_pct, created_at
              from lessons where id = ?1",
             params![id.as_str()],
@@ -132,7 +132,7 @@ pub fn get(app: &AppHandle, id: &LessonId) -> Result<Option<Lesson>, String> {
 
 fn row_to_lesson(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Lesson, String>> {
     let id: String = row.get(0)?;
-    let expectation_id: String = row.get(1)?;
+    let position_id: String = row.get(1)?;
     let code: String = row.get(2)?;
     let observation: String = row.get(3)?;
     let takeaway: String = row.get(4)?;
@@ -146,7 +146,7 @@ fn row_to_lesson(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Lesson, Str
             .map_err(|err| format!("反序列化 signals_in_play 失败：{err}"))?;
         Ok(Lesson {
             id: LessonId::from_string(id),
-            expectation_id: ExpectationId::from_string(expectation_id),
+            position_id: PositionId::from_string(position_id),
             code: StockCode::new(&code).map_err(|e| format!("非法 code {code}: {e:?}"))?,
             observation,
             takeaway,

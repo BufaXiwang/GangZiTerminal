@@ -1,12 +1,10 @@
-//! Strategy DSL——用户 + agent 共建的"什么时候建 Expectation"规则集。
-//!
-//! 见 docs/design/agent-v3-expectation-driven.md § 4。
+//! Strategy DSL——用户 + agent 共建的"什么时候建 Position"规则集。
 //!
 //! 每个 Strategy 是一组 trigger_when 条件 + target 推导规则。当 watchlist
 //! 上的某只股票满足 Strategy.trigger_when 时，scan 阶段调 LLM 决定是否真的建仓。
 //! Strategy 自带 applied_count / hit_count / miss_count 用于反向打分 strategy 本身。
 
-use crate::domain::account::expectation::Direction;
+use crate::domain::account::position::Direction;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::OccurredAt;
 use serde::{Deserialize, Serialize};
@@ -74,25 +72,6 @@ pub struct TargetRule {
     pub horizon_days: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConvictionRule {
-    /// 触发以下任一附加 signal 时升级到 high
-    pub high_if: Vec<SignalKind>,
-    /// 兜底 conviction（默认 Medium）
-    #[serde(default)]
-    pub medium_default: bool,
-}
-
-impl Default for ConvictionRule {
-    fn default() -> Self {
-        Self {
-            high_if: Vec::new(),
-            medium_default: true,
-        }
-    }
-}
-
 // ====== Strategy Aggregate ==============================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,12 +85,10 @@ pub struct Strategy {
     #[serde(default)]
     pub trigger_logic: TriggerLogic,
     pub target: TargetRule,
-    #[serde(default)]
-    pub conviction_rule: ConvictionRule,
     pub enabled: bool,
     /// 该 strategy 累计触发次数（每次 trigger_when 命中并 LLM 决定建仓）
     pub applied_count: u32,
-    /// 该 strategy 触发后形成的 expectation 命中数 / 错过数
+    /// 该 strategy 触发后形成的 position 命中数 / 错过数
     pub hit_count: u32,
     pub miss_count: u32,
     pub created_at: OccurredAt,
@@ -165,7 +142,6 @@ impl Strategy {
             trigger_when,
             trigger_logic: TriggerLogic::And,
             target,
-            conviction_rule: ConvictionRule::default(),
             enabled: true,
             applied_count: 0,
             hit_count: 0,

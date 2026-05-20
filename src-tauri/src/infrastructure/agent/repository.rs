@@ -245,7 +245,7 @@ pub fn finalize_agent_episode(
     server_tool_calls: u32,
     stop_reason: Option<&str>,
     error: Option<&str>,
-    thesis_ids: Option<&str>,
+    position_ids: Option<&str>,
     outcome_summary: Option<&str>,
 ) -> Result<(), String> {
     let connection = open_database(app)?;
@@ -263,7 +263,7 @@ pub fn finalize_agent_episode(
                 server_tool_calls = ?9,
                 stop_reason = ?10,
                 error = ?11,
-                thesis_ids = ?12,
+                position_ids = ?12,
                 outcome_summary = ?13
              where run_id = ?1",
             params![
@@ -278,7 +278,7 @@ pub fn finalize_agent_episode(
                 server_tool_calls,
                 stop_reason,
                 error,
-                thesis_ids,
+                position_ids,
                 outcome_summary,
             ],
         )

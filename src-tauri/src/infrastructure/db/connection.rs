@@ -6,7 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// SQLite 初始化的返回值——给前端 hydrate path + schema 版本号。
 #[derive(Debug, Serialize)]
@@ -40,6 +40,11 @@ pub fn open_database(app: &AppHandle) -> Result<Connection, String> {
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("启用外键失败：{err}"))?;
+    // busy_timeout：WAL 模式下并发写仍互斥。news batch_loop / watchdog / refresh tick
+    // 可能短时间同时拿写锁——给 5s 等待窗口让后到的写自动重试，避免 SQLITE_BUSY 跳轮。
+    connection
+        .busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|err| format!("设置 busy_timeout 失败：{err}"))?;
     Ok(connection)
 }
 

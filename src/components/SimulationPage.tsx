@@ -486,7 +486,7 @@ function OpenPositionCard({
           })()}
         </div>
       ) : null}
-      {position.thesis && <p>{position.thesis}</p>}
+      {position.reasoning && <p>{position.reasoning}</p>}
       <small>建仓时间：{formatDate(position.enteredAt)}</small>
     </article>
   );

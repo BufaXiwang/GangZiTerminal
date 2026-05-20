@@ -2,7 +2,7 @@
 
 > **本文档是权威设计基线**。所有模块、数据流、依赖方向都以这里为准。代码与此不符的，是代码该改。
 >
-> 历史版本见 git log；本次（2026-05-18）同步当前 DDD-lite 落地状态：`domain / infrastructure / pipeline / adapters` 四层、chat-only agent、typed Account/News、删除旧简报/复盘结果模型。
+> 历史版本见 git log。当前架构：`domain / infrastructure / pipeline / adapters` 四层、chat-only agent、typed Account/News、Position 一肩挑「执行 + 假设」（合并 Expectation 后）。
 
 ---
 
@@ -34,14 +34,14 @@ Agent 看到符合自己框架的机会 → **直接调 SimAccount 写工具下�
 | 行情（实时） | **TDX**（主，SH/SZ）+ EM（BJ + 故障兜底）+ 腾讯 / 新浪（极端兜底） | `MARKET_SNAPSHOT` in-memory，旁路盘中 15s / 盘外 60s |
 | 行情（历史 K） | TuShare（日/周/月）+ EM（分钟 + 分时） | `kline_cache` SQLite TTL |
 | 持仓事件 | `position_events`（append-only） | — |
-| 持仓状态 | `simulated_positions`（快照） | 可从 events 重算 |
+| 持仓状态 | `simulated_positions`（含 kind / direction / take_profit / stop_loss / invalidation_signals / signals_used / reasoning 等字段） | 可从 events 重算 |
 | 现金余额 | events walk 派生 | **不存** |
 | PnL / 总资产 | 快照时算 | **不存** |
-| 投资预期 | `expectations` + `expectation_events` 表 | append-only event log → snapshot |
 | 启发式规则 | `heuristics` 表（含 hit/miss/origin） | confidence 现算（hit/(hit+miss)） |
 | 策略 | `strategies` 表（trigger_when + target JSON） | 用户 + agent 共建 |
-| Lesson | `lessons` 表 | 每个 Expectation 终态自动生成 |
-| 完整 v3 spec | [agent-v3-expectation-driven.md](design/agent-v3-expectation-driven.md) | **权威** |
+| Position↔Heuristic 归因 | `position_heuristic_links` | open_position 时声明，close 时反向计 hit/miss |
+| Lesson | `lessons` 表（外键 position_id） | 每个 Position close 自动生成 |
+| 学习闭环 spec | [docs/design/learning-loop.md](design/learning-loop.md) | **权威** |
 
 ### 1.3 模块边界硬约束（依赖单向）
 
@@ -349,13 +349,21 @@ pub fn compute_indicators(klines: &[KlinePoint], cfg: IndicatorConfig) -> Indica
 
 ### 2.2 SimAccount — 模拟账户 source of truth
 
-**责任**：模拟交易 + A 股规则校验 + 持仓事件链 + 自选股管理 + 账户 snapshot 维护。
+**责任**：模拟交易 + A 股规则校验 + 持仓事件链 + 自选股管理 + 账户 snapshot 维护 + 投资假设（合并自 Expectation 聚合）。
+
+**Position 一肩挑两件事**：
+- **执行**：shares / avg_cost / status / 现金影响 —— 传统持仓字段
+- **假设**：direction / take_profit / stop_loss / time_stop_at / invalidation_signals / signals_used / reasoning —— 触发条件 + 学习归因
+
+**PositionKind**：
+- `Live`：真持仓，shares > 0，扣现金，参与 PnL / valuation；走 T+1 / 涨跌停 / 盘口 / 交易时段规则
+- `Watch`：观察型（"看好但不下注"），shares = 0，不动现金，但走完整 judge → close → lesson 学习闭环；可盘外建仓
 
 ```rust
 // === 读（同步，从 snapshot 取）===
 pub fn get_snapshot() -> AccountSnapshot;
 pub fn get_position(id: &PositionId) -> Option<Position>;
-pub fn list_open_positions() -> Vec<Position>;
+pub fn list_open_positions() -> Vec<Position>;       // 含 Live + Watch
 pub fn list_closed_positions(limit: usize) -> Vec<Position>;
 pub fn list_events(id: &PositionId) -> Vec<PositionEvent>;
 pub fn cash_available() -> Money;
@@ -364,16 +372,32 @@ pub fn list_watchlist() -> Vec<StockCode>;
 // === 写（mutation——agent 工具调用入口）===
 pub async fn open_position(app: &AppHandle, req: OpenRequest, source: SourceTag) -> Result<Position, AccountError>;
 pub async fn close_position(app: &AppHandle, id: &PositionId, reason: CloseReason, source: SourceTag) -> Result<Position, AccountError>;
-pub async fn scale_position(app: &AppHandle, id: &PositionId, shares_delta: Shares, note: String, source: SourceTag) -> Result<Position, AccountError>;
+pub async fn scale_position(app: &AppHandle, id: &PositionId, shares_delta: Shares, note: String, source: SourceTag) -> Result<Position, AccountError>;  // 仅 Live
 pub async fn adjust_stops(app: &AppHandle, id: &PositionId, sl: Option<Money>, tp: Option<Money>, ts: Option<DateTime>, source: SourceTag) -> Result<Position, AccountError>;
 pub async fn add_watchlist(app: &AppHandle, code: StockCode) -> Result<(), AccountError>;
 pub async fn remove_watchlist(app: &AppHandle, code: &StockCode) -> Result<(), AccountError>;
 pub fn reset_account(app: &AppHandle) -> Result<usize, AccountError>;
 
-// === 维护（scheduler 调）===
-/// 自动止损止盈：读 Quotes snapshot → 检查 open positions 触发条件 → 自动平仓
-/// 由 SimAccount 自治；scheduler 周期性调度。
-pub async fn scan_and_trigger_stops(app: &AppHandle) -> Result<Vec<Position>, AccountError>;
+// OpenRequest（含合并后的假设字段）
+pub struct OpenRequest {
+    pub code: String,
+    pub shares: Shares,           // Watch 时强制 0
+    pub name: String,
+    pub kind: PositionKind,        // Live / Watch
+    pub direction: Direction,      // Up / Down
+    pub reasoning: String,         // 自然语言决策上下文（无字数限制）
+    pub signals_used: Vec<SignalKind>,         // 入场归因——close 时反向打标 heuristic
+    pub invalidation_signals: Vec<SignalKind>, // 失效条件——任一命中即提前 close(Invalidated)
+    pub stop_loss: Option<Yuan>,
+    pub take_profit: Option<Yuan>,
+    pub time_stop_at: Option<OccurredAt>,
+    // ...
+}
+
+// === 维护（scheduler 调；逻辑在 pipeline/agent/auto_review.rs）===
+/// 自动平仓：读 Quotes snapshot → judge_position 命中触发条件 → 自动 close
+/// + 写 Lesson + 反向打标 heuristic（消费 position_heuristic_links）
+pub async fn run_auto_review(app: &AppHandle, episode_id: Option<String>) -> Result<ReviewResult, String>;
 
 /// Account snapshot 重算——在 events 变化 / Quotes snapshot 更新时调
 pub fn rebuild_snapshot(app: &AppHandle) -> Result<(), AccountError>;
@@ -425,39 +449,40 @@ pub fn recover_stale_processing(app: &AppHandle) -> Result<usize, NewsError>;
 
 **责任**：当前只有 chat pipeline 会触发 LLM run；通过 tool registry 调 Quotes / SimAccount / News；产出答复、交易动作、memory 更新；事件流通知 Chat UI。
 
-**Pipeline 现状（v3 expectation-driven）**：
+**Pipeline 现状**：
 
 | Pipeline | 触发 | Source 输入（优先读 snapshot） | 动作 |
 |---|---|---|---|
-| `chat` | user message / 用户指令 | Quotes + Account snapshot + News + 对话历史 + active Heuristics (by regime, top-N) + pending Expectations | 答复 + 可能的开/平/调仓 / create_expectation / propose_heuristic |
-| `scan_tick` | 9-tick scheduler（09:15/09:40/10:10/10:40/11:10/13:10/13:40/14:10/15:30 Asia/Shanghai） | 全市场 + 自选 universe + news high-importance event | 两阶段：规则 signal_detector 扫（0 LLM）→ 命中 strategy 时触发 mini-scan LLM run 产 Expectation |
-| `expectation_review` | 每 tick + 15:30 close | pending Expectations + 当前 quote/regime | 推进 Expectation state（pending→hit/missed/expired）+ 生成 Lesson + 更新 Heuristic.hit/miss |
-| `news_mini_scan` | news High importance 事件 | 受影响 tickers + 关联 Expectation | 立即跑 LLM 评估是否需调整 / 平仓 |
+| `chat` | user message / 用户指令 | Quotes + Account snapshot + News + 对话历史 + active Heuristics (by regime, top-N) + open Positions | 答复 + 可能的 open / close / adjust / scale |
+| `scan_tick` | 9-tick scheduler（09:15/09:40/10:10/10:40/11:10/13:10/13:40/14:10/15:30 Asia/Shanghai） | 全市场 + 自选 universe + news high-importance event | 两阶段：规则 signal_detector 扫（0 LLM）→ 命中 strategy 时触发 mini-scan LLM run 产 Position |
+| `auto_review` | 每 tick + 15:30 close | open Positions + 当前 quote + signal_detections | judge_position 命中触发条件 → 自动 `close_position` + 写 Lesson + 反向打标 Heuristic |
+| `news_mini_scan` | news High importance 事件 | 受影响 tickers + 关联 open Position | 立即跑 LLM 评估是否需调整 / 平仓 |
 | `refresh` | scheduler | 由 Quotes / Account / News 各自调度，不在 Agent 层 | 维护 snapshot / cache / DB |
 
-**Agent 工具集**（v3）：
+**Agent 工具集**：
 
 | 类别 | 工具 | snapshot vs fetch |
 |---|---|---|
 | 行情快照（同步） | `get_quote` / `get_market_overview` / `get_indicators` / `get_kline` | snapshot |
 | 研究查询（async） | `scan_market` / `get_top_list` / `get_moneyflow` / `get_concept_performance` / `get_company_events` | 一次性 fetch |
 | 账户读 | `get_account` / `get_position` | snapshot |
-| 账户写 | `open_position`（必填 expectation_id） / `close_position` / `scale_position` / `adjust_stops` | mutation |
+| 账户写 | `open_position`（含 kind/direction/take_profit/stop_loss/invalidation_signals/signals_used/reasoning 全部假设字段） / `close_position` / `scale_position` / `adjust_position` | mutation |
 | 资讯 | `search_news` | typed repository 读 DB |
-| Expectation 写 | `create_expectation` / `update_expectation_state` / `cancel_expectation` / `attach_expectation_feedback` | mutation |
 | Strategy 写 | `create_strategy` / `enable_strategy` / `disable_strategy` | mutation |
 | Heuristic 写 | `propose_heuristic` / `apply_heuristic` / `retire_heuristic` | mutation |
 | 视觉 | `analyze_chart` / `propose_visual_pattern` | render → LLM vision → SignalKind |
+| Sub agent | `delegate`（researcher / bear_advocate） | LLM-in-LLM |
+| Context 自管 | `compact_now` | 主动压缩历史释放 token |
 
-完整 spec 见 [docs/design/agent-v3-expectation-driven.md](design/agent-v3-expectation-driven.md)。
+学习闭环 spec 见 [docs/design/learning-loop.md](design/learning-loop.md)。
 
-**Agent 触发模型**（v3）：
+**Agent 触发模型**：
 
 | Trigger | 时机 | 行为 |
 |---|---|---|
-| `chat` / `user_message` | 用户在 chat 发消息 | 全功能 agent run（可创建 expectation / 修订 heuristic） |
+| `chat` / `user_message` | 用户在 chat 发消息 | 全功能 agent run（可开仓 / 修订 heuristic） |
 | `scan_tick` | 9 tick / 日 | 规则信号扫 → 触发条件命中时调 LLM mini-scan |
-| `expectation_close` | Expectation 到达终态 | 自动生成 Lesson → 更新关联 Heuristic.hit/miss → confidence 重算 |
+| `position_close` | Position 自动平仓（auto_review 触发） | 写 Lesson → 反向打标 Heuristic.hit/miss → confidence 重算 |
 | `news_high_importance` | news tagger High 命中 | 立即 mini-scan（绕过 budget） |
 
 ### 2.5 Chat — 观察 + 干预层
@@ -487,17 +512,17 @@ Chat **不**操作 SimAccount、Quotes、News——只触发 agent run。
 | `StockQuote` | — | `MARKET_SNAPSHOT` HashMap | Quotes refresh loop | `get_quote` / `get_quotes_batch` / scanner / Account valuation |
 | `NewsItem` | `news_items` | — | News refresh | UI / Agent `search_news` |
 | `ArticleContent` | `article_contents` | — | News article extractor | `get_article` |
-| `SimulatedPosition` | `simulated_positions` (含 `expectation_id` 列) | `ACCOUNT_SNAPSHOT.positions` | SimAccount 写工具 | snapshot reads |
+| `SimulatedPosition` | `simulated_positions`（含 kind / direction / take_profit / stop_loss / invalidation_signals / signals_used / reasoning 等字段） | `ACCOUNT_SNAPSHOT.positions` | SimAccount 写工具 | snapshot reads |
 | `PositionEvent` | `position_events` | — | SimAccount 写工具 | `list_events` |
-| `Expectation` | `expectations` + `expectation_events` | — | Expectation 工具 / scan_tick / expectation_review | Agent prompt / UI 围观 |
 | `Strategy` | `strategies` | — | Strategy 工具 / seed | scan_tick 规则匹配 |
-| `Lesson` | `lessons` | — | expectation_close 自动 | Heuristic 学习材料 |
+| `Lesson` | `lessons`（外键 position_id） | — | auto_review 自动 | Heuristic 学习材料 |
 | `Heuristic` | `heuristics` | — | reflection / 用户陈述 / seed | Agent prompt（按 regime + confidence 过滤 top-N） |
+| `PositionHeuristicLink` | `position_heuristic_links` | — | open_position 时 agent 声明 | auto_review close 时反向计 hit/miss |
 | `ChatMessage` | `chat_messages` | — | chat pipeline | Chat UI |
 | `AgentEpisode` | `agent_episodes` + `agent_episode_turns` | — | observer | 复盘 / Today 时间线 |
 | `KvState` | `app_state` | — | Settings + scheduler | 全员 |
 
-完整 schema 见 [docs/design/agent-v3-expectation-driven.md § 3](design/agent-v3-expectation-driven.md)。
+完整 schema 见 `src-tauri/src/infrastructure/db/migrations.rs::SCHEMA_SQL`（单一来源）。
 
 ### 3.2 关键不变量
 
@@ -737,13 +762,13 @@ Memory 是结构化 `Heuristic` 实体：
   - **user_stated**：用户在 chat 说"避免追涨" → agent 调 `propose_heuristic(origin=user_stated)`
   - **agent_inferred**：reflection 从多条同类 Lesson emerge（≥3 条同向 Lesson 自动 `propose_heuristic`）
 - 衰减：连续 miss 推进 active→challenged→probationary→dormant→retired
-- 完整规则见 [agent-v3-expectation-driven.md § 5](design/agent-v3-expectation-driven.md)
+- 完整规则见 [docs/design/learning-loop.md](design/learning-loop.md)
 
-#### Lesson + Expectation 闭环
+#### Lesson + Position 闭环
 
-- 每次 `create_expectation` → 写 `expectations` row + `expectation_events(kind=created)`
-- 每 tick `expectation_review` 查 pending：到达终态（hit/missed/expired）→ 写 event + auto-gen Lesson
-- Lesson 携带 `signals_in_play` + `regime_at_close` + `outcome` + agent takeaway
+- 每次 `open_position` → 写 `simulated_positions` row + `position_events(kind=opened)`；agent 在调用时可声明 `applied_heuristic_ids` → 写 `position_heuristic_links`
+- 每 tick `auto_review` 拉所有 open positions：`judge_position(pos, current_price, now, invalidation_hit)` 命中 → 自动 `close_position(reason)` + 写 Lesson + 按 close_reason 反向打标 heuristic
+- Lesson 携带 `position_id` + `signals_in_play` + `outcome`（hit / partial_hit / miss / expired，由 close_reason + PnL 派生）+ takeaway（reflection LLM 后填）
 - Heuristic 通过 `supporting_lesson_ids` 反链——一条新 Lesson 命中 active heuristic 时 hit_count++
 
 #### Off-Contract（明确不做）
@@ -797,7 +822,7 @@ Memory 是结构化 `Heuristic` 实体：
 │      │                                                        │
 │      ↓                                                        │
 │  (6) Persistence + Audit                                      │
-│      agent_episodes 写 audit row（含 trigger_kind / expectation_ids）│
+│      agent_episodes 写 audit row（含 trigger_kind / position_ids）   │
 │      │                                                        │
 │      ↓                                                        │
 │  (7) Feedback                                                 │
@@ -943,8 +968,8 @@ src-tauri/src/
 │   │   ├── indicators.rs            纯函数：compute_indicators / MA / RSI / ...
 │   │   └── mod.rs
 │   ├── account/                     Account Bounded Context
-│   │   ├── aggregate.rs             Account 聚合根
-│   │   ├── position.rs              Position 实体
+│   │   ├── aggregate.rs             Account 聚合根（kind-aware open/close/scale）
+│   │   ├── position.rs              Position 实体（含 kind / direction / take_profit / stop_loss / invalidation_signals / signals_used / reasoning）+ judge_position 纯函数
 │   │   ├── events.rs                PositionEvent enum + payload
 │   │   ├── snapshot.rs              AccountSnapshot
 │   │   ├── rules.rs                 A 股规则校验（纯函数）
@@ -958,10 +983,9 @@ src-tauri/src/
 │   │   └── mod.rs
 │   └── agent/                       Agent Bounded Context
 │       ├── types.rs                 AgentRequest / AgentEvent / ProviderKind / PipelineKind
-│       ├── expectation.rs           Expectation aggregate（target_price/horizon/state/signals_used）
 │       ├── strategy.rs              Strategy aggregate（trigger_when + target_rule DSL）
 │       ├── heuristic.rs             Heuristic aggregate（origin/category/track record）
-│       ├── lesson.rs                Lesson aggregate（auto-gen on expectation close）
+│       ├── lesson.rs                Lesson aggregate（auto-gen on position close）
 │       └── mod.rs
 │
 ├── infrastructure/                   ← I/O 实现（HTTP / DB / cache / provider）
@@ -1171,16 +1195,19 @@ impl PositionRepo {
 
 > 这一节记录"为什么这么选"。后续遇到诱惑想反过来时回看这里。
 
-### Q1: 自动止损止盈 → **SimAccount 自治**
+### Q1: 自动止损止盈 → **Agent review 而非机械 close**
 
-`SimAccount::scan_and_trigger_stops` 是 SimAccount 内部方法；scheduler 周期调用。
+`auto_review` 在 9 个 scan tick 末尾运行：
+1. 纯代码 `judge_position` 识别触发条件（take_profit / stop_loss / time_stop / invalidation_signals 任一命中）
+2. **不直接 close**——而是触发一次 agent mini-scan run（trigger_kind=`position_review`）
+3. Agent 看 position + 触发原因 + 近期 news + 板块动态 + heuristics → 决定 `close_position` / `adjust_position` / `acknowledge_review_no_action`
+4. 真 close 时才写 Lesson；no_action 落 `PositionEvent::Reviewed` 审计
 
-**选 SimAccount 自治的理由**：
-- "什么触发平仓"是账户规则的一部分（stop_loss 字段本身在 Position 上）
-- 触发逻辑（price ≤ stop_loss）是纯 domain 规则
-- scheduler 只是个 ticker，不该懂"规则"
+**为什么不机械 close**：插针式跌破 stop_loss 但板块没崩、9:35 跳空但开盘后回弹——这些场景机械止损全是错的。Agent 看上下文止损更接近真人 trader。
 
-**实现**：内部调 `quotes::get_quotes_batch` 读 snapshot → 应用规则 → 触发的调 `Account::close`。
+**性能取舍**：每次触发条件命中都消耗一次 LLM run。模拟账户 + 9 tick + 通常 ≤10 个 open position，单日 LLM 调用上限可控。
+
+**学习闭环不破**：close 时按 close_reason 出 Lesson outcome（hit / partial_hit / miss / expired）；no_action 不写 lesson 但留审计 → 复盘可查"agent 当时为什么不止损"。
 
 ### Q2: `indicators_at_open` → **冻结存到 PositionEvent payload**
 
@@ -1193,13 +1220,26 @@ impl PositionRepo {
 
 ### Q3: News 不做关联股票识别 → **保持原始资讯**
 
-NewsItem 只存源数据（id, title, summary, url, status）；不做"自动识别这条资讯影响哪些股票"。
+NewsItem 只存源数据（id, title, summary, url, status）+ tagger 输出的 importance/sectors/tickers；不做"自动识别这条资讯影响哪些股票该买卖"。
 
 **理由**：
 - 模块职责单一
 - 关键词匹配误识别率高（不同公司同名 / 概念股 / 联想关系）
 - LLM 在 agent run 中能自己识别——这正是 agent 的工作
-- 后续要做也是 agent 工具（`tag_news_with_symbols`），不是 News 模块的事
+
+### Q3.1: News → Agent review 的触发机制 → **buffer + 定时 + 高重要度即时**
+
+News 不立即触发 agent，按三档汇总：
+
+| 触发器 | 时机 | 用途 |
+|---|---|---|
+| `news_high_importance_listener` | tagger 标 importance=high 时立即 | 央行降准 / 监管处罚等不能等的宏观/政策类 |
+| `news_review` 攒批 | 自上次 review 后新增 ≥ 20 条 | 突发某板块多条相关消息汇集 → 提前喊 agent |
+| `news_review` 定时 | 每 30 分钟兜底 | 平稳期也按节奏复盘当时段全部 news |
+
+后两者**不筛 importance**——agent 自己判断哪些是 actionable，符合"数据驱动 + agent 自主决策"原则。
+
+`news_review` 喂给 agent 的上下文：新增 news 全量（含 title + summary + tickers + sectors）+ 当前 open positions + 自选股 + 近期 lesson + active heuristics + 市场状态。让 agent 在完整上下文里决定 `open_position(kind=watch/live)` / `adjust_position` / `no_action`。
 
 ### Q4: Snapshot 不重复缓存 → **复用 Quotes snapshot**
 
@@ -1323,5 +1363,4 @@ for src in order {
 
 ---
 
-**版本**：2026-05-12 整体重写 + 2026-05-13 trader 视角数据扩展
-**前一版**：见 git history（commit `39423a2`）
+**版本**：base（当前在用）。历史演化见 git history。

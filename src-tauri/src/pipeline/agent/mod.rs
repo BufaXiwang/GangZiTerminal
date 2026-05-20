@@ -10,11 +10,12 @@
 //!
 //! Tauri command 入口在 `adapters::agent_commands`（薄包装）；config 本身保留业务逻辑。
 
+pub mod auto_review;
 pub mod compact;
 pub mod config;
 pub mod context;
-pub mod expectation_review;
 pub mod heuristic_emerge;
+pub mod news_review;
 pub mod loop_;
 pub mod observer;
 pub mod prompt;

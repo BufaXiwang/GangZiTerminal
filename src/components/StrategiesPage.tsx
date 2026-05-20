@@ -51,7 +51,7 @@ export function StrategiesPage({ onAskAgent }: { onAskAgent?: (prefill: string) 
       <header className="section-head">
         <div>
           <h2>策略</h2>
-          <p>用户 + agent 共建的"什么时候建 expectation"规则集。chat 跟 agent 说话可修改。</p>
+          <p>用户 + agent 共建的"什么时候建 position"规则集。chat 跟 agent 说话可修改。</p>
         </div>
       </header>
 

@@ -9,14 +9,12 @@ import {
   MessageSquare,
   Newspaper,
   Settings,
-  Target,
   WalletCards,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { NewsPage } from "./components/NewsPage";
 import { SecondaryView } from "./components/SecondaryView";
 import { TodayPage } from "./components/TodayPage";
-import { ExpectationsPage } from "./components/ExpectationsPage";
 import { StrategiesPage } from "./components/StrategiesPage";
 import { LessonsPage } from "./components/LessonsPage";
 import { HeuristicsPage } from "./components/HeuristicsPage";
@@ -42,7 +40,6 @@ type ViewId = "agent" | "today" | "news" | "simulation" | "settings";
 /// Agent 视图内的子 tab——chat 是默认入口；其他 4 个看 agent 大脑状态
 type AgentSubView =
   | "chat"
-  | "expectations"
   | "strategies"
   | "heuristics"
   | "lessons";
@@ -63,8 +60,7 @@ const agentSubTabs: Array<{
   hint: string;
 }> = [
   { id: "chat", icon: MessageSquare, label: "对话", hint: "和 agent 实时对话——决策入口" },
-  { id: "expectations", icon: Target, label: "预期", hint: "agent 当前跟踪的投资预期" },
-  { id: "strategies", icon: Layers, label: "策略", hint: "触发 expectation 的规则集" },
+  { id: "strategies", icon: Layers, label: "策略", hint: "触发开仓的规则集" },
   { id: "heuristics", icon: Lightbulb, label: "启发式", hint: "agent 学到的启发式规则" },
   { id: "lessons", icon: BookOpen, label: "复盘", hint: "每次复盘的原子观察" },
 ];
@@ -279,15 +275,6 @@ function App() {
                     }}
                     setAutoRefresh={setAutoRefresh}
                     setRefreshInterval={setRefreshInterval}
-                  />
-                ) : agentSubView === "expectations" ? (
-                  <ExpectationsPage
-                    onAskAgent={(prefill) => {
-                      setAgentSubView("chat");
-                      window.dispatchEvent(
-                        new CustomEvent("agent-prefill", { detail: prefill }),
-                      );
-                    }}
                   />
                 ) : agentSubView === "strategies" ? (
                   <StrategiesPage

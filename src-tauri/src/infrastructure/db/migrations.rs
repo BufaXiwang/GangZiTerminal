@@ -1,21 +1,16 @@
-//! SQLite schema 单一来源（v3 expectation-driven）。
+//! SQLite schema 单一来源（v4 position-merged，Expectation 已并入 Position）。
 //!
 //! 旧 DB 文件在 `connection::open_database` 启动时根据 SCHEMA_VERSION 比对自动备份
 //! （`gangzi-terminal.sqlite3.legacy-{ts}`），本文件**只**负责在空 DB 上建一遍新 schema。
 //! 不需要 in-place 升级、不需要 add_column_if_missing。
 //!
 //! 模块归属：
-//! - **Account**: simulated_positions / position_events / expectations / expectation_events
-//!                  （v2 残留：theses / thesis_codes / thesis_events——W23/W24 删旧 code 时一起去掉 CREATE TABLE）
+//! - **Account**: simulated_positions / position_events
 //! - **Agent**: chat_messages / agent_episodes / agent_episode_turns / heuristics / strategies /
-//!              strategy_events / lessons / signal_detections / news_tags / news_tickers
-//!              （v2 残留：principles——W22 末迁移到 heuristics 后删除）
+//!              strategy_events / lessons / position_heuristic_links / signal_detections
 //! - **Quotes**: stocks / indexes / funds / klines / kline_meta / minute_klines / minute_kline_meta
 //! - **News**: news_items / article_contents
 //! - **系统**: schema_meta / app_state (KV)
-//!
-//! 注：simulated_positions 多了 `current_expectation_id` 列；agent_episodes 多了 `expectation_ids` 列。
-//! v2 时代的 `thesis_id` / `thesis_ids` 列暂保留兼容旧代码——W23 切干净后 schema v4 删。
 
 use crate::infrastructure::db::connection::SCHEMA_VERSION;
 use crate::infrastructure::db::helpers::now;
@@ -84,14 +79,25 @@ create table if not exists app_state (
 );
 
 -- ===== News BC =====
+-- analysis_status 在行级列——agent 批量 claim 时用 UPDATE ... RETURNING 原子化
+-- 状态机：pending → processing → consumed / failed → pending(revert by watchdog)
 create table if not exists news_items (
     id text primary key,
     source text not null,
     published text,
+    analysis_status text not null default 'pending'
+        check (analysis_status in ('pending', 'processing', 'consumed', 'failed')),
+    processing_started_at text,            -- 进 processing 时戳；watchdog 用来回收孤儿
     payload_json text not null,
     created_at text not null,
     updated_at text not null
 );
+create index if not exists idx_news_items_status_published
+    on news_items(analysis_status, published);
+-- 部分索引：只索引 processing 状态的，watchdog 扫超时孤儿用
+create index if not exists idx_news_items_processing_at
+    on news_items(processing_started_at)
+    where analysis_status = 'processing';
 
 create table if not exists article_contents (
     url text primary key,
@@ -101,18 +107,21 @@ create table if not exists article_contents (
 );
 
 -- ===== Account BC =====
+-- v4：Position 一肩挑执行 + 假设——payload_json 内嵌 kind/direction/signals_used/
+-- invalidation_signals/reasoning/take_profit/stop_loss/time_stop_at 等字段。
+-- 表只保留行级索引列，详细字段全在 payload_json。
 create table if not exists simulated_positions (
     id text primary key,
     code text not null,
     source_analysis_id text not null,
     status text not null,
-    current_expectation_id text,          -- v3：关联 expectations 表
+    kind text not null default 'live',    -- live / watch
     payload_json text not null,
     created_at text not null,
     updated_at text not null
 );
 create index if not exists idx_simulated_positions_code_status on simulated_positions(code, status);
-create index if not exists idx_simulated_positions_expectation on simulated_positions(current_expectation_id);
+create index if not exists idx_simulated_positions_status_kind on simulated_positions(status, kind);
 
 create table if not exists position_events (
     id text primary key,
@@ -161,7 +170,7 @@ create table if not exists agent_episodes (
     stop_reason text,
     error text,
     trigger_message_id text,
-    expectation_ids text,                 -- v3：JSON array of ExpectationId
+    position_ids text,                    -- v4：JSON array of PositionId（agent run 内 open/close 涉及的 positions）
     outcome_summary text,
     parent_episode_id text                -- 因果链
 );
@@ -267,49 +276,6 @@ create table if not exists minute_kline_meta (
     primary key (ts_code, period)
 );
 
--- ===== v3 expectation-driven 新表 =====
-
--- Expectation：投资预期一等聚合根（归 account BC）
-create table if not exists expectations (
-    id text primary key,
-    code text not null,
-    direction text not null check (direction in ('up', 'down', 'range_bound')),
-    target_price real,
-    target_price_ceiling real,
-    -- v6：创建瞬间的市价快照（用于 partial_hit 判定算实际涨幅 vs 目标涨幅）
-    reference_price real,
-    horizon_days integer not null,
-    reasoning text not null,
-    signals_used text not null,            -- JSON array of SignalKind
-    -- v6：失效条件信号——review 时若任一 family 命中，提前判 Missed
-    invalidation_signals text,             -- JSON array of SignalKind (null = 无失效条件)
-    conviction text not null check (conviction in ('low', 'medium', 'high')),
-    theme text,
-    supersedes_expectation_id text,
-    state text not null check (state in ('pending', 'hit', 'partial_hit', 'missed', 'expired', 'cancelled', 'superseded')),
-    regime_at_creation text,
-    -- v5 审计字段：追溯到生成这条预期的 scan tick + 主信号家族（用于快速 group by）
-    trigger_signal_family text,
-    source_episode_id text,
-    created_at text not null,
-    expires_at text not null,
-    closed_at text
-);
-create index if not exists idx_expectations_code_state on expectations(code, state);
-create index if not exists idx_expectations_state_expires on expectations(state, expires_at);
-create index if not exists idx_expectations_theme on expectations(theme);
-create index if not exists idx_expectations_source_episode on expectations(source_episode_id);
-
--- Expectation 事件链（状态机审计 + 用户反馈 append-only）
-create table if not exists expectation_events (
-    id integer primary key autoincrement,
-    expectation_id text not null,
-    kind text not null,
-    payload text,                          -- JSON
-    occurred_at text not null
-);
-create index if not exists idx_expectation_events_id on expectation_events(expectation_id, occurred_at);
-
 -- Strategy：用户 + agent 共建的规则集
 create table if not exists strategies (
     id text primary key,
@@ -335,21 +301,21 @@ create table if not exists strategy_events (
 );
 create index if not exists idx_strategy_events_id on strategy_events(strategy_id, occurred_at);
 
--- Lesson：每个 expectation 终态自动生成的原子观察（学习闭环底层原料）
+-- Lesson：每个 Position close 自动生成的原子观察（学习闭环底层原料）
 create table if not exists lessons (
     id text primary key,
-    expectation_id text not null,
+    position_id text not null,
     code text not null,
     observation text not null,
     takeaway text not null,
     outcome text not null check (outcome in ('hit', 'partial_hit', 'miss', 'expired')),
     regime_at_close text,
-    signals_in_play text,                  -- JSON array
+    signals_in_play text,                  -- JSON array of SignalKind
     pnl_pct real,
-    source_episode_id text,                -- v5：追溯到产生此 lesson 的 reflection episode
+    source_episode_id text,                -- 追溯到产生此 lesson 的 reflection episode
     created_at text not null
 );
-create index if not exists idx_lessons_expectation on lessons(expectation_id);
+create index if not exists idx_lessons_position on lessons(position_id);
 create index if not exists idx_lessons_code_time on lessons(code, created_at desc);
 create index if not exists idx_lessons_empty_takeaway on lessons(created_at desc) where takeaway = '';
 
@@ -374,14 +340,15 @@ create index if not exists idx_heuristics_origin on heuristics(origin);
 create index if not exists idx_heuristics_retired on heuristics(retired_at);
 create index if not exists idx_heuristics_emerged on heuristics(last_emerged_at desc);
 
--- Expectation ↔ Heuristic link：精确归因 expectation 终态影响哪些 heuristic 的 track record。
--- v6 引入——取代之前"所有 agent_inferred + 有 lessons 支持的 heuristic 都给计数"的粗暴聚合。
-create table if not exists expectation_heuristic_links (
-    expectation_id text not null,
+-- Position ↔ Heuristic link：精确归因 position close 影响哪些 heuristic 的 track record。
+-- agent 在 open_position 时显式声明 applied_heuristic_ids → 写入此表。
+-- close 时按 CloseReason 反向打标 → heuristic.application_count / hit_count / miss_count。
+create table if not exists position_heuristic_links (
+    position_id text not null,
     heuristic_id text not null,
-    primary key (expectation_id, heuristic_id)
+    primary key (position_id, heuristic_id)
 );
-create index if not exists idx_ehl_heuristic on expectation_heuristic_links(heuristic_id);
+create index if not exists idx_phl_heuristic on position_heuristic_links(heuristic_id);
 
 -- Signal detection log（per-tick 检测结果，审计 + 命中率统计）
 create table if not exists signal_detections (
@@ -396,24 +363,7 @@ create index if not exists idx_signal_detections_code_time on signal_detections(
 create index if not exists idx_signal_detections_tick on signal_detections(tick_id);
 create index if not exists idx_signal_detections_family on signal_detections(signal_family, detected_at desc);
 
--- News tagger 输出（资讯入库时打 kind/importance/tickers/sectors）
-create table if not exists news_tags (
-    news_id text primary key,
-    kind text not null check (kind in ('earnings','halt','restructure','regulatory','ownership','operating','policy','sector_trend','market','other')),
-    importance text not null check (importance in ('high','medium','low')),
-    sectors text,                          -- JSON array
-    tagged_at text not null
-);
-create index if not exists idx_news_tags_importance on news_tags(importance);
-
-create table if not exists news_tickers (
-    news_id text not null,
-    code text not null,
-    primary key (news_id, code)
-);
-create index if not exists idx_news_tickers_code on news_tickers(code, news_id);
-
--- ===== News FTS5 全文索引（v5.1 in-place add，不 bump schema version） =====
+-- ===== News FTS5 全文索引 =====
 --
 -- 用 trigram tokenizer——SQLite 3.34+ 自带，对中文友好：把文本切成 3 字符
 -- 窗口去索引，"光模块" 这种三字短语能精确命中而不用分词。
@@ -550,21 +500,27 @@ mod tests {
 
     #[test]
     fn backfill_populates_fts_from_existing_items() {
-        // 模拟"FTS5 启用前已有数据"：先开 conn 关掉触发器 + 表，写入若干 news_items，
-        // 然后重新 migrate 让 backfill 跑一遍。
+        // 模拟"FTS5 启用前已有数据"：先开 conn 手动建 news_items（含新列），写若干条，
+        // 然后跑 migrate 让 backfill 跑一遍。
         let conn = Connection::open_in_memory().unwrap();
-        // 先建 news_items 表（手动，不带 fts），写两条
         conn.execute_batch(
             "create table news_items (
-                id text primary key, source text not null, published text,
-                payload_json text not null, created_at text not null, updated_at text not null
+                id text primary key,
+                source text not null,
+                published text,
+                analysis_status text not null default 'pending',
+                processing_started_at text,
+                payload_json text not null,
+                created_at text not null,
+                updated_at text not null
             );",
         )
         .unwrap();
         for (id, title) in [("n1", "光模块涨停"), ("n2", "央行降准")] {
             let payload = serde_json::json!({"id": id, "title": title, "summary": ""}).to_string();
             conn.execute(
-                "insert into news_items values (?1, 'cls', '2025-01-01', ?2, '2025', '2025')",
+                "insert into news_items (id, source, published, payload_json, created_at, updated_at)
+                 values (?1, 'cls', '2025-01-01', ?2, '2025', '2025')",
                 params![id, payload],
             )
             .unwrap();

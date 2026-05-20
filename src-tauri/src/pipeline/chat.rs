@@ -148,10 +148,6 @@ pub async fn send_chat_message_now(
     let quotes_availability = quotes_status.to_prompt_section();
     let market = fetch_market_overview(&app).await.ok();
 
-    // 当前 pending expectations（agent 决策上下文核心之一）
-    let active_expectations =
-        crate::infrastructure::account::expectation_repo::list_pending(&app, 20).unwrap_or_default();
-
     // 当前 active heuristics（按 confidence + regime 过滤）+ 当前 regime
     let current_regime = crate::infrastructure::quotes::regime_detector_service::current(&app);
     let heuristics =
@@ -163,7 +159,6 @@ pub async fn send_chat_message_now(
         market_overview: market.as_ref(),
         simulated_positions: &positions,
         live_quotes: &quotes_status.quotes,
-        active_expectations: &active_expectations,
         quotes_availability: quotes_availability.as_deref(),
     });
     let static_system_context = build_chat_system_context(&ChatSystemContextInput {

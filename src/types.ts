@@ -13,13 +13,17 @@ export type DomainPosition = {
   id: string;
   code: string;
   name: string;
+  kind: "live" | "watch";
   avgEntryPrice: number;
   currentShares: number;
   status: DomainPositionStatus;
   stopLoss: number | null;
   takeProfit: number | null;
   timeStopAt: number | null;
-  thesis: string;
+  direction: "up" | "down";
+  invalidationSignals: unknown[];
+  signalsUsed: unknown[];
+  reasoning: string;
   sourceAnalysisId: string;
   enteredAt: number;
 };
@@ -128,7 +132,7 @@ export type SimulatedPosition = {
   exitPrice?: number;
   exitAt?: string;
   closeReason?: "stop_loss" | "take_profit" | "time_stop" | "invalidated" | "manual_reset" | string;
-  thesis: string;
+  reasoning?: string;
   stopLoss?: number;
   takeProfit?: number;
   /** ISO 8601 — 超过即触发时间止损平仓。开仓时由后端 derive_time_stop_at 写入。 */

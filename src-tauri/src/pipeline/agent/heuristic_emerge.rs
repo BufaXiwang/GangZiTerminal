@@ -238,8 +238,8 @@ fn collect_regime_tags(cluster: &[Lesson]) -> Vec<crate::domain::quotes::regime:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::account::position::PositionId;
     use crate::domain::agent::lesson::{Lesson, LessonId};
-    use crate::domain::account::expectation::ExpectationId;
     use crate::domain::shared::signal::SignalKind;
     use crate::domain::shared::{OccurredAt, StockCode};
 
@@ -270,7 +270,7 @@ mod tests {
     fn make_lesson(takeaway: &str, signals: Vec<SignalKind>, outcome: LessonOutcome) -> Lesson {
         Lesson {
             id: LessonId::new(),
-            expectation_id: ExpectationId::new(),
+            position_id: PositionId::new(),
             code: StockCode::new("600519").unwrap(),
             observation: "obs".into(),
             takeaway: takeaway.into(),

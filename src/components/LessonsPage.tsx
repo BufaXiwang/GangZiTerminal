@@ -5,11 +5,11 @@ import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 type Lesson = {
   id: string;
-  expectationId: string;
+  positionId: string;
   code: string;
   observation: string;
   takeaway: string;
-  outcome: "hit" | "miss" | "expired";
+  outcome: "hit" | "partial_hit" | "miss" | "expired";
   regimeAtClose: string | null;
   signalsInPlay: Array<{ kind: string }>;
   pnlPct: number | null;
@@ -18,12 +18,14 @@ type Lesson = {
 
 const OUTCOME_BADGE: Record<Lesson["outcome"], "good" | "danger" | "warn"> = {
   hit: "good",
+  partial_hit: "warn",
   miss: "danger",
   expired: "warn",
 };
 
 const OUTCOME_LABEL: Record<Lesson["outcome"], string> = {
   hit: "命中",
+  partial_hit: "部分命中",
   miss: "未中",
   expired: "到期",
 };
@@ -65,7 +67,7 @@ export function LessonsPage({ onAskAgent }: { onAskAgent?: (prefill: string) => 
       <header className="section-head">
         <div>
           <h2>复盘</h2>
-          <p>每个 expectation 终态时自动生成的原子观察——学习闭环的底层原料，启发式从这里 emerge。</p>
+          <p>每个 position close 时自动生成的原子观察——学习闭环的底层原料，启发式从这里 emerge。</p>
         </div>
       </header>
 
@@ -73,8 +75,8 @@ export function LessonsPage({ onAskAgent }: { onAskAgent?: (prefill: string) => 
         <EmptyState
           icon={<BookOpen size={28} strokeWidth={1.4} />}
           title="还没有复盘记录"
-          body="每个 expectation 到期或命中后，agent 会在 15:30 reflection 自动写一条 lesson 进来——内容是「这次预期为什么对/为什么错」的原子观察。"
-          hint="先在「对话」里跟 agent 创建第一个 expectation，等到它进入终态就会有数据。"
+          body="每个 position close 时（命中 take_profit / stop_loss / time_stop / invalidation_signals），agent 会在 15:30 reflection 自动写一条 lesson——这次假设为什么对/为什么错的原子观察。"
+          hint="先在「对话」里让 agent 开第一个 position（live 或 watch），等到它 close 就会有数据。"
         />
       ) : (
         <>

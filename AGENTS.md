@@ -137,6 +137,7 @@ npm run tmux:logs / restart / stop
 5. **持久化先 event 后 state** — append-only audit
 6. **Snapshot-first 数据访问** — Agent 读 snapshot，不在热路径直接 fetch
 7. **不背历史包袱**（快速迭代期）— 删干净 vs deprecate
+8. **前端风格一致性** — 任何 UI 改动必须沿用项目既有视觉系（组件 / spacing / 配色 / 字号 / dark mode）。新页面抄已有页面（`SimulationPage` / `NewsPage` / `SettingsPage`）的结构 + class 命名，不引入与现有 design system 冲突的样式或组件库。引入新组件前先确认是否已有等价物。
 
 ## Handoff Checklist
 

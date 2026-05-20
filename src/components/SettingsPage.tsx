@@ -186,16 +186,16 @@ type HeartbeatRow = {
 };
 
 type AgentHealthDto = {
-  expectationCompletenessRate: number | null;
-  totalExpectations: number;
-  totalClosedExpectations: number;
+  positionCompletenessRate: number | null;
+  totalPositions: number;
+  totalClosedPositions: number;
   reflectionEpisodeCount7d: number;
   scanTickCount7d: number;
   lessonsCount7d: number;
   heuristicCounts: { seed: number; userStated: number; agentInferred: number; retired: number };
   heuristicOriginShare: { seed: number; userStated: number; agentInferred: number; agentInferredShare: number | null };
   scanTicksToday: number;
-  expectationsCreatedToday: number;
+  positionsOpenedToday: number;
   lessonsCreatedToday: number;
   lessonsEmptyTakeaway7d: number;
   heuristicsEmerged7d: number;
@@ -255,10 +255,10 @@ function AgentHealthBlock() {
               level={pickLevel(data.scanTicksToday, { red: -1, yellow: 3 })}
             />
             <HealthRow
-              title="今日新建 expectation"
-              hint="连续多日为 0 → agent 没在产出新预期"
-              value={data.expectationsCreatedToday}
-              level={pickLevel(data.expectationsCreatedToday, { red: -1, yellow: 0 })}
+              title="今日新开 position"
+              hint="连续多日为 0 → agent 没在产出新判断"
+              value={data.positionsOpenedToday}
+              level={pickLevel(data.positionsOpenedToday, { red: -1, yellow: 0 })}
             />
             <HealthRow
               title="今日 lesson"

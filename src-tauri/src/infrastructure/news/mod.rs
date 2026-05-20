@@ -8,11 +8,10 @@
 //! 错误 map 成 `NewsError`。
 
 pub mod article;
-pub mod news_tag_repo;
+pub mod batch;
 pub mod newsnow;
 pub mod repository;
 pub mod rss;
-pub mod tagger;
 
 mod util;
 

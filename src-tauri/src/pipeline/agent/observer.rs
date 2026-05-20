@@ -99,17 +99,17 @@ pub fn finalize(app: &AppHandle, summary: &RunSummary, error: Option<&str>) -> R
         summary.server_tool_calls,
         Some(stop_reason_str(summary.stop_reason)),
         error,
-        None, // thesis_ids — reflection pipeline 会传，chat 暂不写
+        None, // position_ids — reflection pipeline 会传，chat 暂不写
         None, // outcome_summary — reflection pipeline 会传，chat 暂不写
     )
 }
 
-/// reflection / 其他需要写 thesis_ids + outcome_summary 的 pipeline 用这个。
+/// reflection / 其他需要写 position_ids + outcome_summary 的 pipeline 用这个。
 pub fn finalize_with_context(
     app: &AppHandle,
     summary: &RunSummary,
     error: Option<&str>,
-    thesis_ids: Option<&str>,
+    position_ids: Option<&str>,
     outcome_summary: Option<&str>,
 ) -> Result<(), String> {
     let ended_at = Utc::now().to_rfc3339();
@@ -126,7 +126,7 @@ pub fn finalize_with_context(
         summary.server_tool_calls,
         Some(stop_reason_str(summary.stop_reason)),
         error,
-        thesis_ids,
+        position_ids,
         outcome_summary,
     )
 }

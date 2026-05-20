@@ -12,8 +12,10 @@ use super::rules::{
 use super::sizing::derive_time_stop_at;
 use super::types::{
     CloseReason, EventSource, Position, PositionEvent, PositionEventKind, PositionId,
-    PositionStatus, Side,
+    PositionKind, PositionStatus, Side,
 };
+use crate::domain::account::position::Direction;
+use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{Lots, OccurredAt, Shares, StockCode, Yuan};
 
 /// 开仓 / 加仓买入时给 aggregate 的最少行情数据。
@@ -32,10 +34,16 @@ pub struct OpenPositionCommand {
     pub code: String,
     pub shares: Shares,
     pub name: String,
-    pub thesis: String,
-    /// 关联的 Thesis aggregate id（v2 新增）。
-    /// agent 主动建仓必须设；用户直接命令建仓可 None。
-    pub expectation_id: Option<crate::domain::account::expectation::ExpectationId>,
+    /// Live = 真持仓；Watch = "看好但不买"
+    pub kind: PositionKind,
+    /// 看涨 / 看跌方向——决定 take_profit / stop_loss 的语义
+    pub direction: Direction,
+    /// 自然语言决策上下文（替代旧 thesis，无字数限制）
+    pub reasoning: String,
+    /// 触发本次建仓的结构化信号列表——close 时反向打标 heuristic
+    pub signals_used: Vec<SignalKind>,
+    /// 失效条件信号：review 时若任一 family 命中，提前判 Invalidated
+    pub invalidation_signals: Vec<SignalKind>,
     pub stop_loss: Option<Yuan>,
     pub take_profit: Option<Yuan>,
     pub time_stop_at: Option<OccurredAt>,
@@ -104,9 +112,9 @@ impl Account {
         cmd: OpenPositionCommand,
     ) -> Result<AccountMutation, AccountError> {
         ensure_a_share_code(&cmd.code)?;
-        ensure_integer_lot(cmd.shares.value())?;
-        ensure_trading_hours()?;
+        let is_live = matches!(cmd.kind, PositionKind::Live);
 
+        // 同 code 不允许同时多个 open（不分 kind）：要切换 Watch → Live 请先 close
         if self
             .positions
             .iter()
@@ -114,22 +122,33 @@ impl Account {
         {
             return Err(RuleError::DuplicateOpenCode(cmd.code).into());
         }
-
-        ensure_fillable(cmd.quote.ask_top_volume)?;
         ensure_stops_make_sense(cmd.quote.price, cmd.stop_loss, cmd.take_profit)?;
 
-        let comm = commission(cmd.quote.price, cmd.shares);
-        let cost = cmd.quote.price.value() * cmd.shares.value() as f64 + comm.value();
-        if cost > cmd.available_cash.value() + f64::EPSILON {
-            return Err(RuleError::InsufficientFunds {
-                needed: cost,
-                available: cmd.available_cash.value(),
+        // Live-only 规则：整百、交易时段、盘口可成交、现金充足
+        if is_live {
+            ensure_integer_lot(cmd.shares.value())?;
+            ensure_trading_hours()?;
+            ensure_fillable(cmd.quote.ask_top_volume)?;
+
+            let comm = commission(cmd.quote.price, cmd.shares);
+            let cost = cmd.quote.price.value() * cmd.shares.value() as f64 + comm.value();
+            if cost > cmd.available_cash.value() + f64::EPSILON {
+                return Err(RuleError::InsufficientFunds {
+                    needed: cost,
+                    available: cmd.available_cash.value(),
+                }
+                .into());
             }
-            .into());
         }
 
         let position_id = PositionId::new();
         let entered_at = OccurredAt::now();
+        // Watch 强制 shares=0；Live 用传入值
+        let effective_shares = if is_live {
+            cmd.shares
+        } else {
+            Shares::from_unchecked(0)
+        };
         let position = Position {
             id: position_id.clone(),
             code: StockCode::new(&cmd.code).map_err(|e| AccountError::Io(e.to_string()))?,
@@ -138,25 +157,33 @@ impl Account {
             } else {
                 cmd.name
             },
+            kind: cmd.kind,
             avg_entry_price: cmd.quote.price,
-            current_shares: cmd.shares,
+            current_shares: effective_shares,
             status: PositionStatus::Open,
             stop_loss: cmd.stop_loss,
             take_profit: cmd.take_profit,
             time_stop_at: cmd.time_stop_at.or(Some(derive_time_stop_at(entered_at))),
-            thesis: cmd.thesis,
-            expectation_id: cmd.expectation_id,
+            direction: cmd.direction,
+            invalidation_signals: cmd.invalidation_signals,
+            signals_used: cmd.signals_used,
+            reasoning: cmd.reasoning,
             source_analysis_id: cmd.source_analysis_id,
             entered_at,
             last_acquisition_at: entered_at,
         };
 
+        let comm = if is_live {
+            commission(cmd.quote.price, cmd.shares)
+        } else {
+            Yuan::from_unchecked(0.0)
+        };
         let event = PositionEvent {
             id: uuid::Uuid::new_v4().to_string(),
             position_id,
             kind: PositionEventKind::Opened {
                 entry_price: cmd.quote.price,
-                shares: cmd.shares,
+                shares: effective_shares,
                 commission: comm,
             },
             occurred_at: entered_at,
@@ -176,12 +203,12 @@ impl Account {
         &mut self,
         cmd: ClosePositionCommand,
     ) -> Result<AccountMutation, AccountError> {
-        if !cmd.unchecked {
-            ensure_trading_hours()?;
-        }
-
         let target = self.open_position_by_id(&cmd.position_id)?.clone();
-        if !cmd.unchecked {
+        let is_live = matches!(target.kind, PositionKind::Live);
+
+        // Watch / unchecked 都跳过交易时段 / T+1 / 盘口校验
+        if is_live && !cmd.unchecked {
+            ensure_trading_hours()?;
             ensure_t_plus_one(target.last_acquisition_at)?;
             ensure_fillable(cmd.bid_top_volume)?;
         }
@@ -189,8 +216,16 @@ impl Account {
         let position_id = target.id.clone();
         let shares = target.current_shares;
         let exit_at = OccurredAt::now();
-        let comm = commission(cmd.exit_price, shares);
-        let tax = stamp_tax(cmd.exit_price, shares);
+        let comm = if is_live {
+            commission(cmd.exit_price, shares)
+        } else {
+            Yuan::from_unchecked(0.0)
+        };
+        let tax = if is_live {
+            stamp_tax(cmd.exit_price, shares)
+        } else {
+            Yuan::from_unchecked(0.0)
+        };
 
         let mut updated = target;
         updated.status = PositionStatus::Closed {
@@ -232,6 +267,11 @@ impl Account {
         ensure_trading_hours()?;
 
         let target = self.open_position_by_id(&cmd.position_id)?.clone();
+        if matches!(target.kind, PositionKind::Watch) {
+            return Err(AccountError::Io(
+                "Watch 持仓不能加减仓——想转 Live 请先 close watch 再 open".into(),
+            ));
+        }
         let current = target.current_shares.value();
         let new_shares_value = current + cmd.shares_delta;
         if new_shares_value < 0 {

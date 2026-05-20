@@ -28,16 +28,16 @@ const KEY_AUTO_REFRESH: &str = "gangzi-terminal.auto-refresh";
 const KEY_REFRESH_INTERVAL: &str = "gangzi-terminal.refresh-interval";
 
 pub fn spawn_all(app: AppHandle) {
-    // briefing/review 已下线——agent 只剩 chat 能力，由用户主动发起
     tauri::async_runtime::spawn(news_refresh_loop(app.clone()));
+    tauri::async_runtime::spawn(pipeline::news::batch_loop::news_batch_loop(app.clone()));
     tauri::async_runtime::spawn(stocks_refresh_loop(app.clone()));
     tauri::async_runtime::spawn(market_quote_loop(app.clone()));
     tauri::async_runtime::spawn(market_universe_loop(app.clone()));
     tauri::async_runtime::spawn(kline_warm_loop(app.clone()));
     tauri::async_runtime::spawn(account_snapshot_loop(app.clone()));
     tauri::async_runtime::spawn(tushare_probe_once(app));
-    // 注：reflection tick 在 main.rs 直接 spawn——它需要 adapters::agent_tools 构造
-    // registry，而 pipeline 不允许 use adapters。
+    // 注：reflection tick + scan tick + news_batch_listener 在 main.rs 直接 spawn——
+    // 它们需要 adapters::agent_tools 构造 registry，而 pipeline 不允许 use adapters。
 }
 
 // ====== 全市场 universe 刷新 loop ======
@@ -356,6 +356,8 @@ async fn run_news_tick(app: &AppHandle, counter: &mut FailureCounter) {
                 app,
                 crate::infrastructure::scheduler_heartbeat::LOOP_NEWS,
             );
+            // 刚入库一批新闻——如果累计 pending 已经超过 M 立即触发 batch，不等 timer
+            pipeline::news::batch_loop::check_buffer_overflow(app).await;
         }
         Err(e) => {
             tracing::warn!(error = %e, consecutive = counter.count(), "news refresh 失败");

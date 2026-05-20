@@ -25,7 +25,6 @@ pub mod aggregate;
 pub mod cash;
 pub mod errors;
 pub mod events;
-pub mod expectation;
 pub mod position;
 pub mod rules;
 pub mod sizing;
@@ -38,9 +37,8 @@ pub use aggregate::{
 };
 pub use errors::{AccountError, RuleError};
 pub use events::{EventSource, PositionEvent, PositionEventKind, PositionSignalKind};
-pub use expectation::{
-    judge_outcome, Conviction, Direction, Expectation, ExpectationEvent, ExpectationEventRecord,
-    ExpectationId, ExpectationState, OutcomeJudgment,
+pub use position::{
+    is_partial_hit, judge_position, CloseReason, Direction, Position, PositionId, PositionKind,
+    PositionOutcome, PositionStatus, Side,
 };
-pub use position::{CloseReason, Position, PositionId, PositionStatus, Side};
 pub use snapshot::AccountSnapshot;

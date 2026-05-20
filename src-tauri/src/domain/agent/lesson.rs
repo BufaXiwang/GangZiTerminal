@@ -1,16 +1,14 @@
-//! Lesson aggregate——每个 Expectation 终态时自动生成的原子观察。
-//!
-//! 见 docs/design/agent-v3-expectation-driven.md § 8.1。
+//! Lesson aggregate——每个 Position close 时自动生成的原子观察。
 //!
 //! Lesson 是学习闭环的**最底层原料**——不允许凭空写，只能从已发生的
-//! expectation outcome 派生。≥2 条共有模式的 lessons 会 emerge 成 Heuristic。
+//! position close outcome 派生。≥2 条共有模式的 lessons 会 emerge 成 Heuristic。
 //!
 //! 设计原则：
 //! - observation：客观事实，由代码生成（"在 X 价开仓 Y 天后 Z 价平 盈亏 N%"）
 //! - takeaway：可学习的一句话教训，由 reflection 时 LLM 写
 //! - 永不修改、永不删除——历史数据完整保留
 
-use crate::domain::account::expectation::ExpectationId;
+use crate::domain::account::position::PositionId;
 use crate::domain::shared::signal::SignalKind;
 use crate::domain::quotes::regime::Regime;
 use crate::domain::shared::{OccurredAt, StockCode};
@@ -51,13 +49,13 @@ impl Default for LessonId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LessonOutcome {
-    /// expectation 命中
+    /// position close(TakeProfit) → 假设命中
     Hit,
-    /// 到期方向对但未达 target——"目标定高了 / 节奏慢"
+    /// close(TimeStop) 且方向对未达 target——"目标定高了 / 节奏慢"
     PartialHit,
-    /// 到期未达 target
+    /// close(StopLoss / Invalidated) 或 TimeStop 反向 → 假设破
     Miss,
-    /// 观察型到期或区间预期到期（既未命中也未明确证伪节奏）
+    /// 观察型到期且无 target_price（既未命中也未明确证伪节奏）
     Expired,
 }
 
@@ -87,7 +85,7 @@ impl LessonOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct Lesson {
     pub id: LessonId,
-    pub expectation_id: ExpectationId,
+    pub position_id: PositionId,
     pub code: StockCode,
     /// 客观事实（代码生成）："在 X 价开仓 Y 天后 Z 价平 盈亏 N%"
     pub observation: String,
@@ -95,16 +93,16 @@ pub struct Lesson {
     pub takeaway: String,
     pub outcome: LessonOutcome,
     pub regime_at_close: Option<Regime>,
-    /// 该 expectation 触发用的 signals——emerge heuristic 时聚类用
+    /// 该 position 入场触发的 signals——emerge heuristic 时聚类用
     pub signals_in_play: Vec<SignalKind>,
-    /// 关联持仓的盈亏百分比（可选——纯观察型 expectation 无持仓时为 None）
+    /// 关联持仓的盈亏百分比（Watch 类型为 None）
     pub pnl_pct: Option<f64>,
     pub created_at: OccurredAt,
 }
 
 impl Lesson {
     pub fn new(
-        expectation_id: ExpectationId,
+        position_id: PositionId,
         code: StockCode,
         observation: String,
         takeaway: String,
@@ -116,7 +114,7 @@ impl Lesson {
     ) -> Self {
         Self {
             id: LessonId::new(),
-            expectation_id,
+            position_id,
             code,
             observation,
             takeaway,

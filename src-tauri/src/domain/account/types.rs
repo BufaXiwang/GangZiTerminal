@@ -4,7 +4,9 @@
 //! 引入；这个文件保留给已有 `domain::account::types::*` 调用点。
 
 pub use super::events::{EventSource, PositionEvent, PositionEventKind, PositionSignalKind};
-pub use super::position::{CloseReason, Position, PositionId, PositionStatus, Side};
+pub use super::position::{
+    CloseReason, Direction, Position, PositionId, PositionKind, PositionStatus, Side,
+};
 pub use super::snapshot::AccountSnapshot;
 
 #[cfg(test)]

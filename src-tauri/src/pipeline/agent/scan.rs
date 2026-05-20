@@ -23,7 +23,6 @@ use crate::domain::shared::signal::SignalKind;
 use crate::domain::shared::{Lots, OccurredAt, StockCode, TradeDate, Yuan};
 use crate::infrastructure::account::watchlist;
 use crate::infrastructure::agent::signal_detection_repo;
-use crate::infrastructure::news::news_tag_repo;
 use crate::infrastructure::quotes::cache::kline_cache;
 use crate::infrastructure::quotes::signal_detector::{self, DetectorConfig, ScanContext};
 use crate::infrastructure::quotes::tushare::flow as ts_flow;
@@ -251,18 +250,8 @@ pub fn scan_one_stock_with_capital(
         }
     }
 
-    // News 信号——读距离 24h 前涉及该股的资讯，转 NewsCatalystMatched
-    let since = OccurredAt::new(now.value() - 24 * 3600 * 1000);
-    if let Ok(news_ids) = news_tag_repo::list_news_for_code_since(app, code.as_str(), since) {
-        for nid in news_ids {
-            if let Ok(Some(tags)) = news_tag_repo::get(app, &nid) {
-                out.push(SignalKind::NewsCatalystMatched {
-                    news_kind: tags.kind,
-                    importance: tags.importance,
-                });
-            }
-        }
-    }
+    // News 信号已从 scan 解耦——news 走独立 news_review pipeline（按 batch_loop 触发）。
+    // 此处不再读 news tags（tagger 已删）。
 
     out
 }
@@ -459,16 +448,16 @@ const MINI_SCAN_INSTRUCTIONS: &str = r#"
 
 你被一个自动 tick 唤醒，看到某只自选股触发了一组信号。你的任务：
 
-1. 检查当前该股是否已有 active expectation——
-   - 有 → 根据新信号决定 update_expectation / cancel_expectation / no_action
-   - 无 → 根据 strategies 列表决定是否 create_expectation
-2. **不要无脑建仓**——如果信号汇合但 strategy 命中率历史很差 / regime 不匹配 / 风险太大 → no_action 是合理选择
+1. 检查当前该股是否已有 open position（live 或 watch）——
+   - 有 → 根据新信号决定 adjust_position（改 target / stop / invalidation_signals）/ close_position(manual) / no_action
+   - 无 → 根据 strategies 列表决定是否 open_position（kind=live 真建仓 / watch 观察型）
+2. **不要无脑建仓**——如果信号汇合但 strategy 命中率历史很差 / 风险太大 → no_action 是合理选择
 3. 必要时调 analyze_chart 看图佐证形态
 4. 决策完毕给一句话 outcome（最多 500 字符，会落 agent_episodes.outcome_summary）
 
 禁忌：
-- 不允许在 mini-scan 里凭空开仓——必须先 create_expectation
-- 不允许 reasoning 字段写"市场情绪"等无法验证表达
+- 开仓必须填 reasoning + signals_used + direction + take_profit/stop_loss 等假设字段
+- 不允许 reasoning 写"市场情绪"等无法验证表达
 "#;
 
 fn build_mini_scan_context(app: &AppHandle, code: &StockCode, signals: &[SignalKind]) -> String {
@@ -490,17 +479,21 @@ fn build_mini_scan_context(app: &AppHandle, code: &StockCode, signals: &[SignalK
         s.push_str(&format!("- {}\n", sig.family_str()));
     }
 
-    // 现有 active expectations
-    if let Ok(actives) = crate::infrastructure::account::expectation_repo::list_pending_for_code(app, code) {
-        s.push_str(&format!("\n## 当前 active expectations（{}条）\n", actives.len()));
-        for e in actives.iter().take(3) {
+    // 现有 open positions（live + watch 都展示）
+    let repo = crate::infrastructure::account::PositionRepo::new(app.clone());
+    if let Ok(opens) = repo.list_open() {
+        let same_code: Vec<_> = opens.into_iter().filter(|p| p.code.as_str() == code.as_str()).collect();
+        s.push_str(&format!("\n## 当前 open positions on {}（{}条）\n", code.as_str(), same_code.len()));
+        for p in same_code.iter().take(3) {
             s.push_str(&format!(
-                "- id={} direction={} target={:?} horizon={}d reasoning={}\n",
-                e.id.as_str(),
-                e.direction.as_str(),
-                e.target_price.as_ref().map(|y| y.value()),
-                e.horizon_days,
-                truncate(&e.reasoning, 100),
+                "- id={} kind={} direction={} shares={} take_profit={:?} stop_loss={:?} reasoning={}\n",
+                p.id.as_str(),
+                p.kind.as_str(),
+                p.direction.as_str(),
+                p.current_shares.value(),
+                p.take_profit.as_ref().map(|y| y.value()),
+                p.stop_loss.as_ref().map(|y| y.value()),
+                truncate(&p.reasoning, 100),
             ));
         }
     }
@@ -517,7 +510,7 @@ fn build_mini_scan_context(app: &AppHandle, code: &StockCode, signals: &[SignalK
         }
     }
 
-    s.push_str("\n---\n请按 Mini-scan 模式决定建/调/撤 expectation 或 no_action。");
+    s.push_str("\n---\n请按 Mini-scan 模式决定建/调/撤 position 或 no_action。");
     s
 }
 

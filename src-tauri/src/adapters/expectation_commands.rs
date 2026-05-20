@@ -1,51 +1,15 @@
-//! Tauri IPC——Expectation / Strategy / Lesson / Heuristic 只读查询（前端 v3 页面用）。
+//! Tauri IPC——Strategy / Lesson / Heuristic 只读查询（前端学习面板用）。
+//!
+//! 文件名保留 `expectation_commands.rs` 仅历史兼容；实际语义是「学习闭环」面板。
+//! Expectation 聚合在 v4 已并入 Position，不再有独立查询入口。
 
-use crate::domain::account::expectation::{Expectation, ExpectationId, ExpectationState};
+use crate::domain::account::position::PositionId;
 use crate::domain::agent::heuristic::HeuristicId;
 use crate::domain::agent::strategy::StrategyId;
 use crate::domain::shared::OccurredAt;
-use crate::infrastructure::account::expectation_repo;
 use crate::infrastructure::agent::{heuristic_repo, lesson_repo, strategy_repo};
 use serde_json::{json, Value};
 use tauri::AppHandle;
-
-#[tauri::command]
-pub async fn list_expectations(
-    app: AppHandle,
-    state: Option<String>,
-    limit: Option<i64>,
-) -> Result<Value, String> {
-    let limit = limit.unwrap_or(200);
-    let result: Vec<Expectation> = match state.as_deref() {
-        None | Some("pending") => expectation_repo::list_pending(&app, limit)?,
-        Some(s) => {
-            let parsed = ExpectationState::parse(s)
-                .ok_or_else(|| format!("非法 state: {s}"))?;
-            expectation_repo::list_by_state(&app, parsed, limit)?
-        }
-    };
-    Ok(serde_json::to_value(result).map_err(|e| format!("序列化失败：{e}"))?)
-}
-
-#[tauri::command]
-pub async fn get_expectation(
-    app: AppHandle,
-    expectation_id: String,
-) -> Result<Option<Value>, String> {
-    let id = ExpectationId::from_string(expectation_id);
-    let exp = expectation_repo::get(&app, &id)?;
-    Ok(exp.map(|e| serde_json::to_value(e).unwrap()))
-}
-
-#[tauri::command]
-pub async fn list_expectation_events(
-    app: AppHandle,
-    expectation_id: String,
-) -> Result<Value, String> {
-    let id = ExpectationId::from_string(expectation_id);
-    let events = expectation_repo::list_events(&app, &id)?;
-    Ok(serde_json::to_value(events).map_err(|e| format!("序列化失败：{e}"))?)
-}
 
 #[tauri::command]
 pub async fn list_strategies(app: AppHandle) -> Result<Value, String> {
@@ -70,19 +34,18 @@ pub async fn list_lessons(app: AppHandle, limit: Option<i64>) -> Result<Value, S
 }
 
 #[tauri::command]
-pub async fn list_lessons_for_expectation(
+pub async fn list_lessons_for_position(
     app: AppHandle,
-    expectation_id: String,
+    position_id: String,
 ) -> Result<Value, String> {
-    let id = ExpectationId::from_string(expectation_id);
-    let lessons = lesson_repo::list_for_expectation(&app, &id)?;
+    let id = PositionId::from_string(position_id);
+    let lessons = lesson_repo::list_for_position(&app, &id)?;
     Ok(serde_json::to_value(lessons).map_err(|e| format!("序列化失败：{e}"))?)
 }
 
 #[tauri::command]
 pub async fn list_heuristics(app: AppHandle, limit: Option<i64>) -> Result<Value, String> {
     let heuristics = heuristic_repo::list_all(&app, limit.unwrap_or(200))?;
-    // 派生 effective_state 给前端用
     let dtos: Vec<Value> = heuristics
         .iter()
         .map(|h| {

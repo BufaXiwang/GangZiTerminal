@@ -53,7 +53,6 @@ struct StrategyConfig {
     pub trigger_when: Vec<SignalCondition>,
     pub trigger_logic: TriggerLogic,
     pub target: TargetRule,
-    pub conviction_rule: crate::domain::agent::strategy::ConvictionRule,
 }
 
 pub fn create(app: &AppHandle, s: &Strategy) -> Result<(), String> {
@@ -63,7 +62,6 @@ pub fn create(app: &AppHandle, s: &Strategy) -> Result<(), String> {
         trigger_when: s.trigger_when.clone(),
         trigger_logic: s.trigger_logic,
         target: s.target,
-        conviction_rule: s.conviction_rule.clone(),
     };
     let cfg_json = serde_json::to_string(&cfg)
         .map_err(|err| format!("序列化 strategy config 失败：{err}"))?;
@@ -192,7 +190,6 @@ pub fn get(app: &AppHandle, id: &StrategyId) -> Result<Option<Strategy>, String>
         trigger_when: cfg.trigger_when,
         trigger_logic: cfg.trigger_logic,
         target: cfg.target,
-        conviction_rule: cfg.conviction_rule,
         enabled: enabled != 0,
         applied_count: applied,
         hit_count: hit,
@@ -254,7 +251,6 @@ fn list_internal(app: &AppHandle, enabled_only: bool) -> Result<Vec<Strategy>, S
             trigger_when: cfg.trigger_when,
             trigger_logic: cfg.trigger_logic,
             target: cfg.target,
-            conviction_rule: cfg.conviction_rule,
             enabled: enabled != 0,
             applied_count: applied,
             hit_count: hit,

@@ -64,12 +64,6 @@ pub enum SignalKind {
     ROEAboveThreshold { pct: f32 },
     EarningsGrowthAbove { pct: f32 },
 
-    // ===== 消息（1） =====
-    NewsCatalystMatched {
-        news_kind: NewsKind,
-        importance: NewsImportance,
-    },
-
     // ===== 视觉（1，由 LLM 通过 analyze_chart + propose_visual_pattern 调用） =====
     VisualPatternRead {
         pattern: String,             // "double_bottom" / "head_and_shoulders_top" / "exhaustion_top" / ...
@@ -113,7 +107,6 @@ impl SignalKind {
             Self::PBBelowThreshold { .. } => "pb_below_threshold",
             Self::ROEAboveThreshold { .. } => "roe_above_threshold",
             Self::EarningsGrowthAbove { .. } => "earnings_growth_above",
-            Self::NewsCatalystMatched { .. } => "news_catalyst_matched",
             Self::VisualPatternRead { .. } => "visual_pattern_read",
             Self::Custom { .. } => "custom",
         }
@@ -123,11 +116,6 @@ impl SignalKind {
     /// 不由 `signal_detector::scan_all` 触发。
     pub fn is_visual(&self) -> bool {
         matches!(self, Self::VisualPatternRead { .. })
-    }
-
-    /// 消息类信号——由 news tagger 间接触发，不由技术指标 scanner 触发。
-    pub fn is_news_based(&self) -> bool {
-        matches!(self, Self::NewsCatalystMatched { .. })
     }
 }
 
@@ -165,88 +153,6 @@ impl EventKind {
     }
 }
 
-// ====== NewsKind / NewsImportance（用于 NewsCatalystMatched signal） =====
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NewsKind {
-    Earnings,
-    Halt,
-    Restructure,
-    Regulatory,
-    Ownership,
-    Operating,
-    Policy,
-    SectorTrend,
-    Market,
-    Other,
-}
-
-impl NewsKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Earnings => "earnings",
-            Self::Halt => "halt",
-            Self::Restructure => "restructure",
-            Self::Regulatory => "regulatory",
-            Self::Ownership => "ownership",
-            Self::Operating => "operating",
-            Self::Policy => "policy",
-            Self::SectorTrend => "sector_trend",
-            Self::Market => "market",
-            Self::Other => "other",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "earnings" => Some(Self::Earnings),
-            "halt" => Some(Self::Halt),
-            "restructure" => Some(Self::Restructure),
-            "regulatory" => Some(Self::Regulatory),
-            "ownership" => Some(Self::Ownership),
-            "operating" => Some(Self::Operating),
-            "policy" => Some(Self::Policy),
-            "sector_trend" => Some(Self::SectorTrend),
-            "market" => Some(Self::Market),
-            "other" => Some(Self::Other),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NewsImportance {
-    /// 停牌 / 立案 / 退市风险——盘中 5 分钟内必须 mini-scan
-    High,
-    /// 财报 / 解禁——next tick 处理
-    Medium,
-    /// 一般评论——盘后消化
-    Low,
-}
-
-impl NewsImportance {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "high" => Some(Self::High),
-            "medium" => Some(Self::Medium),
-            "low" => Some(Self::Low),
-            _ => None,
-        }
-    }
-    /// High 立即触发 mini-scan，绕过 budget。
-    pub fn triggers_immediate(self) -> bool {
-        matches!(self, Self::High)
-    }
-}
-
 // ====== SignalDetection 持久化形态 ======================================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,25 +185,6 @@ mod tests {
             timeframe: "day".into(),
         };
         assert!(s.is_visual());
-        assert!(!s.is_news_based());
-    }
-
-    #[test]
-    fn news_high_triggers_immediate() {
-        assert!(NewsImportance::High.triggers_immediate());
-        assert!(!NewsImportance::Medium.triggers_immediate());
-        assert!(!NewsImportance::Low.triggers_immediate());
-    }
-
-    #[test]
-    fn news_signal_kind_introspection() {
-        let s = SignalKind::NewsCatalystMatched {
-            news_kind: NewsKind::Halt,
-            importance: NewsImportance::High,
-        };
-        assert!(s.is_news_based());
-        assert!(!s.is_visual());
-        assert_eq!(s.family_str(), "news_catalyst_matched");
     }
 
     #[test]

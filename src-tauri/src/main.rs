@@ -35,10 +35,10 @@ pub fn run() {
 
             // Reflection tick 单独走 adapters/ 入口（需要构造 tool registry，pipeline 不能 use adapters）
             adapters::reflection_scheduler::spawn(app.handle().clone());
-            // Scan tick（9 ticks/天）—— v3 expectation-driven 自驱观察循环
+            // Scan tick（9 ticks/天）—— 自驱观察循环
             adapters::scan_scheduler::spawn(app.handle().clone());
-            // 高重要度新闻 → 即时 mini-scan listener
-            adapters::news_high_importance_listener::spawn(app.handle().clone());
+            // News batch listener：监听 news-batch-ready → 跑 news_review agent run
+            adapters::news_batch_listener::spawn(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。
@@ -108,17 +108,13 @@ pub fn run() {
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,
             adapters::proxy_commands::get_realtime_health,
-            // Agent v3 expectation-driven commands
+            // Agent v4 learning loop commands（strategy / lesson / heuristic 读 + retire）
             adapters::episode_commands::list_agent_episodes,
             adapters::episode_commands::get_account_metrics,
-            // v3 expectation-driven commands
-            adapters::expectation_commands::list_expectations,
-            adapters::expectation_commands::get_expectation,
-            adapters::expectation_commands::list_expectation_events,
             adapters::expectation_commands::list_strategies,
             adapters::expectation_commands::set_strategy_enabled,
             adapters::expectation_commands::list_lessons,
-            adapters::expectation_commands::list_lessons_for_expectation,
+            adapters::expectation_commands::list_lessons_for_position,
             adapters::expectation_commands::list_heuristics,
             adapters::expectation_commands::get_heuristic_counts,
             adapters::expectation_commands::retire_heuristic_cmd,

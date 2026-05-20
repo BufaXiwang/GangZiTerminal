@@ -1,12 +1,10 @@
 //! Agent prompt 构建——chat 模式。
 //!
-//! - AGENT_IDENTITY：从 identity.md include_str! 进来的人格档案（含 v3 重构后的
-//!   操盘手 + Expectation 纪律 + Reflection 纪律 + Heuristics 纪律 + Bull/Bear Steelman）
+//! - AGENT_IDENTITY：从 identity.md include_str! 进来的人格档案
 //! - CHAT_SYSTEM_INSTRUCTIONS：chat 模式追加的简短指令
 //! - build_chat_system_context：system 块末尾的稳定上下文（active heuristics top-N 注入）
-//! - build_chat_dynamic_context：user 块开头的动态上下文（市场 + 持仓 + pending expectations）
+//! - build_chat_dynamic_context：user 块开头的动态上下文（市场 + 持仓）
 
-use crate::domain::account::expectation::Expectation;
 use crate::domain::account::types::Position;
 use crate::domain::agent::heuristic::Heuristic;
 use crate::domain::quotes::regime::Regime;
@@ -20,7 +18,7 @@ pub(crate) const AGENT_IDENTITY: &str = include_str!("identity.md");
 pub(crate) const CHAT_SYSTEM_INSTRUCTIONS: &str = r#"你是 GangZiTerminal 的操盘手 Agent，正在和围观你交易的用户对话。
 
 ## Chat 里你仍然是操盘手
-- 自己判断要开/平/调仓 → **先 create_expectation 拿 expectation_id + 直接调写工具下单**，然后用自然语言汇报"我在 X 价开了 Y 股、止损 Z、理由 W"
+- 自己判断要开/平/调仓 → 直接调写工具下单，然后用自然语言汇报"我在 X 价开了 Y 股、止损 Z、理由 W"
 - 用户给指令（"建 X" / "平 Y" / "调止损到 Z"）→ 同样直接执行 + 汇报
 - 信心不足 → 直说"我不开，因为 X"——这本身就是一个决策，不要把球踢给用户
 - 写工具失败 → 如实告诉用户哪条规则不通 + 下一步可行方案；绝不假装下单成功
@@ -30,10 +28,12 @@ pub(crate) const CHAT_SYSTEM_INSTRUCTIONS: &str = r#"你是 GangZiTerminal 的�
 - 不要把一次性指令写成 heuristic，只写「可反复应用于未来场景」的判断
 - 反复打脸 / 用户撤回 / 与新规则冲突且新的更准 → 调 `retire_heuristic`
 
-## Expectation 纪律
-- agent 主动开仓 → 必须先 `create_expectation` 拿 expectation_id，再 `open_position` 传 expectation_id 关联
-- 用户直接命令开仓 → 可以省 expectation_id（但仍推荐补一条事后总结）
-- 建预期时如果你依赖了上面列出的 heuristic（按 id），就把它们的 id 填到 `applied_heuristic_ids`——review 时按这个精确给该 heuristic 计 hit/miss，胡乱归因会让无关 heuristic 被错误奖惩
+## Position 纪律（v4 合并 Expectation）
+- 开仓 → `open_position(kind=live/watch, direction, take_profit?, stop_loss?, invalidation_signals, signals_used, reasoning, conviction?)`
+- `kind=watch` 表示"看好但不下注"——shares=0，不动现金，只走 judge → close → lesson 学习闭环
+- 触发条件（take_profit / stop_loss / time_stop / invalidation_signals）由 scheduler tick 自动平仓，agent 只在主观撤回时调 `close_position(reason=manual)`
+- 调整假设 → `adjust_position`（改 target / stop / horizon / invalidation_signals / reasoning）
+- 如果你依赖了上面列出的 heuristic（按 id），就把它们填到 `applied_heuristic_ids`——close 时按这个精确给该 heuristic 计 hit/miss
 
 ## 不要做
 - 不要包 JSON 整个回答
@@ -43,23 +43,19 @@ pub(crate) const CHAT_SYSTEM_INSTRUCTIONS: &str = r#"你是 GangZiTerminal 的�
 // ====== Chat prompt 输入打包 ======
 
 /// Chat 的"稳定"系统上下文输入——active heuristics top-N 注入。
-///
-/// 这部分跨 chat turn 基本不变（heuristics 变化通过 propose/apply/retire 工具，
-/// 单次 request 内部稳定），适合放进 system block 末尾打 cache_control。
 pub struct ChatSystemContextInput<'a> {
     pub heuristics: &'a [Heuristic],
     pub current_regime: Option<Regime>,
 }
 
-/// Chat 的"易变"动态上下文输入——市场快照、持仓、active theses。
+/// Chat 的"易变"动态上下文输入——市场快照、持仓。
 ///
 /// `live_quotes`：当前 chat run 已 fetch 的实时行情；按 6 位 code 索引用于
-/// format_positions 显示当前价 + 盈亏%——比"事件链 10 条"对决策有用得多。
+/// format_positions 显示当前价 + 盈亏%。
 pub struct ChatDynamicContextInput<'a> {
     pub market_overview: Option<&'a MarketOverview>,
     pub simulated_positions: &'a [Position],
     pub live_quotes: &'a [StockQuote],
-    pub active_expectations: &'a [Expectation],
     pub quotes_availability: Option<&'a str>,
 }
 
@@ -73,9 +69,6 @@ fn format_availability_block(availability: Option<&str>) -> String {
 }
 
 /// 构造 chat 的 system 上下文文本（active heuristics + 当前 regime）。
-///
-/// 这一段会打 cache_control 形成 cacheable prefix——只要 heuristics 没动，
-/// 多轮 chat 共用同一份 prompt cache。
 pub fn build_chat_system_context(input: &ChatSystemContextInput) -> String {
     let regime_line = match input.current_regime {
         Some(r) => format!("当前市场状态（regime）：{}\n", r.as_str()),
@@ -90,7 +83,7 @@ pub fn build_chat_system_context(input: &ChatSystemContextInput) -> String {
     )
 }
 
-/// 构造 chat 的动态上下文文本（市场 + 持仓 + pending expectations）。
+/// 构造 chat 的动态上下文文本（市场 + 持仓）。
 pub fn build_chat_dynamic_context(input: &ChatDynamicContextInput) -> String {
     format!(
         r#"以下是本次对话开始时的实时上下文，仅作参考——若需要更精准的盘口或 K 线，请用对应工具拉取：
@@ -98,15 +91,11 @@ pub fn build_chat_dynamic_context(input: &ChatDynamicContextInput) -> String {
 当前市场上下文：
 {market}
 
-当前模拟账户持仓（含当前价 / 盈亏；历史事件链请用 get_position(position_id) 单独拉）：
-{positions}
-
-当前 pending expectations（你正在跟踪的投资预期，可代码自动 hit/miss 判定）：
-{expectations}"#,
+当前模拟账户持仓（含当前价 / 盈亏 / 假设字段；历史事件链请用 get_position(position_id) 单独拉）：
+{positions}"#,
         quotes_availability = format_availability_block(input.quotes_availability),
         market = format_market(input.market_overview),
         positions = format_positions(input.simulated_positions, input.live_quotes),
-        expectations = format_active_expectations(input.active_expectations),
     )
 }
 
@@ -175,7 +164,6 @@ fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> Strin
     if opens.is_empty() {
         return "暂无模拟持仓。".into();
     }
-    // 按 6 位 code 建索引，O(1) 查当前价
     let quote_by_code: HashMap<&str, &StockQuote> = live_quotes
         .iter()
         .map(|q| (q.code.as_str(), q))
@@ -185,13 +173,14 @@ fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> Strin
         .take(12)
         .map(|p| {
             let mut line = format!(
-                "{}({}) {}股 成本 ¥{:.2}",
+                "{}({}) [{}] {}股 成本 ¥{:.2} direction={}",
                 p.name,
                 p.code.as_str(),
+                p.kind.as_str(),
                 p.current_shares.value(),
-                p.avg_entry_price.value()
+                p.avg_entry_price.value(),
+                p.direction.as_str(),
             );
-            // 当前价 + 盈亏%——live_quotes 没拿到时（停牌/接口失败）只给空白
             let entry = p.avg_entry_price.value();
             if let Some(q) = quote_by_code.get(p.code.as_str()) {
                 if let Some(px) = q.price.as_ref().map(|y| y.value()) {
@@ -207,7 +196,6 @@ fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> Strin
                     ));
                 }
             }
-            // 止损 / 止盈——相对当前/成本的距离比裸价更直观
             if let Some(sl) = p.stop_loss {
                 let dist = if entry > 0.0 {
                     (sl.value() - entry) / entry * 100.0
@@ -224,41 +212,16 @@ fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> Strin
                 };
                 line.push_str(&format!("  止盈 ¥{:.2} ({:+.2}%)", tp.value(), dist));
             }
-            if let Some(eid) = &p.expectation_id {
-                line.push_str(&format!("  expectation={}", eid.as_str()));
+            if !p.invalidation_signals.is_empty() {
+                let fams: Vec<_> = p.invalidation_signals.iter().map(|s| s.family_str()).collect();
+                line.push_str(&format!("\n  失效条件: {}", fams.join(", ")));
             }
-            line.push_str(&format!("\n  入场理由：{}", truncate_chars(&p.thesis, 120)));
+            line.push_str(&format!("\n  入场理由：{}", truncate_chars(&p.reasoning, 200)));
+            if !p.signals_used.is_empty() {
+                let fams: Vec<_> = p.signals_used.iter().map(|s| s.family_str()).collect();
+                line.push_str(&format!("\n  入场信号: {}", fams.join(", ")));
+            }
             line
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn format_active_expectations(exps: &[Expectation]) -> String {
-    if exps.is_empty() {
-        return "暂无 pending expectation。".into();
-    }
-    exps.iter()
-        .take(10)
-        .map(|e| {
-            let target = e
-                .target_price
-                .as_ref()
-                .map(|y| format!("{:.2}", y.value()))
-                .unwrap_or_else(|| "观察型".into());
-            format!(
-                "- expectation_id={} code={} direction={} target={} horizon={}d conviction={} state={}{}\n  reasoning: {}\n  signals: {}",
-                e.id.as_str(),
-                e.code.as_str(),
-                e.direction.as_str(),
-                target,
-                e.horizon_days,
-                e.conviction.as_str(),
-                e.state.as_str(),
-                e.theme.as_ref().map(|t| format!(" theme=#{}", t)).unwrap_or_default(),
-                truncate_chars(&e.reasoning, 200),
-                e.signals_used.iter().map(|s| s.family_str()).collect::<Vec<_>>().join(", ")
-            )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
