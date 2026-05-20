@@ -10,6 +10,13 @@ import {
   X as XIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useAppState } from "../hooks/useAppState";
+
+// News batch loop 配置（后端 pipeline/news/batch_loop.rs 同名读取）
+const NEWS_BATCH_SIZE_KEY = "gangzi-terminal.news.batch-size";
+const NEWS_BATCH_INTERVAL_KEY = "gangzi-terminal.news.batch-interval-secs";
+const NEWS_BATCH_SIZE_DEFAULT = 20;
+const NEWS_BATCH_INTERVAL_SECS_DEFAULT = 15 * 60;
 
 // ============================================================================
 // AgentConfig payload — 与后端 AgentConfig 一一对应
@@ -121,7 +128,7 @@ export function SettingsPage({
       <div className="settings-section">
         <div className="settings-section-head">
           <h3>资讯</h3>
-          <p>NewsNow 财经源的拉取节奏。</p>
+          <p>NewsNow 财经源的拉取节奏 + Agent 批量分析触发条件。</p>
         </div>
         <div className="settings-rows">
           <Row title="自动刷新" hint="关闭后只在手动点击「刷新资讯」时才拉取">
@@ -139,6 +146,7 @@ export function SettingsPage({
               ]}
             />
           </Row>
+          <NewsBatchSettings />
         </div>
       </div>
 
@@ -394,6 +402,70 @@ function TriggerReflectionButton() {
       )}
     </div>
   );
+}
+
+// ============================================================================
+// News 批量分析配置——后端 batch_loop 攒批 / 定时触发 agent review 的两个旋钮
+//
+// 后端 pipeline/news/batch_loop.rs 在每个 tick 通过 load_app_state 读这两 key。
+// 改完立即生效（next tick）。
+// ============================================================================
+
+function NewsBatchSettings() {
+  const [batchSize, setBatchSize, sizeLoaded] = useAppState<number>(
+    NEWS_BATCH_SIZE_KEY,
+    NEWS_BATCH_SIZE_DEFAULT,
+    (raw) => clampInt(raw, 1, 100, NEWS_BATCH_SIZE_DEFAULT),
+  );
+  const [intervalSecs, setIntervalSecs, intervalLoaded] = useAppState<number>(
+    NEWS_BATCH_INTERVAL_KEY,
+    NEWS_BATCH_INTERVAL_SECS_DEFAULT,
+    (raw) => clampInt(raw, 60, 3600, NEWS_BATCH_INTERVAL_SECS_DEFAULT),
+  );
+  const intervalMinutes = Math.round(intervalSecs / 60);
+  return (
+    <>
+      <Row
+        title="批量分析数量 M"
+        hint="待分析资讯累计 ≥ M 立即触发 Agent；每次最多取 M 条做一次分析"
+      >
+        {sizeLoaded ? (
+          <NumberInput
+            value={batchSize}
+            min={1}
+            max={100}
+            step={1}
+            suffix="条"
+            onChange={setBatchSize}
+          />
+        ) : (
+          <span className="settings-readonly">加载中…</span>
+        )}
+      </Row>
+      <Row
+        title="批量分析间隔 N"
+        hint="即便未攒满 M，每 N 分钟也兜底跑一次 Agent 分析"
+      >
+        {intervalLoaded ? (
+          <NumberInput
+            value={intervalMinutes}
+            min={1}
+            max={60}
+            step={1}
+            suffix="分钟"
+            onChange={(mins) => setIntervalSecs(mins * 60)}
+          />
+        ) : (
+          <span className="settings-readonly">加载中…</span>
+        )}
+      </Row>
+    </>
+  );
+}
+
+function clampInt(raw: number, min: number, max: number, fallback: number): number {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? Math.round(raw) : fallback;
+  return Math.max(min, Math.min(max, n));
 }
 
 // ============================================================================
