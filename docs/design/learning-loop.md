@@ -45,8 +45,7 @@
 | Tick | 触发 | 干什么 |
 |---|---|---|
 | `scan_tick` × 9 | 9 个固定时刻 | ① 规则信号检测（纯代码）② 命中时 LLM mini-scan + 跑 auto_review |
-| `news_high_importance` | tagger 标 high 时即时 | 单条 news 立即喊 agent |
-| `news_review` (buffer ≥ 20 OR 30min) | 攒批或定时 | 喂全量近期 news + 上下文给 agent |
+| `news_review` (buffer ≥ M=20 OR 每 N=15min) | 攒批或定时（M/N 在 SettingsPage 可调） | 喂全量近期 news + 上下文给 agent |
 | `close_reflection` | 每日 15:30 | heuristic emerge + lesson takeaway 填充 |
 
 ---
@@ -61,7 +60,7 @@
                   ↓ 应用
 ┌────────────────────────────────────────────────────────────────────┐
 │  Tick 调度                                                          │
-│    9 scan_tick + news_review (buffer/30min) + news_high_importance  │
+│    9 scan_tick + news_review (buffer M=20 / 每 N=15min)             │
 │                                                                     │
 │  阶段 1：规则信号扫描（纯代码，0 LLM）                                │
 │           触发？─Y─> 阶段 2                                         │
@@ -217,14 +216,20 @@ async fn run_review_for_position(app: &AppHandle, trigger: ReviewTrigger) {
 
 ## News Review 详细
 
-### 三档触发
+### 两档触发
 | 触发器 | 时机 | 用途 |
 |---|---|---|
-| `news_high_importance_listener` | tagger 标 importance=high 时即时 | 央行降准 / 监管处罚等不能等 |
-| `news_review` 攒批 | 自上次 review 后新增 ≥ 20 条 news_items | 突发某板块多消息汇集 |
-| `news_review` 定时 | 每 30 分钟兜底 | 平稳期也按节奏复盘 |
+| `news_review` 攒批 | refresh tick 末尾发现 pending ≥ M=20 立即触发 | 突发某板块多消息汇集 |
+| `news_review` 定时 | 每 N=15 分钟兜底（默认，SettingsPage 可调 1–60 min） | 平稳期也按节奏复盘 |
 
-后两者**不筛 importance**——agent 自己判断哪些是 actionable。
+**不筛 importance**——agent 自己判断哪些是 actionable（原 tagger 关键词分级已删，规则不准）。
+
+### 并发安全
+- `batch::claim_batch` 用 `UPDATE...RETURNING` 原子取走 + 标 processing（同语句持写锁）
+- 进程级 `REVIEW_IN_FLIGHT` AtomicBool 防多 batch 在 listener 排队——batch_loop **claim 之前**就 check，已在 flight 则 skip 本轮
+- listener RAII Drop guard 保证 agent run 成功/失败/panic 都释放锁
+- 30min watchdog 兜底回收 processing 孤儿（进程崩或 emit 失败的极端情况）
+- 失败一律 `revert_processing_to_pending`（不写 failed，防瞬时故障永久漏分析）
 
 ### prompt 喂的数据
 | 段 | 内容 |

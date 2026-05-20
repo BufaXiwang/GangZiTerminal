@@ -3,24 +3,23 @@
 //!
 //! pipeline 不允许 use adapters → registry 构造放在 adapter 层，通过 Tauri Event 解耦。
 //!
-//! **串行化保证**：同一时间只允许 1 个 news_review run。多个 event 同时到达时，
-//! 后到的等前一个 release。理由：
-//! - 决策竞态——多个 agent 同时看 open positions 做相反决定
-//! - Provider 限流——并发 LLM 调用容易撞 rate limit
-//! - 多耗 token 无收益（news 已经按 batch 分组，没有抢资源的必要）
+//! **串行化保证**：batch_loop 在 claim 前已通过 REVIEW_IN_FLIGHT 锁阻挡了"上轮还
+//! 没跑完就再 claim"——理论上 listener 永远不会收到重叠 event。但 emit 仍可能
+//! 同瞬间被多次触发（refresh overflow + timer 撞车），所以这里再保险一层 Drop guard，
+//! 跑完无论成功失败 / panic 都释放 REVIEW_IN_FLIGHT。
 //!
-//! **错误回退**：agent run 失败时**不写 mark_failed**——直接 revert 到 pending
-//! 让下次 batch 重试。Provider 超时 / 网络故障是常见且可恢复的，写 failed 会
-//! 造成"瞬时故障 → 永久漏分析"。真要标 failed 留给 agent 自己显式判定（未来扩展）。
+//! **错误回退**：agent run 失败时不写 mark_failed——直接 revert 到 pending 让下次
+//! batch 重试。Provider 超时 / 网络故障是常见且可恢复的，写 failed 会造成"瞬时
+//! 故障 → 永久漏分析"。
 
 use crate::adapters::agent_tools::build_chat_registry;
 use crate::domain::news::NewsId;
 use crate::infrastructure::news::batch;
 use crate::pipeline::agent::news_review;
+use crate::pipeline::news::batch_loop;
 use serde::Deserialize;
 use std::sync::Arc;
 use tauri::{AppHandle, Listener};
-use tokio::sync::Semaphore;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,11 +30,17 @@ struct Payload {
     trigger_reason: String,
 }
 
-pub fn spawn(app: AppHandle) {
-    // 全局单次许可——保证同一时间只有 1 个 news_review run。
-    // Arc 共享到每个 event handler 的 spawn 闭包里。
-    let permit: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+/// RAII guard——drop 时调 `batch_loop::mark_review_done()` 释放全局 in-flight 锁。
+/// 保证无论 agent run 成功 / 失败 / async block 提前 return 都释放锁。
+struct ReviewDoneGuard;
 
+impl Drop for ReviewDoneGuard {
+    fn drop(&mut self) {
+        batch_loop::mark_review_done();
+    }
+}
+
+pub fn spawn(app: AppHandle) {
     let app_for_handler = app.clone();
     app.listen("news-batch-ready", move |event| {
         let raw = event.payload();
@@ -48,16 +53,10 @@ pub fn spawn(app: AppHandle) {
             return;
         }
         let app_clone = app_for_handler.clone();
-        let permit = permit.clone();
         tauri::async_runtime::spawn(async move {
-            // 等许可——前一个 news_review 跑完才能拿到
-            let _guard = match permit.acquire_owned().await {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!(error = %e, "news_review semaphore acquire 失败（极罕见）");
-                    return;
-                }
-            };
+            // RAII：async block 结束时 drop → 释放 batch_loop 的 REVIEW_IN_FLIGHT
+            let _guard = ReviewDoneGuard;
+
             let news_ids: Vec<NewsId> =
                 payload.news_ids.iter().map(|s| NewsId::new(s.clone())).collect();
             let registry = Arc::new(build_chat_registry(&app_clone));
@@ -84,7 +83,6 @@ pub fn spawn(app: AppHandle) {
                 }
                 Err(e) => {
                     // 系统级错误（provider 超时 / 网络 / 模型配置）→ revert 到 pending
-                    // 让下次 batch 重试。不写 failed 是为了避免"瞬时故障永久漏分析"。
                     tracing::warn!(
                         batch_id = %payload.batch_id,
                         error = %e,
@@ -96,7 +94,7 @@ pub fn spawn(app: AppHandle) {
                     }
                 }
             }
-            // _guard drop 在这里——许可释放，下一个 event 可以拿
+            // _guard drop here → REVIEW_IN_FLIGHT cleared
         });
     });
 }

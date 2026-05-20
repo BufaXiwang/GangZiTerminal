@@ -483,7 +483,7 @@ pub fn recover_stale_processing(app: &AppHandle) -> Result<usize, NewsError>;
 | `chat` / `user_message` | 用户在 chat 发消息 | 全功能 agent run（可开仓 / 修订 heuristic） |
 | `scan_tick` | 9 tick / 日 | 规则信号扫 → 触发条件命中时调 LLM mini-scan |
 | `position_close` | Position 自动平仓（auto_review 触发） | 写 Lesson → 反向打标 Heuristic.hit/miss → confidence 重算 |
-| `news_high_importance` | news tagger High 命中 | 立即 mini-scan（绕过 budget） |
+| `news_batch_ready` | batch_loop 攒批 M=20 / 定时 N=15min 触发 | 跑 news_review agent run（关联 watchlist + 持仓） |
 
 ### 2.5 Chat — 观察 + 干预层
 
@@ -1227,19 +1227,20 @@ NewsItem 只存源数据（id, title, summary, url, status）+ tagger 输出的 
 - 关键词匹配误识别率高（不同公司同名 / 概念股 / 联想关系）
 - LLM 在 agent run 中能自己识别——这正是 agent 的工作
 
-### Q3.1: News → Agent review 的触发机制 → **buffer + 定时 + 高重要度即时**
+### Q3.1: News → Agent review 的触发机制 → **buffer + 定时 + 全量喂 agent**
 
-News 不立即触发 agent，按三档汇总：
+News BC 不感知 agent；通过 Tauri Event 解耦，按两档触发：
 
 | 触发器 | 时机 | 用途 |
 |---|---|---|
-| `news_high_importance_listener` | tagger 标 importance=high 时立即 | 央行降准 / 监管处罚等不能等的宏观/政策类 |
-| `news_review` 攒批 | 自上次 review 后新增 ≥ 20 条 | 突发某板块多条相关消息汇集 → 提前喊 agent |
-| `news_review` 定时 | 每 30 分钟兜底 | 平稳期也按节奏复盘当时段全部 news |
+| `news_review` 攒批 | refresh tick 末尾发现 pending ≥ M=20 立即触发 | 突发某板块多条相关消息汇集 → 提前喊 agent |
+| `news_review` 定时 | 每 N=15 分钟兜底（默认，SettingsPage 可调 1–60 min） | 平稳期也按节奏复盘当时段全部 news |
 
-后两者**不筛 importance**——agent 自己判断哪些是 actionable，符合"数据驱动 + agent 自主决策"原则。
+**不筛 importance**——agent 自己判断哪些是 actionable，符合"数据驱动 + agent 自主决策"原则。原 tagger 关键词分级已删（不准 + 多余）。
 
-`news_review` 喂给 agent 的上下文：新增 news 全量（含 title + summary + tickers + sectors）+ 当前 open positions + 自选股 + 近期 lesson + active heuristics + 市场状态。让 agent 在完整上下文里决定 `open_position(kind=watch/live)` / `adjust_position` / `no_action`。
+**并发安全**：claim_batch 用 `UPDATE...RETURNING` 原子取走 + 标 processing；进程级 `REVIEW_IN_FLIGHT` AtomicBool 防止多 batch 在 listener 排队（claim 前 check）；listener Drop guard 保证释放；30min watchdog 兜底回收孤儿。
+
+`news_review` 喂 agent 的上下文：新增 news 全量 + 当前 open positions + 自选股 + active heuristics。让 agent 决定 `open_position(kind=watch/live)` / `adjust_position` / `add_to_watchlist` / `no_action`。
 
 ### Q4: Snapshot 不重复缓存 → **复用 Quotes snapshot**
 
