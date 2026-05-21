@@ -20,15 +20,15 @@ Account 负责：
 - 提供挂单、撤单、开仓、调仓、平仓、调整止损止盈 / 时间止损的能力。
 - 管理自选列表，并提供带行情状态的自选列表读模型。
 - 基于 Quotes snapshot 计算仓位价格、可卖数量、成本、盈亏、账户总资产。
-- 定时判断订单成交条件和仓位保护条件。
-- 条件触发后写账户事件并 emit 通知，让 Agent 感知。
+- 提供订单成交条件和仓位保护条件的 evaluation use case。
+- 条件触发后写账户事件并 emit 通知；事件路由由 Runtime Orchestrator 负责。
 - 维护前端和 Agent 可读取的账户 snapshot、仓位列表、订单列表、自选列表。
 
 Account 不负责：
 
 - 判断是否应该买入、卖出、加仓、减仓。
 - 响应止损 / 止盈触发后的具体行为。
-- 调用 Agent 或启动 Agent run。
+- 调用 Agent、启动 Agent run 或管理跨模块调度。
 - 获取行情源或维护 Quotes provider。
 - 新闻获取、新闻分析、市场扫描。
 - 真券商连接、真实下单、真实资产同步。
@@ -248,10 +248,10 @@ UI / Agent fetch_account
 - 仓位和自选的行情字段只从 Quotes snapshot 左连接。
 - Quotes snapshot 缺失时返回 `quote_missing` warning，账户基础数据仍返回。
 
-### 定时触发流
+### 触发评估流
 
 ```text
-scheduler tick
+Runtime Orchestrator tick
   -> pending orders + open positions + watchlist
   -> Quotes snapshot
   -> simulate order fills / expirations
@@ -265,6 +265,7 @@ scheduler tick
 - Account 只判断条件和发事件，不调用 Agent。
 - `account-triggered` 是通知，不是交易指令。
 - 触发事件必须带 `trigger_id`，Agent 可用它做幂等处理。
+- Runtime Orchestrator 监听 `account-triggered` 并负责幂等触发 Agent run。
 
 ---
 
@@ -449,13 +450,13 @@ subscribed_codes() -> Vec<TsCode>;
 
 ### 订阅集合
 
-Account 对 Quotes 暴露当前关注集合：
+Account 对 Runtime Orchestrator 暴露当前关注集合：
 
 ```text
 subscribed_codes = watchlist ∪ open_positions ∪ pending_orders
 ```
 
-Quotes 后台任务根据该集合刷新 snapshot。Account 不直接维护行情源。
+Runtime Orchestrator 将该集合合并核心指数后传给 Quotes refresh。Account 不直接维护行情源，也不调用 Quotes provider。
 
 ---
 
@@ -468,6 +469,7 @@ Quotes 后台任务根据该集合刷新 snapshot。Account 不直接维护行�
 - 价格触及止损 / 止盈时，Account 写 `AccountTrigger` 并 emit `account-triggered`，不调用 Agent、不自动平仓。
 - `fetch_account({ include: { watchlist: true } })` 返回自选列表和 Quotes snapshot 行情摘要；缺行情时返回 warning。
 - `AccountSnapshot` 的 cash / PnL / totalAssets 可由 events + fills + positions + Quotes snapshot 重算。
+- Runtime Orchestrator 消费 `subscribed_codes()` 并注入 Quotes refresh；Account 不直接刷新行情。
 - 当日买入 lot 的 `sellableQuantity` 为 0；次一交易日才可卖。
 - 挂买单冻结现金，撤单 / 过期释放冻结现金。
 - 挂卖单冻结对应可卖数量，撤单 / 过期释放冻结数量。

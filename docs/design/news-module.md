@@ -21,7 +21,7 @@ News 负责：
 - 正文抽取与正文缓存。
 - 基础查询：列表、按 ID 获取、全文搜索、按股票/关键词过滤。
 - 保留期清理。
-- 刷新完成事件通知。
+- 刷新完成事件通知；事件路由由 Runtime Orchestrator 负责。
 
 News 不负责：
 
@@ -29,7 +29,7 @@ News 不负责：
 - 判断资讯利好 / 利空。
 - 自动识别影响哪些股票。
 - 管理 pending / processing / consumed 等分析状态。
-- 触发 Agent run。
+- 触发 Agent run 或管理跨模块调度。
 - 调用 Quotes / Account / Agent 代码。
 
 ---
@@ -286,13 +286,13 @@ type ProviderNewsItem = {
 
 ### 后台刷新
 
-资讯刷新由 News 自己的 scheduler 维护。
+News 提供 refresh / retention use case；触发节奏由 Runtime Orchestrator 维护。
 
 | 任务 | 频率 | 说明 |
 |---|---:|---|
-| news refresh | 用户配置，默认 60s | 多源拉取、去重、入库 |
-| article warm | 低频 / 按需队列 | 对重点新闻或最近新闻抽正文 |
-| retention | 每日 | 清理过期 news / article cache |
+| news refresh | Orchestrator 配置，默认 60s | 多源拉取、去重、入库 |
+| article warm | Orchestrator 低频 / 按需队列 | 对重点新闻或最近新闻抽正文 |
+| retention | Orchestrator 每日 | 清理过期 news / article cache |
 
 刷新完成后 emit 事件：
 
@@ -301,6 +301,8 @@ type ProviderNewsItem = {
 | `news-refreshed` | `{ fetchedCount, savedCount, failedCount, firstFailure }` |
 
 事件只表示数据变化。News 不关心谁监听，也不直接调用下游模块。
+
+Runtime Orchestrator 可以监听 `news-refreshed`，按阈值 / 节流 / 幂等规则触发 Agent news batch run。
 
 ### 保留期
 
@@ -327,7 +329,7 @@ type ProviderNewsItem = {
 
 - `fetch_news` 是前端读取 News 的统一入口。
 - `fetch_news` 默认只读本地 DB / article cache，不触发远端 provider 拉取。
-- `refresh_news` 是显式刷新入口；后台刷新也只进入 News 自己的 refresh use case。
+- `refresh_news` 是显式刷新入口；后台刷新由 Runtime Orchestrator 调用 News refresh use case。
 - `fetch_news({ includeArticle: true })` 遇到缺正文时返回 item 级 warning，不让整批失败。
 - `news-refreshed` 只表示数据变化，不直接调用 Agent / Quotes / Account。
 - News 入库以稳定 ID 去重，同一条新闻不会因为 provider 重复返回而生成多条主记录。

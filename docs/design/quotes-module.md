@@ -446,13 +446,21 @@ BJ 可以不支持，返回 per-item warning / error。
 
 ### 后台刷新
 
+Quotes 提供 refresh use case；触发节奏和 scope 由 Runtime Orchestrator 维护。
+
 | 数据 | 策略 |
 |---|---|
-| 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；TuShare 可用时 enrich |
-| 实时行情 | 自选股 / 持仓 / 核心指数盘中 15s；全市场 universe 盘中 60s |
-| K 线 | 启动后预热关注标的；盘后 16:00 补日周月；TuShare 可用时补复权 |
-| `daily_basic` | 每个交易日盘后刷新 |
-| `company_events` | 每日低频刷新，覆盖未来 N 天事件窗口 |
+| 全市场列表 | Orchestrator 启动 + 每日 08:30：TDX 基础 universe；TuShare 可用时 enrich |
+| 实时行情 | Orchestrator 注入 Account subscribed codes + 核心指数，盘中 15s；全市场 universe 盘中 60s |
+| K 线 | Orchestrator 启动后预热关注标的；盘后 16:00 补日周月；TuShare 可用时补复权 |
+| `daily_basic` | Orchestrator 每个交易日盘后刷新 |
+| `company_events` | Orchestrator 每日低频刷新，覆盖未来 N 天事件窗口 |
+
+规则：
+
+- Quotes 不读取 Account 内部实现。
+- Quotes refresh scope 由 Runtime Orchestrator 传入。
+- `market-quotes-refreshed` 只表示 snapshot 已更新；Account snapshot 重建和 Agent run 路由由 Runtime Orchestrator 处理。
 
 ---
 
@@ -469,6 +477,7 @@ BJ 可以不支持，返回 per-item warning / error。
 - `daily_basic` 和 `company_events` 由本地 DB 读取，远端拉取只发生在后台刷新 / 显式 refresh 路径。
 - 所有批量返回都是 per-item warning/error；单个标的缺数据不让整批失败。
 - 指标计算优先使用 `qfq` K 线；只能使用 `none` 时返回复权 warning。
+- Account subscribed codes 注入 Quotes refresh 是 Runtime Orchestrator 的职责，不是 Quotes / Account 互相调用。
 - 依赖方向自检为空：quotes 任一层不 import Agent / Account / News 代码。
 
 ---
