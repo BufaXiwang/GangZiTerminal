@@ -123,6 +123,8 @@ pub struct MarketQuoteSnapshot {
 }
 ```
 
+`MARKET_SNAPSHOT` 语义上是进程内 in-memory snapshot cache（当前实现可用 `HashMap` / 并发 map），不是 SQLite 真源。重启后由后台 refresh / cache hydrate 重新填充；长期历史、K 线、基本面和公司事件仍以 SQLite 读模型为准。
+
 用途：
 
 - breadth 只统计 `category == stock`。
@@ -366,6 +368,90 @@ Agent 只暴露一个工具：
 
 ```ts
 type FetchQuotesToolInput = FetchDataByCodesRequest;
+
+type FetchQuotesToolOutput = {
+  scan?: {
+    generatedAt: string;
+    criteria: string[];
+    items: Array<AgentQuoteItem & { rank?: number; score?: number }>;
+  };
+  items: AgentQuoteItem[];
+  warnings?: string[];
+  errors?: string[];
+};
+
+type AgentQuoteItem = {
+  tsCode: string;
+  code: string;
+  name: string;
+  category: "stock" | "index" | "fund";
+  quote?: {
+    price?: number;
+    change?: number;
+    changePercent?: number;
+    volume?: number;
+    amount?: number;
+    high?: number;
+    low?: number;
+    previousClose?: number;
+    source: string;
+    capturedAt: string;
+    stale: boolean;
+  };
+  intraday?: {
+    tradeDate: string;
+    points: Array<{ time: string; price: number; average?: number; volume?: number }>;
+    truncated?: boolean;
+  };
+  klines?: Array<{
+    period: "day" | "week" | "month";
+    adjust: "none" | "qfq" | "hfq";
+    source: string;
+    fetchedAt: string;
+    points: Array<{ date: string; open: number; high: number; low: number; close: number; volume?: number; amount?: number }>;
+    truncated?: boolean;
+  }>;
+  minuteKlines?: Array<{
+    period: "1m" | "5m" | "15m" | "30m" | "60m";
+    source: string;
+    fetchedAt: string;
+    points: Array<{ timestamp: string; open: number; high: number; low: number; close: number; volume: number; amount: number }>;
+    truncated?: boolean;
+  }>;
+  indicators?: {
+    basis: { period: string; adjust?: string; fetchedAt?: string };
+    values: Record<string, number | string | null>;
+  };
+  dailyBasic?: {
+    tradeDate: string;
+    peTtm?: number;
+    pb?: number;
+    psTtm?: number;
+    turnoverRate?: number;
+    volumeRatio?: number;
+    totalMv?: number;
+    circMv?: number;
+  };
+  profile?: {
+    sector?: string;
+    status?: string;
+    listDate?: string;
+  };
+  events?: Array<{
+    id: string;
+    eventType: string;
+    announceDate?: string;
+    effectiveDate?: string;
+    summary: string;
+  }>;
+  freshness?: {
+    quoteAgeMs?: number;
+    klineFetchedAt?: Record<string, string>;
+    dailyBasicTradeDate?: string;
+  };
+  warnings?: string[];
+  errors?: string[];
+};
 ```
 
 工具名：`fetch_quotes`
@@ -373,7 +459,9 @@ type FetchQuotesToolInput = FetchDataByCodesRequest;
 约束：
 
 - 复用 `fetch_data_by_codes` 的底层 query 能力。
-- 默认输出应比 UI DTO 更精简，避免 token 爆炸。
+- 输出使用 `FetchQuotesToolOutput` 的 token-friendly 视图，不直接返回 UI DTO 或 provider raw payload。
+- K 线、分时、分钟 K 默认按请求 `limit` 截断；超出时必须标记 `truncated = true`。
+- 扫描结果默认只返回排序后摘要字段，详情需 Agent 再按 codes 调一次。
 - Agent 不直接调用 provider，也不需要知道 TDX / EM / TuShare 的细节。
 
 ### 内部 Rust API

@@ -63,6 +63,7 @@ Account 不负责：
 - 订单和仓位分开建模：挂单是 `Order`，成交后才影响 `Position`。
 - 止损 / 止盈不是默认真实挂单，而是 `PositionProtection` 条件；命中后只触发事件，由 Agent 决定后续动作。
 - A 股交易规则由 Account 校验：整手、T+1、交易时段、可成交性、费用、印花税。
+- 交易写路径必须检查 Quotes snapshot freshness；`quote.stale == true`、quote 缺失或关键价格缺失时，不允许即时成交。
 - 批量读取返回 per-item warning/error；单个标的行情缺失不让整批失败。
 
 ### 订单模型
@@ -95,8 +96,9 @@ type Order = {
 规则：
 
 - `open_position` / `scale_position` / `close_position` 可以作为 Agent 的便捷动作，但 Account 内部仍应落为订单 + 成交 + 仓位事件。
-- `market` 表示用当前 Quotes snapshot 模拟即时成交；若盘口不可成交则拒单或保持 pending，按请求策略决定。
+- `market` 表示用当前 fresh Quotes snapshot 模拟即时成交；若 quote stale / missing / 盘口不可成交则拒单或保持 pending，按请求策略决定。
 - `limit` 表示挂单；由定时任务根据 Quotes snapshot 判断是否成交、部分成交、过期。
+- `limit` 订单可以在 quote stale 时创建为 pending，但不能在 stale quote 上成交。
 - A 股股票买入 / 卖出数量必须是 100 股整数倍。
 
 ### 成交模型
@@ -324,11 +326,57 @@ Agent 使用两个 Account 工具：一个读，一个写。
 
 ```ts
 type FetchAccountToolInput = FetchAccountRequest;
+
+type FetchAccountToolOutput = {
+  snapshot?: AccountSnapshot;
+  positions?: Array<{
+    positionId: string;
+    tsCode: string;
+    name: string;
+    status: "open" | "closed";
+    quantity: number;
+    sellableQuantity: number;
+    avgCost: number;
+    marketPrice?: number;
+    marketValue?: number;
+    unrealizedPnl?: number;
+    realizedPnl: number;
+    protection?: PositionProtection;
+    openedAt: string;
+    closedAt?: string;
+  }>;
+  orders?: Array<{
+    orderId: string;
+    tsCode: string;
+    side: "buy" | "sell";
+    orderType: "market" | "limit";
+    limitPrice?: number;
+    quantity: number;
+    filledQuantity: number;
+    status: Order["status"];
+    intent: Order["intent"];
+    positionId?: string;
+    createdAt: string;
+    expiresAt?: string;
+  }>;
+  watchlist?: Array<WatchlistItem & {
+    quote?: {
+      price?: number;
+      changePercent?: number;
+      amount?: number;
+      capturedAt?: string;
+      stale?: boolean;
+    };
+  }>;
+  triggers?: AccountTrigger[];
+  recentEvents?: AccountEvent[];
+  warnings?: string[];
+};
 ```
 
 约束：
 
-- 输出默认比 UI DTO 更精简，避免 token 爆炸。
+- 输出使用 `FetchAccountToolOutput` 的 token-friendly 视图，不直接返回 UI DTO 或完整事件流。
 - 可按 include 精确选择 snapshot / positions / orders / watchlist / events / triggers。
 - 不触发远端行情 provider。
 
@@ -400,6 +448,7 @@ type OperateAccountInput =
 - `open_position`、`scale_position`、`close_position` 是便捷交易动作，内部仍走订单 / 成交流。
 - `adjust_protection` 只调整保护条件，不直接下单。
 - 工具返回必须包含 `accepted/rejected`、订单或仓位 ID、错误原因、最新 snapshot 摘要。
+- 即时成交类 action 遇到 stale / missing quote 必须返回 `rejected`，reason 使用 `quote_stale` / `quote_missing` / `quote_price_missing`。
 
 ### 内部 Rust API
 
@@ -424,6 +473,7 @@ subscribed_codes() -> Vec<TsCode>;
 | 整手 | 股票买入 / 卖出数量必须是 100 股整数倍 |
 | T+1 | 当日买入的 lot 当日不可卖 |
 | 交易时段 | 即时成交类订单只在 A 股交易时段成交；挂单可盘外创建，交易时段再判断 |
+| 行情新鲜度 | `market` 和即时成交类便捷动作必须使用 fresh quote；stale / missing quote 拒单 |
 | 可成交性 | 买入需要卖盘可成交，卖出需要买盘可成交；盘口缺失时不能假装成交 |
 | 费用 | 佣金双向收取，印花税仅卖出收取 |
 | 现金 | 买入不能超过可用现金；挂买单冻结现金 |
@@ -431,9 +481,10 @@ subscribed_codes() -> Vec<TsCode>;
 
 ### 订单成交模拟
 
-- `market` 订单用 Quotes snapshot 的当前价和盘口模拟成交。
-- `limit` 买单在 `quote.price <= limitPrice` 且卖盘可成交时成交。
-- `limit` 卖单在 `quote.price >= limitPrice` 且买盘可成交时成交。
+- `market` 订单用 fresh Quotes snapshot 的当前价和盘口模拟成交。
+- `limit` 买单在 fresh quote 满足 `quote.price <= limitPrice` 且卖盘可成交时成交。
+- `limit` 卖单在 fresh quote 满足 `quote.price >= limitPrice` 且买盘可成交时成交。
+- stale / missing quote 不得触发成交；pending 订单保持 pending 并等待下一次 fresh quote。
 - 盘口量不足时允许部分成交，剩余数量保持 pending。
 - 过期订单变为 `expired`，并释放冻结现金 / 冻结持仓。
 
@@ -466,6 +517,7 @@ Runtime Orchestrator 将该集合合并核心指数后传给 Quotes refresh。Ac
 - Agent Account 工具只有 `fetch_account` 和 `operate_account`。
 - `operate_account(open_position)` 会创建订单；成交后生成 fill、position、account event，并刷新 snapshot。
 - `operate_account(adjust_protection)` 只改保护条件，不自动创建卖单。
+- `operate_account(open_position)` / `market` 订单在 quote stale 或缺失时必须拒单，不能依赖 Agent 自律。
 - 价格触及止损 / 止盈时，Account 写 `AccountTrigger` 并 emit `account-triggered`，不调用 Agent、不自动平仓。
 - `fetch_account({ include: { watchlist: true } })` 返回自选列表和 Quotes snapshot 行情摘要；缺行情时返回 warning。
 - `AccountSnapshot` 的 cash / PnL / totalAssets 可由 events + fills + positions + Quotes snapshot 重算。

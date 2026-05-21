@@ -85,8 +85,17 @@ type NewsRefreshedPayload = {
   fetchedCount: number;
   savedCount: number;
   failedCount: number;
-  firstFailure?: string;
+  firstFailure?: NewsFailure;
+  failures?: NewsFailure[];
   newIds?: string[];
+};
+
+type NewsFailure = {
+  provider: string;
+  error: string;
+  stage?: "fetch" | "normalize" | "save" | "article";
+  retryable?: boolean;
+  occurredAt: string;
 };
 
 type AccountTriggeredPayload = {

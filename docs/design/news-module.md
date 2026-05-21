@@ -218,7 +218,16 @@ type RefreshNewsResponse = {
   fetchedCount: number;
   savedCount: number;
   failedCount: number;
-  firstFailure?: string;
+  firstFailure?: NewsFailure;
+  failures?: NewsFailure[];
+};
+
+type NewsFailure = {
+  provider: string;
+  error: string;
+  stage?: "fetch" | "normalize" | "save" | "article";
+  retryable?: boolean;
+  occurredAt: string;
 };
 ```
 
@@ -234,6 +243,30 @@ type FetchNewsToolInput = {
   includeArticle?: boolean;
   limit?: number;
 };
+
+type FetchNewsToolOutput = {
+  items: AgentNewsItem[];
+  warnings?: string[];
+  errors?: string[];
+};
+
+type AgentNewsItem = {
+  id: string;
+  source: string;
+  title: string;
+  summary?: string;
+  url?: string;
+  publishedAt?: string;
+  articleExcerpt?: string;
+  mentions?: Array<{
+    tsCode: string;
+    mention: string;
+  }>;
+  freshness?: {
+    ageMs?: number;
+    articleFetchedAt?: string;
+  };
+};
 ```
 
 工具名：`fetch_news`
@@ -241,7 +274,8 @@ type FetchNewsToolInput = {
 约束：
 
 - 复用 `fetch_news` 的本地 query 能力。
-- 默认输出应比 UI DTO 更精简，避免 token 爆炸。
+- 输出使用 `FetchNewsToolOutput` 的 token-friendly 视图，不直接返回 UI DTO 或 provider raw payload。
+- `includeArticle = true` 时默认返回正文摘要 / excerpt；完整正文需要显式按 `ids` 精确读取并受长度限制。
 - Agent 只拿资讯内容；重要性、影响、交易动作由 Agent 自己判断。
 
 ### 内部 Rust API
@@ -273,6 +307,14 @@ News provider 是 infrastructure 细节，不进入 UI / Agent API。
 Provider 输出至少包含：
 
 ```ts
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
 type ProviderNewsItem = {
   id: string;
   source: string;
@@ -280,7 +322,7 @@ type ProviderNewsItem = {
   summary?: string;
   url?: string;
   publishedAt?: string;
-  payload: unknown;
+  payload: JsonValue;
 };
 ```
 
@@ -298,7 +340,7 @@ News 提供 refresh / retention use case；触发节奏由 Runtime Orchestrator 
 
 | Event | Payload |
 |---|---|
-| `news-refreshed` | `{ fetchedCount, savedCount, failedCount, firstFailure }` |
+| `news-refreshed` | `{ fetchedCount, savedCount, failedCount, firstFailure?: NewsFailure, failures?: NewsFailure[] }` |
 
 事件只表示数据变化。News 不关心谁监听，也不直接调用下游模块。
 
