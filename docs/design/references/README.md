@@ -23,7 +23,7 @@ Agent 如何做投资判断？
 Account 如何执行交易规则？
 ```
 
-这些分别写在模块 spec 和 `orchestration.md`。
+这些分别写在模块 spec 和 `agent-runtime-module.md`。
 
 ## 目录
 

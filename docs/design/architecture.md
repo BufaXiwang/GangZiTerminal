@@ -19,11 +19,17 @@ A 股研究 + 模拟交易学习终端。Agent 从市场数据和资讯中识别
 | Quotes | [quotes-module.md](quotes-module.md) | 市场数据本地读模型、行情、K 线、指标、基本面、扫描 |
 | News | [news-module.md](news-module.md) | 多源资讯本地读模型、正文缓存、检索 |
 | Account | [account-module.md](account-module.md) | 模拟券商账户、订单、成交、仓位、账户估值、自选列表 |
-| Agent | [agent-module.md](agent-module.md) | 数据驱动的投资专家、决策 loop、复盘、自我迭代、策略动态注入 |
+| Agent | [agent-module.md](agent-module.md)；[agent-infra-module.md](agent-infra-module.md)；[agent-runtime-module.md](agent-runtime-module.md) | Infra 负责模型渠道 / 消息 / 上下文 / 工具注册协议 / 基础 loop；Runtime 负责事件路由 / 调度 / 订阅注入 / run profile / 工具使用策略 / 决策审计 |
 
-跨模块前端体验和视觉系统以 [frontend-design.md](frontend-design.md) 为准。
+Spec 写作规范以 [spec-guidelines.md](spec-guidelines.md) 为准。
 
-跨模块事件路由、后台任务和订阅集注入以 [orchestration.md](orchestration.md) 为准。
+跨模块共享类型以 [shared-types.md](shared-types.md) 为准。
+
+Provider / channel adapter 细节以 [references/](references/) 下的文档为准；模块 spec 只写 provider 选择策略和 canonical contract。
+
+跨模块前端体验和视觉系统以 [../frontend-design.md](../frontend-design.md) 为准。
+
+跨模块事件路由、后台任务和订阅集注入以 [agent-runtime-module.md](agent-runtime-module.md) 为准。
 
 ---
 
@@ -57,7 +63,7 @@ adapters
 ## 3. 模块关系
 
 ```text
-Runtime Orchestrator
+Agent Runtime
   -> News.refresh
   -> Quotes.refresh
   -> Account.evaluate/rebuild/subscriptions
@@ -74,9 +80,9 @@ Account
 
 规则：
 
-- Runtime Orchestrator 是 application 层编排器，不是 bounded context，不拥有业务规则。
-- News / Account / Quotes emit 的事件只表达事实；事件路由和后台 run 触发由 Runtime Orchestrator 负责。
-- Account 的 subscribed codes 由 Runtime Orchestrator 注入 Quotes refresh scope。
+- Agent Runtime 是 application 层编排器，不是 bounded context，不拥有业务规则。
+- News / Account / Quotes emit 的事件只表达事实；事件路由和后台 run 触发由 Agent Runtime 负责。
+- Account 的 subscribed codes 由 Agent Runtime 注入 Quotes refresh scope。
 - Quotes、News、Account 都不知道 Agent 存在。
 - Agent 是消费者和决策者，不是三个执行模块的依赖。
 - Account 可以读取 Quotes snapshot，但不调用行情 provider。
@@ -86,7 +92,11 @@ Account
 
 ## 4. Spec 规则
 
-模块 spec 写领域模型、行为契约和验收标准，不写实现现状流水账。
+模块 spec 写领域模型、行为契约和验收标准，不写实现现状流水账。详细写作规范见 [spec-guidelines.md](spec-guidelines.md)。
+
+每个模块 spec 只约束该 bounded context 自己拥有的数据、规则、接口和事件，不替其他模块规定行为。执行模块不定义 Agent 工具 schema，也不描述下游 run 流程；Agent 工具注册协议写在 `agent-infra-module.md`，Agent 如何消费模块能力、每类 run 使用哪些工具、跨模块事件路由、定时调度和订阅注入写在 `agent-runtime-module.md`。
+
+跨模块共享类型不在各模块内重复定义；统一写在 [shared-types.md](shared-types.md)。
 
 推荐结构：
 

@@ -14,7 +14,7 @@ Account 只负责交易执行、账户估值、事件审计和触发条件发现
 
 - `Order`、`TradeFill`、`Position`、`PositionLot`、`PositionProtection`、`AccountEvent`、`AccountTrigger`、`operate_account`、`update_watchlist` 是 `Spec-as-source`。
 - 成交模拟、T+1、冻结现金 / 持仓、trigger 去重、事件先于状态是不变量。
-- 费用参数、风控阈值默认值是 `Spec-anchored` 配置，但执行时必须 fail closed。
+- 费用参数、风控阈值默认值是 `Spec-anchored` 配置；运行时可覆盖，但缺省必须使用本文档默认值，执行时必须 fail closed。
 
 共享类型见 [shared-types.md](shared-types.md)。
 
@@ -63,7 +63,7 @@ Account 不负责：
 ### 不变量
 
 - Account 只有模拟账户语义，不连接真券商。
-- 订单、仓位和保护条件写能力不通过人工 UI 暴露；只允许自动化 / 系统写入口。
+- 订单、仓位和保护条件写能力不通过人工 UI 暴露；交易意图只允许自动化决策方发起，`system` 仅允许写内部维护事实。
 - 自选列表是非交易能力，可以由用户或自动化决策方维护。
 - Account 可以读取 Quotes snapshot 做估值、成交模拟和触发判断，但不调用 Quotes provider。
 - Account 任一层不 import 下游决策模块代码；触发条件只通过事件通知。
@@ -80,6 +80,7 @@ Account 不负责：
 ```ts
 type TradingActor = "agent" | "system";
 type AccountActor = TradingActor | "user";
+type OrderStatus = "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired";
 
 type Order = {
   orderId: string;
@@ -89,7 +90,7 @@ type Order = {
   limitPrice?: Price;
   quantity: Shares;
   filledQuantity: Shares;
-  status: "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired";
+  status: OrderStatus;
   intent:
     | "open_position"
     | "scale_in"
@@ -98,7 +99,7 @@ type Order = {
     | "direct_order";
   positionId?: string;
   reason?: string;
-  actor: TradingActor;
+  actor: "agent";
   createdAt: OccurredAt;
   updatedAt: OccurredAt;
   expiresAt?: OccurredAt;
@@ -109,7 +110,7 @@ Actor 命名规则：
 
 - `agent` 表示由 Agent tool / 后台自动化决策流程发起的交易意图；Account 只记录 actor，不依赖 Agent 代码。
 - `agent` 交易写动作必须经由 Agent tool / 后台自动化流程进入，不通过人工 UI 暴露。
-- `system` 只用于账户内部维护任务，例如订单过期、挂单成交评估、snapshot 重建和初始化。
+- `system` 只用于账户内部维护任务，例如订单过期、挂单成交评估、snapshot 重建和初始化；当前不允许创建 `Order`。
 - `user` 只允许用于自选维护事件，不允许创建订单、调整仓位或调整保护条件。
 
 字段说明：
@@ -127,21 +128,22 @@ Actor 命名规则：
 | `intent` | 业务意图分类 | 用于审计和复盘，不替代 `side/orderType` |
 | `positionId` | 关联仓位 | 加仓、减仓、平仓时必填；开仓成交后回填 |
 | `reason` | 发起理由 | 写操作必须提供，用于审计 |
-| `actor` | 发起者 | 订单只能由 `agent` 或 `system` 发起；`user` 不允许创建订单 |
+| `actor` | 发起者 | 当前订单只能由 `agent` 发起；`user` 和 `system` 都不允许创建订单 |
 | `createdAt` / `updatedAt` | 创建 / 更新时间 | ISO-8601 |
-| `expiresAt` | 订单过期时间 | 过期后释放冻结现金 / 持仓 |
+| `expiresAt` | 订单过期时间 | 仅对 `limit` 有效；过期后释放冻结现金 / 持仓 |
 
 规则：
 
 - `open_position` / `scale_position` / `close_position` 可以作为写入口的便捷动作，但 Account 内部仍应落为订单 + 成交 + 仓位事件。
 - `market` 表示用当前 fresh Quotes snapshot 模拟即时成交；它是 immediate-or-reject，不允许进入 pending。
+- `market` 订单不得携带 `limitPrice` 或 `expiresAt`；调用方传入时写入口必须返回 `accepted = false` / `invalid_input`，且不得创建 `Order`。
 - `limit` 表示挂单；由定时任务根据 Quotes snapshot 判断是否成交、部分成交、过期。
 - `limit` 订单可以在 quote stale 时创建为 pending，但不能在 stale quote 上成交。
 - Account 交易只支持 `InstrumentCategory = "stock" | "fund"`；`index` 只能用于行情展示和市场背景，不能下单。
 - 股票和场内基金买入 / 卖出数量必须是 100 股 / 份整数倍。
 - 标的不存在返回 `not_found`；标的不是 `stock` / `fund` 返回 `instrument_not_tradable`；标的停牌或退市状态不可成交，使用 `instrument_suspended` 或 `instrument_not_tradable`。
 - `Order.intent` 必须由写入口确定：
-  - `place_order` -> `direct_order`，表示通用委托意图；`actor` 仍只能是 `agent` / `system`，不表示人工 UI 交易。
+  - `place_order` -> `direct_order`，表示通用委托意图；`actor` 仍只能是 `agent`，不表示人工 UI 交易。
   - `open_position` -> `open_position`。
   - `scale_position(side = "increase")` -> `scale_in`。
   - `scale_position(side = "decrease")` -> `scale_out`。
@@ -177,7 +179,7 @@ Actor 命名规则：
 type TradeFill = {
   fillId: string;
   orderId: string;
-  positionId?: string;
+  positionId: string;
   tsCode: TsCode;
   side: "buy" | "sell";
   price: Price;
@@ -194,7 +196,7 @@ type TradeFill = {
 |---|---|---|
 | `fillId` | 成交唯一 ID | append-only，不可变 |
 | `orderId` | 来源订单 ID | 必须指向已接受订单 |
-| `positionId` | 影响的仓位 ID | 开仓首笔成交可生成新仓位 |
+| `positionId` | 影响的仓位 ID | 每笔成交都必须绑定仓位；开仓首笔成交在同一事务内生成新仓位后写入该 ID |
 | `tsCode` | 标的代码 | 与订单一致 |
 | `side` | 成交方向 | 与订单方向一致 |
 | `price` | 成交价 | 买入优先卖一价，卖出优先买一价 |
@@ -248,7 +250,7 @@ type PositionLot = {
 
 - 买入成交必须生成 `PositionLot`；当日买入 lot 的 `sellableFrom` 必须是下一交易日。
 - `remainingQuantity <= quantity`，`frozenQuantity <= remainingQuantity`。
-- `Position.sellableQuantity = sum(max(remainingQuantity - frozenQuantity, 0))`，仅统计 `sellableFrom <= currentTradeDate` 的 lot。
+- `Position.sellableQuantity = sum(max(remainingQuantity - frozenQuantity, 0))`，仅统计 `sellableFrom <= sellabilityTradeDate` 的 lot；`sellabilityTradeDate = MarketTimeContext.currentTradeDate ?? MarketTimeContext.latestCompletedTradeDate`。
 - 卖出成交按可卖 lot FIFO 扣减，排序为 `sellableFrom asc, createdAt asc, lotId asc`。
 - 挂卖单冻结同样按可卖 lot FIFO 分配；撤单 / 过期释放对应 lot 的 `frozenQuantity`。
 - lot 是读模型的一部分，但必须能由 `TradeFill`、订单终态和冻结 / 释放事件重建。
@@ -272,7 +274,7 @@ type Position = {
   openedAt: OccurredAt;
   closedAt?: OccurredAt;
   protection?: PositionProtection;
-  actor: TradingActor;
+  actor: "agent";
   reasoning?: string;
   warnings?: WarningCode[];
 };
@@ -294,18 +296,18 @@ type Position = {
 | `unrealizedPnl` | 浮动盈亏 | 依赖 fresh / stale quote，可为空 |
 | `openedAt` / `closedAt` | 开仓 / 平仓时间 | `closedAt` 仅 closed 仓位有值 |
 | `protection` | 保护条件 | 止损止盈 / 时间止损，只触发事件不自动平仓 |
-| `actor` | 初始开仓发起者 | `agent` 或 `system`，用于审计 |
+| `actor` | 初始开仓发起者 | 当前交易仓位只能由 `agent` 订单派生 |
 | `reasoning` | 开仓理由摘要 | 来自外部决策方 thesis 或系统说明 |
 | `warnings` | 仓位估值警告 | 行情缺失 / stale / 部分估值等 |
 
 规则：
 
-- `avgCost` 由成交记录加权派生。
+- `avgCost` 由买入成交价、买入佣金和剩余持仓数量加权派生。
 - `sellableQuantity` 由 `PositionLot` 和 T+1 规则派生。
 - `marketPrice`、`marketValue`、`unrealizedPnl` 来自 Quotes snapshot 派生。
 - 同一 `ts_code` 默认只有一个 open position；新增买入成交若已有 open position，读模型合并为加仓。
 - 高阶 `open_position(tsCode)` 如果该标的已有 open position，必须拒绝并返回 `invalid_input`；下游决策方需要显式调用 `scale_position(side = "increase")`，避免新的开仓理由被隐式挂到既有仓位上。
-- `Position.actor` 固定表示初始开仓发起者；后续调仓、平仓、保护条件调整由 `AccountEvent.actor` 审计，不回写为“当前管理者”。
+- `Position.actor` 固定表示初始开仓发起者；后续调仓、平仓、保护条件调整由 `AccountEvent.actor` 审计，不回写为“当前管理者”。未来若支持系统导入持仓或系统再平衡，必须先扩展 Position actor 契约。
 - 全部数量卖出后仓位关闭。
 
 ### 保护条件模型
@@ -317,6 +319,7 @@ type PositionProtection = {
   timeStopAt?: OccurredAt;
   invalidationSignals?: string[];
   enabled: boolean;
+  revision: number;
   updatedAt: OccurredAt;
 };
 ```
@@ -330,18 +333,23 @@ type PositionProtection = {
 | `timeStopAt` | 时间止损点 | 到时只生成 trigger |
 | `invalidationSignals` | 持仓 thesis 失效信号标签 | 由外部决策方显式写入；Account 不解析新闻或策略语义 |
 | `enabled` | 是否启用保护 | false 时不触发 |
+| `revision` | 保护条件版本 | 每次 `adjust_protection` 成功变更时递增 |
 | `updatedAt` | 最近更新时间 | 调整保护条件时刷新 |
 
 规则：
 
 - 对多头仓位：`stopLoss < currentPrice`，`takeProfit > currentPrice`。
+- 设置或调整价格型保护条件时必须有参考价：开仓即时成交携带的初始保护条件使用成交价；`adjust_protection` 使用 Quotes snapshot 当前价。参考价缺失返回 `quote_missing` / `quote_price_missing`；使用 stale quote 校验时允许写入，但响应必须带 `quote_stale` warning。
 - 条件命中只生成 `AccountTrigger` 和 `AccountEvent`，不默认自动平仓。
 - 下游决策方可在收到触发后调用 `operate_account` 平仓、减仓、撤单或调整保护条件。
 - 同一保护条件连续命中时必须去重，避免同一价格 tick 反复触发下游响应。
 - `invalidationSignals` 是可选的“持仓理由失效标签”集合。例如开仓理由依赖 `业绩修复`，下游决策方可以设置 `["earnings_recovery_failed"]`；当外部明确调用 `record_invalidation_signal(signal = "earnings_recovery_failed")` 时，Account 做精确匹配并生成 `invalidated` trigger。
 - Account 不解析新闻、策略或自然语言，不判断信号是否成立；它只保存标签、记录外部显式 signal，并做字符串精确匹配。
 - `adjust_protection.invalidationSignals` 采用全量替换语义：字段缺省表示不修改，传空数组表示清空；不得隐式 merge，避免旧失效条件残留。
-- 同一 open position 的同一 `signal` 在仓位生命周期内只生成一次未处理 `invalidated` trigger；需要区分不同事实时，下游决策方应使用不同 signal 标签。
+- 同一 open position 的同一 `protectionRevision + signal` 只生成一次 `invalidated` trigger，即使该 trigger 已 handled 也不重复触发；需要再次触发时，下游决策方必须切换 signal 标签，或通过 `adjust_protection` 使 `revision` 递增。
+- `adjust_protection` 对已存在 open position 是 upsert：没有 `PositionProtection` 时创建，有则更新；position 不存在或非 open 返回 `not_found` / `invalid_input`。
+- 首次创建保护条件时，若请求未传 `enabled`，且至少设置了一个条件或失效信号，则 `enabled = true`；首次创建必须至少设置一个条件或失效信号，单独传 `enabled` 不构成有效保护条件，返回 `invalid_input`。
+- `adjust_protection` 如果不会改变任何字段，必须返回 `accepted = false` / `invalid_input`，不得写空的 `protection_adjusted` 事件。
 - 保护条件只能绑定到已存在的 open position；未成交的开仓限价单不能直接拥有 `PositionProtection`。
 - `open_position` 如果使用 `market` 并即时成交，可以在生成 position 后立即应用请求携带的保护条件；如果使用 `limit` 进入 pending，则请求不得携带 `stopLoss` / `takeProfit` / `timeStopAt`，成交后由下游决策方通过 `adjust_protection` 设置。
 
@@ -426,10 +434,11 @@ Account 拥有账户估值计算。Quotes 只提供标的价格、盘口、状�
 - `avgCost` 由买入成交价、买入佣金和剩余持仓数量加权派生。
 - `marketPrice` 使用 Quotes snapshot 的当前价；行情缺失时 `marketPrice`、`marketValue`、`unrealizedPnl` 可以为空，但仓位基础数量和成本仍必须返回。
 - `marketValue = quantity * marketPrice`，仅在 `marketPrice` 存在时计算。
-- `unrealizedPnl = marketValue - remainingCostBasis`，仅在 fresh 或可展示的 stale quote 存在时计算；响应必须携带 quote freshness。
+- `remainingCostBasis = quantity * avgCost`；`unrealizedPnl = marketValue - remainingCostBasis`，等价于 `(marketPrice - avgCost) * quantity`。未实现盈亏不预扣未来卖出佣金或印花税，仅在 fresh 或可展示的 stale quote 存在时计算；响应必须携带 quote freshness。
 - `realizedPnl` 由卖出成交收入减去被卖出 lot 的成本、佣金和印花税派生。
 - `AccountSnapshot.marketValue` 只汇总成功估值的 open positions；缺行情或不可用行情的仓位不按 0 伪造估值，必须计入 `unpricedPositionCount`。
 - `AccountSnapshot.totalAssets = cash + marketValue`；当 `unpricedPositionCount > 0` 时这是部分估值结果，`warnings` 必须包含 `data_partial`，不能被解释为完整账户净值。
+- `AccountSnapshot.unrealizedPnl` 只汇总成功估值的 open positions；`totalPnl = realizedPnl + unrealizedPnl`。当 `unpricedPositionCount > 0` 时，`unrealizedPnl` 和 `totalPnl` 同样是部分估值结果，必须共用 `data_partial` warning，不能当作完整账户盈亏。
 - `valuationFreshness.status` 反映本次估值使用行情的最弱 freshness：全部可估值且 fresh 为 `fresh`，使用 stale 展示行情为 `stale`，无任何 open position 可估值或全部缺失时为 `missing`。
 - `cash`、`frozenCash`、`availableCash`、`totalAssets` 不得由前端或 Agent 自行计算后写回。
 - Account 读取接口可以返回 stale quote 参与展示估值，但交易写路径必须 fail closed，不能用 stale / missing quote 成交。
@@ -494,9 +503,12 @@ type AccountEvent = {
 
 - 所有账户状态变化必须先 append `AccountEvent`。
 - 账户事件流的首个账户事实必须是 `account_initialized`；其 payload 至少包含 `initialCash`，重建时不得从可变运行时配置隐式改变初始资金。
+- `account_initialized` 只能由 `system` actor 在 application 启动或账户首次使用时通过内部 `initialize_account_if_needed` 写入一次；`operate_account` / `update_watchlist` 不提供初始化 action。
+- `initialize_account_if_needed` 必须幂等：已存在 `account_initialized` 且 `initialCash` 相同则不写新事件；若已有账户但请求的 `initialCash` 不同，必须 fail closed 并返回 `invalid_input` 或 `db_error`。
 - `payload` 保存足以重放读模型的最小事实，不保存 UI 展示冗余。
 - 拒单若订单已经创建，必须写 `order_rejected`；参数校验在订单创建前失败时可以只返回 rejection response。
-- 创建 `AccountTrigger` 时必须有可追溯的 `AccountEvent`。订单成交 / 拒绝 / 过期触发可复用对应订单事件作为 `AccountTrigger.eventId`；保护条件和失效信号触发必须写 `trigger_created` 事件并使用其 `eventId`。
+- 创建 `AccountTrigger` 时必须有可追溯的 `AccountEvent`。订单型 trigger 的 `eventId` 固定指向对应订单终态事件：`order_filled` / `order_rejected` / `order_expired`；保护条件和失效信号 trigger 必须写 `trigger_created` 事件，并使用该 `trigger_created.eventId`。
+- `order_cancelled` 和 `order_partially_filled` 只产生账户更新，不创建 `AccountTrigger`。
 
 ### 冻结和重建规则
 
@@ -505,6 +517,7 @@ type AccountEvent = {
 规则：
 
 - `limit` 买单进入 `pending` 前必须冻结预计最大占用现金：`limitPrice * remainingQuantity + estimatedFees`。
+- accepted `limit` 订单进入 `pending` 时，同一事务内事件 append 顺序必须稳定：先写 `order_placed`，再写 `cash_frozen` 或 `shares_frozen`；若冻结失败，事务不得提交 `order_placed`。
 - `market` 买单即时成交，不保留长期冻结；若成交前需要内部冻结，必须在同一写事务内释放或扣减。
 - 买单部分成交时，成交部分转为实际现金扣减；未成交部分继续冻结，若实际成交价低于冻结价，差额必须释放。
 - 买单撤单 / 过期时，释放该订单剩余未成交数量对应的冻结现金。
@@ -543,12 +556,12 @@ type AccountTrigger = {
 
 type MarkTriggerHandledResponse =
   | {
-      ok: true;
+      accepted: true;
       trigger: AccountTrigger;
       accountEventIds: string[];
     }
   | {
-      ok: false;
+      accepted: false;
       reason: ErrorCode;
       message?: string;
     };
@@ -558,7 +571,7 @@ type MarkTriggerHandledResponse =
 
 | 字段 | 含义 | 规则 |
 |---|---|---|
-| `triggerId` | 跨模块触发幂等 ID | Orchestrator / 下游决策方用它去重 |
+| `triggerId` | 跨模块触发幂等 ID | Agent Runtime / 下游决策方用它去重 |
 | `triggerType` | 触发类型 | 止损、止盈、订单结果等 |
 | `orderId` / `positionId` | 关联订单 / 仓位 | 按触发来源填写 |
 | `tsCode` | 关联标的 | 标的相关 trigger 必须填写 |
@@ -573,17 +586,20 @@ type MarkTriggerHandledResponse =
 规则：
 
 - `triggerId` 是跨模块幂等键。
-- `handled` 表示 Account 已确认该 trigger 被下游消费或显式忽略；不表示下游决策方采取了交易动作。
+- `handled` 表示 Agent Runtime 已确认该 trigger 被下游消费完成或按策略显式忽略；不表示下游决策方采取了交易动作。
+- Account 只保存 `handled` 最终确认位；Agent Runtime 的 consumption record 是 `processing` / `failed` / retry 的权威状态。Agent run 启动成功不等于 handled，只有 run 完成消费、显式忽略或不可恢复放弃后才允许调用 `mark_trigger_handled`。
 - 同一保护条件按下方 `triggerId` 确定性键只能生成一个 trigger。
 - `triggerId` 必须按稳定字段确定性生成：
-  - 价格型持仓保护：`triggerType + positionId + tsCode + threshold + tradeDate`。
-  - 时间止损：`triggerType + positionId + tsCode + timeStopAt`。
-  - 失效信号：`triggerType + positionId + tsCode + signal`。
+  - 价格型持仓保护：`triggerType + positionId + tsCode + protectionRevision + threshold + tradeDate`。
+  - 时间止损：`triggerType + positionId + tsCode + protectionRevision + timeStopAt`。
+  - 失效信号：`triggerType + positionId + tsCode + protectionRevision + signal`。
   - 订单终态：`triggerType + orderId + tsCode + 对应终态 AccountEvent.eventId`。
   盘中连续 tick、分页重试和进程重启不得重复生成相同 trigger。
-- `mark_trigger_handled(trigger_id, reason)` 是内部维护 API，用于 Orchestrator 成功路由、显式忽略或恢复处理后确认 trigger 不再需要重复路由。
+- 价格型持仓保护键中的 `tradeDate = MarketTimeContext.currentTradeDate ?? MarketTimeContext.latestCompletedTradeDate`；盘后评估仍使用当日交易日，周末 / 节假日使用最近已完成交易日。
+- 同一 `protectionRevision`、同一阈值、同一交易日的价格型保护 trigger 最多生成一次，即使已 handled 也不在同日重复生成；下游如果希望再次触发，必须调整保护条件使 `revision` 递增，或等待下一交易日。
+- `mark_trigger_handled(trigger_id, reason)` 是内部维护 API，用于 Agent Runtime 确认下游消费完成、显式忽略或不可恢复放弃后确认 trigger 不再需要重复路由。
 - `mark_trigger_handled` 必须幂等：已 handled 的 trigger 再次标记仍返回同一 trigger，不重复写事件。
-- 首次标记 handled 必须写 `trigger_handled` 事件，并将 `AccountTrigger.handled` 置为 true；未知 `trigger_id` 返回 `ok = false` / `not_found`。
+- 首次标记 handled 必须写 `trigger_handled` 事件，并将 `AccountTrigger.handled` 置为 true；未知 `trigger_id` 返回 `accepted = false` / `not_found`。
 
 触发评估返回：
 
@@ -601,12 +617,19 @@ type AccountTriggerResult = {
 
 - `triggers` 只包含本批次新创建或新命中的 trigger；重复命中的既有 trigger 不重复返回。
 - `accountEventIds` 顺序必须等于事件 append 顺序。
-- `hasMore = true` 时必须返回 `nextCursor`，Orchestrator 必须使用它继续调度；Account 不在单个 tick 内无限循环。
+- `hasMore = true` 时必须返回 `nextCursor`，Agent Runtime 必须使用它继续调度；Account 不在单个 tick 内无限循环。
 - `nextCursor` 必须基于持久排序键生成，例如 `phase + updatedAt/createdAt + orderId/positionId`，不得使用内存 offset；它必须可跨进程重启后恢复同一批次之后的扫描位置。
 
 ### 硬风控模型
 
 ```ts
+type AccountFeePolicy = {
+  commissionRate: Ratio;
+  minCommission: Money;
+  stampTaxSellRate: Ratio;
+  transferFeeRate?: Ratio;
+};
+
 type AccountRiskPolicy = {
   maxSinglePositionRatio: Ratio;
   maxGrossExposureRatio: Ratio;
@@ -617,11 +640,17 @@ type AccountRiskPolicy = {
 
 默认规则：
 
+- 缺省费用参数：`commissionRate = 0.0003`，`minCommission = 5`，`stampTaxSellRate = 0.0005`，`transferFeeRate = 0`。
+- 缺省风控阈值：`maxSinglePositionRatio = 0.25`，`maxGrossExposureRatio = 0.95`，`maxOrderValueRatio = 0.25`，`maxDailyNewOrders = 20`。
 - 自动化交易写动作必须携带可审计 reason；是否存在 active strategy 由下游决策纪律保证，不属于 Account 依赖。
+- 风控估值不得直接使用部分估值的 `AccountSnapshot.totalAssets` 做分母。买入风控必须计算独立的 `riskEquity = cash + sum(positionRiskValue)`：已估值仓位用 `marketValue`，未估值仓位用 `remainingCostBasis`；任何仓位不得按 0 计入风险敞口。
+- 单票和总仓位风控中的新增买入价值按订单最大占用计算：`market` 用 fresh quote 的预计成交价，`limit` 用 `limitPrice`。
+- 风控敞口必须包含 active buy orders 的剩余最大占用：`pending` / `partially_filled` 买单按剩余数量和订单价格计入对应标的与总敞口；不能只统计已成交持仓。
 - 任何买入后单票市值超过 `maxSinglePositionRatio` 必须拒绝。
 - 任何买入后总仓位超过 `maxGrossExposureRatio` 必须拒绝。
-- 单笔订单金额超过 `maxOrderValueRatio * totalAssets` 必须拒绝。
+- 单笔订单金额超过 `maxOrderValueRatio * riskEquity` 必须拒绝。
 - `maxDailyNewOrders` 按 `Asia/Shanghai` 自然日统计 `actor = agent` 新创建订单数；撤单 / 过期不扣减，跨日遗留 pending 订单不计入新一天，`system` 维护动作不计入。
+- 当前 `system` 不允许发起投资意图，故不计入 `maxDailyNewOrders`；未来若引入 system-initiated rebalancing，必须新增 actor / policy 并纳入明确风控计数，不能复用 maintenance 语义绕过限制。
 - 风控拒绝使用 `risk_limit_exceeded`，不得创建成交。
 
 ### Actor 语义
@@ -653,17 +682,22 @@ account write request (operate_account / update_watchlist)
   -> Account use case
   -> domain rule validation
   -> append account_events
+  -> create AccountTrigger for order terminal events when applicable
   -> upsert orders / fills / positions / lots or watchlist
   -> rebuild account snapshot
   -> emit account-updated
+  -> emit account-triggered when new AccountTrigger exists
 ```
 
 规则：
 
 - 所有写操作串行化，避免现金、仓位、订单并发漂移。
-- 交易写操作必须有 `actor = agent | system` 和可审计 note/reason。
+- `operate_account` 交易意图必须有 `actor = agent` 和可审计 note/reason；`system` 只用于内部维护事件，不创建投资意图。
 - 失败的写操作也应能返回明确 rejection reason；是否写 rejection event 由订单是否已创建决定。
 - `account-updated` payload 使用 [shared-types.md](shared-types.md) 定义的 `AccountUpdatedPayload`，至少包含本次 append 的 `accountEventIds` 和重建后的 `snapshotCapturedAt`；消费者收到后应按需重新读 `fetch_account`。
+- `order_filled`、`order_rejected`、`order_expired` 是订单终态通知事实；当这些事件被 append 时，Account 必须在同一事务内创建对应 `AccountTrigger` 并 emit `account-triggered`。这包括 `market` 订单在 `operate_account` 内即时成交 / 拒绝，也包括定时评估 pending 订单后的成交 / 过期。
+- 参数校验在订单创建前失败时没有订单事实，不写 `order_rejected`，也不创建 order trigger；调用方只收到 rejected response。
+- `order_cancelled` 由调用方显式发起，只 emit `account-updated`，不 emit `account-triggered`。
 
 ### 读取流
 
@@ -699,6 +733,7 @@ external scheduler tick
 - `account-triggered` 是通知，不是交易指令；payload 使用 [shared-types.md](shared-types.md) 定义的 `AccountTriggeredPayload`。
 - `account-updated` payload 使用 `AccountUpdatedPayload`；触发评估若同时产生 trigger 和账户读模型变化，两个事件必须引用同一批 `accountEventIds`。
 - 触发事件必须带 `trigger_id`，供下游消费者做幂等处理。
+- 订单终态 trigger 和保护条件 trigger 都由 Account 创建；Agent Runtime 只消费 `account-triggered` 并路由，不补造 trigger。
 
 ---
 
@@ -719,7 +754,9 @@ type FetchAccountRequest = {
     triggers?: boolean;
   };
   positionStatus?: "open" | "closed" | "all";
-  orderStatus?: "open" | "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired" | "all";
+  orderActive?: boolean;
+  orderStatusIn?: OrderStatus[];
+  triggerHandled?: boolean | "all";
   limit?: number;
   offset?: number;
 };
@@ -746,10 +783,13 @@ type FetchAccountResponse = {
 
 约束：
 
-- `positionStatus` 只过滤 `positions`，默认 `open`；`orderStatus` 只过滤 `orders`，默认 `open`，表示 `pending + partially_filled`。两者互不影响，`all` 返回对应集合全部状态；不影响 `snapshot` / `watchlist`。
+- `positionStatus` 只过滤 `positions`，默认 `open`。
+- `orderActive` 是订单过滤关键字，不是 `Order.status`；`true` 表示 `pending + partially_filled`，`false` 表示非活跃订单。`include.orders = true` 且未传 `orderStatusIn` / `orderActive` 时，默认 `orderActive = true`。
+- `orderStatusIn` 只接受真实 `OrderStatus[]`，用于精确过滤订单状态；如果同时传 `orderStatusIn` 和 `orderActive`，必须取两者交集。
+- `triggerHandled` 只过滤 `triggers`；`false` 表示未处理 trigger，`true` 表示已处理 trigger，`"all"` 表示不过滤。`include.triggers = true` 且未传时，默认 `false`。
 - `limit` 默认 100，最大 500；`offset` 默认 0。分页应用到 `positions`、`orders`、`events`、`triggers` 这些可增长集合；`snapshot` 和 `watchlist` 不分页。
 - 人工 UI 不能通过 Tauri command 做交易写操作。
-- `operate_account` 只允许 Agent tool / 自动化运行时 / system maintenance 调用；前端不能绕过 Agent 下单。
+- `operate_account` 只允许 Agent tool / 外部自动化决策运行时调用；`system` 维护流程不通过该入口创建订单，前端不能绕过 Agent 下单。
 - 前端可以通过非交易写入口 `update_watchlist` 添加 / 删除自选或更新备注。
 - 展示自选时，Account 返回自选元信息，行情字段来自 Quotes snapshot。
 - `fetch_account` 是统一读取 facade；前端或 Agent 可以通过 `include.watchlist`、`include.positions`、`include.snapshot` 获取自选、仓位和账户总览。实现可以提供轻量 wrapper，但不得绕过同一套 Account query 规则。
@@ -827,21 +867,26 @@ type OperateAccountInput =
 
 约束：
 
-- 所有 action 都必须写入可审计事件。
+- accepted action 和已经产生副作用的 rejected action 都必须写入可审计事件；参数预校验在任何账户事实创建前失败时，可以只返回 rejected response，并令 `accountEventIds = []`。
 - `open_position`、`scale_position`、`close_position` 是便捷交易动作，内部仍走订单 / 成交流。
 - `open_position` 必须只用于建立新标的仓位；如果 `tsCode` 已存在 open position，必须返回 `accepted = false` / `invalid_input`。加仓必须显式使用 `scale_position(side = "increase")`。
-- `place_order` 是低阶委托入口，不做开仓 / 加仓 / 平仓意图推断；成交后按持仓是否存在和剩余数量派生 `position_opened` / `position_scaled` / `position_closed` 事件。
+- `place_order` 是低阶委托入口，不做开仓 / 加仓 / 平仓意图推断；成交后按成交事件 append 时刻的账户状态派生 `position_opened` / `position_scaled` / `position_closed` 事件。
+- 同一 `tsCode` 存在多个 pending buy order 时，派生以成交事件 append 顺序为准：第一笔成交若当时没有 open position 则 `position_opened`，后续成交若当时已有 open position 则 `position_scaled`。所有写操作串行化；同一批次内排序相同时以 `orderId` 作为稳定 tie-breaker。
+- `cancel_order` 只允许撤销 `pending` / `partially_filled` 订单；未知订单返回 `not_found`，终态订单返回 `order_not_pending`。撤销部分成交订单只释放剩余未成交数量对应的冻结现金 / 持仓，不回滚已成交部分。
 - `scale_position.side = "increase"` 内部生成买入 / 加仓订单，`side = "decrease"` 内部生成卖出 / 减仓订单；`quantity` 必须为正数，不能用负数表达方向。
-- `scale_position.side = "decrease"` 默认只做部分减仓；若 `quantity` 等于全部持仓，应使用 `close_position`，避免复盘语义混淆。
+- `scale_position.side = "decrease"` 默认只做部分减仓；`quantity` 必须满足 `0 < quantity < position.quantity`。若 `quantity` 等于全部持仓，返回 `accepted = false` / `invalid_input`，应改用 `close_position`；若 `quantity > position.quantity` 或 `quantity > sellableQuantity`，返回 `accepted = false` / `insufficient_sellable_quantity`。
+- `close_position.quantity` 缺省时表示尝试卖出全部当前持仓；显式传入时必须等于 `position.quantity`，否则返回 `invalid_input` 并提示使用 `scale_position(side = "decrease")`。若全部持仓数量大于 `sellableQuantity`，返回 `insufficient_sellable_quantity`。
 - `adjust_protection` 只调整保护条件，不直接下单。
 - `adjust_protection` 字段缺省表示“不修改该字段”；`stopLoss` / `takeProfit` / `timeStopAt` 传 `null` 表示清除该条件，传具体值表示设置或替换；`enabled` 缺省表示不修改，传 `true` / `false` 表示启用 / 禁用整组保护条件。
 - `open_position` / `scale_position` / `close_position` 的 `orderType` 缺省时必须按 `"market"` 处理；`place_order` 必须显式传 `orderType`。
-- `open_position` / `scale_position` / `close_position` 使用 `limit` 时可以设置 `expiresAt`；未设置时按当日有效委托处理，非交易时段创建则默认到下一交易日收盘过期。
+- `limit` 订单必须提供 `limitPrice > 0`；`market` 订单不得提供 `limitPrice`。`expiresAt` 若显式传入，必须晚于当前 `now`。
+- 所有 `limit` 订单（含 `place_order` 和便捷交易动作）可以设置 `expiresAt`；未设置时按当日有效委托处理：若当前自然日是交易日且当前时间早于 15:00 Asia/Shanghai，默认 `expiresAt = MarketTimeContext.currentTradeDate 15:00 Asia/Shanghai`；若当前不在交易日或当前时间已达到 / 晚于 15:00，默认 `expiresAt = MarketTimeContext.nextTradeDate 15:00 Asia/Shanghai`。
 - `open_position` 使用 `limit` 且可能进入 pending 时，不允许同时携带 `stopLoss` / `takeProfit` / `timeStopAt`，避免给未存在的仓位设置保护条件；成交后由下游决策方通过 `adjust_protection` 设置。
-- `record_invalidation_signal` 只记录外部显式信号；调用时必须先写 `invalidation_signal_recorded` 事件。当 `signal` 精确命中该仓位启用中的 `invalidationSignals` 时，再生成 `invalidated` trigger，不自动交易。
-- 返回必须包含 `accepted/rejected`、订单或仓位 ID、错误原因、最新 snapshot 摘要。
+- `record_invalidation_signal` 只记录外部显式信号；调用时必须先写 `invalidation_signal_recorded` 事件。无论保护条件是否启用都要记录该事件；只有当 `enabled = true` 且 `signal` 精确命中该仓位当前 `invalidationSignals` 时，才生成 `invalidated` trigger，不自动交易。
+- `record_invalidation_signal` 只允许作用于 open position；position 不存在返回 `not_found`，position 已关闭返回 `invalid_input`，且不得写 `invalidation_signal_recorded`。
+- 返回必须包含 `accepted` 布尔值、相关订单或仓位 ID、错误原因和最新 snapshot 摘要。
 - 交易 action 必须先校验标的可交易性；非股票 / 场内基金返回 `instrument_not_tradable`。
-- 即时成交类 action 遇到 stale / missing quote 必须返回 `rejected`，reason 使用 `quote_stale` / `quote_missing` / `quote_price_missing`。
+- 即时成交类 action 遇到 stale / missing quote 必须返回 `accepted = false`，reason 使用 `quote_stale` / `quote_missing` / `quote_price_missing`。
 
 响应契约：
 
@@ -854,6 +899,7 @@ type OperateAccountResponse = {
   fillIds?: string[];
   positionId?: string;
   triggerId?: string;
+  rejectionEventId?: string;
   accountEventIds: string[];
   snapshot: AccountSnapshot;
   warnings?: WarningCode[];
@@ -862,8 +908,10 @@ type OperateAccountResponse = {
 
 规则：
 
-- `accepted = true` 只表示 Account 接受并处理了命令；`limit` 订单可能仍是 pending。
-- `market` 订单 accepted 时必须已经成交或明确创建了 rejection event；不能返回 pending。
+- `accepted = true` 表示 Account 接受命令并创建了预期账户事实；`limit` 订单可能仍是 pending。
+- `accepted = false` 表示 Account 拒绝该命令；若拒绝发生在订单事实创建之后，响应可以携带 `orderId`、`accountEventIds` 和对应 order trigger，但订单状态必须为 `rejected`。
+- `rejectionEventId` 仅在写入 `order_rejected` 事件时返回，且必须属于 `accountEventIds`。
+- `market` 订单 `accepted = true` 时必须已经成交；`accepted = false` 时可以没有订单事实，或有明确 `order_rejected` 事件，但绝不能返回 pending。
 - rejected 响应必须有 `reason`。
 - 有副作用的 rejected 操作必须返回对应 `accountEventIds`。
 - `accountEventIds` 的顺序必须等于事件 append 顺序，供审计链展示。
@@ -916,8 +964,9 @@ type UpdateWatchlistResponse = {
 内部 API 以 command / query facade 为主：
 
 ```rust
+initialize_account_if_needed(initial_cash) -> AccountSnapshot;
 fetch_account(request) -> FetchAccountResponse;
-operate_account(request, actor: TradingActor) -> OperateAccountResponse;
+operate_account(request, actor: "agent") -> OperateAccountResponse;
 update_watchlist(request, actor: AccountActor) -> UpdateWatchlistResponse;
 evaluate_account_triggers({ now, limit, cursor }) -> AccountTriggerResult;
 mark_trigger_handled(trigger_id, reason) -> MarkTriggerHandledResponse;
@@ -934,7 +983,7 @@ subscribed_codes() -> Vec<TsCode>;
 | 规则 | 说明 |
 |---|---|
 | 可交易范围 | 只支持股票和场内基金；指数、未知标的、退市标的不能下单 |
-| 整手 | 股票和场内基金买入 / 卖出数量必须是 100 股 / 份整数倍 |
+| 整手 | 股票和场内基金买入 / 卖出数量必须是 100 股 / 份整数倍；本模拟统一简化为 100 股 / 份，不区分科创板 / 创业板 200 股门槛或奇数股卖出规则 |
 | T+1 | 当日买入的 lot 当日不可卖 |
 | 交易时段 | 即时成交类订单只在 A 股交易时段成交；挂单可盘外创建，交易时段再判断 |
 | 行情新鲜度 | `market` 和即时成交类便捷动作必须使用 fresh quote；stale / missing quote 拒单 |
@@ -988,8 +1037,8 @@ subscribed_codes = watchlist ∪ open_positions ∪ pending_orders
 
 - `subscribed_codes()` 只是 Account 暴露给编排层的关注集合，不是行情刷新命令。
 - Account 内部需要行情时，只读取 Quotes 已有 snapshot / query facade，用于估值、成交模拟和保护条件评估；Account 不调用 Quotes provider，也不主动触发 refresh。
-- Quotes 拥有 `core_indexes()` 和 `refresh_market_quotes(scope)`；Orchestration 负责调用 `Account.subscribed_codes()`、合并 `Quotes.core_indexes()`，再调用 Quotes refresh。
-- 该跨模块调用流程以 [orchestration.md](orchestration.md) 为准；Account spec 只定义自己暴露的集合和读取 Quotes snapshot 的边界。
+- Quotes 拥有 `core_indexes()` 和 `refresh_market_quotes({ scope, purpose })`；Agent Runtime 负责调用 `Account.subscribed_codes()`、合并 `Quotes.core_indexes()`，再调用 Quotes refresh。
+- 该跨模块调用流程以 [agent-runtime-module.md](agent-runtime-module.md) 为准；Account spec 只定义自己暴露的集合和读取 Quotes snapshot 的边界。
 
 ---
 
@@ -997,7 +1046,7 @@ subscribed_codes = watchlist ∪ open_positions ∪ pending_orders
 
 - Account 读取入口为 `fetch_account`；人工 UI 没有交易写 command。
 - Account 交易写入口为 `operate_account`。
-- `operate_account` 只对 Agent tool / 自动化运行时 / system maintenance 暴露，人工 UI 不能直接调用它创建订单。
+- `operate_account` 只对 Agent tool / 外部自动化决策运行时暴露，人工 UI 和 `system` 维护流程都不能直接调用它创建订单。
 - 自选维护入口为 `update_watchlist`；人工 UI 可以添加 / 删除自选或更新备注，但不能通过它创建订单、调整仓位或修改保护条件。
 - `operate_account(open_position)` 会创建订单；成交后生成 fill、position、account event，并刷新 snapshot。
 - `operate_account(open_position)` 使用 `limit` 时不能同时设置保护条件；限价开仓成交后由下游决策方再调用 `adjust_protection`。

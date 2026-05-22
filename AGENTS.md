@@ -12,8 +12,11 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 
 - **[docs/design/architecture.md](docs/design/architecture.md)** ← 整体设计入口。模块级领域契约以 `docs/design/*-module.md` 为准
 - [docs/design/](docs/design/) — 各模块 spec。写实现前先确认对应 spec；spec 只写最新设计契约
-- [docs/provider-design.md](docs/provider-design.md) — Provider 抽象（wire format 不是厂商）
-- [docs/development.md](docs/development.md) — 开发命令 / Tauri runtime / 配置
+- [docs/design/spec-guidelines.md](docs/design/spec-guidelines.md) — spec 写作规范：定位 / 边界 / 领域模型 / 能力 / 验收标准
+- [docs/design/shared-types.md](docs/design/shared-types.md) — 跨模块共享领域类型
+- [docs/design/references/](docs/design/references/) — provider / 渠道 / 模型 wire format 参考
+- [docs/development.md](docs/development.md) — 开发命令 / Tauri runtime / 本地配置
+- [docs/frontend-design.md](docs/frontend-design.md) — 前端体验 / 视觉系统 / 展示边界
 
 ## Spec Docs
 
@@ -21,12 +24,12 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 
 推荐结构：**定位 → 责任边界 → 领域模型 → 数据流 → 对外接口 → 模块独有功能 → 验收标准 / 例子 → 不纳入范围**。
 
-- **领域模型** 写核心概念、状态、规则、不变量，以及必要的 domain 类型 / SQLite 读模型。
-- **对外接口** 拆成前端展示接口、Agent 调用方法、内部 Rust API。
+- **领域模型** 写核心概念、状态、规则、不变量，以及必要的 domain 类型 / 本地读模型；不写 SQL / migration / 索引细节。
+- **对外接口** 只写该模块自己拥有的读取 / 写入 / 刷新能力和内部 Rust API；不要在执行模块 spec 中定义 Agent 工具 schema 或下游消费流程。Agent 工具注册协议写在 `agent-infra-module.md`；Agent 如何消费模块能力、每类 run 使用哪些工具，写在 `agent-runtime-module.md`。
 - **模块独有功能** 按该 BC 特性描述 scheduler、provider、snapshot/cache、事件、学习闭环等；没有就省略。
 - **验收标准 / 例子** 用可检查场景说明 spec 是否满足；不要展开到文件级代码结构。
 
-Spec 是实现依据：所有实现均以最新 spec 为准；实现计划和任务可以从 spec 派生，但 spec 本身保持在领域模型、行为契约、验收标准这一层。
+模块 spec 是该 bounded context 的领域模型契约：只约束自己拥有的数据、规则、接口和事件，不替其他模块规定行为。跨模块事件路由、定时调度和订阅注入写在 `docs/design/agent-runtime-module.md`；整体依赖规则写在 `docs/design/architecture.md`。Spec 是实现依据：所有实现均以最新 spec 为准；实现计划和任务可以从 spec 派生，但 spec 本身保持在领域模型、行为契约、验收标准这一层。
 
 ## Stack
 

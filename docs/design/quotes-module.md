@@ -658,7 +658,7 @@ list_market(request) -> ListMarketResponse;
 fetch_data(request) -> FetchDataResponse;
 scan_market(request) -> ScanMarketResponse;
 refresh_market_instruments();
-refresh_market_quotes(scope);
+refresh_market_quotes({ scope, purpose });
 refresh_klines(scope);
 refresh_daily_basic(scope);
 refresh_company_events(scope);
@@ -752,7 +752,7 @@ BJ 可以不支持，返回 per-item warning / error。
 
 ### 后台刷新
 
-Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传入，Quotes 不关心 scope 来源。下表是推荐默认值，实际调度权威写在 [orchestration.md](orchestration.md)。
+Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传入，Quotes 不关心 scope 来源。下表是推荐默认值，实际调度权威写在 [agent-runtime-module.md](agent-runtime-module.md)。
 
 | 数据 | 策略 |
 |---|---|
@@ -787,7 +787,7 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 规则：
 
 - 外部调度只调用 `core_indexes()` 合并 refresh scope，不内嵌指数列表。
-- 这组指数是系统默认市场背景，不是用户偏好；用户自定义关注指数属于 orchestration / preferences，不改变 Quotes 的默认集合。
+- 这组指数是系统默认市场背景，不是用户偏好；用户自定义关注指数属于 Agent Runtime / preferences，不改变 Quotes 的默认集合。
 - 核心指数变更属于 Quotes 配置 / 数据契约变更。
 
 ### 研究扩展能力边界

@@ -63,7 +63,7 @@ Eastmoney 可以在以下场景被调用：
 - TDX 连接失败或缺字段。
 - 标的是 BJ。
 - TDX 不支持的分钟 K / 分时场景。
-- 显式 `refresh_market_quotes(scope)` 的 scope 包含对应 `TsCode`，且本地 snapshot 缺失、过期，或 TDX 本轮不可用。
+- 显式 `refresh_market_quotes({ scope, purpose })` 的 scope 包含对应 `TsCode`，且本地 snapshot 缺失、过期，或 TDX 本轮不可用。
 
 Eastmoney 失败后：
 

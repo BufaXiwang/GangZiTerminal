@@ -4,7 +4,7 @@
 
 ## 一句话定位
 
-Shared types 是跨 Quotes / News / Account / Agent / Orchestration 使用的最小公共语言：标的、金额、数量、时间、freshness、错误码和事件 envelope。
+Shared types 是跨 Quotes / News / Account / Agent / Agent Runtime 使用的最小公共语言：标的、金额、数量、时间、freshness、错误码和事件 envelope。
 
 ---
 
@@ -280,7 +280,7 @@ type AccountTriggeredPayload = {
 - `causationId` 指向直接导致本事件的上游 event / command / run，由调用方传入；没有上游事实时可省略。
 - 生产者只表达事实，不指定消费者。
 - 消费者必须以模块规定的 event key 做幂等处理。
-- 跨模块事件 payload 只在本文件定义一次；模块 spec 和 orchestration 只引用类型名。
+- 跨模块事件 payload 只在本文件定义一次；模块 spec 和 Agent Runtime 只引用类型名。
 
 ---
 
