@@ -28,7 +28,7 @@ News 负责：
 - 资讯去重、入库、更新时间维护。
 - 正文抽取与正文缓存。
 - 基础查询：列表、按 ID 获取、按来源 / 时间过滤、FTS 相关性搜索。
-- 保留期清理。
+- 查询分页和批量上限控制。
 - 刷新完成事件通知。
 
 News 不负责：
@@ -39,6 +39,7 @@ News 不负责：
 - 产出“相关标的”“受影响标的”或行业标签。
 - 管理 pending / processing / consumed 等分析状态。
 - 启动下游分析或管理跨模块调度。
+- 按产品保留期主动删除历史新闻或正文缓存。
 - 调用其他 bounded context 的代码。
 
 ---
@@ -51,6 +52,7 @@ News 不负责：
 |---|---|---|
 | `NewsItem` | 一条资讯的标准化内容 | `id` |
 | `ArticleContent` | 某条资讯 URL 的正文抽取结果 | `url` |
+| `NewsSource` | 可用于过滤 / 刷新的 feed 或 channel | `source_id` |
 | `NewsRefreshResult` | 一轮资讯刷新结果 | 查询派生 |
 
 ### 不变量
@@ -60,7 +62,7 @@ News 不负责：
 - News 不持有下游消费状态。需要长期引用新闻的消费者应保存引用摘要或快照。
 - 对外 / domain 字段名使用 `payload`；持久化层可以使用 `payload_json` 作为列名。两者表示同一份 provider 原始 payload，不得在 DTO 中同时暴露两套字段。
 - 稳定 ID 必须由 News provider adapter 生成；同一条新闻重复刷新不能生成多条主记录。
-- 正文和全文搜索索引都是 News 读模型；删除过期新闻时必须清理孤儿读模型。
+- 正文和全文搜索索引都是 News 读模型；News 不按默认保留期主动删除历史 `NewsItem` 或 `ArticleContent`。
 
 ### `NewsItem`
 
@@ -83,6 +85,7 @@ type NewsItem = {
 - `id` 是新闻主记录唯一身份。
 - `source` 是 feed / channel 的稳定 ID，例如 `newsnow:hot`、`rss:example`。它用于查询过滤、watermark 和去重 namespace。
 - `source` 统一使用小写 `namespace:channel` 形式；匹配大小写敏感，provider reference 负责定义各自可用 channel。
+- `source` 创建后不可变；展示名、URL、启用状态可以变，但不能通过改名迁移历史新闻。
 - `provider` 是 adapter 类型，例如 `newsnow`、`rss`、`article_extractor`，只出现在 refresh failure / warning 和 payload 审计信息中。
 - 原始媒体名、站点名或作者信息保存在 `payload.media` / `payload.publisher`，不能替代 `source`。
 - `payload` 保存 provider 原始信息，便于审计和后续补字段。
@@ -92,15 +95,16 @@ type NewsItem = {
 稳定 ID 规则：
 
 ```text
-1. 有 URL -> source:canonical_url_hash
-2. 无 URL，provider 提供稳定 item id / guid -> source:item_id
-3. 无 URL 且无稳定 item id -> source:normalized_title + normalized_published_at? + normalized_summary? fingerprint
+1. 有 URL -> source:url:sha256(canonical_url)
+2. 无 URL，provider 提供稳定 item id / guid -> source:item:sha256(provider_item_id)
+3. 无 URL 且无稳定 item id -> source:fingerprint:sha256(normalized_title + normalized_published_at? + normalized_summary?)
 ```
 
 规则：
 
 - URL canonicalization 至少包括：scheme / host 小写、去除 fragment、去除默认端口、路径去除重复斜杠和尾部斜杠差异、query 参数按 key 排序。
 - tracking query 必须去除 `utm_*`、`spm`、`from`、`source`、`ref`、`refer`、`share`、`isappinstalled`、`nsukey`；provider reference 可以追加 source-specific tracking key，但不能减少这组默认规则。
+- hash 算法固定为 SHA-256，输入为 UTF-8 字符串，输出为 lowercase hex，不截断；`url` / `item` / `fingerprint` 前缀用于避免不同输入类型碰撞。
 - `publishedAt` 必须 normalize 为带 timezone 的 ISO-8601；参与 fingerprint 时按 UTC 秒级精度。若某 source 的时间精度不稳定，adapter 必须降到该 source 稳定精度或跳过该时间字段，不能因为 provider 二次返回精度变化生成新 ID。
 - fingerprint 不能包含 fetch time / createdAt / batchId 这类刷新时刻字段；如果 title / summary / payload 中没有足够稳定信息，adapter 必须跳过该 item 并记录 refresh warning，不能生成不稳定随机 ID。
 - 同一 source 下 ID 冲突时更新 `updated_at` 和 `payload`，不新建记录。
@@ -111,7 +115,7 @@ type NewsItem = {
 ```ts
 type ArticleContent = {
   url: string;
-  newsId?: string;
+  firstNewsId?: string;
   title?: string;
   content?: string;
   payload: JsonValue;
@@ -124,9 +128,36 @@ type ArticleContent = {
 
 - `ArticleContent.url` 使用 canonical URL。
 - `fetch_news(includeArticle = true)` 按 `NewsItem.url` 的 canonical URL 查询 `ArticleContent`；不按 provider 原始 URL 查询。
-- 多条 `NewsItem` 指向同一 canonical URL 时，`ArticleContent.newsId` 保存首次关联新闻；其他关联通过 canonical `NewsItem.url` 查询，不另建重复正文。
+- 多条 `NewsItem` 指向同一 canonical URL 时只保存一份 `ArticleContent`；`firstNewsId` 仅用于审计，不作为外键或读取路径。
 - 正文抽取失败必须保存失败 payload 或 warning，避免同一 URL 在短时间内反复失败重试。
 - `content` 缺失的 `ArticleContent` 只表示失败缓存 / 抑制短期重试；读取路径不能把它当作可用正文返回。
+
+### `NewsSource`
+
+`NewsSource` 是当前可用资讯 source 的发现读模型。它只描述 source 配置和健康状态，不承载新闻内容。
+
+```ts
+type NewsSource = {
+  sourceId: string;
+  provider: "newsnow" | "rss" | string;
+  displayName?: string;
+  enabled: boolean;
+  dynamic?: boolean;
+  lastRefreshAt?: OccurredAt;
+  lastError?: {
+    code: ErrorCode;
+    message?: string;
+    occurredAt: OccurredAt;
+  };
+};
+```
+
+规则：
+
+- `sourceId` 使用 `namespace:channel` 形式，并与 `NewsItem.source` 完全一致。
+- RSS source 由运行时配置提供，必须 normalize 为 `rss:<source_id>`；`source_id` 创建后不可变。
+- `list_news_sources()` 返回当前已知 source 集合，供 UI / 调用方构造 `sources` 过滤条件。
+- 新增、禁用或修改 RSS feed URL 属于配置维护能力，不属于 `fetch_news` 读取路径。
 
 ### 全文搜索读模型
 
@@ -136,7 +167,7 @@ type ArticleContent = {
 
 - `query` 同时检索 title / summary / article。
 - `article` 缺失时只索引 title / summary。
-- 更新 `ArticleContent` 后必须同步更新对应搜索读模型。
+- 更新 `ArticleContent` 后必须同步更新所有 `NewsItem.url == ArticleContent.url` 的搜索读模型。
 
 ---
 
@@ -240,6 +271,21 @@ type FetchNewsResponse = {
 - `includeArticle = true` 时不触发远端抽取；缺正文、正文失败缓存或 `ArticleContent.content` 为空时，不返回 `article` 字段，并必须返回 `article_missing` warning。
 - News 不生成行业标签、相关标的或影响判断；`query` 只是资讯文本搜索条件。
 
+#### `list_news_sources`
+
+列出当前可用的资讯来源，用于前端 source 过滤和手动 refresh 选择。
+
+```ts
+type ListNewsSourcesResponse = {
+  items: NewsSource[];
+};
+```
+
+规则：
+
+- `list_news_sources` 只读本地 source 配置 / refresh 状态，不触发远端请求。
+- `fetch_news.sources` 或 `refresh_news.sources` 包含未知 source 时返回 `invalid_input`，避免把拼写错误误读为“无新闻”。
+
 #### `refresh_news`
 
 手动触发刷新。它是维护入口，不是常规读取路径。
@@ -250,14 +296,32 @@ type RefreshNewsRequest = {
   force?: boolean;
 };
 
-type RefreshNewsResponse = NewsRefreshedPayload;
+type RefreshNewsError = {
+  code: ErrorCode;
+  field?: "sources" | "force";
+  message?: string;
+};
+
+type RefreshNewsResponse =
+  | {
+      ok: true;
+      result: NewsRefreshedPayload;
+    }
+  | {
+      ok: false;
+      error: RefreshNewsError;
+    };
 ```
 
 规则：
 
+- `sources` 包含未知 source、禁用 source 或非法格式时，必须返回 `invalid_input`，不创建 `batchId`，不触发 provider。
+- 以下刷新统计字段均位于 `ok = true` 的 `result` 中。
 - `batchId` 是本轮 refresh 的幂等和审计 ID。
 - `fetchedCount` 表示 provider 返回的原始 item 数量；`skippedCount` 表示 normalize / validate 阶段跳过的 item 数量。
 - `savedCount = newIds.length + updatedIds.length`。
+- `savedCount` 只统计 `NewsItem` 主记录新增 / 更新；`ArticleContent` 写入或更新只计入 `articleUpdatedCount`，两者不重叠。
+- `articleUpdatedNewsIds` 表示本轮正文变化影响到的 `NewsItem.id`，包括共享同一 canonical URL 的多条新闻；仅正文变化时 `newIds` / `updatedIds` 可以为空。
 - 单个 provider 失败不影响其他 provider；失败写入 `failures`。
 - 单条 item 缺必要字段、ID 不稳定、URL 不可解析等可跳过问题写入 `warnings`，必要时累计到 `skippedCount`；不把单条跳过提升为整源失败。
 - `force = false` 时 provider adapter 可以按 source watermark 增量拉取。
@@ -268,10 +332,11 @@ type RefreshNewsResponse = NewsRefreshedPayload;
 
 ```rust
 fetch_news(request) -> FetchNewsResponse;
+list_news_sources() -> ListNewsSourcesResponse;
 refresh_news(request) -> RefreshNewsResponse;
+warm_articles(request) -> WarmArticlesResponse;
 save_news_items(items);
 save_article_content(article);
-purge_old_news(cutoff);
 ```
 
 ---
@@ -309,7 +374,7 @@ Provider reference：
 - 具体 source URL、字段映射、timeout、retry、正文抽取算法写在 provider reference。
 - `FetchNewsRequest.sources` 和 `RefreshNewsRequest.sources` 都表示 feed / channel source ID，不表示 adapter provider 类型。
 - 任何 provider 都不能写重要性、情绪、分析状态或交易影响。
-- 单个 provider 失败只进入 `RefreshNewsResponse.failures`，不影响其他 provider 保存成功。
+- 单个 provider 失败只进入成功结果的 `NewsRefreshedPayload.failures`，不影响其他 provider 保存成功。
 
 Provider 输出至少包含：
 
@@ -327,13 +392,58 @@ type ProviderNewsItem = {
 
 ### 后台刷新
 
-News 提供 refresh / retention use case；触发节奏由模块外运行时配置。
+News 提供 refresh / article warm use case；触发节奏由模块外运行时配置。
 
 | 任务 | 频率 | 说明 |
 |---|---:|---|
 | news refresh | 外部调度，默认 60s | 多源拉取、去重、入库 |
 | article warm | 外部调度低频 / 按需队列 | 对最近 N 条、外部指定 `newsIds`、或未抽取且有 URL 的新闻抽正文 |
-| retention | 外部调度每日 | 清理过期 news / article cache |
+
+正文预热入口：
+
+```ts
+type WarmArticlesRequest = {
+  newsIds?: string[];
+  recentLimit?: number;
+  force?: boolean;
+};
+
+type WarmArticlesError = {
+  code: ErrorCode;
+  field?: "newsIds" | "recentLimit";
+  message?: string;
+};
+
+type WarmArticlesResult = {
+  batchId: string;
+  requestedCount: number;
+  attemptedCount: number;
+  articleUpdatedCount: number;
+  articleUpdatedNewsIds: string[];
+  warnings?: NewsRefreshWarning[];
+  failures?: NewsFailure[];
+};
+
+type WarmArticlesResponse =
+  | {
+      ok: true;
+      result: WarmArticlesResult;
+    }
+  | {
+      ok: false;
+      error: WarmArticlesError;
+    };
+```
+
+规则：
+
+- `warm_articles` 是维护入口，不是读取路径；`fetch_news(includeArticle = true)` 仍然只读本地 `ArticleContent`。
+- `newsIds` 指定时只处理这些新闻；缺失时按最近 `recentLimit` 条、且有 canonical URL 的新闻选择候选。
+- `recentLimit` 默认 50，最大 200；`newsIds` 最多 200 个。
+- 未找到的 `newsIds` 返回 `ok = false` / `not_found`，不创建 `batchId`；没有 URL 的新闻跳过并进入 warning，不计入 `attemptedCount`。
+- `force = false` 时，已有成功正文或近期失败缓存的 URL 不重复抽取；`force = true` 可重新抽取。
+- 成功写入或更新 `ArticleContent` 时，`articleUpdatedNewsIds` 必须包含所有共享同一 canonical URL 且受影响的 `NewsItem.id`。
+- `articleUpdatedCount > 0` 时必须 emit `news-refreshed`，其中 `savedCount = 0`，`articleUpdatedNewsIds` 表达正文变化影响范围。
 
 刷新完成后 emit 事件：
 
@@ -345,21 +455,22 @@ News 提供 refresh / retention use case；触发节奏由模块外运行时配�
 
 `news-refreshed` 只表示本地读模型发生变化；`savedCount = 0` 且 `articleUpdatedCount = 0` 的 refresh 不发布该事件，失败和 warning 只进入 refresh result / observability。Article warm 如果写入或更新 `ArticleContent`，也属于 News 读模型变化。News 不关心谁监听，也不直接调用下游模块。
 
-### 保留期
+### 查询规模限制
 
-默认保留 30 天资讯。
+News 不定义默认数据保留期，也不主动删除历史 `NewsItem` 或 `ArticleContent`。历史数据清理如果未来需要，必须作为独立产品 / 维护策略另行定义，不能由 News 读取或刷新路径隐式执行。
 
-保留期清理目标：
+读取和维护入口必须限制单次处理规模：
 
-- 删除过期 `NewsItem`。
-- 删除孤儿 `ArticleContent`。
-- 只清理 News 拥有的表，不清理其他模块数据。
+- `fetch_news.limit` 默认 50，最大 200；不允许无上限列表读取。
+- `warm_articles.recentLimit` 默认 50，最大 200；`newsIds` 最多 200 个。
+- Provider refresh 的分页、batch size、timeout 和 retry 写在 provider reference；adapter 不得一次性无界拉取。
+- 调用方需要长期回看时，必须通过时间窗口、分页或明确 ID 集合分批读取。
 
 ### 依赖约束
 
 - `domain/news` 不依赖 Tauri / SQLite / HTTP / infrastructure / pipeline / adapters。
 - `infrastructure/news` 可以依赖 DB / HTTP provider，但不依赖 pipeline / adapters。
-- `pipeline/news` 负责编排 refresh / retention，不依赖 adapters。
+- `pipeline/news` 负责编排 refresh / article warm，不依赖 adapters。
 - `adapters/news_commands` 只做 IPC DTO 转换。
 - News 任一层不 import 其他 bounded context 代码。
 
@@ -368,11 +479,13 @@ News 提供 refresh / retention use case；触发节奏由模块外运行时配�
 ## 6. 验收标准 / 例子
 
 - `fetch_news` 是读取 News 的统一入口。
+- `list_news_sources` 能列出当前可用于过滤和刷新选择的 source。
 - `fetch_news` 默认只读本地 DB / article cache，不触发远端 provider 拉取。
 - `refresh_news` 是显式刷新入口；后台刷新调用 News refresh use case。
 - `fetch_news({ query })` 能按 FTS 相关性搜索新闻，但不产出影响判断。
 - `fetch_news({ includeArticle: true })` 遇到缺正文时不返回 `article` 字段，并返回 `article_missing` warning，不让整批失败。
 - `news-refreshed` 只表示数据变化，不直接调用下游模块。
+- 正文更新必须通过 `articleUpdatedNewsIds` 表达受影响新闻；`savedCount` 不统计正文变化。
 - News 入库以稳定 ID 去重，同一条新闻不会因为 provider 重复返回而生成多条主记录。
 - News 任一层不 import 其他 bounded context 代码。
 

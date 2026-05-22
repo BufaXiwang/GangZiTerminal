@@ -26,6 +26,7 @@ type InstrumentStatus =
 规则：
 
 - 跨模块主键必须使用 `TsCode`。
+- `TsCode` 格式为 6 位数字 + `.` + 市场后缀，例如 `600519.SH` / `000001.SZ` / `430047.BJ`；匹配大小写不敏感，但对外返回必须大写。
 - 非 `TsCode` 标识不能作为跨模块持久化主键。
 - Quotes 对外读取不提供非 `TsCode` 标识的市场推断能力；调用方需要精确查询标的时必须提供完整 `TsCode`。
 
@@ -35,8 +36,8 @@ type InstrumentStatus =
 
 ```ts
 type Money = number;       // CNY，保留到分；内部计算可使用更高精度
-type Price = number;       // CNY / share
-type Shares = number;      // 股数，Account 股票交易要求 100 股整数倍
+type Price = number;       // CNY / 股或份
+type Shares = number;      // 股 / 份数量，Account 股票和场内基金交易要求 100 股 / 份整数倍
 type Ratio = number;       // 0..1
 type Percent = number;     // 百分数点，例如 3.25 表示 3.25%
 type Amount = number;      // 成交额，CNY
@@ -48,7 +49,7 @@ type Volume = number;      // 成交量，股或份；provider 单位必须 norm
 - 对外 DTO 不使用 provider 原始单位。
 - 股票成交量 / 盘口量统一为股；基金成交量统一为份；不使用“手”或“千股”作为 DTO 单位。
 - 金额、价格、数量不能用字符串承载，除非是用户展示文案。
-- Account 写接口必须校验 `Shares` 为正数；A 股股票买卖数量必须是 100 股整数倍。
+- Account 写接口必须校验 `Shares` 为正数；股票和场内基金买卖数量必须是 100 股 / 份整数倍。
 
 ---
 
@@ -145,6 +146,7 @@ type ErrorCode =
   | "quote_price_missing"
   | "depth_missing"
   | "outside_trading_session"
+  | "instrument_not_tradable"
   | "instrument_suspended"
   | "limit_up_down_blocked"
   | "insufficient_cash"
@@ -199,7 +201,9 @@ type AppEventEnvelope<T> = {
 type NewsFailure = {
   provider: string;
   source?: string;
-  error: string;
+  code: ErrorCode;
+  message?: string;
+  details?: JsonValue;
   stage?: "fetch" | "normalize" | "save" | "article";
   retryable?: boolean;
   occurredAt: OccurredAt;
@@ -223,6 +227,7 @@ type NewsRefreshedPayload = {
   articleUpdatedCount: number;
   newIds: string[];
   updatedIds: string[];
+  articleUpdatedNewsIds?: string[];
   failedCount: number;
   firstFailure?: NewsFailure;
   failures?: NewsFailure[];
@@ -231,11 +236,22 @@ type NewsRefreshedPayload = {
 
 type MarketQuotesRefreshedPayload = {
   scope: "subscribed" | "universe" | "manual";
+  purpose: "intraday" | "close";
   tradeDate?: TradeDate;
   total: number;
   success: number;
   failedBatches: number;
   capturedAt: OccurredAt;
+};
+
+type AccountUpdatedPayload = {
+  accountEventIds: string[];
+  affectedOrderIds?: string[];
+  affectedPositionIds?: string[];
+  affectedTsCodes?: TsCode[];
+  affectedWatchlistTsCodes?: TsCode[];
+  triggerIds?: string[];
+  snapshotCapturedAt: OccurredAt;
 };
 
 type AccountTriggeredPayload = {
@@ -251,14 +267,17 @@ type AccountTriggeredPayload = {
     | "order_rejected"
     | "order_expired"
     | "invalidated";
+  quoteFreshness?: Freshness;
+  warnings?: WarningCode[];
 };
 ```
 
 规则：
 
 - `eventId` 唯一标识一次事件事实。
-- `correlationId` 串联一次用户请求、后台 run 或跨模块流程。
-- `causationId` 指向直接导致本事件的上游 event / command / run。
+- `eventId` 和 `occurredAt` 由事件发布 helper 在 emit 时生成。
+- `correlationId` 串联一次用户请求、后台 run 或跨模块流程，由调用 use case / scheduler / 上游事件上下文传入；没有上下文时可省略。
+- `causationId` 指向直接导致本事件的上游 event / command / run，由调用方传入；没有上游事实时可省略。
 - 生产者只表达事实，不指定消费者。
 - 消费者必须以模块规定的 event key 做幂等处理。
 - 跨模块事件 payload 只在本文件定义一次；模块 spec 和 orchestration 只引用类型名。

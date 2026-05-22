@@ -16,6 +16,14 @@ Agent 的长期目标是成为围绕模拟账户持续学习的投资专家；�
 
 策略是运行时动态注入的上下文，也是 Agent 自我迭代的承载物。第一阶段先保留策略调整入口和复盘建议，不自动让策略更新生效。
 
+契约强度：
+
+- `AgentRun`、`AgentMessage`、`ToolCall`、`DecisionEpisode`、`EvidenceRef`、`TradeIntent`、`StrategyCard`、`DecisionReview`、Agent events、Agent tool schema 是 `Spec-as-source`。
+- provider wire-format mapping、上下文压缩顺序、策略注入规则是 `Spec-anchored`。
+- 自动调参、自动策略晋升、多 agent 协作不属于第一阶段。
+
+共享类型见 [shared-types.md](shared-types.md)。
+
 ---
 
 ## 1. 责任边界
@@ -56,8 +64,7 @@ Agent 不负责：
 | 概念 | 含义 | 身份 |
 |---|---|---|
 | `AgentRun` | 一次 Agent loop 运行 | `run_id` |
-| `DecisionEpisode` | 一次由用户、新闻、账户事件或定时任务触发的完整决策 | `episode_id` |
-| `RealtimeDecisionPacket` | 每次 run 临时构造的事实上下文 | `run_id` |
+| `DecisionEpisode` | 一次可复盘的投资判断记录，可由用户、新闻、账户事件或定时任务触发 | `episode_id` |
 | `AgentEvent` | 前端可见的流式事件 | `event_id` 或流内序号 |
 | `AgentMessage` | 用户 / assistant / system 消息 | `message_id` |
 | `ToolCall` | 一次工具调用审计 | `tool_call_id` |
@@ -69,21 +76,23 @@ Agent 不负责：
 ### 不变量
 
 - 每次 Agent run 必须有 `run_id`、trigger、状态、开始时间和结束状态。
-- 每次产生交易意图的 run 必须关联一个 `DecisionEpisode`。
+- 一个 Agent run 可以产生 0..N 个 `DecisionEpisode`；纯聊天 / 设置解释 / 普通知识问答可以只有 run，不产生 episode。
+- 只要 Agent 对标的、组合、新闻或账户触发形成投资判断，就必须产生 `DecisionEpisode`，即使结论是 `no_action`。
+- 每次产生 `TradeIntent` / `operate_account` 调用的 run 必须先关联一个 `DecisionEpisode`。
 - 所有交易写动作必须通过 Account 的 `operate_account`，不能直接写订单、持仓或现金。
 - 行情、账户、新闻工具结果必须带时间戳；过期事实不能作为当前下单依据。
 - 同一 Account trigger 必须幂等处理，不能重复触发交易动作。
 - Agent 可以建议策略调整，但第一阶段不会自动改写 active `StrategyCard`。
 - `StrategyCard` 是动态注入上下文的一部分；调整入口必须保留，但生效动作由显式更新流程完成。
 - 所有工具调用必须在前端可见：开始、参数摘要、结束、耗时、错误状态。
-- 后台 run 也必须产生事件流和 episode 记录，不能静默执行。
+- 后台 run 也必须产生事件流；如果形成投资判断，必须产生 episode，不能静默消费触发事件。
 
 ### `AgentRun`
 
 ```ts
 type AgentRun = {
   runId: string;
-  episodeId?: string;
+  episodeIds?: string[];
   trigger:
     | { kind: "user_chat"; messageId: string }
     | { kind: "news_batch"; newsIds: string[] }
@@ -94,8 +103,8 @@ type AgentRun = {
   wireFormat: "messages" | "responses" | "chat_completions";
   model: string;
   status: "running" | "completed" | "failed" | "cancelled";
-  startedAt: string;
-  endedAt?: string;
+  startedAt: OccurredAt;
+  endedAt?: OccurredAt;
   error?: string;
 };
 ```
@@ -103,6 +112,7 @@ type AgentRun = {
 规则：
 
 - `run_id` 是事件流、工具调用、模型 turn、episode 的关联键。
+- `episodeIds` 是该 run 产生的投资判断集合；不是所有 run 都有 episode。
 - 用户对话和后台触发共用同一套 loop，只是 trigger、上下文和最大预算不同。
 - 运行失败也必须落状态和错误原因。
 
@@ -113,7 +123,7 @@ type DecisionEpisode = {
   episodeId: string;
   runId: string;
   triggerKind: "user_chat" | "news_batch" | "account_trigger" | "scheduled_review" | "manual_replay";
-  symbols: string[];
+  symbols: TsCode[];
   thesis: string;
   action:
     | "no_action"
@@ -126,264 +136,200 @@ type DecisionEpisode = {
     | "adjust_position"
     | "close_position"
     | "adjust_protection";
-  confidence?: number;
+  confidence?: number; // 0..1
   riskPlan?: {
-    maxPositionRatio?: number;
-    stopLoss?: string;
-    takeProfit?: string;
+    maxPositionRatio?: Ratio;
+    stopLoss?: Price;
+    takeProfit?: Price;
     invalidation?: string;
-    reviewAfter?: string;
+    reviewAfter?: OccurredAt;
   };
   strategyIds: string[];
   evidenceRefs: EvidenceRef[];
-  createdAt: string;
+  createdAt: OccurredAt;
 };
 ```
 
 规则：
 
 - Episode 是可复盘的最小决策单元，不等同于一条聊天消息。
+- Episode 只属于 Agent 决策域；News / Quotes / Account 不创建也不持有 `DecisionEpisode`。
+- `no_action` 也是有效 episode，用于记录“为什么不行动”，避免新闻或账户触发被静默消费。
 - `DecisionEpisode.action` 是决策摘要分类，面向复盘和前端时间线；`OperateAccountInput.action` 是 Account 可执行命令。
 - `DecisionEpisode.action` 是 `OperateAccountInput.action` 的上层超集，可包含 `no_action`、观察、自选维护或更粗粒度的 `adjust_position`。
 - 一个 episode 不一定产生账户写动作；只有需要写 Account 时，才生成 `TradeIntent.accountInput`。
 - `thesis` 必须描述为什么做或为什么不做。
+- `symbols` 必须使用标准 `TsCode`，不能保存自由股票名或 6 位代码。
+- `confidence` 取值范围为 0..1；缺失表示模型未给出可审计置信度，不等于 0。
 - 交易动作必须绑定 `strategyIds` 或明确说明是临时判断。
 - `evidenceRefs` 引用当时使用的新闻、行情、账户事件、工具结果和策略卡，并携带最小快照，避免上游清理或字段变化后无法复盘。
+
+### `AgentMessage`
+
+```ts
+type AgentMessageRole = "system" | "user" | "assistant" | "tool";
+
+type AgentMessageBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; dataRef: string }
+  | { type: "thinking"; text: string; provider?: string }
+  | { type: "tool_use"; toolCallId: string; name: string; inputSummary: JsonSummary }
+  | { type: "tool_result"; toolCallId: string; outputSummary: JsonSummary; isError: boolean };
+
+type AgentMessage = {
+  messageId: string;
+  runId?: string;
+  role: AgentMessageRole;
+  blocks: AgentMessageBlock[];
+  createdAt: OccurredAt;
+};
+```
+
+规则：
+
+- `AgentMessage` 是对话和 provider 上下文的持久化视图，不是投资判断。
+- 图片使用 `dataRef` 指向本地附件或缓存，不把大二进制直接塞进长期消息表。
+- thinking 是否持久化取决于 provider 支持和配置；跨 provider 不保证恢复。
+- 工具调用审计以 `ToolCall` 为准，message block 只保存对话上下文所需摘要。
+
+### `ToolCall`
+
+```ts
+type ToolCall = {
+  toolCallId: string;
+  runId: string;
+  episodeId?: string;
+  name: "fetch_quotes" | "fetch_news" | "fetch_account" | "operate_account" | "update_watchlist" | string;
+  inputSummary: JsonSummary;
+  outputSummary?: JsonSummary;
+  isError: boolean;
+  errorCode?: ErrorCode;
+  startedAt: OccurredAt;
+  endedAt?: OccurredAt;
+  durationMs?: number;
+};
+```
+
+规则：
+
+- 所有 local tool 和 server-side tool 都必须记录 `ToolCall`。
+- `operate_account` / `update_watchlist` 成功或拒绝都必须记录；拒绝时 `isError` 可为 false，执行结果由 Account response 表达。
+- `episodeId` 只在该工具调用支撑某个投资判断时填写。
+- 完整 payload 可以进入详情表或日志，但 `inputSummary` / `outputSummary` 必须可前端展示。
 
 ### `EvidenceRef`
 
 ```ts
 type EvidenceRef =
-  | { kind: "news"; id: string; snapshot: PacketNewsItem }
-  | { kind: "quote"; id: string; snapshot: PacketQuoteItem }
-  | { kind: "account_snapshot"; id: string; snapshot: PacketAccountSnapshot }
-  | { kind: "position"; id: string; snapshot: PacketPosition }
-  | { kind: "order"; id: string; snapshot: PacketOrder }
-  | { kind: "account_trigger"; id: string; snapshot: PacketAccountTrigger }
-  | { kind: "strategy"; id: string; snapshot: StrategyCard }
+  | { kind: "news"; id: string; snapshot: EvidenceNewsSnapshot }
+  | { kind: "quote"; id: string; snapshot: EvidenceQuoteSnapshot }
+  | { kind: "account_snapshot"; id: string; snapshot: EvidenceAccountSnapshot }
+  | { kind: "position"; id: string; snapshot: EvidencePositionSnapshot }
+  | { kind: "order"; id: string; snapshot: EvidenceOrderSnapshot }
+  | { kind: "account_trigger"; id: string; snapshot: EvidenceAccountTriggerSnapshot }
+  | { kind: "strategy"; id: string; snapshot: EvidenceStrategySnapshot }
   | { kind: "tool_call"; id: string; snapshot: ToolCallEvidenceSnapshot };
 
+type EvidenceSnapshotBase = {
+  schemaVersion: 1;
+  capturedAt: OccurredAt;
+  source?: string;
+  freshness?: Freshness;
+};
+
+type EvidenceNewsSnapshot = EvidenceSnapshotBase & {
+  newsId: string;
+  title: string;
+  summary?: string;
+  url?: string;
+  publishedAt?: OccurredAt;
+  articleExcerpt?: string;
+};
+
+type EvidenceQuoteSnapshot = EvidenceSnapshotBase & {
+  tsCode: TsCode;
+  name?: string;
+  price?: Price;
+  changePercent?: Percent;
+  volume?: Volume;
+  amount?: Amount;
+  peTtm?: number;
+  pb?: number;
+};
+
+type EvidenceAccountSnapshot = EvidenceSnapshotBase & {
+  cash: Money;
+  totalAssets: Money;
+  marketValue: Money;
+  totalPnl: Money;
+  openPositionCount: number;
+  pendingOrderCount: number;
+};
+
+type EvidencePositionSnapshot = EvidenceSnapshotBase & {
+  positionId: string;
+  tsCode: TsCode;
+  quantity: Shares;
+  sellableQuantity: Shares;
+  avgCost: Price;
+  marketPrice?: Price;
+  unrealizedPnl?: Money;
+  protection?: { stopLoss?: Price; takeProfit?: Price; timeStopAt?: OccurredAt; enabled: boolean };
+};
+
+type EvidenceOrderSnapshot = EvidenceSnapshotBase & {
+  orderId: string;
+  tsCode: TsCode;
+  side: "buy" | "sell";
+  orderType: "market" | "limit";
+  limitPrice?: Price;
+  quantity: Shares;
+  filledQuantity: Shares;
+  status: string;
+};
+
+type EvidenceAccountTriggerSnapshot = EvidenceSnapshotBase & {
+  triggerId: string;
+  triggerType: string;
+  tsCode?: TsCode;
+  positionId?: string;
+  orderId?: string;
+  occurredAt: OccurredAt;
+};
+
+type EvidenceStrategySnapshot = EvidenceSnapshotBase & {
+  strategyId: string;
+  name: string;
+  description: string;
+  status: "active" | "paused";
+  configSummary: string;
+};
+
 type ToolCallEvidenceSnapshot = {
+  schemaVersion: 1;
   name: string;
   inputSummary: string;
   outputSummary?: string;
   isError: boolean;
-  capturedAt: string;
+  capturedAt: OccurredAt;
 };
 ```
 
 规则：
 
 - `id` 用于跳转和重新查询；`snapshot` 才是 episode / review 的长期证据。
-- News 默认保留期只有 30 天，因此被 episode 引用的新闻必须保存 `PacketNewsItem` 快照。
+- Evidence snapshot 是持久化审计 schema，不直接存 `Packet*` 运行时投影；写入时由当前 packet / tool result 映射成 `Evidence*Snapshot`。
+- 每个 snapshot 必须带 `schemaVersion`。同一 version 只能新增可选字段，不能重命名或删除已有字段；破坏性变更必须 bump version 并保留旧 version 反序列化。
+- 被 episode 引用的重要新闻必须保存 `EvidenceNewsSnapshot`，避免源内容变更、远端不可用或后续正文重抽取影响复盘。
 - 快照应是最小可复盘视图，不保存无限长正文；长正文使用摘要或 excerpt。
 - 行情、账户、工具调用证据也保存当时的 source / freshness / timestamp。
-
-### `RealtimeDecisionPacket`
-
-```ts
-type Freshness = {
-  status: "fresh" | "stale" | "missing";
-  capturedAt?: string;
-  ageMs?: number;
-  source?: string;
-  warning?: string;
-};
-
-type RealtimeDecisionPacket = {
-  runId: string;
-  trigger: AgentRun["trigger"];
-  account?: PacketAccount;
-  quotes?: PacketQuotes;
-  news?: PacketNews;
-  strategies: StrategyCard[];
-  recentEpisodes: PacketEpisodeSummary[];
-  userPreferences: PacketUserPreference[];
-};
-
-type PacketAccount = {
-  snapshot: PacketAccountSnapshot;
-  positions: PacketPosition[];
-  openOrders: PacketOrder[];
-  watchlist: PacketWatchlistItem[];
-  triggers: PacketAccountTrigger[];
-  freshness: Freshness;
-  warnings?: string[];
-};
-
-type PacketAccountSnapshot = {
-  capturedAt: string;
-  cash: number;
-  availableCash: number;
-  frozenCash: number;
-  marketValue: number;
-  totalAssets: number;
-  realizedPnl: number;
-  unrealizedPnl: number;
-  totalPnl: number;
-  openPositionCount: number;
-  pendingOrderCount: number;
-};
-
-type PacketPosition = {
-  positionId: string;
-  tsCode: string;
-  name: string;
-  status: "open" | "closed";
-  quantity: number;
-  sellableQuantity: number;
-  avgCost: number;
-  marketPrice?: number;
-  marketValue?: number;
-  unrealizedPnl?: number;
-  realizedPnl: number;
-  protection?: {
-    stopLoss?: number;
-    takeProfit?: number;
-    timeStopAt?: string;
-    enabled: boolean;
-  };
-  openedAt: string;
-  closedAt?: string;
-};
-
-type PacketOrder = {
-  orderId: string;
-  tsCode: string;
-  side: "buy" | "sell";
-  orderType: "market" | "limit";
-  limitPrice?: number;
-  quantity: number;
-  filledQuantity: number;
-  status: "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired";
-  intent: string;
-  positionId?: string;
-  createdAt: string;
-  expiresAt?: string;
-};
-
-type PacketWatchlistItem = {
-  tsCode: string;
-  name?: string;
-  addedBy: "agent" | "user" | "system";
-  addedAt: string;
-  note?: string;
-  quote?: PacketQuoteItem;
-};
-
-type PacketAccountTrigger = {
-  triggerId: string;
-  triggerType: "stop_loss" | "take_profit" | "time_stop" | "order_filled" | "order_rejected" | "order_expired" | "invalidated";
-  tsCode?: string;
-  positionId?: string;
-  orderId?: string;
-  occurredAt: string;
-  handled: boolean;
-};
-
-type PacketQuotes = {
-  snapshotAt: string;
-  freshness: Freshness;
-  items: PacketQuoteItem[];
-  klines?: PacketKlineSeries[];
-  indicators?: PacketIndicatorSnapshot[];
-  scan?: PacketScanResult;
-};
-
-type PacketQuoteItem = {
-  tsCode: string;
-  code: string;
-  name: string;
-  category: "stock" | "index" | "fund";
-  price?: number;
-  change?: number;
-  changePercent?: number;
-  volume?: number;
-  amount?: number;
-  turnoverRate?: number;
-  volumeRatio?: number;
-  peTtm?: number;
-  pb?: number;
-  source: string;
-  freshness: Freshness;
-};
-
-type PacketKlineSeries = {
-  tsCode: string;
-  period: "minute" | "1m" | "5m" | "15m" | "30m" | "60m" | "day" | "week" | "month";
-  adjust?: "none" | "qfq" | "hfq";
-  source: string;
-  fetchedAt: string;
-  points: Array<{
-    time: string;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume?: number;
-    amount?: number;
-  }>;
-};
-
-type PacketIndicatorSnapshot = {
-  tsCode: string;
-  basis: { period: string; adjust?: string; fetchedAt: string };
-  values: Record<string, number | string | null>;
-};
-
-type PacketScanResult = {
-  generatedAt: string;
-  criteria: string[];
-  items: Array<PacketQuoteItem & { rank?: number; score?: number }>;
-};
-
-type PacketNews = {
-  snapshotAt: string;
-  freshness: Freshness;
-  items: PacketNewsItem[];
-};
-
-type PacketNewsItem = {
-  id: string;
-  source: string;
-  title: string;
-  summary?: string;
-  url?: string;
-  publishedAt?: string;
-  articleExcerpt?: string;
-  mentions?: Array<{ tsCode: string; mention: string }>;
-  fetchedAt?: string;
-};
-
-type PacketEpisodeSummary = {
-  episodeId: string;
-  createdAt: string;
-  symbols: string[];
-  action: DecisionEpisode["action"];
-  thesis: string;
-  outcome?: string;
-};
-
-type PacketUserPreference = {
-  key: string;
-  value: string;
-  updatedAt: string;
-};
-```
-
-规则：
-
-- 该对象是运行时投影，不是长期存储真源。
-- 该对象是 Agent 核心决策输入，禁止使用 `unknown` 兜底；上游字段变化应通过类型契约暴露出来。
-- Packet 类型是面向 Agent 的瘦身视图，不要求等同于上游完整 DTO，但字段必须稳定、可渲染、可审计。
-- 每次 run 重新构造，不能把旧工具结果当作实时事实复用。
-- Chat 历史只作为交互上下文；交易判断主要依赖这个实时决策包。
 
 ### `StrategyCard`
 
 ```ts
 type StrategyCard = {
   strategyId: string;
+  version: number;
   name: string;
   description: string;
   status: "active" | "paused";
@@ -398,16 +344,19 @@ type StrategyCard = {
     };
     applicableRegimes?: string[];
   };
-  createdAt: string;
-  updatedAt: string;
+  createdAt: OccurredAt;
+  updatedAt: OccurredAt;
 };
 ```
 
 规则：
 
 - `StrategyCard` 是 Agent 决策时动态注入的策略上下文。
+- 首次启动若没有 active strategy，系统必须 seed 一个内置 active baseline 策略卡（例如 `baseline_a_share_risk_control`），覆盖仓位上限、freshness、止损和不确定时不交易等基础纪律。
+- 如果策略表为空或 seed 失败，Agent 仍可回答和读取数据，但交易写动作默认禁用，直到至少一个 active strategy 可注入。
 - Agent 运行时读取 active strategy，不直接把复盘建议写回 active strategy。
 - 策略卡可以被外部显式调整；调整后下一次 Agent run 自动使用新版本内容。
+- 每次策略卡调整必须递增 `version`，并保留旧版本可追溯。
 - 第一阶段不要求策略版本晋升、shadow run、自动调参、回测引擎。
 
 ### `DecisionReview`
@@ -424,7 +373,7 @@ type DecisionReview = {
     | "scheduled_review"
     | "manual_review";
   result?: {
-    pnl?: number;
+    pnl?: Money;
     pnlPct?: number;
     maxFavorableExcursion?: number;
     maxAdverseExcursion?: number;
@@ -437,7 +386,7 @@ type DecisionReview = {
     reason: string;
   };
   evidenceRefs: EvidenceRef[];
-  createdAt: string;
+  createdAt: OccurredAt;
 };
 ```
 
@@ -466,6 +415,7 @@ type AgentEvent =
   | { type: "tool_end"; runId: string; toolCallId: string; name: string; outputSummary: JsonSummary; isError: boolean; durationMs: number }
   | { type: "episode_created"; runId: string; episodeId: string; action: string }
   | { type: "review_created"; runId: string; reviewId: string; episodeId: string }
+  | { type: "compacted"; runId: string; tier: "micro_clear" | "summarize" | "drop" | "reactive_retry"; droppedMessages: number; estimatedTokensSaved?: number }
   | { type: "usage"; runId: string; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: "done"; runId: string; stopReason: string; turns: number }
   | { type: "error"; runId: string; message: string };
@@ -478,6 +428,12 @@ type AgentEvent =
 - 后台触发的 run 也要进入时间线或 episode 列表。
 
 ### `ProviderChannel`
+
+Channel reference：
+
+- [Anthropic Messages](references/agent/anthropic-messages.md)
+- [OpenAI Responses](references/agent/openai-responses.md)
+- [OpenAI Chat Completions](references/agent/openai-chat-completions.md)
 
 ```ts
 type ProviderChannel = {
@@ -500,6 +456,8 @@ type ProviderChannel = {
 - 必须支持流式输出；不支持 streaming 的 provider 不能作为主 Agent 渠道。
 - 支持三类 wire format：Anthropic `/messages`、OpenAI `/responses`、OpenAI-compatible `/chat/completions`。
 - Provider 层不执行 tool loop，不管理业务上下文，不写业务状态。
+- 本 spec 定义 Agent canonical loop、事件和工具契约；具体 stream event、tool call、thinking、web_search 和错误映射写在 channel reference。
+- 主交易 Agent 渠道必须同时支持 streaming 和 local tools；不支持 tools 的渠道只能用于非交易问答或禁用。
 
 ---
 
@@ -514,45 +472,46 @@ UI chat input
   -> provider stream
   -> tool loop
   -> AgentEvent stream to UI
-  -> persist messages / episode / tool calls / usage
+  -> persist messages / optional DecisionEpisode / tool calls / usage
 ```
 
 规则：
 
 - 用户可以要求解释、复盘、修改偏好、请求交易建议。
-- 如果用户请求交易动作，Agent 仍需读取实时账户和行情，再生成 episode 和 trade intent。
+- 纯聊天、设置解释、普通问答可以只落 `AgentRun`、messages、tool calls 和 usage，不产生 episode。
+- 如果用户请求投资判断或交易动作，Agent 仍需读取实时账户和行情，再生成 `DecisionEpisode`；需要写 Account 时再生成 `TradeIntent`。
 - 交易写入必须经过 Account 校验。
 
 ### News 驱动分析流
 
 ```text
-Runtime Orchestrator receives news-refreshed
-  -> AgentRun(trigger=news_batch)
+AgentRun(trigger=news_batch)
   -> fetch_news
   -> identify related instruments
   -> fetch_quotes / fetch_account
   -> inject relevant StrategyCard
   -> decide no_action / watchlist / order / position action
-  -> persist DecisionEpisode
+  -> Agent records DecisionEpisode when it forms an investment judgment
   -> operate_account only when justified
 ```
 
 规则：
 
-- Runtime Orchestrator 负责监听 `news-refreshed`、攒批、节流、幂等和启动 run。
 - News 只提供事实；相关股票、重要性和交易影响由 Agent 判断。
+- `DecisionEpisode` 由 Agent 持久化；News 不创建、不更新、不持有 episode。
+- News 触发的 run 如果完成了影响判断，即使结论是 `no_action`，也必须记录一个 episode。
 - 大多数新闻应输出 `no_action` 或加入观察，不应强行交易。
 - 若影响已有仓位，优先评估保护条件、撤单、减仓或平仓。
 
 ### Account 触发复盘流
 
 ```text
-Runtime Orchestrator receives account-triggered
-  -> AgentRun(trigger=account_trigger)
+AgentRun(trigger=account_trigger)
   -> fetch_account(trigger/position/order)
   -> fetch_quotes(symbols)
   -> optional fetch_news
   -> decide response action
+  -> Agent records DecisionEpisode for the response judgment
   -> operate_account if needed
   -> write DecisionReview
   -> optionally record suggested strategy change
@@ -560,20 +519,20 @@ Runtime Orchestrator receives account-triggered
 
 规则：
 
-- Runtime Orchestrator 负责监听 `account-triggered`、按 `trigger_id` 去重和启动 run。
 - Account 只触发事件，不决定 Agent 后续行为。
 - Agent 必须处理止损、止盈、订单成交、订单拒绝、订单过期、时间止损等事件。
 - 同一 `trigger_id` 的交易响应必须幂等。
+- Agent 必须持久化 `trigger_id -> run_id / episode_id / trade_intent_id` 映射；已完成映射不得再次产生交易写动作。
+- Account 触发的 run 完成响应判断后必须记录 episode；选择继续持有或不操作也是 `no_action` episode。
 - 复盘可以产生 `suggestedChange`，但不会自动更新 active strategy。
 
 ### 定时巡检流
 
 ```text
-Runtime Orchestrator scheduled tick
-  -> AgentRun(trigger=scheduled_review)
+AgentRun(trigger=scheduled_review)
   -> fetch_account + fetch_quotes + fetch_news as needed
   -> review open positions / pending orders / watchlist
-  -> create DecisionReview or DecisionEpisode
+  -> create DecisionReview and/or DecisionEpisode when a judgment is formed
   -> operate_account only when action is justified
 ```
 
@@ -581,6 +540,7 @@ Runtime Orchestrator scheduled tick
 
 - 定时 run 用于巡检持仓、挂单、自选和最近 episode。
 - 定时 run 不是每次都必须交易。
+- 纯健康检查可以只落 run summary；如果对标的、仓位或组合形成判断，则必须记录 episode。
 - 关键输出是可审计记录：看了什么、判断什么、做了什么、为什么没做。
 
 ### 第一阶段学习闭环
@@ -666,10 +626,12 @@ type FetchStrategyCardsRequest = {
 ```ts
 type UpsertStrategyCardRequest = {
   strategyId?: string;
+  baseVersion?: number;
   name: string;
   description: string;
   status: "active" | "paused";
   config: StrategyCard["config"];
+  reason: string;
 };
 ```
 
@@ -678,6 +640,8 @@ type UpsertStrategyCardRequest = {
 - 显式创建或调整策略卡。
 - 调整后的 active 策略卡从下一次 Agent run 开始注入。
 - Agent 的 `DecisionReview.suggestedChange` 不会自动调用该接口。
+- `baseVersion` 用于乐观并发；版本冲突必须拒绝。
+- `reason` 进入策略审计记录。
 
 ### Agent 使用的模块工具
 
@@ -686,16 +650,292 @@ Agent 消费其他模块时，工具应收敛为少数高层工具。
 | 工具 | 来源模块 | 能力 |
 |---|---|---|
 | `fetch_quotes` | Quotes | 行情、K 线、分时、指标、基本面、扫描 |
-| `fetch_news` | News | 新闻列表、全文、搜索、按标的过滤 |
+| `fetch_news` | News | 新闻列表、全文、关键词搜索 |
 | `fetch_account` | Account | 账户总览、仓位、订单、自选、事件、触发 |
-| `operate_account` | Account | 挂单、撤单、开仓、调仓、平仓、调整保护条件、自选维护 |
+| `operate_account` | Account | 挂单、撤单、开仓、调仓、平仓、调整保护条件 |
+| `update_watchlist` | Account | 添加 / 删除自选、更新自选备注 |
 
 规则：
 
 - Agent 不直接使用碎片化模块接口。
 - 读工具可以并发；`operate_account` 必须串行执行。
 - 交易写能力只存在于 `operate_account`。
+- `update_watchlist` 是非交易写能力，可由 Agent 用于维护观察列表。
 - 工具返回值必须带时间戳和来源摘要，供 Agent 判断 freshness。
+- Agent 工具 schema 属于 Agent 模块；执行模块只需要提供自己的领域接口。
+
+工具 schema 使用 Agent 自己的 packet 视图：
+
+```ts
+type RealtimeDecisionPacket = {
+  runId: string;
+  trigger: AgentRun["trigger"];
+  account?: PacketAccount;
+  quotes?: PacketQuotes;
+  news?: PacketNews;
+  strategies: StrategyCard[];
+  recentEpisodes: PacketEpisodeSummary[];
+  userPreferences: PacketUserPreference[];
+};
+
+type PacketAccount = {
+  snapshot: PacketAccountSnapshot;
+  positions: PacketPosition[];
+  openOrders: PacketOrder[];
+  watchlist: PacketWatchlistItem[];
+  triggers: PacketAccountTrigger[];
+  freshness: Freshness;
+  warnings?: WarningCode[];
+};
+
+type PacketAccountSnapshot = {
+  capturedAt: OccurredAt;
+  cash: Money;
+  availableCash: Money;
+  frozenCash: Money;
+  marketValue: Money;
+  totalAssets: Money;
+  realizedPnl: Money;
+  unrealizedPnl: Money;
+  totalPnl: Money;
+  pricedPositionCount: number;
+  unpricedPositionCount: number;
+  valuationFreshness: Freshness;
+  openPositionCount: number;
+  pendingOrderCount: number;
+  warnings?: WarningCode[];
+};
+
+type PacketPosition = {
+  positionId: string;
+  tsCode: TsCode;
+  name: string;
+  status: "open" | "closed";
+  quantity: Shares;
+  sellableQuantity: Shares;
+  avgCost: Price;
+  marketPrice?: Price;
+  marketValue?: Money;
+  quoteFreshness?: Freshness;
+  unrealizedPnl?: Money;
+  realizedPnl: Money;
+  protection?: {
+    stopLoss?: Price;
+    takeProfit?: Price;
+    timeStopAt?: OccurredAt;
+    enabled: boolean;
+  };
+  openedAt: OccurredAt;
+  closedAt?: OccurredAt;
+  warnings?: WarningCode[];
+};
+
+type PacketOrder = {
+  orderId: string;
+  tsCode: TsCode;
+  side: "buy" | "sell";
+  orderType: "market" | "limit";
+  limitPrice?: Price;
+  quantity: Shares;
+  filledQuantity: Shares;
+  status: "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired";
+  intent: string;
+  positionId?: string;
+  createdAt: OccurredAt;
+  expiresAt?: OccurredAt;
+};
+
+type PacketWatchlistItem = {
+  tsCode: TsCode;
+  name?: string;
+  addedAt: OccurredAt;
+  note?: string;
+  quote?: PacketQuoteItem;
+};
+
+type PacketAccountTrigger = {
+  triggerId: string;
+  triggerType: "stop_loss" | "take_profit" | "time_stop" | "order_filled" | "order_rejected" | "order_expired" | "invalidated";
+  tsCode?: TsCode;
+  positionId?: string;
+  orderId?: string;
+  price?: Price;
+  threshold?: Price | OccurredAt | string;
+  quoteFreshness?: Freshness;
+  warnings?: WarningCode[];
+  occurredAt: OccurredAt;
+  handled: boolean;
+};
+
+type PacketQuotes = {
+  snapshotAt: OccurredAt;
+  freshness: Freshness;
+  items: PacketQuoteItem[];
+  klines?: PacketKlineSeries[];
+  indicators?: PacketIndicatorSnapshot[];
+  scan?: PacketScanResult;
+};
+
+type PacketQuoteItem = {
+  tsCode: TsCode;
+  name: string;
+  category: InstrumentCategory;
+  price?: Price;
+  change?: Price;
+  changePercent?: Percent;
+  volume?: Volume;
+  amount?: Amount;
+  turnoverRate?: Percent;
+  volumeRatio?: number;
+  peTtm?: number;
+  pb?: number;
+  source: string;
+  freshness: Freshness;
+};
+
+type PacketKlineSeries = {
+  tsCode: TsCode;
+  period: "minute" | "1m" | "5m" | "15m" | "30m" | "60m" | "day" | "week" | "month";
+  adjust?: "none" | "qfq" | "hfq";
+  source: string;
+  fetchedAt: OccurredAt;
+  points: Array<{
+    time: OccurredAt | TradeDate;
+    open: Price;
+    high: Price;
+    low: Price;
+    close: Price;
+    volume?: Volume;
+    amount?: Amount;
+  }>;
+};
+
+type PacketIndicatorSnapshot = {
+  tsCode: TsCode;
+  basis: { period: string; adjust?: string; fetchedAt: OccurredAt };
+  values: Partial<Record<IndicatorName, number | null>>;
+};
+
+type PacketScanResult = {
+  generatedAt: OccurredAt;
+  criteria: string[];
+  items: Array<PacketQuoteItem & { rank?: number }>;
+};
+
+type PacketNews = {
+  snapshotAt: OccurredAt;
+  freshness: Freshness;
+  items: PacketNewsItem[];
+};
+
+type PacketNewsItem = {
+  id: string;
+  source: string;
+  title: string;
+  summary?: string;
+  url?: string;
+  publishedAt?: OccurredAt;
+  articleExcerpt?: string;
+  fetchedAt?: OccurredAt;
+};
+
+type PacketEpisodeSummary = {
+  episodeId: string;
+  createdAt: OccurredAt;
+  symbols: TsCode[];
+  action: DecisionEpisode["action"];
+  thesis: string;
+  outcome?: string;
+};
+
+type PacketUserPreference = {
+  key: string;
+  value: string;
+  updatedAt: OccurredAt;
+};
+```
+
+规则：
+
+- 该对象是运行时投影，不是长期存储真源。
+- Packet 类型是 Agent 工具输出和上下文组装 schema，不是 Agent 长期领域模型。
+- Packet 类型是面向 Agent 的瘦身视图，不要求等同于上游完整 DTO，但字段必须稳定、可渲染、可审计。
+- 指标名使用 Quotes spec 定义的固定 `IndicatorName` 集合和小写 snake_case；新增指标必须先扩展 Quotes spec，不能用自由字符串临时塞值。
+- 每次 run 重新构造，不能把旧工具结果当作实时事实复用。
+- Chat 历史只作为交互上下文；交易判断主要依赖这个实时决策包。
+
+```ts
+type FetchQuotesToolInput = {
+  tsCodes?: TsCode[];
+  scan?: {
+    filter?: string;
+    conditions?: JsonSummary[];
+    sortBy?: string;
+    limit?: number;
+  };
+  include?: {
+    quote?: boolean;
+    intraday?: boolean;
+    klines?: Array<"day" | "week" | "month">;
+    minuteKlines?: Array<"1m" | "5m" | "15m" | "30m" | "60m">;
+    indicators?: true | IndicatorName[];
+    profile?: boolean;
+    dailyBasic?: boolean;
+    events?: boolean;
+  };
+  limit?: JsonSummary;
+};
+
+type FetchQuotesToolOutput = PacketQuotes & {
+  warnings?: WarningCode[];
+  errors?: ErrorCode[];
+};
+
+type FetchNewsToolInput = {
+  ids?: string[];
+  query?: string;
+  includeArticle?: boolean;
+  limit?: number;
+};
+
+type FetchNewsToolOutput = PacketNews & {
+  warnings?: WarningCode[];
+  errors?: ErrorCode[];
+};
+
+type FetchAccountToolInput = {
+  include?: {
+    snapshot?: boolean;
+    positions?: boolean;
+    orders?: boolean;
+    watchlist?: boolean;
+    events?: boolean;
+    triggers?: boolean;
+  };
+  positionStatus?: "open" | "closed" | "all";
+  orderStatus?: "open" | "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired" | "all";
+  limit?: number;
+  offset?: number;
+};
+
+type FetchAccountToolOutput = PacketAccount;
+
+type UpdateWatchlistToolInput = UpdateWatchlistInput;
+
+type UpdateWatchlistToolOutput = UpdateWatchlistResponse;
+
+type OperateAccountToolInput = OperateAccountInput;
+
+type OperateAccountToolOutput = {
+  accepted: boolean;
+  reason?: ErrorCode;
+  orderId?: string;
+  positionId?: string;
+  triggerId?: string;
+  snapshot?: PacketAccountSnapshot;
+  warnings?: WarningCode[];
+};
+```
 
 ### 内部 Rust API
 
@@ -810,7 +1050,7 @@ provider.stream(canonical request)
 
 ```text
 active StrategyCard
-  -> selected by trigger / symbol / market context
+  -> select active cards by deterministic injection rule
   -> injected into RealtimeDecisionPacket
   -> used by Agent to form thesis and risk plan
   -> review may produce suggestedChange
@@ -820,6 +1060,7 @@ active StrategyCard
 
 - 策略不是硬编码 prompt，也不是 Account 规则。
 - 策略卡调整后，下一次 run 使用最新 active 内容。
+- 第一阶段默认注入全部 `status = active` 的策略卡；如果超过 `agent.strategy.max_active_cards`，必须保留 baseline 策略卡，再按 `applicableRegimes` 匹配度和 `updatedAt desc` 截断，并在 packet warning 中列出被省略的 strategy id。
 - Agent 可以引用策略卡，也可以说明为什么本次不适用。
 - 第一阶段只保留策略调整入口和建议记录，不实现自动生效。
 
@@ -843,14 +1084,23 @@ type TradeIntent = {
   reason: string;
   strategyIds: string[];
   status: "proposed" | "submitted" | "accepted" | "rejected" | "executed";
-  accountResultRef?: string;
-  createdAt: string;
+  accountResultRef?: AccountResultRef;
+  createdAt: OccurredAt;
+};
+
+type AccountResultRef = {
+  orderId?: string;
+  positionId?: string;
+  accountEventIds?: string[];
+  triggerId?: string;
+  rejectionEventId?: string;
 };
 ```
 
 规则：
 
 - Agent 生成 `operate_account` input；`TradeIntent` 只是把本次调用意图、理由和执行结果持久化，供复盘和前端追溯。
+- `accountResultRef` 指向 Account 返回或写入的稳定 ID：订单用 `orderId`，仓位变更用 `positionId`，审计链用 `accountEventIds`；拒单若写入事件则填 `rejectionEventId`。
 - Account 决定是否可执行。
 - Account 拒绝后，Agent 只能记录或重新判断，不能绕过 Account。
 - 行情 freshness 不足时，Agent 不应执行交易写动作。

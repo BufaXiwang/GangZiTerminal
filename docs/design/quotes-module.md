@@ -74,8 +74,10 @@ type MarketInstrument = {
   name: string;
   category: InstrumentCategory;
   market: Market;
+  board?: string;
   sector?: string;
   status?: InstrumentStatus;
+  isSt?: boolean;
   publisher?: string;
   indexCategory?: string;
   fundType?: string;
@@ -93,6 +95,7 @@ type MarketInstrument = {
 - `category` 决定 provider 分流、扫描范围和 breadth 统计。
 - TuShare / TDX / Eastmoney 等来源只能 enrich 该模型，不能改变 `tsCode` 身份。
 - `source` 表示标的档案 / universe 来源，不表示实时行情来源；实时行情来源以 `StockQuote.source` 和 `StockQuote.freshness.source` 为准。
+- `board` 和 `isSt` 是 Quotes 维护的当前派生属性，用于涨跌停规则；来源可以是 universe enrich、名称变更 / ST 事件或 provider 字段，但对外只暴露当前事实。
 
 ### 行情快照
 
@@ -111,6 +114,8 @@ type MarketQuoteSnapshot = {
 
 `MarketQuoteSnapshot` 不对外暴露 freshness 字段。实现可以为索引或 cache 存储 `tradeDate` / `capturedAt` / `source`，但对外 freshness 只能由 query facade 派生到 `StockQuote.freshness` 或 item-level `quoteFreshness`。
 
+`MARKET_SNAPSHOT` 以 `tsCode` 为单槽 cache。交易日切换时不要求立即清空旧槽位；读取路径必须按 eligible trade date 校验，`tradeDate` 不匹配时视为无可用 quote。
+
 用途：
 
 - breadth 只统计 `category == stock`。
@@ -123,11 +128,16 @@ freshness 定义：
 - provider / refresh 成功写入 snapshot 时更新 `capturedAt`、`exchangeTime`、`source`；读取路径不能刷新 `capturedAt`，也不能因为被读取而延长有效期。
 - `exchangeTime` 只用于审计和展示市场时间，不能替代 `capturedAt` 或 `tradeDate` 做有效性判断。
 - `tradeDate` 表示该 quote 对应的交易日。Quotes 通过 `resolve_market_time(now)` 返回的 `MarketTimeContext` 和 `tradeDate` 推导它是盘中事实还是收盘事实，不额外暴露 snapshot kind 枚举。
-- `MarketTimeContext.isTradingTime = true` 时，读取必须使用 `tradeDate = currentTradeDate` 的 quote；`now - capturedAt > quote_stale_threshold_secs` 时 `freshness.status = "stale"`，默认阈值为 30s。
+- 每个读取请求只调用一次 `resolve_market_time(now)`，并由该结果计算唯一 eligible trade date：交易时段内为 `currentTradeDate`，非交易时段为 `latestCompletedTradeDate`。
+- snapshot `tradeDate` 不等于 eligible trade date 时不得返回 quote；交易时段内返回 `quote_missing`，非交易时段返回 `snapshot_expired` 或 `quote_missing`。
+- `MarketTimeContext.isTradingTime = true` 时，读取必须使用 `tradeDate = currentTradeDate` 的 quote；`now - capturedAt` 超过当前读取意图的 stale threshold 时 `freshness.status = "stale"`。
+- stale threshold 按读取意图选择：`detail` 默认 30s，用于 `fetch_data(include.quote = true)` 等精确标的详情读取；`universe` 默认 90s，用于 `list_market(includeQuote = true)` 和 `scan_market` 这类全市场 / 大范围读取。
+- `quote_stale` warning 只在超过适用 threshold 时返回；全市场 60s refresh 下，正常完成的 universe snapshot 不应天然产生 stale warning。
 - `MarketTimeContext.isTradingTime = true` 时，`now - capturedAt > quote_snapshot_expire_secs` 的当日 quote 硬过期；默认阈值为 1 小时。硬过期时 `quote` 不返回可用行情字段，`quoteFreshness.status = "missing"`，`quoteFreshness.warning = "snapshot_expired"`。
 - `MarketTimeContext.isTradingTime = false` 时，读取优先使用 `tradeDate = latestCompletedTradeDate` 的 quote；只要 trade date 匹配最新已完成交易日，就视为收盘事实，不因 `capturedAt > 1h` 过期。
 - 非交易时段如果缺少最新已完成交易日的 close snapshot，则 quote 为空并返回 `snapshot_expired` 或 `quote_missing`；不能退回更早交易日的旧 quote。
-- 默认阈值不因 TDX / Eastmoney / 腾讯 / 新浪 source 改变；如配置 source-specific threshold，响应必须保留 source 以便审计。
+- 启动冷加载或 cache hydrate 未完成时，读取接口按无可用 snapshot 处理：quote 为空，并在 response 或 item warning 返回 `snapshot_expired` / `quote_missing`。
+- stale threshold 和硬过期阈值不因 TDX / Eastmoney / 腾讯 / 新浪 source 改变；如配置 source-specific threshold，响应必须保留 source 以便审计。
 
 行情 DTO：
 
@@ -136,6 +146,8 @@ type QuoteDepthLevel = {
   price?: Price;
   volume?: Volume;
 };
+
+type QuoteSource = "tdx" | "eastmoney" | "tencent" | "sina" | "mixed";
 
 type StockQuote = {
   tsCode: TsCode;
@@ -158,7 +170,7 @@ type StockQuote = {
   bid?: QuoteDepthLevel[];
   ask?: QuoteDepthLevel[];
   tradeStatus: "trading" | "halted" | "closed" | "unknown";
-  source: string;
+  source: QuoteSource;
   capturedAt: OccurredAt;
   exchangeTime?: OccurredAt;
   freshness: Freshness;
@@ -169,14 +181,18 @@ type StockQuote = {
 规则：
 
 - `price` 是当前最新价；不能用 `previousClose` 伪造当前价。
-- instrument `status = suspended` 时 `tradeStatus` 必须为 `halted`；instrument `status = delisted` 时 `tradeStatus` 必须为 `closed` 或 `unknown`。
+- `tradeStatus` 是 query facade 按当前 `MarketTimeContext`、instrument lifecycle 和 quote eligibility 派生的读取时状态，不是 provider 原始状态。
+- instrument `status = suspended` 时 `tradeStatus` 必须为 `halted`；非交易时段或不可交易标的可为 `closed`；无法判断时为 `unknown`。
+- instrument `status = delisted` 由 `InstrumentStatus` 表达；`tradeStatus = closed` 只表示当前读取时不可即时交易，不承载退市原因。
 - `tradeStatus = halted` / `closed` / `unknown` 时 Account 写路径必须 fail closed，不能即时成交。
 - Quotes 提供 L1 五档盘口能力：`bid` 表示买一到买五，`ask` 表示卖一到卖五，数组按离成交价最近到最远排序，最多 5 档。
 - `QuoteDepthLevel.volume` 使用 shared `Volume` 规范化单位；价格或数量缺失的档位不得伪造为 0。
 - 缺盘口、盘口为空、买一 / 卖一价格缺失时必须返回 `depth_missing` warning。
 - 少于 5 档但买一 / 卖一可用时仍返回已有档位，并返回 `data_partial` warning；Quotes 不在本模块判断某笔订单需要消耗几档盘口。
 - TDX 是五档盘口主路径；Eastmoney / Tencent 可补充可用盘口；Sina 不保证盘口，通常只可作为基础展示 fallback。
-- `limitUp` / `limitDown` 优先由 Quotes 基于 `previousClose`、市场板块、ST 状态和 A 股涨跌幅规则计算；provider 返回值只能作为校验或补充。缺少计算所需字段时可为空，并必须返回 `quote_price_missing` warning；Account 不得执行涨跌停相关判断。
+- `limitUp` / `limitDown` 优先由 Quotes 基于 `previousClose`、`MarketInstrument.board`、`MarketInstrument.isSt`、上市日期 / 公司事件和 A 股涨跌幅规则计算；provider 返回值只能作为校验或补充。
+- 计算涨跌停价必须使用纯规则：确定适用涨跌幅、处理新股 / 无涨跌幅限制场景、按最小价格 tick 舍入；缺少必要输入时可为空，并必须返回 `quote_price_missing` warning。
+- Account 不得自行推导涨跌停价；`limitUp` / `limitDown` 缺失时不得执行涨跌停相关判断。
 - `changePercent` 使用百分点，例如 `3.25` 表示上涨 3.25%。
 
 ### K 线和分时读模型
@@ -188,7 +204,7 @@ K 线和分时是 Quotes 的本地读模型，不是 provider 原始数据直出
 - 日 / 周 / 月 K：`(tsCode, period, adjust, date)` 唯一。
 - 分钟 K：`(tsCode, period, timestampMs)` 唯一。
 - 分时点：`(tsCode, tradeDate, time)` 唯一。
-- 本地读模型必须记录 source / fetchedAt；对外日 / 周 / 月 K 通过 `KlineSeries.freshness` 暴露统一 freshness。
+- 本地读模型必须记录 source / fetchedAt；对外 K 线、分钟 K 和分时都通过 series-level `freshness` 暴露统一 freshness。
 
 对外点位模型：
 
@@ -219,8 +235,6 @@ type MinuteKlinePoint = {
   low: Price;
   volume: Volume;
   amount: Amount;
-  source: string;
-  fetchedAt: OccurredAt;
 };
 
 type MinutePoint = {
@@ -230,8 +244,20 @@ type MinutePoint = {
   average?: Price;
   volume?: Volume;
   amount?: Amount;
-  source: string;
-  fetchedAt: OccurredAt;
+};
+
+type MinuteKlineSeries = {
+  period: "1m" | "5m" | "15m" | "30m" | "60m";
+  points: MinuteKlinePoint[];
+  freshness: Freshness;
+  warnings?: WarningCode[];
+};
+
+type IntradaySeries = {
+  tradeDate: TradeDate;
+  points: MinutePoint[];
+  freshness: Freshness;
+  warnings?: WarningCode[];
 };
 
 type IndicatorName =
@@ -349,8 +375,10 @@ type StockProfile = {
   name: string;
   category: InstrumentCategory;
   market: Market;
+  board?: string;
   sector?: string;
   status?: InstrumentStatus;
+  isSt?: boolean;
   listDate?: string;
 };
 
@@ -374,6 +402,9 @@ type ScanResult = {
   universe: {
     category?: InstrumentCategory;
     total: number;
+    validQuoteCount?: number;
+    excludedMissingQuoteCount?: number;
+    excludedExpiredQuoteCount?: number;
     matched: number;
   };
   criteria: {
@@ -389,7 +420,6 @@ type ScanResult = {
     category: InstrumentCategory;
     quote?: StockQuote;
     dailyBasic?: DailyBasic;
-    score?: number;
     warnings?: WarningCode[];
   }>;
   warnings?: WarningCode[];
@@ -399,13 +429,29 @@ type ScanResult = {
 规则：
 
 - 扫描只能基于本地 snapshot / `daily_basic` / K 线派生数据。
+- 扫描开始时固定一次 `MarketTimeContext` 和 snapshot view；同一次扫描不能混用 refresh 前后的 quote。
 - 扫描使用 quote 字段时必须先应用 quote 有效性规则：`isTradingTime = true` 时使用 `tradeDate = currentTradeDate` 且未硬过期的 quote；`isTradingTime = false` 时使用 `tradeDate = latestCompletedTradeDate` 的 quote。无有效 snapshot 的 item 不能参与排名、条件判断或 breadth 统计。
+- `validQuoteCount` 表示参与扫描的有效 quote 数；`excludedMissingQuoteCount` / `excludedExpiredQuoteCount` 表示因缺失或过期被排除的数量。覆盖不完整时响应级 `warnings` 必须包含 `data_partial`。
+- 需要 `DailyBasic` 的条件使用 `tradeDate <= eligible quote tradeDate` 的最新一条 `DailyBasic`；缺失时该 item 不匹配该条件，并返回 `daily_basic_missing` 或 `data_partial`。
 - `ScanCondition.field` 不允许自由字符串；新增字段必须先扩展 spec。
 - `conditions` 内部按 AND 组合；任一条件不满足则该 item 不进入结果。
 - 条件字段缺失时该 item 不匹配该条件，并在响应级 `warnings` 返回 `data_partial`；不能把缺失当作 0。
 - `filter` 是预设筛选模板；与 `conditions` 同时出现时先应用 `filter`，再按 AND 应用 `conditions`。
 - `sortBy` 显式传入时覆盖 `filter` 的默认排序；未传入时使用 `filter` 对应默认排序，再按 `tsCode` 稳定 tie-breaker。
 - 连续竞价时段内未硬过期但 freshness 为 `stale` 的 quote 可以参与扫描，但该 item 必须带 `quote_stale` warning。
+
+预设 filter：
+
+| filter | 条件 | 默认排序 |
+|---|---|---|
+| `limit_up` | `price == limitUp`，且 `limitUp` 存在 | `amount desc, tsCode asc` |
+| `limit_down` | `price == limitDown`，且 `limitDown` 存在 | `amount desc, tsCode asc` |
+| `top_gain` | `changePercent` 存在 | `changePercent desc, tsCode asc` |
+| `top_loss` | `changePercent` 存在 | `changePercent asc, tsCode asc` |
+| `top_amount` | `amount` 存在 | `amount desc, tsCode asc` |
+| `top_volume` | `volume` 存在 | `volume desc, tsCode asc` |
+
+缺少 filter 必需字段的 item 不进入结果，并计入 coverage / warning；不能把缺失字段当 0。
 
 ---
 
@@ -517,6 +563,7 @@ type ResponseError = {
   code: ErrorCode;
   message?: string;
   field?: string;
+  tsCode?: TsCode;
 };
 
 type FetchDataRequest = {
@@ -534,9 +581,7 @@ type FetchDataRequest = {
   limit?: {
     kline?: number;
     minuteKline?: number;
-    intradayDays?: number;
     eventsDaysAhead?: number;
-    instruments?: number;
   };
 };
 
@@ -548,9 +593,9 @@ type FetchDataResponse = {
     name?: string;
     quote?: StockQuote;
     quoteFreshness?: Freshness;
-    intraday?: MinutePoint[];
+    intraday?: IntradaySeries;
     klines?: Partial<Record<"day" | "week" | "month", KlineSeries>>;
-    minuteKlines?: Partial<Record<"1m" | "5m" | "15m" | "30m" | "60m", MinuteKlinePoint[]>>;
+    minuteKlines?: Partial<Record<"1m" | "5m" | "15m" | "30m" | "60m", MinuteKlineSeries>>;
     indicators?: IndicatorSnapshot;
     profile?: StockProfile;
     dailyBasic?: DailyBasic;
@@ -565,10 +610,13 @@ type FetchDataResponse = {
 规则：
 
 - `tsCodes` 是唯一目标来源；缺失或为空时返回顶层 `errors[]`，`code = "invalid_input"`，且 `items = []`。
-- `tsCodes` 是精确身份查询，所有 item 必须返回标准 `tsCode`。
+- `tsCodes` 是精确身份查询，最多 200 个；超过上限返回 `invalid_input`。
+- `tsCodes` 按 shared `TsCode` 格式校验；格式非法返回 `invalid_input`，合法但本地 universe 未知返回 `not_found`。
+- 重复 `tsCode` 按首次出现去重；响应 item 顺序按去重后的请求顺序返回。
 - 名称模糊搜索必须走 `list_market({ query })`；`fetch_data` 不做名称匹配，避免详情读取出现多义结果。
 - `include` 缺失时默认等同于 `{ profile: true, quote: true }`。
 - `include.klines` / `include.minuteKlines` 只返回调用方请求的周期；未请求的周期 key 不出现在响应中，不能用空数组伪装为“已请求但无数据”。
+- `include.intraday = true` 只返回一个交易日的 `IntradaySeries`：交易时段内为 `currentTradeDate`，非交易时段为 `latestCompletedTradeDate`。多日分时不属于当前 `fetch_data` 契约；如需扩展必须先调整响应 DTO。
 - `include.klines` 默认优先返回 `adjust = "qfq"`；缺少 qfq 时可降级为 `adjust = "none"`，必须在对应 `KlineSeries.warnings` 和 item `warnings` 返回 `using_unadjusted_kline`。
 - `include.quote = true` 时，如果 snapshot 缺失，`quote` 为空并返回 `quote_missing` warning。
 - `include.quote = true` 时，必须返回 `quoteFreshness`；有可用 `quote` 时它与 `quote.freshness` 语义一致，`quote` 为空时它承载缺失 / 过期原因。
@@ -596,7 +644,7 @@ type ScanMarketResponse = ScanResult & {
 规则：
 
 - `scan_market` 只负责发现候选标的，不返回 K 线、分钟 K、分时、公司事件等详情。
-- `scan_market` 的返回项可以包含用于筛选和展示的 `quote` / `dailyBasic` / `score` / `rank`。
+- `scan_market` 的返回项可以包含用于筛选和展示的 `quote` / `dailyBasic` / `rank`。
 - 调用方需要深入分析候选标的时，必须再用 `fetch_data({ tsCodes })` 读取详情。
 - `scan_market` 使用 quote 字段时必须先应用 quote 有效性规则；`isTradingTime = true` 时使用 `tradeDate = currentTradeDate` 且未硬过期的 quote，`isTradingTime = false` 时使用 `tradeDate = latestCompletedTradeDate` 的 quote。
 - `scan_market` 不触发远端 provider；缺失、过期或字段不足只通过 item warning / response warning 表达。
@@ -635,7 +683,7 @@ Provider reference：
 
 - 本 spec 定义 provider 选择策略和 canonical contract。
 - 具体连接方式、字段映射、单位转换、timeout、retry 写在 provider reference。
-- 所有 provider 输出必须 normalize 到 `MarketInstrument`、`StockQuote`、`KlineSeries` / K 线读模型行、`DailyBasic` 或 `CompanyEvent`。
+- 所有 provider 输出必须 normalize 到 `MarketInstrument`、`StockQuote`、K 线 / 分钟 K / 分时读模型行、`DailyBasic` 或 `CompanyEvent`，对外由对应 series DTO 暴露。
 - Provider 失败默认是 item / batch 级 partial failure，不改变对外读取契约。
 - 当前 provider 集合保留 TDX / Eastmoney / 腾讯 / 新浪 / TuShare；后续可以继续扩展 provider，但新增 provider 必须先补 reference 文档，并 normalize 到本 spec 的 canonical model。
 
@@ -655,6 +703,8 @@ TDX > Eastmoney > 腾讯 > 新浪
 - Eastmoney 是 BJ 主路径，也是 TDX 失败或缺字段时的第一 fallback。
 - Tencent / Sina 只作为基础展示 fallback，不能覆盖更新鲜且字段更完整的 snapshot。
 - fallback 选择以单个 provider 的完整 normalized quote 为单位；默认不做跨 provider 字段拼接。若未来引入 field-level merge，必须显式标记 `source = "mixed"` 并提供字段来源审计。
+- quote 写入 snapshot 前先判断该 provider 输出是否满足当前用途的必需字段：展示至少需要 `price/tradeDate/capturedAt`，成交模拟还需要可用买一 / 卖一盘口。多个 provider 同时可用时，先比较 eligible trade date 和 freshness，再比较字段完整度，最后按 `TDX > Eastmoney > Tencent > Sina` tie-breaker。
+- `StockQuote.source` 与 `StockQuote.freshness.source` 必须一致；缺盘口的 fallback quote 可以用于展示，但必须带 `depth_missing` warning。
 - Account 成交模拟需要 fresh quote 和盘口；fallback 源缺盘口时必须返回 `depth_missing`，是否可成交由 Account 交易规则判断。
 
 日 / 周 / 月 K：
@@ -707,7 +757,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | 数据 | 策略 |
 |---|---|
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；TuShare 可用时 enrich |
-| 实时行情 | 连续竞价时段：关注标的 + 核心指数 15s，全市场 universe 60s |
+| 实时行情 | 连续竞价时段：关注标的 + 核心指数 15s，全市场 universe 60s；读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线 | 启动后预热关注标的；盘后 16:00 补日周月；TuShare 可用时补复权 |
 | `daily_basic` | 每个交易日盘后刷新 |
@@ -718,13 +768,14 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - Quotes 不读取其他 bounded context 的内部实现。
 - Quotes refresh scope 是 use case 入参。
 - 收盘快照用于维护展示 / 分析可用的最后行情事实，不表示可交易。Account 仍必须按交易日历和交易时段规则禁止即时成交。
+- 收盘快照 refresh 按 `tradeDate` 幂等；完成状态至少记录 `tradeDate`、完成时间、覆盖总数和成功数，供启动 catch-up 和 diagnostics 判断是否已有最新已完成交易日快照。
 - 非交易时段不为了维持 `capturedAt < 1h` 持续刷新 quote；只要 quote 的 `tradeDate` 等于最新已完成交易日，就可用于读取。
 - 如果 app 暂停、网络不可用或 provider 失败导致缺少最新已完成交易日 quote，非交易时段读取接口按 `snapshot_expired` / `quote_missing` 返回空 quote。
-- `market-quotes-refreshed` 只表示 snapshot 已更新；payload 使用 [shared-types.md](shared-types.md) 定义的 `MarketQuotesRefreshedPayload`；下游重建和事件路由由模块外编排处理。
+- `market-quotes-refreshed` 只表示 snapshot 已更新；payload 使用 [shared-types.md](shared-types.md) 定义的 `MarketQuotesRefreshedPayload`，其中 `purpose = "close"` 表示收盘快照，`purpose = "intraday"` 表示盘中 / 手动常规刷新；下游重建和事件路由由模块外编排处理。
 
 ### 核心指数集合
 
-Quotes 拥有默认核心指数集合，并通过 `core_indexes()` 暴露给外部调度：
+Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴露给外部调度：
 
 ```text
 000001.SH  上证指数
@@ -736,6 +787,7 @@ Quotes 拥有默认核心指数集合，并通过 `core_indexes()` 暴露给外�
 规则：
 
 - 外部调度只调用 `core_indexes()` 合并 refresh scope，不内嵌指数列表。
+- 这组指数是系统默认市场背景，不是用户偏好；用户自定义关注指数属于 orchestration / preferences，不改变 Quotes 的默认集合。
 - 核心指数变更属于 Quotes 配置 / 数据契约变更。
 
 ### 研究扩展能力边界
@@ -758,10 +810,12 @@ Quotes 拥有默认核心指数集合，并通过 `core_indexes()` 暴露给外�
 - `list_market`、`fetch_data` 和 `scan_market` 是读取 quotes 的统一入口。
 - 对外读取路径默认不直接请求 TDX / EM / TuShare / 腾讯 / 新浪。
 - `list_market({ includeQuote: true })` 只读取 `MarketInstrument` 本地读模型 + `MARKET_SNAPSHOT`，缺实时字段时 `quote` 为空，不触发远端补拉。
-- 连续竞价时段超过 1 小时的当日 quote 不得返回；非交易时段可返回最新已完成交易日 quote。
+- 连续竞价时段超过 1 小时的当日 quote 不得返回；非交易时段可返回最新已完成交易日 quote；`tradeDate` 不匹配 eligible trade date 的 snapshot 不得返回。
 - `fetch_data({ tsCodes, include })` 只读本地 DB / snapshot；需要远端刷新必须走显式 refresh / 后台任务。
-- `scan_market` 返回候选排名结果；需要详情时再调用 `fetch_data({ tsCodes })`。
+- `fetch_data.tsCodes` 必须校验格式、数量上限和请求顺序。
+- `scan_market` 返回候选排名结果和 snapshot 覆盖率；需要详情时再调用 `fetch_data({ tsCodes })`。
 - `MARKET_SNAPSHOT` item 带 `category/tradeDate/capturedAt/source`，对外 freshness 由 query facade 派生；breadth 只统计 `category == stock`。
+- 分钟 K / 分时通过 series-level freshness 表达，不在每个点位重复 freshness。
 - K 线读取必须使用 `TsCode`；已知 `ts_code` 必须贯穿到 provider/cache。
 - `DailyBasic` 和 `CompanyEvent` 由本地读模型读取，远端拉取只发生在后台刷新 / 显式 refresh 路径。
 - 所有批量返回都是 per-item warning/error；单个标的缺数据不让整批失败。

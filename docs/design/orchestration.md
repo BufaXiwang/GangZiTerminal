@@ -16,6 +16,14 @@ Runtime Orchestrator 决定“谁应该被唤起、何时唤起、如何去重�
 Agent 决定“如何判断和行动”
 ```
 
+契约强度：
+
+- `AppEventEnvelope`、跨模块 event payload、event consumption key、in-flight lock、调度优先级是 `Spec-as-source`。
+- 默认 tick 频率、watchdog 超时、退避参数是 `Spec-anchored`。
+- 具体 runtime 文件组织是实现建议。
+
+共享类型见 [shared-types.md](shared-types.md)。
+
 ---
 
 ## 1. 责任边界
@@ -49,71 +57,40 @@ Runtime Orchestrator 不负责：
 
 ## 2. 事件模型
 
+命名规则：
+
+- 跨 BC / 应用事件使用 `kebab-case`，并表达已发生事实，例如 `news-refreshed`、`account-triggered`。
+- BC 内部领域事件枚举使用 `snake_case`，并表达已发生事实，例如 `order_placed`、`position_closed`。
+- 需要跨 BC 路由的共享 payload 使用 `<PascalCase>Payload`，并只在 [shared-types.md](shared-types.md) 定义一次。
+- Event type 一旦对外使用，不复用为其他语义；破坏性变更必须新增事件名。
+
 ### 应用事件
 
-| Event | Producer | Consumer | 含义 |
-|---|---|---|---|
-| `news-refreshed` | News refresh use case | Orchestrator / UI | 新闻本地读模型发生变化 |
-| `market-quotes-refreshed` | Quotes refresh use case | Orchestrator / Account snapshot / UI | 行情 snapshot 更新 |
-| `account-updated` | Account write / trigger use case | Orchestrator / UI | 账户状态发生变化 |
-| `account-triggered` | Account trigger evaluation | Orchestrator / UI | 订单或仓位条件命中，需要 Agent 感知 |
-| `agent-run-started` | Agent run use case | UI / observability | Agent run 开始 |
-| `agent-run-finished` | Agent run use case | UI / observability | Agent run 结束 |
+| Event | Payload | Producer | Consumer | 含义 |
+|---|---|---|---|---|
+| `news-refreshed` | `NewsRefreshedPayload` | News refresh use case | Orchestrator / UI | 新闻本地读模型发生变化 |
+| `market-quotes-refreshed` | `MarketQuotesRefreshedPayload` | Quotes refresh use case | Orchestrator / Account snapshot / UI | 行情 snapshot 更新 |
+| `account-updated` | `AccountUpdatedPayload` | Account write / trigger use case | Orchestrator / UI | 账户状态发生变化 |
+| `account-triggered` | `AccountTriggeredPayload` | Account trigger evaluation | Orchestrator / UI | 订单或仓位条件命中，需要下游决策方感知 |
+| `agent-run-started` | Agent 自有最小 payload | Agent run use case | UI / observability | Agent run 开始 |
+| `agent-run-finished` | Agent 自有最小 payload | Agent run use case | UI / observability | Agent run 结束 |
 
 规则：
 
 - Event 只表达事实，不携带业务决策。
 - Producer 不知道 consumer。
 - Consumer 必须做幂等处理。
-- Event payload 必须包含关联 ID 和发生时间。
+- Event envelope 必须包含 `eventId` 和 `occurredAt`，可携带 `correlationId` / `causationId`；payload 只放业务事实，不重复 envelope 字段。
 
 ### Payload 最小要求
 
-```ts
-type AppEventEnvelope<T> = {
-  eventId: string;
-  type: string;
-  occurredAt: string;
-  payload: T;
-};
-```
+`AppEventEnvelope` 和跨模块 payload 定义见 [shared-types.md](shared-types.md)。模块 spec 只说明何时 emit，不重复展开 payload 字段。
 
-示例：
+规则：
 
-```ts
-type NewsRefreshedPayload = {
-  fetchedCount: number;
-  savedCount: number;
-  failedCount: number;
-  firstFailure?: NewsFailure;
-  failures?: NewsFailure[];
-  newIds?: string[];
-};
-
-type NewsFailure = {
-  provider: string;
-  error: string;
-  stage?: "fetch" | "normalize" | "save" | "article";
-  retryable?: boolean;
-  occurredAt: string;
-};
-
-type AccountTriggeredPayload = {
-  triggerId: string;
-  positionId?: string;
-  orderId?: string;
-  tsCode?: string;
-  triggerType: "stop_loss" | "take_profit" | "time_stop" | "order_filled" | "order_rejected" | "order_expired" | "invalidated";
-};
-
-type MarketQuotesRefreshedPayload = {
-  scope: "subscribed" | "universe" | "manual";
-  total: number;
-  success: number;
-  failedBatches: number;
-  capturedAt: string;
-};
-```
+- 模块事件必须先成为可查询事实，再被 Orchestrator 消费；不能只依赖进程内瞬时回调。
+- Orchestrator 可以通过 event bus 收到即时通知，但重启恢复必须能从模块事实或事件消费记录继续。
+- UI 事件可以是 transient；跨模块路由事件必须有 durable consumption record。
 
 ---
 
@@ -139,7 +116,7 @@ Runtime Orchestrator tick
 
 ```text
 Runtime Orchestrator tick
-  -> Account.evaluate_account_triggers(now)
+  -> Account.evaluate_account_triggers({ now, limit, cursor })
   -> Account appends AccountTrigger
   -> Account emits account-triggered
   -> Orchestrator dedupe(trigger_id)
@@ -149,6 +126,7 @@ Runtime Orchestrator tick
 规则：
 
 - Account 只判断条件是否命中，不决定响应动作。
+- Orchestrator 负责按 `has_more` / `next_cursor` 继续调度评估批次，不能把大账户一次性阻塞在单个 tick 内。
 - Orchestrator 负责同一 `trigger_id` 只路由一次。
 - Agent 收到触发后读取 Account / Quotes / News，再决定是否操作账户。
 
@@ -158,15 +136,18 @@ Runtime Orchestrator tick
 Runtime Orchestrator quote tick
   -> Account.subscribed_codes()
   -> add Quotes.core_indexes()
-  -> Quotes.refresh_market_quotes(scope=subscribed)
+  -> Quotes.refresh_market_quotes(scope=subscribed, purpose=intraday)
   -> Quotes emits market-quotes-refreshed
 ```
 
 规则：
 
 - Account 拥有自选、持仓、挂单，因此暴露 subscribed codes。
+- 核心指数列表归 Quotes 定义并通过 `core_indexes()` 暴露；Orchestrator 只调用该方法，不内嵌指数代码列表。
 - Quotes 负责按 scope 刷新行情 snapshot。
 - Orchestrator 负责把 subscribed codes 注入 Quotes refresh。
+- Account 只消费 Quotes 已有 snapshot / query facade，不直接触发 Quotes refresh；Account -> Quotes refresh 的跨模块 wiring 只写在 Orchestration。
+- 收盘后 Orchestrator 触发 `purpose=close` 的 quote refresh；该任务按交易日加锁，并在启动时补做缺失的最新已完成交易日 close snapshot。
 - Account 不调用 Quotes provider；Quotes 不读取 Account 内部实现。
 
 ### Quotes -> Account snapshot
@@ -213,6 +194,7 @@ Runtime Orchestrator scheduled tick
 - P0 可以打断或延后低优先级后台任务。
 - P2 news batch 允许攒批，不要求每条新闻立即启动 Agent。
 - 数据维护任务失败不应阻塞用户交互，但必须记录 heartbeat。
+- P0 不直接杀死已提交的 Account 写操作；只允许取消尚未提交 provider / tool 的低优先级 Agent run，或延后其后续 turn。
 
 ---
 
@@ -229,31 +211,34 @@ Runtime Orchestrator scheduled tick
 | scheduled review | `agent.scheduled_review` |
 | quote subscribed refresh | `quotes.subscribed_refresh` |
 | universe refresh | `quotes.universe_refresh` |
+| close snapshot refresh | `quotes.close_snapshot:{trade_date}` |
 
 ### 事件消费记录
 
-跨模块事件路由需要记录消费状态：
+跨模块事件路由需要记录消费状态。具体存储结构由实现决定，但必须满足以下领域模型：
 
-```sql
-create table orchestration_event_consumptions (
-    event_type text not null,
-    event_key text not null,
-    consumer text not null,
-    status text not null, -- processing / consumed / failed
-    run_id text,
-    error text,
-    created_at text not null,
-    updated_at text not null,
-    primary key (event_type, event_key, consumer)
-);
+```ts
+type OrchestrationEventConsumption = {
+  eventType: string;
+  eventKey: string;
+  consumer: string;
+  status: "processing" | "consumed" | "failed";
+  runId?: string;
+  error?: string;
+  createdAt: OccurredAt;
+  updatedAt: OccurredAt;
+};
 ```
 
 规则：
 
+- `(eventType, eventKey, consumer)` 是消费幂等键。
 - `account-triggered` 使用 `trigger_id` 做 `event_key`。
 - `news-refreshed` 可用 batch id 或 news id set hash 做 `event_key`。
 - 已 consumed 的 event 不重复触发 Agent run。
 - processing 超时可被 watchdog 回收。
+- `news-refreshed` 默认使用 `batchId` 做 `event_key`；如果需要合并多批，使用排序后的 `newIds` hash。
+- P0 account trigger 使用 `trigger_id`，并要求 Agent 侧也记录同一 trigger 的处理映射。
 
 ### 失败策略
 
@@ -261,6 +246,8 @@ create table orchestration_event_consumptions (
 - 连续失败进入退避。
 - 可恢复任务保留 pending 状态等待下次重试。
 - 不可恢复错误写入失败状态和 UI 可见事件。
+- 进程启动时必须扫描 `processing` 超时和 `failed` 可重试消费记录。
+- 错过的盘后任务必须在下次启动或下个 scheduler tick 补偿执行，不能永久丢失。
 
 ---
 
