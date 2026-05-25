@@ -165,7 +165,9 @@ type ToolCall = {
   name: string;
   source: "local_tool" | "server_side_tool";
   inputSummary: JsonSummary;
+  inputPayloadRef?: string;
   outputSummary?: JsonSummary;
+  outputPayloadRef?: string;
   isError: boolean;
   errorCode?: ErrorCode;
   startedAt: OccurredAt;
@@ -181,7 +183,9 @@ type ToolCall = {
 - Provider 原生工具不得绕过本地工具注册表调用 Quotes / Account / News 能力。
 - 工具被业务决策引用时，Runtime 可把 `ToolCall` 转成 `EvidenceRef`；Infra 不决定证据归属。
 - 拒绝型业务结果不一定是 `isError = true`，例如 Account 拒单应由工具 output 表达业务原因。
-- 完整 payload 可以进入详情表或日志，但 `inputSummary` / `outputSummary` 必须可前端展示。
+- `inputSummary` / `outputSummary` 是可前端展示的摘要，不是恢复算法的真源。
+- 需要恢复副作用或审计精确结果的 local tool 必须持久化结构化 input / output payload，并通过 `inputPayloadRef` / `outputPayloadRef` 关联；例如 `operate_account` 必须能通过 `toolCallId` 读回 Account response 的完整结构。
+- 只读工具可以只保存摘要；完整 payload 过大时可进入详情表或对象存储，但 ref 必须稳定可读。
 
 ### `AgentEvent`
 

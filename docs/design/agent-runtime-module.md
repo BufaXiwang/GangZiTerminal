@@ -223,7 +223,6 @@ type DecisionEpisode = {
     | "cancel_order"
     | "open_position"
     | "scale_position"
-    | "adjust_position"
     | "close_position"
     | "adjust_protection"
     | "record_invalidation_signal";
@@ -251,16 +250,28 @@ type DecisionEpisode = {
 - `DecisionEpisode.action` 表示 Agent 的决策意图，不表示 Account 已实际执行。
 - `actionStatus` 表示该意图的执行状态：`no_action` 表示明确不行动；`intended` 表示形成动作意图但尚未提交；`submitted` 表示 Runtime 已创建 `TradeIntent` 并开始提交；`blocked` 表示因 stale quote、risk limit、insufficient cash 或 Account 拒绝等原因未能执行；`deferred` 表示等待更多信息或下次 review。
 - 一个 episode 不一定产生账户写动作；只有需要写 Account 时，才生成 `TradeIntent.accountInput`。
+- 仓位数量变化必须使用 `scale_position`，保护条件变化必须使用 `adjust_protection`，完整退出必须使用 `close_position`；Runtime 不定义泛化的 `adjust_position` 动作。
 - `record_decision_episode` 只能创建 episode，不能修改已有 episode；同一 run 内需要记录新的判断时必须创建新 episode。
 - 交易类动作在 `record_decision_episode` 时应使用 `actionStatus = "intended"`；Runtime 接受 `operate_account` 后自动把该 episode 推进为 `submitted`，并关联 `TradeIntent`。
 - run 结束时，`action` 为交易类动作且 `actionStatus = "submitted"` 的 episode 必须关联 `TradeIntent`；否则 Runtime 必须把它推进到 `blocked` 或 `deferred` 并记录原因。
 - `action` 为交易类动作但未生成 `TradeIntent` 时，`actionStatus` 必须是 `blocked` 或 `deferred`，并在 `blockedReason` 或 `thesis` 中写清原因。
 - `action = "no_action"` 时，`actionStatus` 必须是 `no_action`。
+- `DecisionEpisode.actionStatus` 只描述 Agent 意图是否已交给 Runtime / Account，不镜像订单生命周期；Account 是否受理、成交、拒绝或等待后续订单终态以 `TradeIntent.status`、`AccountResultRef` 和 `DecisionReview` 为准。
 - `thesis` 必须描述为什么做或为什么不做。
 - `symbols` 必须使用标准 `TsCode`，不能保存自由股票名或 6 位代码。
 - `confidence` 取值范围为 0..1；缺失表示模型未给出可审计置信度，不等于 0。
 - 交易动作必须绑定 `strategyIds` 或明确说明是临时判断。
 - `evidenceRefs` 必须引用当时使用的新闻、行情、账户事件、工具结果和策略卡。
+
+`DecisionEpisode.actionStatus` 与 `TradeIntent.status` 的关系：
+
+| Episode actionStatus | TradeIntent 关系 | 语义 |
+|---|---|---|
+| `no_action` | 不允许有关联 TradeIntent | Agent 明确选择不行动 |
+| `intended` | 尚未创建 TradeIntent | 已形成动作意图，等待 Runtime 提交或阻断 |
+| `submitted` | 必须已有关联 TradeIntent，且 TradeIntent 可以是 `submitted` / `accepted` / `executed` | 意图已交给 Account；后续状态看 TradeIntent |
+| `blocked` | 可以没有 TradeIntent，或有关联 `rejected` TradeIntent | 提交前 fail closed 或 Account 拒绝 |
+| `deferred` | 通常没有 TradeIntent | 延后到后续 run / review 再判断 |
 
 ### `EvidenceRef`
 
@@ -278,7 +289,7 @@ type EvidenceRef =
 type EvidenceSelector = {
   kind: EvidenceRef["kind"];
   id: string;
-  source: "packet" | "tool_result" | "recent_episode" | "recent_review" | "replay_ref";
+  source: "packet" | "tool_result" | "recent_episode" | "recent_review" | "linked_episode" | "replay_ref";
 };
 
 type EvidenceSnapshotBase = {
@@ -381,8 +392,9 @@ type ToolCallEvidenceSnapshot = {
 - 写入时由当前 packet / tool result 映射成 `Evidence*Snapshot`。
 - `record_decision_episode` / `record_decision_review` 工具输入提交 `EvidenceSelector[]`，不是完整 snapshot；Runtime 校验 selector 后 hydrate 成持久化 `EvidenceRef[]`。
 - selector 必须由模型显式声明；Runtime 不自动把本 run 的所有 tool calls 都挂到 episode 或 review 上。
-- Runtime 必须校验声明的 evidence 是否来自本 run 的 packet、工具结果、active strategy、recent episode / review 或指定 replay ref；校验失败时拒绝记录。
+- Runtime 必须校验声明的 evidence 是否来自本 run 的 packet、工具结果、active strategy、recent episode / review、linked episode 或指定 replay ref；校验失败时拒绝记录。
 - `recent_episode` / `recent_review` 只允许引用本次 packet 已注入的 recent summaries 所对应证据，或 `manual_replay` 指定的 replay ref；不能任意引用历史库里的旧 evidence。
+- `linked_episode` 只允许在 Runtime 已建立显式因果链接时使用，例如 `orderId -> episodeId` 反查命中、Account trigger 指向原始订单意图，或 `manual_replay` 显式指定原始 episode；它用于订单终态 review 复用原始 episode 的 evidence，即使该 episode 未出现在本次 recent summaries 中。
 - `OrderStatus` 和 `AccountTriggerType` 引用 Account 模块的 canonical enum，不能降级成任意字符串。
 - 每个 snapshot 必须带 `schemaVersion`。
 - 同一 version 只能新增可选字段，不能重命名或删除已有字段；破坏性变更必须 bump version 并保留旧 version 反序列化。
@@ -482,7 +494,8 @@ type AgentOrderIntentIndex = {
 - 合法转换：`proposed -> submitted -> accepted | executed | rejected`；`proposed -> rejected`；`submitted -> rejected`。
 - `rejected`、`accepted`、`executed` 是终态；不得回退或复用同一个 `intentId` 重新提交。
 - 后续 limit 订单成交 / 过期 / 拒绝由 Account trigger 和新的 run / review 记录，不回写旧 `TradeIntent.status`。
-- 启动恢复时，Runtime 必须扫描 `status = "submitted"` 的 `TradeIntent`：若已有 `accountResultRef` 或可通过 `toolCallId` 对应的 ToolCall audit output 读到 Account result，则按结果补到 `accepted` / `executed` / `rejected`；若无法证明 Account 已产生任何持久事实，则标记为 `rejected`，`message = "submission_unknown_no_account_effect"`，并写可观测事件。
+- 启动恢复时，Runtime 必须扫描 `status = "submitted"` 的 `TradeIntent`：若已有 `accountResultRef` 或可通过 `toolCallId` 对应的 ToolCall `outputPayloadRef` 读到结构化 Account result，则按结果补到 `accepted` / `executed` / `rejected`；若无法证明 Account 已产生任何持久事实，则标记为 `rejected`，`message = "submission_unknown_no_account_effect"`，并写可观测事件。
+- TradeIntent 恢复不得依赖 `ToolCall.outputSummary` 解析；`outputSummary` 仅用于展示。
 - `toolCallId` 是 Runtime / Infra 审计关联键，Account 不保存也不理解 `toolCallId`；Account 只返回自己的 `orderId`、`fillIds`、`accountEventIds`、`rejectionEventId` 等稳定 ID。
 
 ### `DecisionReview`
@@ -527,6 +540,7 @@ type DecisionReview = {
 - 单次交易结果不能证明策略有效或无效。
 - 建议必须能追溯到 episode、账户结果、行情或新闻证据。
 - 每次保护条件触发、订单终态、平仓或定时复盘可以生成 `DecisionReview`。
+- `trigger = "position_closed"` 不是 AccountTriggerType；它由 Runtime 从 `account-updated.accountEventIds` 读取到 AccountEvent `position_closed` 后派生，用于对完整平仓做复盘。
 - 找不到原始 episode / order 映射时，review 必须带 `mapping_missing` warning，并挂到当前 account trigger run 产生的 episode 上。
 
 ---
@@ -872,6 +886,9 @@ type OperateAccountToolOutput = {
 规则：
 
 - `ScanMarketRequest` 引用 [Quotes `scan_market`](quotes-module.md#scan_market) canonical DSL；Runtime 不重定义 `filter` / `conditions` / `sortBy` 自由字符串。
+- `FetchQuotesToolInput.tsCodes` 和 `scan` 必须二选一：同时出现或同时缺失时返回 `invalid_input`，不得猜测路由。
+- `tsCodes` 路径调用 Quotes `fetch_data`，并把结果写入 `PacketQuotes.items` / `klines` / `indicators`；`include` 只对该路径生效。
+- `scan` 路径调用 Quotes `scan_market`，并只写入 `PacketQuotes.scan`；`scan` 与 `include` 同时出现时返回 `invalid_input`。扫描不会隐式追加详情拉取，Agent 若要查看候选标的细节，必须再调用一次 `fetch_quotes({ tsCodes })`。
 - `FetchNewsToolInput` 引用 [News `fetch_news`](news-module.md#fetch_news) canonical request，保留 `ids`、`query`、`sources`、`publishedFrom`、`publishedTo`、`includeArticle`、`limit`、`offset` 的组合语义。
 - `UpdateWatchlistToolInput.accountInput`、`OperateAccountInput`、`OrderStatus` 引用 Account 模块 canonical 类型；Runtime 只把 `accountInput` 传给 Account。
 - `record_decision_episode` 是模型产出 `DecisionEpisode` 的唯一写路径；`no_action`、`add_watchlist`、交易意图被阻断等不调用 Account 的判断也必须通过该工具持久化。
@@ -967,7 +984,7 @@ Account emits account-triggered
 
 规则：
 
-- Runtime 负责调用 `Account.evaluate_account_triggers({ now, limit, cursor })`：每次 `market-quotes-refreshed` 后触发一次，另按 `account_trigger_eval_interval_secs` 做兜底定时。
+- Runtime 负责调用 `Account.evaluate_account_triggers({ now, limit, cursor })`：每次 `market-quotes-refreshed` 后在 `Account.rebuild_account_snapshot()` 完成后触发一次，另按 `account_trigger_eval_interval_secs` 做兜底定时。
 - 单次 trigger evaluation 使用 `account_trigger_eval_batch_size` 作为 `limit`；若 Account 返回 `has_more = true` / `next_cursor`，Runtime 必须继续分页直到本轮耗尽或达到调度预算。
 - Account 只判断订单终态或保护条件是否需要通知，不决定响应动作。
 - Runtime 负责按 `has_more` / `next_cursor` 继续调度评估批次，不能把大账户一次性阻塞在单个 tick 内。
@@ -1000,18 +1017,40 @@ Agent Runtime quote tick
 - Account 只消费 Quotes 已有 snapshot / query facade，不直接触发 Quotes refresh。
 - 收盘后 Runtime 触发 `purpose=close` 的 quote refresh；该任务按交易日加锁，并在启动时补做缺失的最新已完成交易日 close snapshot。
 
-### Quotes -> Account snapshot
+### Quotes / News 维护任务
+
+```text
+Agent Runtime maintenance tick
+  -> Quotes.refresh_market_instruments()
+  -> Quotes.refresh_klines(scope)
+  -> Quotes.refresh_daily_basic(scope)
+  -> Quotes.refresh_company_events(scope)
+  -> News.warm_articles(request)
+```
+
+规则：
+
+- Quotes / News 拥有具体 refresh / warm use case；Runtime 只拥有调度节奏、lock、退避和补偿执行。
+- `refresh_market_instruments`、`refresh_klines`、`refresh_daily_basic`、`refresh_company_events` 的默认 cadence 由 Runtime settings 决定；scope 必须由 Runtime 从自选 / 持仓 / 挂单 / 核心指数 / 市场列表派生，不能让 Quotes 感知 Agent 或 Account 业务语义。
+- `News.warm_articles` 是维护任务；Runtime 默认低频处理最近未抽正文且有 URL 的新闻，也可以在 Agent 明确需要正文时按需 warm 指定 `newsIds`。
+- 维护任务属于 P4，失败不阻塞用户聊天、交易触发或 news analysis，但必须写 heartbeat 并按 retry policy 退避。
+
+### Quotes -> Account snapshot / triggers
 
 ```text
 Quotes emits market-quotes-refreshed
   -> Agent Runtime schedules Account.rebuild_account_snapshot()
+  -> Agent Runtime schedules Account.evaluate_account_triggers()
   -> Account emits account-updated
+  -> Account may emit account-triggered
 ```
 
 规则：
 
 - Account snapshot 可因行情变化重新派生。
 - 这不是交易决策，只是估值和前端展示更新。
+- 每次 `market-quotes-refreshed` 后，Runtime 必须先调用 `Account.rebuild_account_snapshot()`，再调用 `Account.evaluate_account_triggers({ now, limit, cursor })`；这样后续 `fetch_account` 看到的 snapshot 和 trigger evaluation 使用的是同一轮行情之后的账户读模型。
+- 若 `MarketQuotesRefreshedPayload.affectedTsCodes` 缺失或 scope 为 universe，Runtime 可以按全量账户 snapshot 重建；若提供 affected codes，可只重建受影响持仓 / 订单 / 自选的派生视图。
 
 ### Scheduled Agent Review
 
@@ -1111,6 +1150,11 @@ DecisionEpisode
 | quote subscribed refresh | `quotes.subscribed_refresh` |
 | universe refresh | `quotes.universe_refresh` |
 | close snapshot refresh | `quotes.close_snapshot:{trade_date}` |
+| kline refresh / warm | `quotes.kline_refresh` |
+| daily basic refresh | `quotes.daily_basic_refresh` |
+| company events refresh | `quotes.company_events_refresh` |
+| market instruments refresh | `quotes.market_instruments_refresh` |
+| article warm | `news.article_warm` |
 
 ### 事件消费记录
 
@@ -1161,6 +1205,15 @@ type AgentRuntimeEventConsumption = {
 | `account_trigger_eval_batch_size` | 单次 `evaluate_account_triggers` 处理上限 | 200 |
 | `scheduled_review_interval_secs` | 定时巡检间隔；未配置时不启动周期性 scheduled review | unset |
 | `scheduled_review.allow_trading_write` | 定时巡检是否允许暴露 `operate_account` | false |
+| `quotes_market_instruments_refresh_time` | 市场列表刷新时间 | `08:30 Asia/Shanghai` |
+| `quotes_kline_warm_time` | 日线 / 分钟线维护刷新时间 | `16:00 Asia/Shanghai` |
+| `quotes_daily_basic_refresh_time` | daily basic 维护刷新时间 | `16:30 Asia/Shanghai` |
+| `quotes_company_events_refresh_interval_secs` | 公司事件维护刷新间隔 | 86400 |
+| `news_article_warm_interval_secs` | article warm 低频维护间隔 | 1800 |
+| `news_article_warm_recent_limit` | article warm 默认扫描最近新闻条数 | 50 |
+| `context_soft_limit_tokens` | Infra context compaction soft limit | 48000 |
+| `context_summarize_threshold` | MicroClear 后仍超过该阈值时触发 Summarize | 64000 |
+| `context_hard_limit_tokens` | 尽力压缩后仍超过该阈值则中止 run | 96000 |
 | `agent_context_compact_channel_id` | compact 模型使用的 provider channel；未配置时使用当前 run channel | unset |
 | `agent_context_compact_model` | compact 模型名；未配置时使用当前 run model | unset |
 
