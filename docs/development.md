@@ -102,7 +102,7 @@ Set via Settings → AI 配置 (or directly in `app_state.agent.config`):
 
 `briefing` / `review` model slots are still present in config for future pipeline reuse, but no current runtime path starts those pipelines. Current agent entry is chat.
 
-The `provider` field selects which wire format `build_provider` constructs. All three formats share the same `domain::agent::types::AgentRequest` IR; the wire serializer is the only thing that changes. See [provider-design.md](provider-design.md) for the canonical Block ↔ wire format mapping.
+The `provider` field selects which wire format `build_provider` constructs. All three formats share the same `domain::agent::types::AgentRequest` IR; the wire serializer is the only thing that changes. See [design/agent-module.md](design/agent-module.md) for the Agent provider contract and [design/references/agent/](design/references/agent/) for per-wire-format references.
 
 `build_provider` wraps the concrete provider in `RetryingProvider` (exponential backoff + jitter, max 5 attempts on `RateLimited` / `Transient` / 5xx).
 
@@ -148,7 +148,7 @@ To add a new wire format (e.g. Gemini, Bedrock Converse):
 2. Extend `domain::agent::ProviderKind` if the provider is a new kind.
 3. Extend `pipeline::agent::config` and `build_provider` dispatch.
 4. Update SettingsPage with a new tab in the provider switcher.
-5. Update `docs/provider-design.md` mapping table.
+5. Update `docs/design/references/agent/<provider>.md`; if the canonical Agent contract changes, update `docs/design/agent-module.md`.
 
 Do not shoehorn into an existing wire format. Keep one provider per wire format; OpenAI-compatible vendors reuse `OpenAIChatCompletionsProvider` only when they implement that wire format.
 

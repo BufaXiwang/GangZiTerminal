@@ -80,6 +80,7 @@ Agent Runtime 不负责：
 | `TradeIntent` | `operate_account` 调用的持久化意图 / 审计快照 | `intent_id` |
 | `StrategyCard` | 运行时注入 Agent 上下文的策略卡 | `strategy_id` |
 | `DecisionReview` | 对一次决策、交易或触发事件的复盘 | `review_id` |
+| `InvestorMemory` | 用户偏好、长期约束和可注入记忆 | `memory_key` |
 | `AgentRuntimeEventConsumption` | 跨模块事件消费幂等记录 | `event_type + event_key + consumer` |
 
 ### 不变量
@@ -103,7 +104,9 @@ type AgentToolName =
   | "fetch_news"
   | "fetch_account"
   | "operate_account"
-  | "update_watchlist";
+  | "update_watchlist"
+  | "record_decision_episode"
+  | "record_decision_review";
 
 type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
   name: AgentToolName;
@@ -115,6 +118,7 @@ type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
 - `AgentToolName` 是本产品的 canonical local tool name union。
 - `AgentRunProfile.allowedTools` 和 Runtime 注册给 Infra 的 `AgentRuntimeToolSpec.name` 必须使用 `AgentToolName`。
 - 新增 Agent local tool 必须先扩展本 union 和本 spec，不能只在实现里注册自由字符串。
+- `record_decision_episode` / `record_decision_review` 是 Agent 业务审计写工具，归 Agent Runtime 拥有，不调用 Quotes / News / Account。
 
 ### `AgentRun`
 
@@ -175,16 +179,27 @@ type AgentRunProfile = {
 
 | Profile | Trigger | allowed tools | 交易写 |
 |---|---|---|---|
-| `user_chat` | 用户消息 | `fetch_quotes`、`fetch_news`、`fetch_account`、`update_watchlist`、按需 `operate_account` | 仅用户请求交易建议 / 动作时允许 |
-| `news_analysis` | news batch | `fetch_news`、`fetch_quotes`、`fetch_account`、`update_watchlist`、`operate_account` | 允许，但必须有 episode 和新鲜行情 |
-| `account_trigger_response` | account trigger | `fetch_account`、`fetch_quotes`、`fetch_news`、`operate_account`、`update_watchlist` | 允许 |
-| `scheduled_review` | 定时巡检 | `fetch_account`、`fetch_quotes`、`fetch_news`、`update_watchlist`、按配置 `operate_account` | 默认关闭，可配置开启 |
-| `manual_replay` | 人工复盘 | `fetch_account`、`fetch_quotes`、`fetch_news` | 禁止 |
+| `user_chat` | 用户消息 | `fetch_quotes`、`fetch_news`、`fetch_account`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许，但必须先记录 episode 并通过 Account 校验 |
+| `news_analysis` | news batch | `fetch_news`、`fetch_quotes`、`fetch_account`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许，但必须有 episode 和新鲜行情 |
+| `account_trigger_response` | account trigger | `fetch_account`、`fetch_quotes`、`fetch_news`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许 |
+| `scheduled_review` | 定时巡检 | `fetch_account`、`fetch_quotes`、`fetch_news`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、按配置 `operate_account` | 默认关闭，可配置开启 |
+| `manual_replay` | 人工复盘 | `fetch_account`、`fetch_quotes`、`fetch_news`、`record_decision_review` | 禁止 |
+
+默认 required packet sections：
+
+| Profile | requiredPacketSections |
+|---|---|
+| `user_chat` | `strategies`、`recent_episodes`、`user_preferences`；账户 / 行情 / 新闻按工具调用实时读取 |
+| `news_analysis` | `news`、`quotes`、`account`、`strategies`、`recent_episodes`、`user_preferences` |
+| `account_trigger_response` | `account`、`quotes`、`news`、`strategies`、`recent_episodes`、`user_preferences` |
+| `scheduled_review` | `account`、`quotes`、`news`、`strategies`、`recent_episodes`、`user_preferences` |
+| `manual_replay` | `account`、`quotes`、`news`、`strategies`、`recent_episodes` |
 
 规则：
 
 - Runtime 根据 trigger 选择 profile，并把 `allowedTools` 注册进 Infra `ToolRegistry`。
 - `operate_account` 只有在 `allowTradingWrite = true` 且 `allowedTools` 包含它时才可暴露。
+- `user_chat` 不做独立的预意图分类闸门；交易写仍必须先调用 `record_decision_episode`，并由 Strategy 纪律、freshness 校验和 Account fail-closed 共同约束。
 - `scheduled_review.allowTradingWrite` 默认由 runtime settings KV 控制；未配置时为 false，不从 `StrategyCard` 或模型输出隐式开启。
 - `update_watchlist` 是非交易写工具，可以由用户消息、新闻分析或定时巡检使用。
 - `manual_replay` 永远不能写 Account。
@@ -356,6 +371,8 @@ type ToolCallEvidenceSnapshot = {
 - `id` 用于跳转和重新查询；`snapshot` 才是 episode / review 的长期证据。
 - Evidence snapshot 是持久化审计 schema，不直接存 `Packet*` 运行时投影。
 - 写入时由当前 packet / tool result 映射成 `Evidence*Snapshot`。
+- `evidenceRefs` 必须由 `record_decision_episode` / `record_decision_review` 显式声明；Runtime 不自动把本 run 的所有 tool calls 都挂到 episode 或 review 上。
+- Runtime 必须校验声明的 evidence 是否来自本 run 的 packet、工具结果、active strategy、recent episode / review 或指定 replay ref；校验失败时拒绝记录。
 - `OrderStatus` 和 `AccountTriggerType` 引用 Account 模块的 canonical enum，不能降级成任意字符串。
 - 每个 snapshot 必须带 `schemaVersion`。
 - 同一 version 只能新增可选字段，不能重命名或删除已有字段；破坏性变更必须 bump version 并保留旧 version 反序列化。
@@ -434,6 +451,7 @@ type AccountResultRef = {
 - Account 拒绝后，Agent 只能记录或重新判断，不能绕过 Account。
 - `accountResultRef` 指向 Account 返回或写入的稳定 ID。
 - 行情 freshness 不足时，Runtime 不应提交交易写工具。
+- Runtime 必须维护 `orderId -> intentId / episodeId / runId` 的反查索引；Account trigger 只携带 `orderId` 时，Runtime 通过该索引把订单终态 review 归因回原始 episode。Account payload 不携带 Agent 的 `intentId`，避免 Account 反向感知 Agent。
 - 状态机：
   - `proposed`：Runtime 已记录交易意图，但尚未调用 `operate_account`。
   - `submitted`：`operate_account` 调用已开始，等待 Account response；若 tool 超时或 provider 中断，保持 `submitted` 并依靠 `toolCallId` / Account 审计 ID 做恢复核对。
@@ -443,6 +461,7 @@ type AccountResultRef = {
 - 合法转换：`proposed -> submitted -> accepted | executed | rejected`；`proposed -> rejected`；`submitted -> rejected`。
 - `rejected`、`accepted`、`executed` 是终态；不得回退或复用同一个 `intentId` 重新提交。
 - 后续 limit 订单成交 / 过期 / 拒绝由 Account trigger 和新的 run / review 记录，不回写旧 `TradeIntent.status`。
+- 启动恢复时，Runtime 必须扫描 `status = "submitted"` 的 `TradeIntent`：若已有 `accountResultRef` 或可通过 `toolCallId` 读到 Account result，则按结果补到 `accepted` / `executed` / `rejected`；若无法证明 Account 已产生任何持久事实，则标记为 `rejected`，`message = "submission_unknown_no_account_effect"`，并写可观测事件。
 
 ### `DecisionReview`
 
@@ -689,6 +708,8 @@ type PacketUserPreference = {
 - Packet 是面向 Agent 的瘦身视图，不要求等同于上游完整 DTO，但字段必须稳定、可渲染、可审计。
 - 每次 run 重新构造，不能把旧工具结果当作实时事实复用。
 - Chat 历史只作为交互上下文；交易判断主要依赖本次 packet 和本次工具调用。
+- 非 `user_chat` run 默认不注入完整聊天历史，只注入策略、用户偏好、相关 recent episodes / reviews 和实时 packet；`manual_replay` 可按 `refId` 注入指定历史。
+- 用户偏好和长期记忆来自 `InvestorMemory`；Runtime 只按 profile 和相关性注入摘要，不把未筛选的全部 memory 塞进上下文。
 - `PacketEpisodeSummary.outcome` 由最近一条 `DecisionReview.conclusion` 和可用的 `DecisionReview.result` 派生；没有 review 时为空，Runtime 不得凭空生成 outcome 文案。
 - 指标名使用 Quotes spec 定义的固定 `IndicatorName` 集合；新增指标必须先扩展 Quotes spec，不能用自由字符串临时塞值。
 - 构建交易相关 packet 时，Runtime 必须请求账户决策所需的完整字段，并将缺失集合规范化为空数组。
@@ -772,7 +793,30 @@ type UpdateWatchlistToolInput = UpdateWatchlistInput;
 
 type UpdateWatchlistToolOutput = UpdateWatchlistResponse;
 
-type OperateAccountToolInput = OperateAccountInput;
+type RecordDecisionEpisodeToolInput =
+  Omit<DecisionEpisode, "episodeId" | "runId" | "triggerKind" | "createdAt">;
+
+type RecordDecisionEpisodeToolOutput = {
+  accepted: boolean;
+  episodeId?: string;
+  reason?: ErrorCode;
+  message?: string;
+};
+
+type RecordDecisionReviewToolInput =
+  Omit<DecisionReview, "reviewId" | "createdAt">;
+
+type RecordDecisionReviewToolOutput = {
+  accepted: boolean;
+  reviewId?: string;
+  reason?: ErrorCode;
+  message?: string;
+};
+
+type OperateAccountToolInput = {
+  episodeId: string;
+  accountInput: OperateAccountInput;
+};
 
 type OperateAccountToolOutput = {
   accepted: boolean;
@@ -794,9 +838,15 @@ type OperateAccountToolOutput = {
 - `ScanMarketRequest` 引用 [Quotes `scan_market`](quotes-module.md#scan_market) canonical DSL；Runtime 不重定义 `filter` / `conditions` / `sortBy` 自由字符串。
 - `FetchNewsToolInput` 引用 [News `fetch_news`](news-module.md#fetch_news) canonical request，保留 `ids`、`query`、`sources`、`publishedFrom`、`publishedTo`、`includeArticle`、`limit`、`offset` 的组合语义。
 - `UpdateWatchlistInput`、`OperateAccountInput`、`OrderStatus` 引用 Account 模块 canonical 类型。
+- `record_decision_episode` 是模型产出 `DecisionEpisode` 的唯一写路径；`no_action`、`add_watchlist`、交易意图被阻断等不调用 Account 的判断也必须通过该工具持久化。
+- `record_decision_review` 是模型产出 `DecisionReview` 的唯一写路径；它只记录复盘，不自动修改 `StrategyCard`。
+- `record_decision_episode` / `record_decision_review` 必须显式提交 `evidenceRefs`；Runtime 只校验和持久化声明的 evidence，不自动 attach 全部 tool calls。
+- `operate_account` 工具外层携带 `episodeId`，内层 `accountInput` 原样使用 Account canonical `OperateAccountInput`；Runtime 只把 `accountInput` 传给 Account。
+- `operate_account.episodeId` 必须指向同一 run 中已接受的 `DecisionEpisode`，且该 episode 的 `actionStatus = "submitted"`；否则工具必须返回 rejected，不调用 Account。
 - `operate_account` 工具输出必须保留 Account 返回的审计 ID，尤其是 `accountEventIds`、`fillIds` 和 `rejectionEventId`。
 - Runtime 必须在提交 `operate_account` 前创建 `TradeIntent(status = "proposed")` 或确保同一事务可补写。
 - Account 接受 / 拒绝后，Runtime 根据工具结果更新 `TradeIntent.status` 和 `accountResultRef`。
+- 只有一个模拟账户时，`operate_account` 必须按账户全局串行执行；未来支持多账户时，串行粒度改为 `accountId`。
 
 ---
 
@@ -821,6 +871,7 @@ send_agent_message
 - 同一用户会话默认只允许一个前台交互 run。
 - 纯聊天、设置解释、普通问答可以只落 `AgentRun`、messages、tool calls 和 usage，不产生 episode。
 - 如果用户请求投资判断或交易动作，Runtime 必须读取实时账户和行情，再允许生成 `DecisionEpisode`。
+- 如果模型形成投资判断，必须调用 `record_decision_episode`；仅输出自然语言解释不能替代 episode 记录。
 
 ### News -> Agent
 
@@ -828,7 +879,8 @@ send_agent_message
 Agent Runtime tick
   -> News.refresh_news()
   -> News emits news-refreshed
-  -> Agent Runtime checks pending / newIds / throttle
+  -> Agent Runtime buffers pending newIds
+  -> trigger when pending count >= M or oldest pending age >= N
   -> create AgentRun(trigger=news_batch, profile=news_analysis)
   -> Agent Infra run_agent_loop
 ```
@@ -836,7 +888,12 @@ Agent Runtime tick
 规则：
 
 - News 只刷新和 emit，不启动 Agent。
-- Runtime 负责攒批、阈值、节流和 in-flight lock。
+- Runtime 负责维护待分析 news buffer，buffer item 必须至少包含 `newsId`、进入 buffer 时间和来源 `batchId`。
+- 当 `pending news count >= news_agent_batch_size` 时，Runtime 必须触发一次 `news_analysis` run。
+- 如果在 `news_agent_max_wait_secs` 内没有因为数量阈值触发分析，且 buffer 非空，Runtime 必须触发一次 `news_analysis` run。
+- 触发 run 时，Runtime 从 buffer 中取出本批 `newsIds`，创建 `AgentRun(trigger=news_batch, profile=news_analysis)`；已进入本批的 news 在该 run 完成、失败或被恢复逻辑接管前不得重复进入另一批。
+- Runtime 仍必须使用 `agent.news_batch` in-flight lock 和 throttle，避免多个 news batch run 并发或过度密集。
+- News batch run 成功消费后，本批 `newsIds` 从 buffer 移除；可恢复失败时必须回到 buffer 并保留 retry metadata；不可恢复失败时标记对应 consumption record 为 `failed` 或 `ignored`，不得静默丢失。
 - Agent 负责新闻分析、关联标的、交易影响判断。
 - News 触发的 run 如果完成了影响判断，即使结论是 `no_action`，也必须记录 episode。
 - 大多数新闻应输出 `no_action` 或加入观察，不应强行交易。
@@ -861,6 +918,7 @@ Account emits account-triggered
 - Runtime 的 event consumption record 是 trigger 投递、processing、failed、retry 的权威状态；Account 的 `handled` 只作为最终确认位。
 - 只有当 Agent run 完成消费、Runtime 按策略显式忽略、或事件被判定不可恢复放弃时，Runtime 才能调用 `Account.mark_trigger_handled`。
 - 仅启动 Agent run 不得标记 handled。
+- 订单终态 trigger 若包含 `orderId`，Runtime 必须通过 `orderId -> intentId / episodeId` 反查索引找到原始 episode，再把后续 `DecisionReview` 挂回该 episode；找不到映射时仍可处理 trigger，但 review 必须记录 `mapping_missing` warning。
 
 ### Account -> Quotes 订阅行情
 
@@ -1022,7 +1080,9 @@ type AgentRuntimeEventConsumption = {
 - 连续失败进入退避。
 - 可恢复任务保留 pending 状态等待下次重试。
 - 不可恢复错误写入失败状态和 UI 可见事件。
+- 进程启动时，`AgentRun.status = "running"` 的旧 run 必须标记为 `failed`，`error = "interrupted_by_restart"`；`queued` run 可按 profile 和 lock 状态重新调度。
 - 进程启动时必须扫描未进入终态的消费记录（`processing` 超时、`failed` 可重试）并恢复。
+- 进程启动时必须扫描 `TradeIntent.status = "submitted"` 并按 `TradeIntent` 状态机恢复规则核对 Account 结果。
 - 启动时必须从模块读模型补扫仍未 handled 的 Account trigger 和仍待路由的 news batch，避免停机期间事件永久丢失。
 - 错过的盘后任务必须在下次启动或下个 scheduler tick 补偿执行，不能永久丢失。
 
@@ -1088,6 +1148,7 @@ type CancelAgentRunResponse = {
 规则：
 
 - 只能取消 `queued` 或尚未提交当前 tool call 的 `running` run。
+- “已提交当前 tool call”以 Infra 调用 `dispatch_tool_call` 的 handler 后为界；handler 已开始执行后，取消请求不得中断该 tool 的副作用，只能阻止后续 turn。
 - 已提交给 Account 的 `operate_account` 不得被 Runtime 撤销；需要撤单必须走新的 `operate_account(cancel_order)`。
 - 取消成功后 `AgentRun.status = "cancelled"`，并 emit `agent-run-finished`。
 
@@ -1135,6 +1196,8 @@ register_tools_for_profile(profile) -> AgentRuntimeToolSpec[];
 record_decision_episode(run_id, episode) -> EpisodeId;
 record_trade_intent(run_id, episode_id, account_input) -> IntentId;
 record_decision_review(episode_id, review) -> ReviewId;
+recover_interrupted_agent_runs(now) -> RecoverySummary;
+recover_submitted_trade_intents(now) -> RecoverySummary;
 ```
 
 规则：

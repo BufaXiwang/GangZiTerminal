@@ -194,6 +194,15 @@ type JsonSummary =
   | JsonSummary[]
   | { [key: string]: JsonSummary };
 
+type AgentStopReason =
+  | "completed"
+  | "max_turns"
+  | "cancelled"
+  | "provider_stop"
+  | "tool_error"
+  | "context_limit"
+  | "error";
+
 type AgentEvent =
   | { type: "run_start"; runId: string; trigger: string; model: string }
   | { type: "text_delta"; runId: string; delta: string }
@@ -202,7 +211,7 @@ type AgentEvent =
   | { type: "tool_end"; runId: string; toolCallId: string; name: string; outputSummary: JsonSummary; isError: boolean; durationMs: number }
   | { type: "compacted"; runId: string; tier: "micro_clear" | "summarize" | "drop" | "reactive_retry"; droppedMessages: number; estimatedTokensSaved?: number }
   | { type: "usage"; runId: string; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
-  | { type: "done"; runId: string; stopReason: string; turns: number }
+  | { type: "done"; runId: string; stopReason: AgentStopReason; turns: number }
   | { type: "error"; runId: string; message: string };
 ```
 
@@ -271,6 +280,7 @@ type ContextPart = {
 - 当前交易事实必须来自 Runtime 本次提供的 realtime context 或本次工具调用。
 - 历史聊天和 summary 只能作为交互上下文，不能替代实时行情 / 账户读取。
 - `droppable = false` 的内容只允许在 hard failure 前保留；如果超限仍无法发送，必须 fail closed。
+- Context compaction 只影响本次或后续 provider request 的上下文投影，不修改已经持久化的 `AgentMessage`、`ToolCall`、`DecisionEpisode` 或 evidence snapshot。
 
 ---
 
@@ -312,6 +322,7 @@ Runtime builds AgentRunRequest
 规则：
 
 - Infra 只负责装配和压缩，不判断业务事实是否足够交易。
+- `Chat Context` 只用于需要对话续接的 run；非交互后台 run 默认由 Runtime 提供 `Realtime Packet` 和 `Review / Memory`，不要求恢复完整聊天历史。
 - 易腐工具结果不能长期保留为事实。
 - 交易写工具结果应保留操作确认摘要。
 - 长上下文压缩时优先丢弃旧行情、旧搜索、旧新闻全文等易腐内容。

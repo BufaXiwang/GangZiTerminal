@@ -14,8 +14,8 @@ Eastmoney 不是对外 API；所有输出必须 normalize 到 Quotes canonical m
 |---|---|---|
 | SH / SZ / BJ 实时行情 | TDX fallback / BJ 主源 | `StockQuote` |
 | 指数 / 场内基金行情 | fallback | `StockQuote` |
-| 分钟 K | fallback / 补充源 | `MinuteKlinePoint` |
-| 分时 | fallback / 补充源 | `MinutePoint` |
+| 分钟 K | fallback / 补充源 | 分钟 K 读模型行 |
+| 分时 | fallback / 补充源 | 分时读模型行 |
 | 估值 / 市值字段 | 可补充 | `DailyBasic` 子集 |
 
 ## 获取方式

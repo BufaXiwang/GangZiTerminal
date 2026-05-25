@@ -35,7 +35,7 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 
 ## Normalize 规则
 
-- `source` 使用 NewsNow source id 或配置映射后的稳定 source 名。
+- `source` 使用 `newsnow:<channel>` 或配置映射后的稳定 `namespace:channel` source 名。
 - 如果 NewsNow item 有原始媒体名，保存在 `payload.media`，不替代 `source`。
 - `id` 按 News spec 稳定 ID 规则生成。
 - URL canonicalization 与 RSS 一致。
@@ -45,8 +45,8 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 
 - NewsNow 整体不可用不影响 RSS refresh。
 - 单条 item 字段缺失或无法生成稳定 ID 时跳过该 item，计入 `NewsRefreshedPayload.warnings[]` 并累计 `skippedCount`。
-- 解析失败计入 `NewsFailure(provider="newsnow", source?, stage="normalize")`。
-- 保存失败计入 `NewsFailure(provider="newsnow", source?, stage="save")`，该批次可 partial success。
+- 解析失败计入 `NewsFailure(provider="newsnow", source?, code="invalid_input", stage="normalize")`。
+- 保存失败计入 `NewsFailure(provider="newsnow", source?, code="db_error", stage="save")`，该批次可 partial success。
 
 ## 验收标准
 

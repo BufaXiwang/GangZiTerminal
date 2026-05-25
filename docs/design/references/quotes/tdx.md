@@ -16,7 +16,7 @@ TDX adapter 只负责获取和 normalize 数据，不定义 Quotes 对外 API。
 | SH / SZ 指数实时行情 | 主源 | `StockQuote` |
 | 场内基金实时行情 | 可用时主源 | `StockQuote` |
 | 日 / 周 / 月 K | 快速主源 | `KlineSeries(adjust=none)` |
-| 分钟 K / 分时 | 优先源 | `MinuteKlinePoint` / `MinutePoint` |
+| 分钟 K / 分时 | 优先源 | 分钟 K / 分时读模型行 |
 | BJ 标的 | 不保证 | 失败后 fallback Eastmoney |
 | 复权 K | 不支持 | fallback TuShare |
 
@@ -53,7 +53,7 @@ TDX HQ command 能力：
 | `security_count(market)` | 获取 SH / SZ 证券数量 | universe 分页上限 |
 | `security_list(market, start)` | 分页获取证券列表 | `MarketInstrument` 最小档案 |
 | `security_quotes([(market, code)])` | 批量获取实时 L1 行情和五档盘口 | `StockQuote` |
-| `security_bars(category, market, code, start, count)` | 获取 K 线 / 分钟线 | `KlinePoint` / `MinuteKlinePoint` / `MinutePoint` |
+| `security_bars(category, market, code, start, count)` | 获取 K 线 / 分钟线 | K 线 / 分钟 K / 分时读模型行 |
 
 默认限制：
 
@@ -104,7 +104,7 @@ TDX HQ market 只支持：
 - 不能用昨收、开盘价或 0 值伪造 `price`。
 - 盘口缺失时返回 `depth_missing` warning。
 - 成交量 / 成交额单位必须 normalize 到 [shared-types.md](../../shared-types.md)。
-- TDX 不直接给出可靠 `tradeStatus` 时，adapter 根据交易日历、停牌读模型和价格/盘口可用性推导 `trading` / `closed` / `unknown`。
+- TDX 不直接给出可靠 `tradeStatus`；adapter 只 normalize 可用原始状态，最终对外 `tradeStatus` 由 Quotes query facade 按 `MarketTimeContext`、instrument status 和 quote eligibility 派生。
 - TDX `SecurityQuote` 不包含可靠名称时，`name` 可为空；展示层必须从 `MarketInstrument` 补名。
 - TDX 价格、盘口、成交量字段为 0 或非法值时按 missing 处理，不能转成有效 0。
 

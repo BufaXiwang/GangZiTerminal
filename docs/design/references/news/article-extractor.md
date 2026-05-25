@@ -23,7 +23,7 @@ type ArticleExtractRequest = {
 ```ts
 type ArticleExtractResult = {
   url: string;
-  newsId: string;
+  firstNewsId?: string;
   title?: string;
   content?: string;
   payload: JsonValue;
@@ -61,7 +61,7 @@ type ArticleExtractResult = {
 ## 缓存和失败
 
 - `article_contents.url` 是 canonical URL 主键。
-- 抽取成功后同步更新 `news_fts.article`。
+- 抽取成功后同步更新所有同 canonical URL 新闻的全文搜索读模型。
 - 抽取失败也应记录 `fetchedAt` 和失败 payload，避免短时间内反复抓取。
 - 抽取失败缓存的 `content` 必须为空；它只用于审计和抑制短期重试，不代表可用正文。
 - `includeArticle = true` 的读取路径不触发 extractor；抽取只发生在 refresh / warm / 显式维护路径。

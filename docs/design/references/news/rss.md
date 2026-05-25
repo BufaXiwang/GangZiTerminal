@@ -18,7 +18,8 @@ RSS 是 News 的稳定低成本来源，用于定期获取公开资讯列表。R
 
 ## 获取方式
 
-- 每个 RSS source 由配置声明：`source_id`、`feed_url`、可选 `enabled`。
+- 每个 RSS source 由配置声明：`source_id`、`feed_url`、可选 `display_name` / `enabled`。
+- `source_id` 创建后不可变；`feed_url` 和展示名可以修改。
 - refresh 按 source 拉取 feed。
 - 支持 conditional request 时应使用 ETag / Last-Modified；不支持时按本地 stable ID 去重。
 - 单个 RSS source 失败不影响其他 source。
@@ -47,7 +48,7 @@ type ProviderNewsItem = {
 
 规则：
 
-- `source` 使用配置中的 `source_id`，不能用 URL 当 source。
+- `source` 使用 `rss:<source_id>`，不能用 URL 当 source。
 - `id` 按 News spec 稳定 ID 规则生成。
 - URL 必须 canonicalize 后写入。
 - RSS HTML summary 可以保留文本摘要；清洗失败时 summary 可为空，但 title 不得为空。
@@ -55,8 +56,8 @@ type ProviderNewsItem = {
 
 ## Fallback 和失败
 
-- 网络失败：该 source 计入 `NewsFailure(provider="rss", source, stage="fetch", retryable=true)`。
-- 解析失败：该 source 计入 `NewsFailure(provider="rss", source, stage="normalize")`。
+- 网络失败：该 source 计入 `NewsFailure(provider="rss", source, code="provider_unavailable", stage="fetch", retryable=true)`。
+- 解析失败：该 source 计入 `NewsFailure(provider="rss", source, code="invalid_input", stage="normalize")`。
 - 单条 item 缺 title 或无法生成稳定 ID：跳过该 item，计入 `NewsRefreshedPayload.warnings[]` 并累计 `skippedCount`，不让整源失败。
 
 ## 验收标准
