@@ -620,10 +620,25 @@ type FetchDataResponse = {
 - `include.klines` 默认优先返回 `adjust = "qfq"`；缺少 qfq 时可降级为 `adjust = "none"`，必须在对应 `KlineSeries.warnings` 和 item `warnings` 返回 `using_unadjusted_kline`。
 - `include.quote = true` 时，如果 snapshot 缺失，`quote` 为空并返回 `quote_missing` warning。
 - `include.quote = true` 时，必须返回 `quoteFreshness`；有可用 `quote` 时它与 `quote.freshness` 语义一致，`quote` 为空时它承载缺失 / 过期原因。
+- `include.quote = true` 返回完整 `StockQuote`，包括可用的 `bid` / `ask`、`limitUp` / `limitDown`、`tradeStatus` 和 warnings；Account 估值、成交模拟和保护条件评估必须走该 facade 或同等内部 query，不得使用 `list_market.quote` 摘要字段。
 - 如果连续竞价时段内当日 quote 已超过 1 小时硬过期，`quote` 为空，`quoteFreshness.status = "missing"`，`quoteFreshness.warning = "snapshot_expired"`；不得把硬过期行情降级塞入 `quote`。
 - `include.quote = true` 时，如果当前为非交易时段，可返回 `tradeDate = latestCompletedTradeDate` 的 quote；缺少该交易日 quote 时返回空 quote 和 `snapshot_expired` / `quote_missing` warning。
 - `include.indicators = true` 返回完整默认指标集合；`include.indicators = IndicatorName[]` 只返回请求的指标子集，未知指标名必须返回 `invalid_input`。
 - `fetch_data` 不触发远端 provider；缺失、过期或字段不足只通过 item warning / error 表达。刷新必须走显式 refresh use case 或后台任务。
+
+Warning / Error code 规则：
+
+| 条件 | Code |
+|---|---|
+| `TsCode` 格式非法、数量超限或 unknown indicator | `invalid_input` |
+| 合法 `TsCode` 不在本地 universe | `not_found` / `instrument_missing` |
+| 请求 quote 但 snapshot 不存在 | `quote_missing` |
+| snapshot 存在但不符合当前 eligible trade date / 硬过期规则 | `snapshot_expired` |
+| 当前价、昨收、涨跌停价等关键价格缺失 | `quote_price_missing` |
+| 五档盘口缺失、为空或买一 / 卖一价格缺失 | `depth_missing` |
+| 默认 qfq K 线缺失但可降级返回 `adjust = "none"` | `using_unadjusted_kline` |
+| 调用方或后续扩展明确要求 qfq 且不得降级时缺少 qfq | `qfq_missing` |
+| refresh 部分 provider / batch 失败但仍有可用结果 | `provider_partial_failure` |
 
 #### `scan_market`
 
@@ -653,17 +668,38 @@ type ScanMarketResponse = ScanResult & {
 
 内部 API 以 query facade 为主：
 
+```ts
+type RefreshMarketQuotesScope =
+  | { kind: "subscribed"; tsCodes: TsCode[] }
+  | { kind: "universe" }
+  | { kind: "manual"; tsCodes: TsCode[] };
+
+type RefreshMarketQuotesRequest = {
+  scope: RefreshMarketQuotesScope;
+  purpose: "intraday" | "close";
+  tradeDate?: TradeDate;
+};
+```
+
 ```rust
 list_market(request) -> ListMarketResponse;
 fetch_data(request) -> FetchDataResponse;
 scan_market(request) -> ScanMarketResponse;
 refresh_market_instruments();
-refresh_market_quotes({ scope, purpose });
+refresh_market_quotes(request: RefreshMarketQuotesRequest);
 refresh_klines(scope);
 refresh_daily_basic(scope);
 refresh_company_events(scope);
 core_indexes() -> Vec<TsCode>;
 ```
+
+规则：
+
+- `scope.kind = "subscribed"` 时，调用方必须传入已合并的关注标的集合；Quotes 不读取 Account，也不内嵌核心指数列表。
+- `scope.kind = "manual"` 时，`tsCodes` 必须非空并通过 `TsCode` 校验；缺失或为空返回 `invalid_input`。
+- `scope.kind = "universe"` 表示刷新 Quotes 当前全市场 universe，不接受调用方自带 `tsCodes`。
+- `purpose = "close"` 表示为最新已完成交易日补收盘快照；`tradeDate` 缺省时由 Quotes `MarketTimeContext.latestCompletedTradeDate` 派生。
+- `purpose = "intraday"` 表示盘中 / 手动常规刷新；非交易时段可刷新最新已完成交易日的可读快照，但不表示可交易。
 
 ---
 
@@ -772,6 +808,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - 非交易时段不为了维持 `capturedAt < 1h` 持续刷新 quote；只要 quote 的 `tradeDate` 等于最新已完成交易日，就可用于读取。
 - 如果 app 暂停、网络不可用或 provider 失败导致缺少最新已完成交易日 quote，非交易时段读取接口按 `snapshot_expired` / `quote_missing` 返回空 quote。
 - `market-quotes-refreshed` 只表示 snapshot 已更新；payload 使用 [shared-types.md](shared-types.md) 定义的 `MarketQuotesRefreshedPayload`，其中 `purpose = "close"` 表示收盘快照，`purpose = "intraday"` 表示盘中 / 手动常规刷新；下游重建和事件路由由模块外编排处理。
+- `MarketQuotesRefreshedPayload.affectedTsCodes` 在 `subscribed` / `manual` scope 下必须尽量填写成功写入 snapshot 的标的集合；`universe` scope 数据量过大时可以省略。消费者看到 `affectedTsCodes` 缺失时必须按 `scope` 做全量重读 / 重建。
+- `failedBatches > 0` 表示本轮 quote refresh 部分失败；事件仍可 emit，但消费者必须把本次读取视为 partial，不得把缺失标的解释为确定无数据。
 
 ### 核心指数集合
 

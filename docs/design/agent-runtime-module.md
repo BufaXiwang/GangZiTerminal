@@ -919,7 +919,7 @@ send_agent_message
 Agent Runtime tick
   -> News.refresh_news()
   -> News emits news-refreshed
-  -> Agent Runtime buffers pending newIds
+  -> Agent Runtime buffers pending changed newsIds
   -> trigger when pending count >= M or oldest pending age >= N
   -> create AgentRun(trigger=news_batch, profile=news_analysis)
   -> Agent Infra run_agent_loop
@@ -942,6 +942,7 @@ type AgentNewsBufferItem = {
 规则：
 
 - News 只刷新和 emit，不启动 Agent。
+- Runtime 从 `NewsRefreshedPayload.newIds ∪ updatedIds ∪ articleUpdatedNewsIds` 取待分析集合，并按 `newsId` 去重；仅 `failedCount` / `warnings` 变化但没有受影响 news id 时，不进入分析 buffer。
 - Runtime 负责维护 durable 待分析 news buffer；buffer item 必须至少包含 `newsId`、进入 buffer 时间、来源 `sourceBatchId`、状态和 retry metadata，不能只存在内存里。
 - 当 `pending news count >= news_agent_batch_size` 时，Runtime 必须触发一次 `news_analysis` run。
 - 如果在 `news_agent_max_wait_secs` 内没有因为数量阈值触发分析，且 buffer 非空，Runtime 必须触发一次 `news_analysis` run。
@@ -966,6 +967,8 @@ Account emits account-triggered
 
 规则：
 
+- Runtime 负责调用 `Account.evaluate_account_triggers({ now, limit, cursor })`：每次 `market-quotes-refreshed` 后触发一次，另按 `account_trigger_eval_interval_secs` 做兜底定时。
+- 单次 trigger evaluation 使用 `account_trigger_eval_batch_size` 作为 `limit`；若 Account 返回 `has_more = true` / `next_cursor`，Runtime 必须继续分页直到本轮耗尽或达到调度预算。
 - Account 只判断订单终态或保护条件是否需要通知，不决定响应动作。
 - Runtime 负责按 `has_more` / `next_cursor` 继续调度评估批次，不能把大账户一次性阻塞在单个 tick 内。
 - Runtime 负责同一 `trigger_id` 只路由一次。
@@ -982,7 +985,10 @@ Account emits account-triggered
 Agent Runtime quote tick
   -> Account.subscribed_codes()
   -> add Quotes.core_indexes()
-  -> Quotes.refresh_market_quotes({ scope: subscribed, purpose: "intraday" })
+  -> Quotes.refresh_market_quotes({
+       scope: { kind: "subscribed", tsCodes },
+       purpose: "intraday"
+     })
   -> Quotes emits market-quotes-refreshed
 ```
 
@@ -1099,6 +1105,7 @@ DecisionEpisode
 | Task | Lock Key |
 |---|---|
 | news batch Agent run | `agent.news_batch` |
+| account trigger evaluation | `account.trigger_eval` |
 | account trigger Agent run | `agent.account_trigger:{trigger_id}` |
 | scheduled review | `agent.scheduled_review` |
 | quote subscribed refresh | `quotes.subscribed_refresh` |
@@ -1124,7 +1131,7 @@ type AgentRuntimeEventConsumption = {
 
 - `(eventType, eventKey, consumer)` 是消费幂等键。
 - `account-triggered` 使用 `trigger_id` 做 `event_key`。
-- `news-refreshed` 默认使用 `batchId` 做 `event_key`；如果需要合并多批，使用排序后的 `newIds` hash。
+- `news-refreshed` 默认使用 `batchId` 做 `event_key`；如果需要合并多批，使用排序后的 changed news ids hash，changed news ids = `newIds ∪ updatedIds ∪ articleUpdatedNewsIds`。
 - 已 `consumed` 的 event 不重复触发 Agent run。
 - `ignored` 表示 Runtime 已明确判定该 event 无需触发 Agent run 或无需进一步处理；它是终态，不能被 watchdog 当作失败重试。
 - `processing` 超时可被 watchdog 回收。
@@ -1150,6 +1157,8 @@ type AgentRuntimeEventConsumption = {
 |---|---|---|
 | `news_agent_batch_size` | 触发 `news_analysis` 的 pending news 数量阈值 | 20 |
 | `news_agent_max_wait_secs` | 最老 pending news 等待多久后触发 `news_analysis` | 300 |
+| `account_trigger_eval_interval_secs` | Account trigger evaluation 兜底定时间隔 | 10 |
+| `account_trigger_eval_batch_size` | 单次 `evaluate_account_triggers` 处理上限 | 200 |
 | `scheduled_review_interval_secs` | 定时巡检间隔；未配置时不启动周期性 scheduled review | unset |
 | `scheduled_review.allow_trading_write` | 定时巡检是否允许暴露 `operate_account` | false |
 | `agent_context_compact_channel_id` | compact 模型使用的 provider channel；未配置时使用当前 run channel | unset |

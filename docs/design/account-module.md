@@ -916,6 +916,18 @@ type OperateAccountResponse = {
 - 有副作用的 rejected 操作必须返回对应 `accountEventIds`。
 - `accountEventIds` 的顺序必须等于事件 append 顺序，供审计链展示。
 
+字段矩阵：
+
+| 场景 | `accepted = true` 必须返回 | 说明 |
+|---|---|---|
+| `place_order` / `open_position` / `scale_position` / `close_position` 创建订单 | `orderId`、`accountEventIds`、`snapshot` | `limit` pending 也必须返回 `orderId`，供 Runtime 建立订单反查索引 |
+| 上述交易动作即时成交或部分成交 | `orderId`、`fillIds`、`accountEventIds`、`snapshot`；涉及仓位时返回 `positionId` | `fillIds` 至少包含本次新增成交；部分成交仍保留同一 `orderId` |
+| `cancel_order` 成功 | `orderId`、`accountEventIds`、`snapshot` | 撤销已完成订单返回 `order_not_pending`，不得伪造成功 |
+| `adjust_protection` 成功 | `positionId`、`accountEventIds`、`snapshot` | 不创建 `orderId` / `fillIds` |
+| `record_invalidation_signal` 成功 | `positionId`、`accountEventIds`、`snapshot`；若生成 trigger 则返回 `triggerId` | 不自动创建订单或成交 |
+| 参数预校验拒绝且无账户事实 | `reason`、`snapshot`、`accountEventIds = []` | 不返回对象 ID |
+| 写入拒单事实后的拒绝 | `reason`、`orderId`、`rejectionEventId`、`accountEventIds`、`snapshot` | `rejectionEventId` 必须属于 `accountEventIds` |
+
 #### `update_watchlist`
 
 自选维护是非交易能力，可由前端用户、Agent tool 或系统维护流程调用。它不能创建订单、修改仓位或调整保护条件。
@@ -994,16 +1006,34 @@ subscribed_codes() -> Vec<TsCode>;
 | 涨跌停 / 停牌 | 停牌不得成交；涨停不可买入成交，跌停不可卖出成交，除非盘口证明可成交 |
 | 硬风控 | 买入必须满足 `AccountRiskPolicy` |
 
+Error code 规则：
+
+| 条件 | `OperateAccountResponse.reason` |
+|---|---|
+| action 参数组合非法、数量小于等于 0、position 状态不允许该动作 | `invalid_input` |
+| 标的不是股票 / 场内基金、退市或未知不可交易标的 | `instrument_not_tradable` |
+| 即时成交读取到 `tradeStatus = "halted"` 或明确停牌 | `instrument_suspended` |
+| 即时成交在非交易时段或 `tradeStatus = "closed"` | `outside_trading_session` |
+| fresh quote 缺失 / stale / 关键价格缺失 | `quote_missing` / `quote_stale` / `quote_price_missing` |
+| 需要盘口成交但买一 / 卖一不可用 | `depth_missing` |
+| 涨停买入或跌停卖出且盘口不能证明可成交 | `limit_up_down_blocked` |
+| 可用现金不足或风险预算不足 | `insufficient_cash` / `risk_limit_exceeded` |
+| 可卖数量不足或 T+1 / 冻结导致不可卖 | `insufficient_sellable_quantity` |
+| 数量不满足最小手数 | `invalid_lot_size` |
+| 撤单目标不存在或不是 pending / partially_filled | `order_not_pending` |
+
 ### 订单成交模拟
 
 - `market` 订单用 fresh Quotes snapshot 的当前价和盘口模拟成交。
 - 买入成交价格优先使用一档卖价；卖出成交价格优先使用一档买价；缺盘口时不得成交。
-- `limit` 买单在 fresh quote 满足 `quote.price <= limitPrice` 且卖盘可成交时成交。
-- `limit` 卖单在 fresh quote 满足 `quote.price >= limitPrice` 且买盘可成交时成交。
+- `limit` 买单在 fresh quote 的一档卖价 `ask[0].price <= limitPrice` 且卖盘可成交时成交；不得用 `quote.price` 替代可执行卖价。
+- `limit` 卖单在 fresh quote 的一档买价 `bid[0].price >= limitPrice` 且买盘可成交时成交；不得用 `quote.price` 替代可执行买价。
 - stale / missing quote 不得触发成交；pending 订单保持 pending 并等待下一次 fresh quote。
+- `tradeStatus = "halted"` 时即时成交类动作必须返回 `instrument_suspended`；`tradeStatus = "closed"` 或非交易时段即时成交必须返回 `outside_trading_session`。
+- 买入遇到涨停且卖盘不可成交、卖出遇到跌停且买盘不可成交时，新提交的即时成交类命令必须返回 `accepted = false` / `limit_up_down_blocked`；既有 pending limit 订单评估时保持 pending，不写成交事件。若 `limitUp` / `limitDown` 缺失导致无法判断，返回或记录 `quote_price_missing`。
 - 盘口量不足时允许部分成交，剩余数量保持 pending；部分成交只写 `order_partially_filled` / `position_scaled` 等账户事件并 emit `account-updated`，不创建 `AccountTrigger`，也不 emit `account-triggered`。
 - 过期订单变为 `expired`，并释放冻结现金 / 冻结持仓。
-- 评估大量订单 / 仓位时必须分批处理；每 tick 最多处理 `account.trigger_eval_batch_size` 条，结果返回 `has_more` / `next_cursor` 供下次继续。
+- 评估大量订单 / 仓位时必须分批处理；每 tick 最多处理 `account_trigger_eval_batch_size` 条，结果返回 `has_more` / `next_cursor` 供下次继续。
 - 批处理顺序必须稳定：先 pending orders，再 open positions；同一类按 `updated_at asc` / `created_at asc` 排序。
 - `trigger_id` 生成规则必须使用“触发事件模型”中定义的统一稳定键，重试或分页不能产生重复触发。
 
@@ -1025,6 +1055,12 @@ subscribed_codes() -> Vec<TsCode>;
 - missing quote 或关键价格缺失时跳过价格型保护评估，不生成 trigger；本批次 `AccountTriggerResult.warnings` 必须包含 `quote_missing` 或 `quote_price_missing`，并记录可观测日志。
 - `time_stop` 和 `invalidated` 不依赖行情 freshness。
 
+调度期望：
+
+- Account 不拥有 scheduler；`evaluate_account_triggers` 由 Agent Runtime / 应用调度层调用。
+- 调度层应在 `market-quotes-refreshed` 后触发一次评估，并使用固定 cadence 做兜底；具体间隔和 batch size 以 [agent-runtime-module.md](agent-runtime-module.md) 的 runtime settings 为准。
+- 每次调用必须尊重 `limit` / `cursor`，若返回 `has_more = true`，调度层应继续分页直到本轮耗尽或达到调度预算。
+
 ### 订阅集合
 
 Account 对外暴露当前关注集合：
@@ -1036,8 +1072,8 @@ subscribed_codes = watchlist ∪ open_positions ∪ pending_orders
 规则：
 
 - `subscribed_codes()` 只是 Account 暴露给编排层的关注集合，不是行情刷新命令。
-- Account 内部需要行情时，只读取 Quotes 已有 snapshot / query facade，用于估值、成交模拟和保护条件评估；Account 不调用 Quotes provider，也不主动触发 refresh。
-- Quotes 拥有 `core_indexes()` 和 `refresh_market_quotes({ scope, purpose })`；Agent Runtime 负责调用 `Account.subscribed_codes()`、合并 `Quotes.core_indexes()`，再调用 Quotes refresh。
+- Account 内部需要行情时，只读取 Quotes 已有 snapshot / query facade，用于估值、成交模拟和保护条件评估；标准读取路径是 `fetch_data({ tsCodes, include: { quote: true } })` 或同等内部 query facade。Account 不调用 Quotes provider，也不主动触发 refresh。
+- Quotes 拥有 `core_indexes()` 和 `refresh_market_quotes({ scope: { kind: "subscribed", tsCodes }, purpose })`；Agent Runtime 负责调用 `Account.subscribed_codes()`、合并 `Quotes.core_indexes()`，再调用 Quotes refresh。
 - 该跨模块调用流程以 [agent-runtime-module.md](agent-runtime-module.md) 为准；Account spec 只定义自己暴露的集合和读取 Quotes snapshot 的边界。
 
 ---

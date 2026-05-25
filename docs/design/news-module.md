@@ -232,6 +232,7 @@ type FetchNewsResponse = {
     summary?: string;
     url?: string;
     publishedAt?: OccurredAt;
+    articleExcerpt?: string;
     article?: {
       title?: string;
       content: string;
@@ -269,6 +270,7 @@ type FetchNewsResponse = {
 - 有 `query` 时默认按 FTS relevance 排序，并以 `publishedAt desc, createdAt desc, id asc` 作为稳定 tie-breaker；无 `query` 时按 `publishedAt desc, createdAt desc, id asc` 排序。`publishedAt` 缺失时用 `createdAt` 参与第一排序位。
 - `limit` 默认 50，最大 200；`offset` 默认 0；`hasMore` 必须基于同一查询条件计算。
 - `includeArticle = true` 时不触发远端抽取；缺正文、正文失败缓存或 `ArticleContent.content` 为空时，不返回 `article` 字段，并必须返回 `article_missing` warning。
+- `articleExcerpt` 是面向 Agent / 列表摘要的短正文摘录；当本地存在 `ArticleContent.content` 时必须由 News query facade 生成并返回，默认取清洗后首段起最多 500 个字符。`includeArticle = false` 时也可以返回已有 `articleExcerpt`，但不得触发远端抽取。
 - News 不生成行业标签、相关标的或影响判断；`query` 只是资讯文本搜索条件。
 
 #### `list_news_sources`
@@ -317,14 +319,28 @@ type RefreshNewsResponse =
 
 - `sources` 包含未知 source、禁用 source 或非法格式时，必须返回 `invalid_input`，不创建 `batchId`，不触发 provider。
 - 以下刷新统计字段均位于 `ok = true` 的 `result` 中。
-- `batchId` 是本轮 refresh 的幂等和审计 ID。
+- `batchId` 是本轮 refresh 的幂等和审计 ID，必须在一次 refresh / warm_articles 开始时生成并贯穿 warnings / failures / emitted event；同一轮重试不得生成多个 batchId，不同轮 refresh 不要求稳定复用。
 - `fetchedCount` 表示 provider 返回的原始 item 数量；`skippedCount` 表示 normalize / validate 阶段跳过的 item 数量。
 - `savedCount = newIds.length + updatedIds.length`。
 - `savedCount` 只统计 `NewsItem` 主记录新增 / 更新；`ArticleContent` 写入或更新只计入 `articleUpdatedCount`，两者不重叠。
+- `newIds` 表示本轮首次插入的 `NewsItem.id`；`updatedIds` 表示已有 `NewsItem` 的 title / summary / url / publishedAt / payload 等主记录字段发生变化。两者互斥。
 - `articleUpdatedNewsIds` 表示本轮正文变化影响到的 `NewsItem.id`，包括共享同一 canonical URL 的多条新闻；仅正文变化时 `newIds` / `updatedIds` 可以为空。
+- 同一 `NewsItem.id` 可以同时出现在 `articleUpdatedNewsIds` 和 `newIds` / `updatedIds` 中；Runtime 侧入队必须按 `newsId` 去重。
 - 单个 provider 失败不影响其他 provider；失败写入 `failures`。
 - 单条 item 缺必要字段、ID 不稳定、URL 不可解析等可跳过问题写入 `warnings`，必要时累计到 `skippedCount`；不把单条跳过提升为整源失败。
 - `force = false` 时 provider adapter 可以按 source watermark 增量拉取。
+
+Failure code 规则：
+
+| Stage | 条件 | `NewsFailure.code` |
+|---|---|---|
+| `fetch` | provider 网络不可用、超时、5xx 或返回不可用 | `provider_unavailable` |
+| `fetch` | provider 明确限流、429 或等价响应 | `rate_limited` |
+| `normalize` | provider payload 无法解析、字段类型错误、正文 / 标题结构不可识别 | `parse_error` |
+| `save` | DB 写入或事务失败 | `db_error` |
+| `article` | 正文抽取器无法提取有效正文、正文解析失败或正文 provider 明确失败 | `article_extract_failed` |
+
+`NewsRefreshWarning.code` 用于可跳过或部分成功场景：缺正文用 `article_missing`，单条 item 无法稳定生成 ID 或字段不足用 `data_partial` / `provider_partial_failure`，不得把 warning 临时塞进 `ErrorCode`。
 
 ### 内部 Rust API
 

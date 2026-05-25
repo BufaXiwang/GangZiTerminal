@@ -141,7 +141,9 @@ type ErrorCode =
   | "invalid_input"
   | "not_found"
   | "provider_unavailable"
+  | "rate_limited"
   | "db_error"
+  | "parse_error"
   | "quote_missing"
   | "quote_stale"
   | "quote_price_missing"
@@ -158,6 +160,7 @@ type ErrorCode =
   | "strategy_required"
   | "duplicate_event"
   | "version_conflict"
+  | "article_extract_failed"
   | "tool_timeout"
   | "provider_context_too_long";
 ```
@@ -240,6 +243,7 @@ type MarketQuotesRefreshedPayload = {
   scope: "subscribed" | "universe" | "manual";
   purpose: "intraday" | "close";
   tradeDate?: TradeDate;
+  affectedTsCodes?: TsCode[];
   total: number;
   success: number;
   failedBatches: number;
