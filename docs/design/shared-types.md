@@ -157,6 +157,7 @@ type ErrorCode =
   | "risk_limit_exceeded"
   | "strategy_required"
   | "duplicate_event"
+  | "version_conflict"
   | "tool_timeout"
   | "provider_context_too_long";
 ```
