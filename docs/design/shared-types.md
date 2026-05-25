@@ -134,6 +134,7 @@ type WarningCode =
   | "daily_basic_missing"
   | "events_missing"
   | "strategy_omitted"
+  | "mapping_missing"
   | "data_partial";
 
 type ErrorCode =

@@ -249,9 +249,11 @@ type DecisionEpisode = {
 - Episode 只属于 Agent Runtime；News / Quotes / Account 不创建也不持有 `DecisionEpisode`。
 - `no_action` 是有效 episode，用于记录“为什么不行动”。
 - `DecisionEpisode.action` 表示 Agent 的决策意图，不表示 Account 已实际执行。
-- `actionStatus` 表示该意图的执行状态：`no_action` 表示明确不行动；`intended` 表示形成动作意图但尚未提交；`submitted` 表示已生成或准备生成 `TradeIntent`；`blocked` 表示因 stale quote、risk limit、insufficient cash 等原因未提交；`deferred` 表示等待更多信息或下次 review。
+- `actionStatus` 表示该意图的执行状态：`no_action` 表示明确不行动；`intended` 表示形成动作意图但尚未提交；`submitted` 表示 Runtime 已创建 `TradeIntent` 并开始提交；`blocked` 表示因 stale quote、risk limit、insufficient cash 或 Account 拒绝等原因未能执行；`deferred` 表示等待更多信息或下次 review。
 - 一个 episode 不一定产生账户写动作；只有需要写 Account 时，才生成 `TradeIntent.accountInput`。
-- `action` 为交易类动作且 `actionStatus = "submitted"` 时，必须关联 `TradeIntent`。
+- `record_decision_episode` 只能创建 episode，不能修改已有 episode；同一 run 内需要记录新的判断时必须创建新 episode。
+- 交易类动作在 `record_decision_episode` 时应使用 `actionStatus = "intended"`；Runtime 接受 `operate_account` 后自动把该 episode 推进为 `submitted`，并关联 `TradeIntent`。
+- run 结束时，`action` 为交易类动作且 `actionStatus = "submitted"` 的 episode 必须关联 `TradeIntent`；否则 Runtime 必须把它推进到 `blocked` 或 `deferred` 并记录原因。
 - `action` 为交易类动作但未生成 `TradeIntent` 时，`actionStatus` 必须是 `blocked` 或 `deferred`，并在 `blockedReason` 或 `thesis` 中写清原因。
 - `action = "no_action"` 时，`actionStatus` 必须是 `no_action`。
 - `thesis` 必须描述为什么做或为什么不做。
@@ -494,6 +496,7 @@ type DecisionReview = {
     reason: string;
   };
   evidenceRefs: EvidenceRef[];
+  warnings?: WarningCode[];
   createdAt: OccurredAt;
 };
 ```
@@ -504,6 +507,7 @@ type DecisionReview = {
 - 单次交易结果不能证明策略有效或无效。
 - 建议必须能追溯到 episode、账户结果、行情或新闻证据。
 - 每次保护条件触发、订单终态、平仓或定时复盘可以生成 `DecisionReview`。
+- 找不到原始 episode / order 映射时，review 必须带 `mapping_missing` warning，并挂到当前 account trigger run 产生的 episode 上。
 
 ---
 
@@ -728,6 +732,8 @@ Agent 消费其他模块时，Runtime 将工具收敛为少数高层工具，并
 | `fetch_account` | Account | 账户总览、仓位、订单、自选、事件、触发 | none |
 | `operate_account` | Account | 挂单、撤单、开仓、调仓、平仓、调整保护条件 | trading_write |
 | `update_watchlist` | Account | 添加 / 删除自选、更新自选备注 | non_trading_write |
+| `record_decision_episode` | Agent Runtime | 记录一次可复盘投资判断 | non_trading_write |
+| `record_decision_review` | Agent Runtime | 记录一次决策 / 交易 / 触发复盘 | non_trading_write |
 
 规则：
 
@@ -736,6 +742,7 @@ Agent 消费其他模块时，Runtime 将工具收敛为少数高层工具，并
 - 读工具可以并发；`operate_account` 必须串行执行。
 - 交易写能力只存在于 `operate_account`。
 - `update_watchlist` 是非交易写能力，可由 Agent 用于维护观察列表。
+- `record_decision_episode` / `record_decision_review` 是 Agent Runtime 审计写能力，不调用 Quotes / News / Account。
 - 工具返回值必须带时间戳和来源摘要，供 Agent 判断 freshness。
 - 执行模块只需要提供自己的领域接口；Runtime / adapter 负责反腐译码成 Agent tool。
 
@@ -789,9 +796,14 @@ type FetchAccountToolInput = {
 
 type FetchAccountToolOutput = PacketAccount;
 
-type UpdateWatchlistToolInput = UpdateWatchlistInput;
+type UpdateWatchlistToolInput = {
+  episodeId?: string;
+  accountInput: UpdateWatchlistInput;
+};
 
-type UpdateWatchlistToolOutput = UpdateWatchlistResponse;
+type UpdateWatchlistToolOutput = UpdateWatchlistResponse & {
+  episodeId?: string;
+};
 
 type RecordDecisionEpisodeToolInput =
   Omit<DecisionEpisode, "episodeId" | "runId" | "triggerKind" | "createdAt">;
@@ -837,15 +849,19 @@ type OperateAccountToolOutput = {
 
 - `ScanMarketRequest` 引用 [Quotes `scan_market`](quotes-module.md#scan_market) canonical DSL；Runtime 不重定义 `filter` / `conditions` / `sortBy` 自由字符串。
 - `FetchNewsToolInput` 引用 [News `fetch_news`](news-module.md#fetch_news) canonical request，保留 `ids`、`query`、`sources`、`publishedFrom`、`publishedTo`、`includeArticle`、`limit`、`offset` 的组合语义。
-- `UpdateWatchlistInput`、`OperateAccountInput`、`OrderStatus` 引用 Account 模块 canonical 类型。
+- `UpdateWatchlistToolInput.accountInput`、`OperateAccountInput`、`OrderStatus` 引用 Account 模块 canonical 类型；Runtime 只把 `accountInput` 传给 Account。
 - `record_decision_episode` 是模型产出 `DecisionEpisode` 的唯一写路径；`no_action`、`add_watchlist`、交易意图被阻断等不调用 Account 的判断也必须通过该工具持久化。
 - `record_decision_review` 是模型产出 `DecisionReview` 的唯一写路径；它只记录复盘，不自动修改 `StrategyCard`。
 - `record_decision_episode` / `record_decision_review` 必须显式提交 `evidenceRefs`；Runtime 只校验和持久化声明的 evidence，不自动 attach 全部 tool calls。
+- `update_watchlist` 如果是 Agent 基于行情 / 新闻 / 账户形成判断后的动作，必须携带同一 run 内已接受的 `episodeId`；纯用户指令或系统维护型自选更新可以不携带 episode。
+- `update_watchlist.episodeId` 若存在，必须指向同一 run 的 `DecisionEpisode`；`accountInput.action = "add"` 时 episode action 应为 `add_watchlist`，`accountInput.action = "remove"` 时 episode action 应为 `remove_watchlist`。
 - `operate_account` 工具外层携带 `episodeId`，内层 `accountInput` 原样使用 Account canonical `OperateAccountInput`；Runtime 只把 `accountInput` 传给 Account。
-- `operate_account.episodeId` 必须指向同一 run 中已接受的 `DecisionEpisode`，且该 episode 的 `actionStatus = "submitted"`；否则工具必须返回 rejected，不调用 Account。
+- `operate_account.episodeId` 必须指向同一 run 中已接受的 `DecisionEpisode`，且该 episode 的 `actionStatus` 必须是 `"intended"` 或 `"submitted"`；否则工具必须返回 rejected，不调用 Account。
+- `operate_account` 创建 `TradeIntent(status = "proposed")` 后，Runtime 必须把对应 episode 推进到 `actionStatus = "submitted"`。
 - `operate_account` 工具输出必须保留 Account 返回的审计 ID，尤其是 `accountEventIds`、`fillIds` 和 `rejectionEventId`。
 - Runtime 必须在提交 `operate_account` 前创建 `TradeIntent(status = "proposed")` 或确保同一事务可补写。
 - Account 接受 / 拒绝后，Runtime 根据工具结果更新 `TradeIntent.status` 和 `accountResultRef`。
+- `operate_account` 返回 `accepted = false` 时，Runtime 必须把对应 episode 推进到 `actionStatus = "blocked"`，并设置 `blockedReason = OperateAccountToolOutput.reason`；模型不需要、也不应通过再次调用 `record_decision_episode` 覆盖同一 episode。
 - 只有一个模拟账户时，`operate_account` 必须按账户全局串行执行；未来支持多账户时，串行粒度改为 `accountId`。
 
 ---
@@ -918,7 +934,8 @@ Account emits account-triggered
 - Runtime 的 event consumption record 是 trigger 投递、processing、failed、retry 的权威状态；Account 的 `handled` 只作为最终确认位。
 - 只有当 Agent run 完成消费、Runtime 按策略显式忽略、或事件被判定不可恢复放弃时，Runtime 才能调用 `Account.mark_trigger_handled`。
 - 仅启动 Agent run 不得标记 handled。
-- 订单终态 trigger 若包含 `orderId`，Runtime 必须通过 `orderId -> intentId / episodeId` 反查索引找到原始 episode，再把后续 `DecisionReview` 挂回该 episode；找不到映射时仍可处理 trigger，但 review 必须记录 `mapping_missing` warning。
+- 订单终态 trigger 若包含 `orderId`，Runtime 必须通过 `orderId -> intentId / episodeId` 反查索引找到原始 episode，再把后续 `DecisionReview` 挂回该 episode；找不到映射时仍可处理 trigger，但必须为当前 trigger run 产生 episode，并把 review 挂到当前 episode 且带 `mapping_missing` warning。
+- 订单终态 review 可以引用原始 episode 已记录的 evidence；Runtime 校验 evidenceRefs 时必须允许来自该原始 episode 的 evidence snapshot，不要求它们都来自当前 account trigger run。
 
 ### Account -> Quotes 订阅行情
 
@@ -1182,6 +1199,23 @@ type UpsertStrategyCardRequest = {
 - `baseVersion` 用于乐观并发；版本冲突必须拒绝。
 - `reason` 进入策略审计记录。
 
+### 恢复结果
+
+```ts
+type RecoverySummary = {
+  scanned: number;
+  recovered: number;
+  failed: number;
+  ignored: number;
+  details?: Array<{
+    id: string;
+    kind: "agent_run" | "trade_intent" | "event_consumption" | "news_batch";
+    status: "recovered" | "failed" | "ignored";
+    message?: string;
+  }>;
+};
+```
+
 ### 内部 Runtime API
 
 ```rust
@@ -1269,6 +1303,8 @@ pipeline/scheduler.rs
 - 同一 `trigger_id` 不会导致重复 Agent 交易动作。
 - 每类 run 的 allowed tools 由 `AgentRunProfile` 决定；Infra 不默认暴露所有工具。
 - 禁止交易写的 profile 不能调用 `operate_account`。
+- 模型形成投资判断必须通过 `record_decision_episode` 持久化；`no_action` 和自选变更也不能只停留在自然语言输出。
+- Agent 基于投资判断发起的自选变更必须通过 `update_watchlist.episodeId` 关联对应 episode。
 - 每次交易写动作都有 `DecisionEpisode`、`TradeIntent` 和 `operate_account` 调用记录。
 - 每次保护条件触发、订单终态、平仓或定时复盘可以生成 `DecisionReview`。
 - `DecisionReview` 可以包含策略调整建议，但不会自动修改 active `StrategyCard`。
