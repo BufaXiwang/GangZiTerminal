@@ -102,18 +102,56 @@ impl PositionRepo {
         Ok(all.into_iter().find(|p| p.id == *id))
     }
 
-    /// 原子提交：append 一条 event + 整列替换 positions。
+    /// 原子提交：append 一条 PositionEvent + 整列替换 positions。
     ///
-    /// AccountService 写路径统一走这里，避免 event/state 撕裂。
+    /// AccountService 写路径统一走这里，避免 event/state 撕裂。向后兼容入口，
+    /// 不写 AccountEvent；新代码请改用 [`commit_atomic`]。
     pub fn commit_event_and_positions(
         &self,
         event: &PositionEvent,
         positions: &[Position],
     ) -> Result<(), AccountError> {
+        self.commit_atomic(event, positions, &[]).map(|_| ())
+    }
+
+    /// spec `account-module.md §2`：单一事务原子写入
+    /// `position_events` + `simulated_positions` + `account_events`，
+    /// 避免跨 connection 撕裂（PositionEvent 已落、AccountEvent 缺失）。
+    ///
+    /// `account_events` 按入参顺序 append；返回写入的 event_id 列表（顺序对应
+    /// 入参），供 caller 把生成的 id 推给 `OperateAccountResult.accountEventIds`。
+    pub fn commit_atomic(
+        &self,
+        position_event: &PositionEvent,
+        positions: &[Position],
+        account_events: &[crate::domain::account::AccountEvent],
+    ) -> Result<Vec<String>, AccountError> {
         let rows = positions_to_db_rows(positions)?;
-        commit_account_positions(self.app.clone(), Some(event_to_db_json(event)), rows, false)
-            .map_err(AccountError::Io)?;
-        Ok(())
+        commit_account_positions_atomic(
+            self.app.clone(),
+            Some(event_to_db_json(position_event)),
+            rows,
+            account_events.to_vec(),
+            false,
+        )
+        .map_err(AccountError::Io)
+    }
+
+    /// spec `account-module.md §2`：只 append AccountEvent（无 PositionEvent /
+    /// positions 变化），仍走单一事务保证持久化原子性。用于 watchlist /
+    /// trigger_handled / snapshot_rebuilt 等不影响仓位的写动作。
+    pub fn commit_account_events_only(
+        &self,
+        account_events: &[crate::domain::account::AccountEvent],
+    ) -> Result<Vec<String>, AccountError> {
+        commit_account_positions_atomic(
+            self.app.clone(),
+            None,
+            Vec::new(),
+            account_events.to_vec(),
+            false,
+        )
+        .map_err(AccountError::Io)
     }
 
     /// 清空账户状态 + 事件链。用于 reset 重新训练。
@@ -716,6 +754,20 @@ pub fn commit_account_positions(
     positions: Vec<Value>,
     clear_events: bool,
 ) -> Result<(), String> {
+    commit_account_positions_atomic(app, event, positions, Vec::new(), clear_events).map(|_| ())
+}
+
+/// spec `account-module.md §2`：position_events / simulated_positions /
+/// account_events 三表在同一事务内提交，避免跨 connection 撕裂。
+///
+/// 返回 account_events 写入的 event_id 列表（顺序对应入参）。
+pub fn commit_account_positions_atomic(
+    app: AppHandle,
+    event: Option<Value>,
+    positions: Vec<Value>,
+    account_events: Vec<crate::domain::account::AccountEvent>,
+    clear_events: bool,
+) -> Result<Vec<String>, String> {
     let mut connection = open_database(&app)?;
     migrate(&connection)?;
     let tx = connection
@@ -733,8 +785,42 @@ pub fn commit_account_positions(
 
     replace_simulated_positions_tx(&tx, positions)?;
 
+    // spec §2「所有账户状态变化必须先 append AccountEvent」：与 PositionEvent /
+    // simulated_positions 在同一事务，要么都成功要么都回滚。
+    let mut account_event_ids = Vec::with_capacity(account_events.len());
+    for ev in &account_events {
+        insert_account_event_tx(&tx, ev)?;
+        account_event_ids.push(ev.event_id.clone());
+    }
+
     tx.commit()
         .map_err(|err| format!("提交账户事务失败：{err}"))?;
+    Ok(account_event_ids)
+}
+
+fn insert_account_event_tx(
+    tx: &Transaction<'_>,
+    event: &crate::domain::account::AccountEvent,
+) -> Result<(), String> {
+    tx.execute(
+        "insert into account_events(
+            event_id, event_type, order_id, fill_id, position_id, ts_code,
+            reason, actor, payload_json, occurred_at
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            event.event_id,
+            event.event_type.as_str(),
+            event.order_id,
+            event.fill_id,
+            event.position_id,
+            event.ts_code,
+            event.reason,
+            event.actor.as_str(),
+            event.payload.to_string(),
+            event.occurred_at,
+        ],
+    )
+    .map_err(|err| format!("写入 account_event 失败（TX）：{err}"))?;
     Ok(())
 }
 

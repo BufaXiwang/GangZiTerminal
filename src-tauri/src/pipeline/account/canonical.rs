@@ -253,40 +253,18 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                 .iter()
                 .find(|p| p.code.as_str() == ts_code)
                 .cloned();
-            let (intent, position_outcome): (OrderIntent, Result<String, OperateAccountResult>) =
+            // 先决定 intent + 派生 position_event_type；events 在 build_extras 闭包里组装。
+            let (intent, position_event_type): (OrderIntent, AccountEventType) =
                 match (side, &existing) {
-                    (OrderSide::Buy, None) => {
-                        let intent = OrderIntent::OpenPosition;
-                        let r = open_position_internal(
-                            app,
-                            &ts_code,
-                            qty_i64,
-                            reason.clone(),
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                        (intent, r)
-                    }
-                    (OrderSide::Buy, Some(pos)) => {
-                        let intent = OrderIntent::ScaleIn;
-                        let r = scale_position_internal(app, &pos.id, qty_i64, reason.clone()).await;
-                        (intent, r)
-                    }
+                    (OrderSide::Buy, None) => (OrderIntent::OpenPosition, AccountEventType::PositionOpened),
+                    (OrderSide::Buy, Some(_)) => (OrderIntent::ScaleIn, AccountEventType::PositionScaled),
                     (OrderSide::Sell, Some(pos)) => {
                         let is_full = pos.current_shares.value() == qty_i64;
-                        let intent = if is_full {
-                            OrderIntent::ClosePosition
+                        if is_full {
+                            (OrderIntent::ClosePosition, AccountEventType::PositionClosed)
                         } else {
-                            OrderIntent::ScaleOut
-                        };
-                        let r = if is_full {
-                            close_position_internal(app, &pos.id, reason.clone()).await
-                        } else {
-                            scale_position_internal(app, &pos.id, -qty_i64, reason.clone()).await
-                        };
-                        (intent, r)
+                            (OrderIntent::ScaleOut, AccountEventType::PositionScaled)
+                        }
                     }
                     (OrderSide::Sell, None) => {
                         return OperateAccountResult::rejected(
@@ -295,8 +273,70 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                         );
                     }
                 };
-            let pos_id = match position_outcome {
-                Ok(id) => id,
+
+            // spec §2：market 成交事件链 order_placed → order_filled → position_*
+            // 三条 AccountEvent 必须与 PositionEvent / simulated_positions 在同一
+            // SQLite 事务内 commit，避免跨 connection 撕裂。
+            let order_id_for_extras = order_id.clone();
+            let ts_code_for_extras = ts_code.clone();
+            let reason_for_extras = reason.clone();
+            let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+                let placed = AccountEvent::new(
+                    AccountEventType::OrderPlaced,
+                    AccountActor::Agent,
+                    serde_json::json!({
+                        "tsCode": ts_code_for_extras,
+                        "side": side.as_str(),
+                        "orderType": "market",
+                        "quantity": qty_i64,
+                        "intent": intent.as_str(),
+                    }),
+                )
+                .with_order(&order_id_for_extras)
+                .with_ts_code(&ts_code_for_extras)
+                .with_reason(&reason_for_extras);
+                let filled = AccountEvent::new(
+                    AccountEventType::OrderFilled,
+                    AccountActor::Agent,
+                    serde_json::json!({ "quantity": qty_i64 }),
+                )
+                .with_order(&order_id_for_extras)
+                .with_position(pos.id.as_str())
+                .with_ts_code(&ts_code_for_extras);
+                let pos_evt = AccountEvent::new(
+                    position_event_type,
+                    AccountActor::Agent,
+                    serde_json::json!({ "quantity": qty_i64, "intent": intent.as_str() }),
+                )
+                .with_position(pos.id.as_str())
+                .with_ts_code(&ts_code_for_extras)
+                .with_order(&order_id_for_extras);
+                vec![placed, filled, pos_evt]
+            });
+
+            let position_outcome = match (side, &existing) {
+                (OrderSide::Buy, None) => {
+                    open_position_internal(
+                        app, &ts_code, qty_i64, reason.clone(), None, None, None, build_extras,
+                    )
+                    .await
+                }
+                (OrderSide::Buy, Some(pos)) => {
+                    scale_position_internal(app, &pos.id, qty_i64, reason.clone(), build_extras).await
+                }
+                (OrderSide::Sell, Some(pos)) => {
+                    let is_full = pos.current_shares.value() == qty_i64;
+                    if is_full {
+                        close_position_internal(app, &pos.id, reason.clone(), build_extras).await
+                    } else {
+                        scale_position_internal(app, &pos.id, -qty_i64, reason.clone(), build_extras).await
+                    }
+                }
+                (OrderSide::Sell, None) => unreachable!(),
+            };
+
+            let (pos_id, event_ids) = match position_outcome {
+                Ok(pair) => pair,
                 Err(r) => {
                     let mut r = r;
                     // 写一条 rejected order 留 audit
@@ -316,7 +356,9 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                             expires_at,
                         ),
                     );
-                    // spec §2：rejected 订单产生 order_rejected 事件；rejection_event_id 必须属于 accountEventIds
+                    // spec §2：rejected 订单产生 order_rejected 事件；rejection_event_id
+                    // 必须属于 accountEventIds。这里没有 PositionEvent 配套，走
+                    // commit_account_events_only 保证两条 AccountEvent 在同一 TX。
                     let placed = AccountEvent::new(
                         AccountEventType::OrderPlaced,
                         AccountActor::Agent,
@@ -332,7 +374,6 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                     .with_order(&order_id)
                     .with_ts_code(&ts_code)
                     .with_reason(&reason);
-                    let _ = append_event(app, &mut r, placed);
                     let rejected = AccountEvent::new(
                         AccountEventType::OrderRejected,
                         AccountActor::Agent,
@@ -340,8 +381,21 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                     )
                     .with_order(&order_id)
                     .with_ts_code(&ts_code);
-                    let rej_id = append_event(app, &mut r, rejected);
-                    r.rejection_event_id = rej_id;
+                    let svc = AccountService::new(app.clone());
+                    match svc.repo().commit_account_events_only(&[placed, rejected]) {
+                        Ok(ids) => {
+                            // 第二个 id 是 order_rejected.event_id
+                            if let Some(rej_id) = ids.get(1).cloned() {
+                                r.rejection_event_id = Some(rej_id);
+                            }
+                            r.account_event_ids.extend(ids);
+                        }
+                        Err(e) => tracing::warn!(
+                            target = "account.canonical",
+                            error = %e,
+                            "rejected order 事件批量 append 失败"
+                        ),
+                    }
                     r.order_id = Some(order_id);
                     return r;
                 }
@@ -367,74 +421,19 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
                 },
             );
             let _ = orders_repo::attach_position(app, &order_id, &pos_id);
-            let mut result = OperateAccountResult {
+            OperateAccountResult {
                 accepted: true,
                 reason: None,
                 message: None,
-                order_id: Some(order_id.clone()),
-                position_id: Some(pos_id.clone()),
+                order_id: Some(order_id),
+                position_id: Some(pos_id),
                 fill_ids: Vec::new(),
-                account_event_ids: Vec::new(),
+                account_event_ids: event_ids,
                 trigger_id: None,
                 rejection_event_id: None,
                 warnings: Vec::new(),
                 snapshot: None,
-            };
-            // spec §2：market 成交先写 order_placed → order_filled，再派生 position_* 事件。
-            let placed = AccountEvent::new(
-                AccountEventType::OrderPlaced,
-                AccountActor::Agent,
-                serde_json::json!({
-                    "tsCode": ts_code,
-                    "side": side.as_str(),
-                    "orderType": order_type.as_str(),
-                    "quantity": qty_i64,
-                    "intent": intent.as_str(),
-                }),
-            )
-            .with_order(&order_id)
-            .with_ts_code(&ts_code)
-            .with_reason(&reason);
-            let _ = append_event(app, &mut result, placed);
-            let filled = AccountEvent::new(
-                AccountEventType::OrderFilled,
-                AccountActor::Agent,
-                serde_json::json!({ "quantity": qty_i64 }),
-            )
-            .with_order(&order_id)
-            .with_position(&pos_id)
-            .with_ts_code(&ts_code);
-            let _ = append_event(app, &mut result, filled);
-            let position_event_type = match intent {
-                OrderIntent::OpenPosition => AccountEventType::PositionOpened,
-                OrderIntent::ScaleIn | OrderIntent::ScaleOut => AccountEventType::PositionScaled,
-                OrderIntent::ClosePosition => AccountEventType::PositionClosed,
-                OrderIntent::DirectOrder => match (side, &existing) {
-                    (OrderSide::Buy, None) => AccountEventType::PositionOpened,
-                    (OrderSide::Sell, Some(_)) => {
-                        let sold_all = existing
-                            .as_ref()
-                            .map(|p| p.current_shares.value() == qty_i64)
-                            .unwrap_or(false);
-                        if sold_all {
-                            AccountEventType::PositionClosed
-                        } else {
-                            AccountEventType::PositionScaled
-                        }
-                    }
-                    _ => AccountEventType::PositionScaled,
-                },
-            };
-            let position_event = AccountEvent::new(
-                position_event_type,
-                AccountActor::Agent,
-                serde_json::json!({ "quantity": qty_i64, "intent": intent.as_str() }),
-            )
-            .with_position(&pos_id)
-            .with_ts_code(&ts_code)
-            .with_order(&order_id);
-            let _ = append_event(app, &mut result, position_event);
-            result
+            }
         }
         OrderType::Limit => {
             // pending：spec §2 AcceptedPending 分支
@@ -544,6 +543,17 @@ fn account_err_to_result(e: crate::domain::account::AccountError) -> OperateAcco
     OperateAccountResult::rejected(code.as_str(), e.to_string())
 }
 
+/// 闭包类型别名：根据 service 内部派生出的 Position + PositionEvent 构造一组
+/// 配套的 AccountEvent。这些事件会与 PositionEvent / simulated_positions 在同一
+/// SQLite 事务内 commit（spec `account-module.md §2` 原子性要求）。
+type ExtraEventsFn = Box<
+    dyn FnOnce(
+            &crate::domain::account::Position,
+            &crate::domain::account::PositionEvent,
+        ) -> Vec<AccountEvent>
+        + Send,
+>;
+
 async fn open_position_internal(
     app: &AppHandle,
     ts_code: &str,
@@ -552,7 +562,8 @@ async fn open_position_internal(
     stop_loss: Option<Yuan>,
     take_profit: Option<Yuan>,
     time_stop_at: Option<OccurredAt>,
-) -> Result<String, OperateAccountResult> {
+    build_extras: ExtraEventsFn,
+) -> Result<(String, Vec<String>), OperateAccountResult> {
     use crate::domain::account::position::{Direction, PositionKind};
     use crate::pipeline::account::service::OpenRequest;
     let svc = AccountService::new(app.clone());
@@ -572,9 +583,9 @@ async fn open_position_internal(
         source_analysis_id: String::new(),
         agent_note_md: reason,
     };
-    svc.open_position(req)
+    svc.open_position_atomic(req, build_extras)
         .await
-        .map(|pos| pos.id.as_str().to_string())
+        .map(|(pos, ids)| (pos.id.as_str().to_string(), ids))
         .map_err(account_err_to_result)
 }
 
@@ -583,11 +594,12 @@ async fn scale_position_internal(
     pid: &PositionId,
     delta: i64,
     reason: String,
-) -> Result<String, OperateAccountResult> {
+    build_extras: ExtraEventsFn,
+) -> Result<(String, Vec<String>), OperateAccountResult> {
     let svc = AccountService::new(app.clone());
-    svc.scale_position(pid, delta, reason, EventSource::Manual)
+    svc.scale_position_atomic(pid, delta, reason, EventSource::Manual, build_extras)
         .await
-        .map(|p| p.id.as_str().to_string())
+        .map(|(p, ids)| (p.id.as_str().to_string(), ids))
         .map_err(account_err_to_result)
 }
 
@@ -595,13 +607,20 @@ async fn close_position_internal(
     app: &AppHandle,
     pid: &PositionId,
     reason: String,
-) -> Result<String, OperateAccountResult> {
+    build_extras: ExtraEventsFn,
+) -> Result<(String, Vec<String>), OperateAccountResult> {
     use crate::domain::account::position::CloseReason;
     let svc = AccountService::new(app.clone());
-    svc.close_position(pid, CloseReason::Manual, EventSource::Manual, reason)
-        .await
-        .map(|p| p.id.as_str().to_string())
-        .map_err(account_err_to_result)
+    svc.close_position_atomic(
+        pid,
+        CloseReason::Manual,
+        EventSource::Manual,
+        reason,
+        build_extras,
+    )
+    .await
+    .map(|(p, ids)| (p.id.as_str().to_string(), ids))
+    .map_err(account_err_to_result)
 }
 
 // ============ cancel_order ==============================================
@@ -807,10 +826,56 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
     let time_stop_at = time_stop_raw
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| OccurredAt::new(dt.timestamp_millis()));
-    match open_position_internal(app, &ts_code, qty_i64, reason.clone(), stop_loss, take_profit, time_stop_at)
-        .await
+    // spec §2：open_position(market) 三条 AccountEvent 与 PositionEvent 原子提交。
+    let order_id_for_extras = order_id.clone();
+    let ts_code_for_extras = ts_code.clone();
+    let reason_for_extras = reason.clone();
+    let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+        let placed = AccountEvent::new(
+            AccountEventType::OrderPlaced,
+            AccountActor::Agent,
+            serde_json::json!({
+                "tsCode": ts_code_for_extras,
+                "side": "buy",
+                "orderType": "market",
+                "quantity": qty_i64,
+                "intent": OrderIntent::OpenPosition.as_str(),
+            }),
+        )
+        .with_order(&order_id_for_extras)
+        .with_ts_code(&ts_code_for_extras)
+        .with_reason(&reason_for_extras);
+        let filled = AccountEvent::new(
+            AccountEventType::OrderFilled,
+            AccountActor::Agent,
+            serde_json::json!({ "quantity": qty_i64 }),
+        )
+        .with_order(&order_id_for_extras)
+        .with_position(pos.id.as_str())
+        .with_ts_code(&ts_code_for_extras);
+        let opened = AccountEvent::new(
+            AccountEventType::PositionOpened,
+            AccountActor::Agent,
+            serde_json::json!({ "quantity": qty_i64 }),
+        )
+        .with_position(pos.id.as_str())
+        .with_ts_code(&ts_code_for_extras)
+        .with_order(&order_id_for_extras);
+        vec![placed, filled, opened]
+    });
+    match open_position_internal(
+        app,
+        &ts_code,
+        qty_i64,
+        reason.clone(),
+        stop_loss,
+        take_profit,
+        time_stop_at,
+        build_extras,
+    )
+    .await
     {
-        Ok(pos_id) => {
+        Ok((pos_id, event_ids)) => {
             let _ = orders_repo::insert(
                 app,
                 &Order {
@@ -830,53 +895,19 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
                     )
                 },
             );
-            let mut result = OperateAccountResult {
+            OperateAccountResult {
                 accepted: true,
                 reason: None,
                 message: None,
-                order_id: Some(order_id.clone()),
-                position_id: Some(pos_id.clone()),
+                order_id: Some(order_id),
+                position_id: Some(pos_id),
                 fill_ids: Vec::new(),
-                account_event_ids: Vec::new(),
+                account_event_ids: event_ids,
                 trigger_id: None,
                 rejection_event_id: None,
                 warnings: Vec::new(),
                 snapshot: None,
-            };
-            let placed = AccountEvent::new(
-                AccountEventType::OrderPlaced,
-                AccountActor::Agent,
-                serde_json::json!({
-                    "tsCode": ts_code,
-                    "side": "buy",
-                    "orderType": "market",
-                    "quantity": qty_i64,
-                    "intent": OrderIntent::OpenPosition.as_str(),
-                }),
-            )
-            .with_order(&order_id)
-            .with_ts_code(&ts_code)
-            .with_reason(&reason);
-            let _ = append_event(app, &mut result, placed);
-            let filled = AccountEvent::new(
-                AccountEventType::OrderFilled,
-                AccountActor::Agent,
-                serde_json::json!({ "quantity": qty_i64 }),
-            )
-            .with_order(&order_id)
-            .with_position(&pos_id)
-            .with_ts_code(&ts_code);
-            let _ = append_event(app, &mut result, filled);
-            let opened = AccountEvent::new(
-                AccountEventType::PositionOpened,
-                AccountActor::Agent,
-                serde_json::json!({ "quantity": qty_i64 }),
-            )
-            .with_position(&pos_id)
-            .with_ts_code(&ts_code)
-            .with_order(&order_id);
-            let _ = append_event(app, &mut result, opened);
-            result
+            }
         }
         Err(mut r) => {
             let _ = orders_repo::insert(
@@ -895,6 +926,7 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
                     None,
                 ),
             );
+            // spec §2：rejected 订单的 placed + rejected 两条 AccountEvent 走单一 TX
             let placed = AccountEvent::new(
                 AccountEventType::OrderPlaced,
                 AccountActor::Agent,
@@ -909,7 +941,6 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
             .with_order(&order_id)
             .with_ts_code(&ts_code)
             .with_reason(&reason);
-            let _ = append_event(app, &mut r, placed);
             let rejected = AccountEvent::new(
                 AccountEventType::OrderRejected,
                 AccountActor::Agent,
@@ -917,8 +948,20 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
             )
             .with_order(&order_id)
             .with_ts_code(&ts_code);
-            let rej_id = append_event(app, &mut r, rejected);
-            r.rejection_event_id = rej_id;
+            let svc = AccountService::new(app.clone());
+            match svc.repo().commit_account_events_only(&[placed, rejected]) {
+                Ok(ids) => {
+                    if let Some(rej_id) = ids.get(1).cloned() {
+                        r.rejection_event_id = Some(rej_id);
+                    }
+                    r.account_event_ids.extend(ids);
+                }
+                Err(e) => tracing::warn!(
+                    target = "account.canonical",
+                    error = %e,
+                    "open_position(market) rejected 事件 append 失败"
+                ),
+            }
             r.order_id = Some(order_id);
             r
         }
@@ -956,19 +999,23 @@ async fn scale_position(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    match scale_position_internal(app, &pid, delta, reason.clone()).await {
-        Ok(pid_out) => {
-            let mut result = OperateAccountResult::accepted_position(pid_out.clone());
-            // spec §2：scale 成交后写 position_scaled event；缺一笔成交事件链，
-            // 由后续 fill 模型 (PositionLot 写路径) 接入后再补 order_filled/fill 事件
-            let scaled = AccountEvent::new(
-                AccountEventType::PositionScaled,
-                AccountActor::Agent,
-                serde_json::json!({ "delta": delta, "side": side }),
-            )
-            .with_position(&pid_out)
-            .with_reason(&reason);
-            let _ = append_event(app, &mut result, scaled);
+    // spec §2：scale 成交后 position_scaled event 与 PositionEvent 原子提交
+    let side_for_extras = side.to_string();
+    let reason_for_extras = reason.clone();
+    let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+        let scaled = AccountEvent::new(
+            AccountEventType::PositionScaled,
+            AccountActor::Agent,
+            serde_json::json!({ "delta": delta, "side": side_for_extras }),
+        )
+        .with_position(pos.id.as_str())
+        .with_reason(&reason_for_extras);
+        vec![scaled]
+    });
+    match scale_position_internal(app, &pid, delta, reason.clone(), build_extras).await {
+        Ok((pid_out, event_ids)) => {
+            let mut result = OperateAccountResult::accepted_position(pid_out);
+            result.account_event_ids = event_ids;
             result
         }
         Err(r) => r,
@@ -1002,20 +1049,22 @@ async fn close_position(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    match close_position_internal(app, &pid, reason.clone()).await {
-        Ok(pid_out) => {
-            let mut result = OperateAccountResult::accepted_position(pid_out.clone());
-            // spec §2：position_closed 事件；service.close_position 内部已 append
-            // trigger_created（保护条件场景），这里补一条仓位级 position_closed 让
-            // accountEventIds 完整反映 action 副作用。
-            let closed = AccountEvent::new(
-                AccountEventType::PositionClosed,
-                AccountActor::Agent,
-                serde_json::json!({ "reason": "manual_close" }),
-            )
-            .with_position(&pid_out)
-            .with_reason(&reason);
-            let _ = append_event(app, &mut result, closed);
+    // spec §2：position_closed 事件与 PositionEvent 原子提交。
+    let reason_for_extras = reason.clone();
+    let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+        let closed = AccountEvent::new(
+            AccountEventType::PositionClosed,
+            AccountActor::Agent,
+            serde_json::json!({ "reason": "manual_close" }),
+        )
+        .with_position(pos.id.as_str())
+        .with_reason(&reason_for_extras);
+        vec![closed]
+    });
+    match close_position_internal(app, &pid, reason.clone(), build_extras).await {
+        Ok((pid_out, event_ids)) => {
+            let mut result = OperateAccountResult::accepted_position(pid_out);
+            result.account_event_ids = event_ids;
             result
         }
         Err(r) => r,
@@ -1066,25 +1115,38 @@ async fn adjust_protection(app: &AppHandle, acc: &Value) -> OperateAccountResult
         .unwrap_or("")
         .to_string();
     let svc = AccountService::new(app.clone());
+    // spec §2：protection_adjusted AccountEvent 与 PositionEvent(StopsAdjusted) 原子提交
+    let reason_for_extras = reason.clone();
+    let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+        let adjusted = AccountEvent::new(
+            AccountEventType::ProtectionAdjusted,
+            AccountActor::Agent,
+            serde_json::json!({
+                "stopLoss": stop_loss.as_ref().map(|y| y.value()),
+                "takeProfit": take_profit.as_ref().map(|y| y.value()),
+                "timeStopAt": time_stop_at,
+            }),
+        )
+        .with_position(pos.id.as_str())
+        .with_ts_code(pos.code.as_str())
+        .with_reason(&reason_for_extras);
+        vec![adjusted]
+    });
     match svc
-        .adjust_stops(&pid, stop_loss, take_profit, time_stop_at, EventSource::Manual, reason.clone())
+        .adjust_stops_atomic(
+            &pid,
+            stop_loss,
+            take_profit,
+            time_stop_at,
+            EventSource::Manual,
+            reason.clone(),
+            build_extras,
+        )
         .await
     {
-        Ok(pos) => {
+        Ok((pos, event_ids)) => {
             let mut result = OperateAccountResult::accepted_position(pos.id.as_str());
-            let adjusted = AccountEvent::new(
-                AccountEventType::ProtectionAdjusted,
-                AccountActor::Agent,
-                serde_json::json!({
-                    "stopLoss": stop_loss.as_ref().map(|y| y.value()),
-                    "takeProfit": take_profit.as_ref().map(|y| y.value()),
-                    "timeStopAt": time_stop_at,
-                }),
-            )
-            .with_position(pos.id.as_str())
-            .with_ts_code(pos.code.as_str())
-            .with_reason(&reason);
-            let _ = append_event(app, &mut result, adjusted);
+            result.account_event_ids = event_ids;
             result
         }
         Err(e) => account_err_to_result(e),
@@ -1157,17 +1219,30 @@ async fn record_invalidation_signal(app: &AppHandle, acc: &Value) -> OperateAcco
         append_event(app, &mut tmp, signal_recorded)
     };
     if hit {
-        // 触发"按 invalidation 派生 trigger"——走 close path with Invalidated reason 让 maybe_emit_close_trigger 跑
+        // 触发"按 invalidation 派生 trigger"——走 close path with Invalidated reason
+        // 让 maybe_emit_close_trigger 跑。position_closed AccountEvent 与 PositionEvent
+        // 原子提交（spec §2）。
+        let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
+            let closed = AccountEvent::new(
+                AccountEventType::PositionClosed,
+                AccountActor::Agent,
+                serde_json::json!({ "reason": "invalidated" }),
+            )
+            .with_position(pos.id.as_str())
+            .with_ts_code(pos.code.as_str());
+            vec![closed]
+        });
         match svc
-            .close_position(
+            .close_position_atomic(
                 &pid,
                 CloseReason::Invalidated,
                 EventSource::Manual,
                 format!("invalidation_signal={signal}; {reason}"),
+                build_extras,
             )
             .await
         {
-            Ok(pos) => {
+            Ok((pos, event_ids)) => {
                 let mut result = OperateAccountResult {
                     accepted: true,
                     reason: None,
@@ -1184,14 +1259,7 @@ async fn record_invalidation_signal(app: &AppHandle, acc: &Value) -> OperateAcco
                 if let Some(id) = signal_event_id {
                     result.account_event_ids.push(id);
                 }
-                let closed = AccountEvent::new(
-                    AccountEventType::PositionClosed,
-                    AccountActor::Agent,
-                    serde_json::json!({ "reason": "invalidated" }),
-                )
-                .with_position(pos.id.as_str())
-                .with_ts_code(pos.code.as_str());
-                let _ = append_event(app, &mut result, closed);
+                result.account_event_ids.extend(event_ids);
                 result
             }
             Err(e) => account_err_to_result(e),

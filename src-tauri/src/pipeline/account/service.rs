@@ -124,6 +124,12 @@ impl AccountService {
         Self { app, repo }
     }
 
+    /// 暴露 repo 给同 pipeline 的 canonical dispatch 使用，便于把不依赖 PositionEvent
+    /// 的 AccountEvent 批次（rejected order、trigger_handled 等）也走单一事务。
+    pub fn repo(&self) -> &PositionRepo {
+        &self.repo
+    }
+
     // ========================================================================
     // 读：AccountSnapshot 派生
     // ========================================================================
@@ -152,7 +158,32 @@ impl AccountService {
     // 写：开仓
     // ========================================================================
 
+    /// 兼容入口：不写额外 AccountEvent 的 open。新代码应使用
+    /// [`AccountService::open_position_atomic`] 一起 commit 关联 AccountEvent，
+    /// 避免跨 connection 撕裂。
+    #[allow(dead_code)]
     pub async fn open_position(&self, req: OpenRequest) -> Result<Position, AccountError> {
+        self.open_position_atomic(req, |_pos, _pe| Vec::new())
+            .await
+            .map(|(p, _)| p)
+    }
+
+    /// spec `account-module.md §2`：开仓 + 关联 AccountEvents 一次性原子提交。
+    /// `build_extra_events` 在 PositionEvent 已构造、新 Position 已知后调用，
+    /// 返回与本次开仓配套的 AccountEvent（如 order_placed/order_filled/
+    /// position_opened）。三者与 PositionEvent + simulated_positions 在同一
+    /// SQLite 事务内提交，避免跨 connection 撕裂。
+    pub async fn open_position_atomic<F>(
+        &self,
+        req: OpenRequest,
+        build_extra_events: F,
+    ) -> Result<(Position, Vec<String>), AccountError>
+    where
+        F: FnOnce(
+            &Position,
+            &crate::domain::account::PositionEvent,
+        ) -> Vec<crate::domain::account::AccountEvent>,
+    {
         let _guard = account_write_lock().lock().await;
 
         let positions = self.repo.list_all()?;
@@ -185,16 +216,22 @@ impl AccountService {
             available_cash: cash,
         })?;
 
-        self.repo
-            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
+        let extra_events = build_extra_events(&mutation.position, &mutation.event);
+        let event_ids = self.repo.commit_atomic(
+            &mutation.event,
+            &mutation.positions,
+            &extra_events,
+        )?;
         self.emit_positions_changed();
-        Ok(mutation.position)
+        Ok((mutation.position, event_ids))
     }
 
     // ========================================================================
     // 写：全平
     // ========================================================================
 
+    /// 兼容入口；新代码应使用 [`AccountService::close_position_atomic`]。
+    #[allow(dead_code)]
     pub async fn close_position(
         &self,
         position_id: &PositionId,
@@ -202,6 +239,28 @@ impl AccountService {
         source: EventSource,
         agent_note_md: String,
     ) -> Result<Position, AccountError> {
+        self.close_position_atomic(position_id, reason, source, agent_note_md, |_p, _pe| {
+            Vec::new()
+        })
+        .await
+        .map(|(p, _)| p)
+    }
+
+    /// spec `account-module.md §2` 原子版本：close + 关联 AccountEvents 同事务。
+    pub async fn close_position_atomic<F>(
+        &self,
+        position_id: &PositionId,
+        reason: CloseReason,
+        source: EventSource,
+        agent_note_md: String,
+        build_extra_events: F,
+    ) -> Result<(Position, Vec<String>), AccountError>
+    where
+        F: FnOnce(
+            &Position,
+            &crate::domain::account::PositionEvent,
+        ) -> Vec<crate::domain::account::AccountEvent>,
+    {
         let _guard = account_write_lock().lock().await;
         let positions = self.repo.list_all()?;
         let target = positions
@@ -242,8 +301,12 @@ impl AccountService {
         let event_id_for_trigger = mutation.event.id.clone();
         let position_id_str = mutation.event.position_id.as_str().to_string();
         let ts_code = target.code.as_str().to_string();
-        self.repo
-            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
+        let extra_events = build_extra_events(&mutation.position, &mutation.event);
+        let event_ids = self.repo.commit_atomic(
+            &mutation.event,
+            &mutation.positions,
+            &extra_events,
+        )?;
 
         // Spec account-module.md §2: 保护条件 / 失效信号触发的 close 生成 AccountTrigger
         // 并 emit `account-triggered`，让 Agent Runtime 路由后续复盘 run。
@@ -257,7 +320,7 @@ impl AccountService {
         );
 
         self.emit_positions_changed();
-        Ok(mutation.position)
+        Ok((mutation.position, event_ids))
     }
 
     fn maybe_emit_close_trigger(
@@ -371,6 +434,8 @@ impl AccountService {
     // 写：加 / 减仓
     // ========================================================================
 
+    /// 兼容入口；新代码应使用 [`AccountService::scale_position_atomic`]。
+    #[allow(dead_code)]
     pub async fn scale_position(
         &self,
         position_id: &PositionId,
@@ -378,6 +443,28 @@ impl AccountService {
         agent_note_md: String,
         source: EventSource,
     ) -> Result<Position, AccountError> {
+        self.scale_position_atomic(position_id, shares_delta, agent_note_md, source, |_p, _pe| {
+            Vec::new()
+        })
+        .await
+        .map(|(p, _)| p)
+    }
+
+    /// spec `account-module.md §2` 原子版本：scale + 关联 AccountEvents 同事务。
+    pub async fn scale_position_atomic<F>(
+        &self,
+        position_id: &PositionId,
+        shares_delta: i64,
+        agent_note_md: String,
+        source: EventSource,
+        build_extra_events: F,
+    ) -> Result<(Position, Vec<String>), AccountError>
+    where
+        F: FnOnce(
+            &Position,
+            &crate::domain::account::PositionEvent,
+        ) -> Vec<crate::domain::account::AccountEvent>,
+    {
         let _guard = account_write_lock().lock().await;
 
         let positions = self.repo.list_all()?;
@@ -404,11 +491,15 @@ impl AccountService {
             source,
             agent_note_md,
         })?;
-        self.repo
-            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
+        let extra_events = build_extra_events(&mutation.position, &mutation.event);
+        let event_ids = self.repo.commit_atomic(
+            &mutation.event,
+            &mutation.positions,
+            &extra_events,
+        )?;
 
         self.emit_positions_changed();
-        Ok(mutation.position)
+        Ok((mutation.position, event_ids))
     }
 
     // ========================================================================
@@ -424,6 +515,36 @@ impl AccountService {
         source: EventSource,
         agent_note_md: String,
     ) -> Result<Position, AccountError> {
+        self.adjust_stops_atomic(
+            position_id,
+            stop_loss,
+            take_profit,
+            time_stop_at,
+            source,
+            agent_note_md,
+            |_p, _pe| Vec::new(),
+        )
+        .await
+        .map(|(p, _)| p)
+    }
+
+    /// spec `account-module.md §2` 原子版本：adjust_stops + 关联 AccountEvents 同事务。
+    pub async fn adjust_stops_atomic<F>(
+        &self,
+        position_id: &PositionId,
+        stop_loss: Option<Yuan>,
+        take_profit: Option<Yuan>,
+        time_stop_at: Option<OccurredAt>,
+        source: EventSource,
+        agent_note_md: String,
+        build_extra_events: F,
+    ) -> Result<(Position, Vec<String>), AccountError>
+    where
+        F: FnOnce(
+            &Position,
+            &crate::domain::account::PositionEvent,
+        ) -> Vec<crate::domain::account::AccountEvent>,
+    {
         let _guard = account_write_lock().lock().await;
 
         let positions = self.repo.list_all()?;
@@ -450,11 +571,15 @@ impl AccountService {
             source,
             agent_note_md,
         })?;
-        self.repo
-            .commit_event_and_positions(&mutation.event, &mutation.positions)?;
+        let extra_events = build_extra_events(&mutation.position, &mutation.event);
+        let event_ids = self.repo.commit_atomic(
+            &mutation.event,
+            &mutation.positions,
+            &extra_events,
+        )?;
 
         self.emit_positions_changed();
-        Ok(mutation.position)
+        Ok((mutation.position, event_ids))
     }
 
     // ========================================================================
