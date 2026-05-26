@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/tdx"]
+
 [package]
 name = "gangzi-terminal"
 version = "0.1.0"
@@ -31,11 +34,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 regex = "1.10"
-# 通达信 (TDX) 行情协议——内部实现在 infrastructure/quotes/tdx/
-# 参考实现：https://github.com/mootdx/mootdx （Python 版 pytdx wire 兼容）
-# Rust 端口参考：https://github.com/mootdx/mootdx-rust
-byteorder = "1.5"
-flate2 = "1.0"
+# 通达信 (TDX) 行情协议——独立 crate，参考 mootdx / pytdx wire format
+tdx = { path = "crates/tdx" }
 # K 线渲染——为 analyze_chart 工具生成 PNG 给 LLM vision 看
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "candlestick"] }
 png = "0.17"

@@ -1319,11 +1319,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "byteorder",
  "chrono",
  "encoding_rs",
  "eventsource-stream",
- "flate2",
  "futures-util",
  "plotters",
  "png",
@@ -1338,6 +1336,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tdx",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4720,6 +4719,16 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "tdx"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "encoding_rs",
+ "flate2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

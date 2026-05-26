@@ -1,0 +1,12 @@
+[package]
+name = "tdx"
+version = "0.1.0"
+edition = "2021"
+description = "通达信 (TDX) HQ 行情协议 Rust 端口——pytdx / mootdx wire compatible"
+license = "MIT"
+
+[dependencies]
+byteorder = "1.5"
+encoding_rs = "0.8"
+flate2 = "1.0"
+thiserror = "2"
