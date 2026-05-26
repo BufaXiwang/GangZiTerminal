@@ -24,6 +24,25 @@ pub struct ResolvedQuote<'a> {
     pub warning: Option<WarningCode>,
 }
 
+/// spec quotes-module.md §2「五档盘口缺失返回 depth_missing」。集中判定 helper，
+/// 避免各 adapter 各自手写 `bid_levels.is_empty() || ask_levels.is_empty()`。
+///
+/// 返回 None 表示不缺失；Some(WarningCode::DepthMissing) 表示需要附 warning。
+/// 缺失条件：
+/// - bid_levels 或 ask_levels 整体为空
+/// - 一档（bid[0] / ask[0]）价格 Some 但为 0 / 缺失
+pub fn validate_depth_levels(q: &StockQuote) -> Option<WarningCode> {
+    if q.bid_levels.is_empty() || q.ask_levels.is_empty() {
+        return Some(WarningCode::DepthMissing);
+    }
+    let bid_top_price = q.bid_levels.first().and_then(|l| l.price.as_ref());
+    let ask_top_price = q.ask_levels.first().and_then(|l| l.price.as_ref());
+    if bid_top_price.is_none() || ask_top_price.is_none() {
+        return Some(WarningCode::DepthMissing);
+    }
+    None
+}
+
 pub fn resolve_quote_view<'a>(
     snapshot: Option<&'a StockQuote>,
     mkt: &MarketTimeContext,

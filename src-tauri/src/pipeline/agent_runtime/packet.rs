@@ -56,6 +56,31 @@ pub struct PacketReviewSummary {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketUserPreferences {
+    #[serde(default)]
+    pub risk_tolerance: Option<String>,
+    #[serde(default)]
+    pub default_holding_horizon: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketQuotes {
+    /// 关注集 ts_code → 最近 snapshot 摘要；空 map 表示按需走 fetch_quotes。
+    #[serde(default)]
+    pub items: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PacketNews {
+    /// 最近 N 条新闻摘要；空表示按需走 fetch_news。
+    #[serde(default)]
+    pub items: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RealtimeDecisionPacket {
@@ -63,9 +88,12 @@ pub struct RealtimeDecisionPacket {
     pub profile_id: String,
     pub trigger_kind: String,
     pub account: PacketAccount,
+    pub quotes: PacketQuotes,
+    pub news: PacketNews,
     pub strategies: Vec<StrategyCard>,
     pub recent_episodes: Vec<PacketEpisodeSummary>,
     pub recent_reviews: Vec<PacketReviewSummary>,
+    pub user_preferences: PacketUserPreferences,
 }
 
 impl RealtimeDecisionPacket {
@@ -240,13 +268,48 @@ pub fn build(
 
     put_scope(run_id, scope);
 
-    Ok(RealtimeDecisionPacket {
+    let packet = RealtimeDecisionPacket {
         run_id: run_id.to_string(),
         profile_id: profile_str.to_string(),
         trigger_kind: trigger_kind.to_string(),
         account,
+        quotes: PacketQuotes::default(),
+        news: PacketNews::default(),
         strategies,
         recent_episodes,
         recent_reviews,
-    })
+        user_preferences: PacketUserPreferences::default(),
+    };
+
+    // spec §2/§3「profile.requiredPacketSections」校验：缺必需 section 时告警。
+    use crate::domain::agent_runtime::tools::{required_packet_sections, PacketSection};
+    let required = required_packet_sections(profile);
+    let mut missing: Vec<&'static str> = Vec::new();
+    for sec in required {
+        let ok = match sec {
+            PacketSection::Account => packet.account.snapshot.is_some(),
+            PacketSection::Strategies => !packet.strategies.is_empty(),
+            PacketSection::RecentEpisodes => !packet.recent_episodes.is_empty(),
+            // Quotes / News / UserPreferences 当前由按需 fetch 工具承担，packet
+            // 内允许空容器；spec L192「user_chat 账户/行情/新闻按工具调用实时读取」
+            // 即默认行为，不视为缺失。
+            PacketSection::Quotes
+            | PacketSection::News
+            | PacketSection::UserPreferences => true,
+        };
+        if !ok {
+            missing.push(sec.as_str());
+        }
+    }
+    if !missing.is_empty() {
+        tracing::warn!(
+            target = "agent_runtime.packet",
+            run_id = %run_id,
+            profile = %profile_str,
+            missing = ?missing,
+            "RealtimeDecisionPacket 缺 spec §2 requiredPacketSections"
+        );
+    }
+
+    Ok(packet)
 }

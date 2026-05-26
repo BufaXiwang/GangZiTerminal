@@ -19,6 +19,7 @@ use crate::domain::agent_runtime::tools::{allow_trading_write, allowed_tools, Ag
 use crate::pipeline::agent::tools::ToolRegistry;
 
 pub mod account;
+pub mod compact_now;
 pub mod decisions;
 pub mod news;
 pub mod quotes;
@@ -52,6 +53,7 @@ pub fn build_registry_for_profile(
         (AgentToolName::RecordDecisionEpisode, Arc::new(decisions::RecordDecisionEpisodeTool::new(app.clone()))),
         (AgentToolName::RecordDecisionReview, Arc::new(decisions::RecordDecisionReviewTool::new(app.clone()))),
         (AgentToolName::OperateAccount, Arc::new(account::OperateAccountTool::new(app.clone()))),
+        (AgentToolName::CompactNow, Arc::new(compact_now::CompactNowTool::new())),
     ];
     for (kind, tool) in candidates {
         if !allowed.contains(&kind) {

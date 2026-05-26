@@ -10,9 +10,51 @@
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
+use crate::domain::account::account_event::{AccountEvent, AccountEventType};
+use crate::domain::account::events::AccountActor;
 use crate::domain::shared::{ErrorCode, StockCode};
-use crate::infrastructure::account::{watchlist, watchlist_events};
+use crate::infrastructure::account::{account_events_repo, watchlist, watchlist_events};
 use crate::pipeline::quotes_universe;
+
+fn parse_actor(s: &str) -> AccountActor {
+    match s {
+        "agent" => AccountActor::Agent,
+        "system" => AccountActor::System,
+        _ => AccountActor::User,
+    }
+}
+
+/// 把 watchlist 事件镜像到统一 `account_events` 流 —— spec `account-module.md §2`
+/// 「所有账户状态变化必须先 append AccountEvent」。本地 watchlist_events 表保留
+/// 给读模型（note_for / 派生 addedAt 用），但 spec contract 的真源是 account_events。
+fn mirror_to_account_events(
+    app: &tauri::AppHandle,
+    event_type: AccountEventType,
+    actor: &str,
+    ts_code: &str,
+    note: Option<&str>,
+    reason: Option<&str>,
+) -> Option<String> {
+    let event = AccountEvent::new(
+        event_type,
+        parse_actor(actor),
+        serde_json::json!({ "note": note }),
+    )
+    .with_ts_code(ts_code)
+    .with_reason(reason.unwrap_or(""));
+    match account_events_repo::append(app, &event) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!(
+                target = "account.update_watchlist",
+                error = %e,
+                event_type = event_type.as_str(),
+                "镜像 AccountEvent 失败"
+            );
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchlistAction {
@@ -118,6 +160,17 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
+            let mut event_ids = vec![event_id];
+            if let Some(acc_id) = mirror_to_account_events(
+                app,
+                AccountEventType::WatchlistAdded,
+                actor,
+                &ts_code_raw,
+                input.note.as_deref(),
+                input.reason.as_deref(),
+            ) {
+                event_ids.push(acc_id);
+            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
@@ -126,7 +179,7 @@ pub fn dispatch(
                     ts_code: ts_code_raw,
                     note: input.note,
                 }),
-                account_event_ids: vec![event_id],
+                account_event_ids: event_ids,
             }
         }
         WatchlistAction::Remove => {
@@ -153,12 +206,23 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
+            let mut event_ids = vec![event_id];
+            if let Some(acc_id) = mirror_to_account_events(
+                app,
+                AccountEventType::WatchlistRemoved,
+                actor,
+                &ts_code_raw,
+                None,
+                input.reason.as_deref(),
+            ) {
+                event_ids.push(acc_id);
+            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
                 message: None,
                 item: None,
-                account_event_ids: vec![event_id],
+                account_event_ids: event_ids,
             }
         }
         WatchlistAction::UpdateNote => {
@@ -179,6 +243,17 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
+            let mut event_ids = vec![event_id];
+            if let Some(acc_id) = mirror_to_account_events(
+                app,
+                AccountEventType::WatchlistNoteUpdated,
+                actor,
+                &ts_code_raw,
+                input.note.as_deref(),
+                input.reason.as_deref(),
+            ) {
+                event_ids.push(acc_id);
+            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
@@ -187,7 +262,7 @@ pub fn dispatch(
                     ts_code: ts_code_raw,
                     note: input.note,
                 }),
-                account_event_ids: vec![event_id],
+                account_event_ids: event_ids,
             }
         }
     }

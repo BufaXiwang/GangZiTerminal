@@ -27,6 +27,11 @@ pub struct ToolCallRow<'a> {
     pub output_summary_json: Option<&'a str>,
     pub input_payload_ref: Option<&'a str>,
     pub output_payload_ref: Option<&'a str>,
+    /// spec §2 完整结构化输入；写副作用工具（operate_account 等）必填，保证 recovery
+    /// 不依赖摘要解析。读路径走 [`read_input_payload`].
+    pub input_payload_json: Option<&'a str>,
+    /// 完整结构化输出；写副作用工具必填。读路径走 [`read_output_payload`].
+    pub output_payload_json: Option<&'a str>,
     pub is_error: bool,
     pub error_code: Option<&'a str>,
     pub started_at: &'a str,
@@ -79,8 +84,9 @@ pub fn insert(app: &AppHandle, row: ToolCallRow<'_>) -> Result<(), String> {
             tool_call_id, run_id, name, source,
             input_summary_json, output_summary_json,
             input_payload_ref, output_payload_ref,
+            input_payload_json, output_payload_json,
             is_error, error_code, started_at, ended_at, duration_ms
-         ) values (?1,?2,?3,?4, ?5,?6, ?7,?8, ?9,?10, ?11,?12,?13)",
+         ) values (?1,?2,?3,?4, ?5,?6, ?7,?8, ?9,?10, ?11,?12, ?13,?14,?15)",
         params![
             row.tool_call_id,
             row.run_id,
@@ -90,6 +96,8 @@ pub fn insert(app: &AppHandle, row: ToolCallRow<'_>) -> Result<(), String> {
             row.output_summary_json,
             row.input_payload_ref,
             row.output_payload_ref,
+            row.input_payload_json,
+            row.output_payload_json,
             if row.is_error { 1i64 } else { 0i64 },
             row.error_code,
             row.started_at,
@@ -100,6 +108,21 @@ pub fn insert(app: &AppHandle, row: ToolCallRow<'_>) -> Result<(), String> {
     .map_err(|e| format!("写 agent_tool_call 失败：{e}"))?;
     let _ = now();
     Ok(())
+}
+
+/// spec §2 read input payload for recovery / audit。
+pub fn read_input_payload(
+    app: &AppHandle,
+    tool_call_id: &str,
+) -> Result<Option<String>, String> {
+    let c = conn(app)?;
+    Ok(c.query_row(
+        "select input_payload_json from agent_tool_calls where tool_call_id = ?1",
+        params![tool_call_id],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten())
 }
 
 /// spec §2「需要恢复副作用或审计精确结果的 local tool 必须持久化结构化 input /

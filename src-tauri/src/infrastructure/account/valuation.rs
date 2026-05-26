@@ -90,8 +90,41 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
     let total_pnl = realized_pnl + unrealized_pnl;
     let total_assets = cash.value() + market_value;
 
-    let (open_positions, closed_positions): (Vec<_>, Vec<_>) =
+    let (mut open_positions, closed_positions): (Vec<_>, Vec<_>) =
         positions.iter().cloned().partition(|p| p.status.is_open());
+    // spec §2 Position.warnings —— 派生填充：缺行情时 quote_missing；stale 时 quote_stale。
+    // 优先级（重 → 轻）：quote_missing > quote_stale > quote_price_missing
+    for p in open_positions.iter_mut() {
+        p.warnings.clear();
+        let ts_code = p.code.to_ts_code();
+        let mut quote_missing = false;
+        let mut quote_stale = false;
+        let mut quote_price_missing = false;
+        match market_snapshot::get(&ts_code) {
+            None => quote_missing = true,
+            Some(q) => {
+                match q.freshness.status {
+                    FreshnessStatus::Missing => quote_missing = true,
+                    FreshnessStatus::Stale => quote_stale = true,
+                    FreshnessStatus::Fresh => {}
+                }
+                if q.price.is_none() {
+                    quote_price_missing = true;
+                }
+            }
+        }
+        // 按 spec 优先级顺序 push
+        if quote_missing {
+            p.warnings.push(crate::domain::shared::WarningCode::QuoteMissing);
+        }
+        if quote_stale {
+            p.warnings.push(crate::domain::shared::WarningCode::QuoteStale);
+        }
+        if quote_price_missing {
+            p.warnings
+                .push(crate::domain::shared::WarningCode::QuotePriceMissing);
+        }
+    }
 
     let mut warnings: Vec<crate::domain::shared::WarningCode> = Vec::new();
     if unpriced > 0 {

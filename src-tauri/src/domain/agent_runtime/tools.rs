@@ -18,6 +18,9 @@ pub enum AgentToolName {
     UpdateWatchlist,
     RecordDecisionEpisode,
     RecordDecisionReview,
+    /// spec `agent-infra-module.md §4`：agent 主动释放上下文。
+    /// 所有 profile 都可见；loop 检测到调用后设 force_summarize_next_turn。
+    CompactNow,
 }
 
 /// spec §2 默认 profile 的 allowedTools。
@@ -35,12 +38,14 @@ pub fn allowed_tools(profile: AgentRunProfileId) -> Vec<AgentToolName> {
             RecordDecisionEpisode,
             RecordDecisionReview,
             OperateAccount,
+            CompactNow,
         ],
         AgentRunProfileId::ManualReplay => vec![
             FetchAccount,
             FetchQuotes,
             FetchNews,
             RecordDecisionReview,
+            CompactNow,
         ],
     }
 }
@@ -50,4 +55,57 @@ pub fn allow_trading_write(profile: AgentRunProfileId) -> bool {
         profile,
         AgentRunProfileId::ManualReplay | AgentRunProfileId::ScheduledReview
     )
+}
+
+/// spec `agent-runtime-module.md §2`：每个 profile 的 packet 必需 section 集合。
+/// Packet builder 必须保证这些 section 在 packet 里非空 / 已注入，否则 fail closed。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PacketSection {
+    Account,
+    Quotes,
+    News,
+    Strategies,
+    RecentEpisodes,
+    UserPreferences,
+}
+
+impl PacketSection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PacketSection::Account => "account",
+            PacketSection::Quotes => "quotes",
+            PacketSection::News => "news",
+            PacketSection::Strategies => "strategies",
+            PacketSection::RecentEpisodes => "recent_episodes",
+            PacketSection::UserPreferences => "user_preferences",
+        }
+    }
+}
+
+pub fn required_packet_sections(profile: AgentRunProfileId) -> Vec<PacketSection> {
+    use PacketSection::*;
+    match profile {
+        AgentRunProfileId::UserChat => {
+            // 账户 / 行情 / 新闻按工具调用实时读取
+            vec![Strategies, RecentEpisodes, UserPreferences]
+        }
+        AgentRunProfileId::NewsAnalysis
+        | AgentRunProfileId::AccountTriggerResponse
+        | AgentRunProfileId::ScheduledReview => vec![
+            News,
+            Quotes,
+            Account,
+            Strategies,
+            RecentEpisodes,
+            UserPreferences,
+        ],
+        AgentRunProfileId::ManualReplay => vec![
+            Account,
+            Quotes,
+            News,
+            Strategies,
+            RecentEpisodes,
+        ],
+    }
 }

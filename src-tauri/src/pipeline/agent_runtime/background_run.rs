@@ -39,10 +39,43 @@ pub async fn run_background_loop(
     trigger_prompt: String,
     on_success: impl FnOnce(&AppHandle) + Send + 'static,
 ) {
-    // 占位：调用方可通过 `move |inner| { ... }` 在闭包内捕获 InflightGuard，
-    // run 完成时一起 drop。当前 router/account_trigger 直接把 guard 移进
-    // on_success 闭包，无需额外参数。
-    run_background_loop_impl(app, run_id, profile, trigger_kind, trigger_prompt, on_success).await;
+    run_background_loop_impl(
+        app,
+        run_id,
+        profile,
+        trigger_kind,
+        trigger_prompt,
+        on_success,
+        no_op_on_fail(),
+    )
+    .await;
+}
+
+fn no_op_on_fail() -> impl FnOnce(&AppHandle, &str) + Send + 'static {
+    |_app: &AppHandle, _err: &str| {}
+}
+
+/// 同 [`run_background_loop`] 但额外接收 `on_fail` 钩子。run 失败（非 cancelled）时
+/// 调用，用于例如 `news_buffer_repo::mark_failed` 把 batch 推进 retry / terminal。
+pub async fn run_background_loop_with_fail(
+    app: AppHandle,
+    run_id: String,
+    profile: AgentRunProfileId,
+    trigger_kind: &'static str,
+    trigger_prompt: String,
+    on_success: impl FnOnce(&AppHandle) + Send + 'static,
+    on_fail: impl FnOnce(&AppHandle, &str) + Send + 'static,
+) {
+    run_background_loop_impl(
+        app,
+        run_id,
+        profile,
+        trigger_kind,
+        trigger_prompt,
+        on_success,
+        on_fail,
+    )
+    .await;
 }
 
 async fn run_background_loop_impl(
@@ -52,6 +85,7 @@ async fn run_background_loop_impl(
     trigger_kind: &'static str,
     trigger_prompt: String,
     on_success: impl FnOnce(&AppHandle) + Send + 'static,
+    on_fail: impl FnOnce(&AppHandle, &str) + Send + 'static,
 ) {
     // spec §9 race fix：spawn 前如果 cancel flag 已 set（cancel 命令先于 spawn 到达），
     // 直接落 Cancelled 不再启动 run_inner，避免 status 从 Cancelled 被覆盖回 Running。
@@ -112,6 +146,10 @@ async fn run_background_loop_impl(
                 Some(&e),
                 Some(&chrono::Utc::now().to_rfc3339()),
             );
+            let err_msg = e.clone();
+            tauri::async_runtime::spawn(async move {
+                on_fail(&app, &err_msg);
+            });
         }
     }
 }

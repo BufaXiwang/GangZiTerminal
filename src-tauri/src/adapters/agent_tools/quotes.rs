@@ -255,9 +255,11 @@ fn derive_item_warnings(q: &StockQuote) -> Vec<&'static str> {
     for w in &q.warnings {
         ws.push(warning_str(*w));
     }
-    if q.bid_levels.is_empty() || q.ask_levels.is_empty() {
-        if !ws.contains(&"depth_missing") {
-            ws.push("depth_missing");
+    // spec quotes-module.md §2 集中 depth_missing 判定
+    if let Some(w) = crate::domain::quotes::freshness_rules::validate_depth_levels(q) {
+        let s = warning_str(w);
+        if !ws.contains(&s) {
+            ws.push(s);
         }
     }
     if q.price.is_none() {

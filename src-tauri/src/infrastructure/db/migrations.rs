@@ -309,7 +309,9 @@ create table if not exists agent_tool_calls (
     output_payload_ref text,
     -- spec agent-infra-module.md §2 + agent-runtime-module.md §2:
     -- 写副作用工具（operate_account）必须落结构化 payload；recovery 不允许依赖
-    -- output_summary_json 解析。本列承载持久化后的结构化 Account result snapshot。
+    -- output_summary_json 解析。两列承载持久化后的结构化 input / output snapshot；
+    -- spec 上叫 *_payload_ref，本地存内联 JSON（"ref by value"）。
+    input_payload_json text,
     output_payload_json text,
     is_error integer not null default 0,
     error_code text,

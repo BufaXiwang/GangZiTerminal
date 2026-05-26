@@ -113,6 +113,10 @@ pub async fn run_agent(
     // agent 调 compact_now 工具后，下一轮 turn 强制跑 Summarize（无视 trigger_threshold）。
     // 每跑一次 Summarize 后归位为 false。让 agent 主动管 context。
     let mut force_summarize_next_turn: bool = false;
+    // spec agent-infra-module.md §2 ContextBudget.max_search_calls：单次 run 内允许的
+    // 搜索调用上限（含本地 search_* 与 server-side web_search）。命中后下一轮拒绝继续。
+    let max_search_calls = req.budget.max_search_calls;
+    let mut search_call_count: u32 = 0;
     let mut summary = RunSummary {
         run_id: run_id.clone(),
         turns: 0,
@@ -365,6 +369,34 @@ pub async fn run_agent(
             .count() as u32;
         summary.server_tool_calls += server_tool_calls_this_turn;
 
+        // spec §2 ContextBudget.max_search_calls：累加本回合所有搜索调用（含
+        // 本地 search_*、server-side web_search / web_search_*）。
+        let search_calls_this_turn = assistant_message
+            .content
+            .iter()
+            .filter(|b| match b {
+                Block::ToolUse { name, .. } => is_search_tool(name),
+                _ => false,
+            })
+            .count() as u32;
+        search_call_count += search_calls_this_turn;
+        if max_search_calls > 0 && search_call_count > max_search_calls {
+            tracing::warn!(
+                run_id = %run_id,
+                used = search_call_count,
+                budget = max_search_calls,
+                "命中 ContextBudget.max_search_calls，停止 agent run"
+            );
+            summary.stop_reason = StopReason::SearchBudgetExhausted;
+            summary.turns = turn;
+            let _ = event_tx.send(AgentEvent::Done {
+                run_id: run_id.clone(),
+                stop_reason: StopReason::SearchBudgetExhausted,
+                turns: turn,
+            });
+            return Ok(summary);
+        }
+
         if local_tool_uses.is_empty() {
             // 没有要本地执行的工具 → 模型回合自然结束。
             // MaxTokens 也走这里（模型说话说一半被截断、没出 tool_use）——pipeline 拿
@@ -470,6 +502,13 @@ async fn run_one_turn(
         assistant_message,
         stop_reason,
     })
+}
+
+/// spec §2 ContextBudget.max_search_calls 范围内的搜索工具识别：
+/// - 本地：`search_*` 命名前缀（spec 约定）
+/// - server-side：`web_search` 及其版本化变体（`web_search_*`）
+fn is_search_tool(name: &str) -> bool {
+    name.starts_with("search_") || name == "web_search" || name.starts_with("web_search_")
 }
 
 /// 从 assistant 消息里挑出所有需要本地执行的 ToolUse。
@@ -622,7 +661,17 @@ async fn execute_single_tool(
             .map(|t| t.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         let ended_at = chrono::Utc::now().to_rfc3339();
-        let input_summary = serde_json::to_string(&input).ok();
+        // spec §2：input_payload_json 持久化完整结构化输入；写副作用工具（operate_account）
+        // 的 recovery 需要它精确重放，不能依赖 summary 文本解析。
+        let input_payload = serde_json::to_string(&input).ok();
+        // summary 是短文本截断（用于 packet / UI 展示）；payload 是完整 JSON。
+        let input_summary = input_payload.as_deref().map(|s| {
+            if s.len() > 512 {
+                format!("{}...(truncated {})", &s[..512], s.len() - 512)
+            } else {
+                s.to_string()
+            }
+        });
         let output_text: String = content
             .iter()
             .map(|c| match c {
@@ -631,16 +680,24 @@ async fn execute_single_tool(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let output_summary = serde_json::to_string(&output_text).ok();
+        let output_payload = serde_json::to_string(&content).ok();
+        let output_summary = if output_text.len() > 512 {
+            format!("{}...(truncated {})", &output_text[..512], output_text.len() - 512)
+        } else {
+            output_text.clone()
+        };
+        let output_summary_json = serde_json::to_string(&output_summary).ok();
         let row = crate::infrastructure::agent::tool_calls_repo::ToolCallRow {
             tool_call_id: &id,
             run_id,
             name: &name,
             source: "local_tool",
             input_summary_json: input_summary.as_deref(),
-            output_summary_json: output_summary.as_deref(),
+            output_summary_json: output_summary_json.as_deref(),
             input_payload_ref: None,
             output_payload_ref: None,
+            input_payload_json: input_payload.as_deref(),
+            output_payload_json: output_payload.as_deref(),
             is_error,
             error_code: None,
             started_at: &started_at,

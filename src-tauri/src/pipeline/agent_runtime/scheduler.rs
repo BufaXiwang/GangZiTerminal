@@ -132,7 +132,13 @@ async fn tick_news_buffer(app: &AppHandle) -> Result<(), String> {
         news_ids.join(", ")
     );
     let guard_for_run = inflight_guard.take();
-    tauri::async_runtime::spawn(super::background_run::run_background_loop(
+    // spec §8：run 完成 → mark_consumed；run 失败 → mark_failed (retryable retry + terminal)。
+    // 把 batch ids 分别 clone 给 success / fail 闭包（FnOnce 不能共享）。
+    let news_ids_success = news_ids_for_run.clone();
+    let news_ids_fail = news_ids_for_run.clone();
+    let max_retries = 3i64;
+    let retry_delay_secs = 60i64;
+    tauri::async_runtime::spawn(super::background_run::run_background_loop_with_fail(
         app_for_run,
         run_id,
         AgentRunProfileId::NewsAnalysis,
@@ -143,13 +149,40 @@ async fn tick_news_buffer(app: &AppHandle) -> Result<(), String> {
             let _guard = guard_for_run;
             if let Err(e) = crate::infrastructure::agent_runtime::news_buffer_repo::mark_consumed(
                 inner_app,
-                &news_ids_for_run,
+                &news_ids_success,
             ) {
                 tracing::warn!(
                     target = "agent_runtime.scheduler",
                     error = %e,
                     "mark_consumed 失败"
                 );
+            }
+        },
+        move |inner_app, err_msg| {
+            // spec §8：retryable=true（agent run 失败一般是 transient），按 max_retries
+            // 退避；超过则终态 failed。
+            match crate::infrastructure::agent_runtime::news_buffer_repo::mark_failed(
+                inner_app,
+                &news_ids_fail,
+                err_msg,
+                true,
+                max_retries,
+                retry_delay_secs,
+            ) {
+                Ok((requeued, terminal)) => {
+                    tracing::warn!(
+                        target = "agent_runtime.scheduler",
+                        requeued,
+                        terminal,
+                        error = %err_msg,
+                        "news_batch run 失败，news_buffer 已 retry/terminal"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target = "agent_runtime.scheduler",
+                    error = %e,
+                    "mark_failed 失败"
+                ),
             }
         },
     ));
