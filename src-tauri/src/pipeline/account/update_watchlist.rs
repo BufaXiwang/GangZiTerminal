@@ -3,8 +3,9 @@
 //! 写动作：
 //! 1. 校验 tsCode 是否 Quotes universe 已知（spec：未知返回 not_found）
 //! 2. 幂等处理（重复 add / 不存在 remove 不重复写事件）
-//! 3. append watchlist_added / watchlist_removed / watchlist_note_updated
-//! 4. 更新内存 watchlist + KV
+//! 3. 写一条 AccountEvent 到统一 `account_events` 流（spec §2「所有账户状态变化
+//!    必须先 append AccountEvent」）—— watchlist 的状态完全由该流派生
+//! 4. 更新内存 watchlist（in-memory KV，启动时由 watchlist::hydrate 从事件流重建）
 //! 5. 返回 accountEventIds + 最新 item
 
 use serde::{Deserialize, Serialize};
@@ -13,48 +14,8 @@ use tauri::AppHandle;
 use crate::domain::account::account_event::{AccountEvent, AccountEventType};
 use crate::domain::account::events::AccountActor;
 use crate::domain::shared::{ErrorCode, StockCode};
-use crate::infrastructure::account::{account_events_repo, watchlist, watchlist_events};
+use crate::infrastructure::account::{account_events_repo, watchlist};
 use crate::pipeline::quotes_universe;
-
-fn parse_actor(s: &str) -> AccountActor {
-    match s {
-        "agent" => AccountActor::Agent,
-        "system" => AccountActor::System,
-        _ => AccountActor::User,
-    }
-}
-
-/// 把 watchlist 事件镜像到统一 `account_events` 流 —— spec `account-module.md §2`
-/// 「所有账户状态变化必须先 append AccountEvent」。本地 watchlist_events 表保留
-/// 给读模型（note_for / 派生 addedAt 用），但 spec contract 的真源是 account_events。
-fn mirror_to_account_events(
-    app: &tauri::AppHandle,
-    event_type: AccountEventType,
-    actor: &str,
-    ts_code: &str,
-    note: Option<&str>,
-    reason: Option<&str>,
-) -> Option<String> {
-    let event = AccountEvent::new(
-        event_type,
-        parse_actor(actor),
-        serde_json::json!({ "note": note }),
-    )
-    .with_ts_code(ts_code)
-    .with_reason(reason.unwrap_or(""));
-    match account_events_repo::append(app, &event) {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!(
-                target = "account.update_watchlist",
-                error = %e,
-                event_type = event_type.as_str(),
-                "镜像 AccountEvent 失败"
-            );
-            None
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchlistAction {
@@ -105,6 +66,34 @@ impl UpdateWatchlistResponse {
     }
 }
 
+fn parse_actor(s: &str) -> AccountActor {
+    match s {
+        "agent" => AccountActor::Agent,
+        "system" => AccountActor::System,
+        _ => AccountActor::User,
+    }
+}
+
+/// 写一条 watchlist 类型的 AccountEvent。spec §2 真源；watchlist 读模型完全
+/// 由该事件流派生（add → 加入；note_updated → 更新备注；removed → 移出）。
+fn append_event(
+    app: &AppHandle,
+    event_type: AccountEventType,
+    actor: &str,
+    ts_code: &str,
+    note: Option<&str>,
+    reason: Option<&str>,
+) -> Result<String, String> {
+    let event = AccountEvent::new(
+        event_type,
+        parse_actor(actor),
+        serde_json::json!({ "note": note }),
+    )
+    .with_ts_code(ts_code)
+    .with_reason(reason.unwrap_or(""));
+    account_events_repo::append(app, &event)
+}
+
 /// 执行 update_watchlist。
 ///
 /// - `actor`：spec `AccountActor`（user / agent / system）。
@@ -130,7 +119,9 @@ pub fn dispatch(
         WatchlistAction::Add => {
             let already = watchlist::contains(&code);
             // spec §4：重复 add 是幂等更新；只在首次或 note 变化时写事件
-            let current_note = watchlist_events::note_for(app, &ts_code_raw).ok().flatten();
+            let current_note = account_events_repo::note_for(app, &ts_code_raw)
+                .ok()
+                .flatten();
             let note_changed = match (&input.note, &current_note) {
                 (Some(n), Some(c)) => n != c,
                 (Some(_), None) => true,
@@ -149,9 +140,16 @@ pub fn dispatch(
                 };
             }
             watchlist::add(app, code);
-            let event_id = match watchlist_events::append(
+            // 已在 watchlist 但 note 变化 → spec §2 用 watchlist_note_updated；
+            // 首次 add 用 watchlist_added。
+            let event_type = if already {
+                AccountEventType::WatchlistNoteUpdated
+            } else {
+                AccountEventType::WatchlistAdded
+            };
+            let event_id = match append_event(
                 app,
-                watchlist_events::WatchlistEventType::Added,
+                event_type,
                 actor,
                 &ts_code_raw,
                 input.note.as_deref(),
@@ -160,17 +158,6 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
-            let mut event_ids = vec![event_id];
-            if let Some(acc_id) = mirror_to_account_events(
-                app,
-                AccountEventType::WatchlistAdded,
-                actor,
-                &ts_code_raw,
-                input.note.as_deref(),
-                input.reason.as_deref(),
-            ) {
-                event_ids.push(acc_id);
-            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
@@ -179,7 +166,7 @@ pub fn dispatch(
                     ts_code: ts_code_raw,
                     note: input.note,
                 }),
-                account_event_ids: event_ids,
+                account_event_ids: vec![event_id],
             }
         }
         WatchlistAction::Remove => {
@@ -195,9 +182,9 @@ pub fn dispatch(
                 };
             }
             watchlist::remove(app, &code);
-            let event_id = match watchlist_events::append(
+            let event_id = match append_event(
                 app,
-                watchlist_events::WatchlistEventType::Removed,
+                AccountEventType::WatchlistRemoved,
                 actor,
                 &ts_code_raw,
                 None,
@@ -206,23 +193,12 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
-            let mut event_ids = vec![event_id];
-            if let Some(acc_id) = mirror_to_account_events(
-                app,
-                AccountEventType::WatchlistRemoved,
-                actor,
-                &ts_code_raw,
-                None,
-                input.reason.as_deref(),
-            ) {
-                event_ids.push(acc_id);
-            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
                 message: None,
                 item: None,
-                account_event_ids: event_ids,
+                account_event_ids: vec![event_id],
             }
         }
         WatchlistAction::UpdateNote => {
@@ -232,9 +208,9 @@ pub fn dispatch(
                     format!("{ts_code_raw} 不在自选；先调 add"),
                 );
             }
-            let event_id = match watchlist_events::append(
+            let event_id = match append_event(
                 app,
-                watchlist_events::WatchlistEventType::NoteUpdated,
+                AccountEventType::WatchlistNoteUpdated,
                 actor,
                 &ts_code_raw,
                 input.note.as_deref(),
@@ -243,17 +219,6 @@ pub fn dispatch(
                 Ok(id) => id,
                 Err(msg) => return UpdateWatchlistResponse::rejected(ErrorCode::DbError, msg),
             };
-            let mut event_ids = vec![event_id];
-            if let Some(acc_id) = mirror_to_account_events(
-                app,
-                AccountEventType::WatchlistNoteUpdated,
-                actor,
-                &ts_code_raw,
-                input.note.as_deref(),
-                input.reason.as_deref(),
-            ) {
-                event_ids.push(acc_id);
-            }
             UpdateWatchlistResponse {
                 accepted: true,
                 reason: None,
@@ -262,7 +227,7 @@ pub fn dispatch(
                     ts_code: ts_code_raw,
                     note: input.note,
                 }),
-                account_event_ids: event_ids,
+                account_event_ids: vec![event_id],
             }
         }
     }

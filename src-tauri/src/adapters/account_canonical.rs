@@ -160,10 +160,15 @@ fn fetch_account_inner(
                     "freshness": q.freshness,
                 })
             });
-            let note = crate::infrastructure::account::watchlist_events::note_for(&app, &ts)
+            let note = crate::infrastructure::account::account_events_repo::note_for(&app, &ts)
                 .ok()
                 .flatten();
-            let added_at = latest_watchlist_added_at(&app, &ts);
+            let added_at =
+                crate::infrastructure::account::account_events_repo::latest_watchlist_added_at(
+                    &app, &ts,
+                )
+                .ok()
+                .flatten();
             let name = quote_snip
                 .as_ref()
                 .and_then(|q| q.get("name").and_then(|v| v.as_str()).map(String::from))
@@ -457,20 +462,6 @@ fn order_to_packet(o: crate::domain::account::order::Order) -> Value {
             .insert("expiresAt".into(), Value::String(exp));
     }
     out
-}
-
-fn latest_watchlist_added_at(app: &AppHandle, ts_code: &str) -> Option<String> {
-    use crate::infrastructure::db::{migrate, open_database};
-    let c = open_database(app).ok()?;
-    migrate(&c).ok()?;
-    c.query_row(
-        "select occurred_at from watchlist_events
-         where ts_code = ?1 and event_type = 'watchlist_added'
-         order by occurred_at desc limit 1",
-        rusqlite::params![ts_code],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
 }
 
 fn stock_name_for(app: &AppHandle, ts_code: &str) -> Option<String> {

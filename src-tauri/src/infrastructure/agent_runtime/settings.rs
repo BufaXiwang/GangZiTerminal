@@ -37,6 +37,18 @@ pub const K_CONTEXT_SUMMARIZE_THRESHOLD: &str = "runtime.context_summarize_thres
 pub const K_CONTEXT_HARD_LIMIT_TOKENS: &str = "runtime.context_hard_limit_tokens";
 pub const K_AGENT_CONTEXT_COMPACT_CHANNEL_ID: &str = "runtime.agent_context_compact_channel_id";
 pub const K_AGENT_CONTEXT_COMPACT_MODEL: &str = "runtime.agent_context_compact_model";
+/// 模拟账户初始现金；默认 20000。仅在首次初始化（无 account_initialized 事件）
+/// 时生效；后续 spec 要求账户 initialCash 不可变（已有则幂等校验）。
+pub const K_ACCOUNT_INITIAL_CASH: &str = "runtime.account_initial_cash";
+
+/// 读账户初始现金 KV，缺省回退到 `DEFAULT_INITIAL_CASH`。
+pub fn account_initial_cash(app: &AppHandle) -> f64 {
+    let default_cash = crate::infrastructure::account::valuation::DEFAULT_INITIAL_CASH;
+    read_value(app, K_ACCOUNT_INITIAL_CASH)
+        .and_then(|v| parse::<f64>(v, K_ACCOUNT_INITIAL_CASH))
+        .filter(|n| *n > 0.0)
+        .unwrap_or(default_cash)
+}
 
 /// spec `agent-runtime-module.md §8 Runtime settings keys`：14 项配置注册。
 /// 部分字段（scheduled_review_interval_secs / agent_context_compact_*）目前

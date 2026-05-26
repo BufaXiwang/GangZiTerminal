@@ -18,7 +18,6 @@ pub mod snapshot_cache;
 pub mod trigger_repo;
 pub mod valuation;
 pub mod watchlist;
-pub mod watchlist_events;
 
 pub use repository::PositionRepo;
 pub use valuation::{compute_snapshot, INITIAL_CASH};

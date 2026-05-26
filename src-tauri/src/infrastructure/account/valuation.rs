@@ -20,8 +20,15 @@ use crate::domain::shared::{OccurredAt, Yuan};
 use crate::infrastructure::quotes::snapshot::market_snapshot;
 use std::collections::HashMap;
 
-/// 模拟账户初始现金——20000 元。硬编码，第一版不配置化。
-pub const INITIAL_CASH: f64 = 20000.0;
+/// 模拟账户初始现金的默认值——20000 元。
+/// 启动时由 `runtime.account_initial_cash` KV 覆盖（spec settings KV pattern）。
+/// `compute_snapshot` 仍用此默认作 baseline——若用户改了 KV，需要走
+/// `initialize_account_if_needed(new_initial_cash)` 重新初始化新账户，旧账户由
+/// `account_initialized` 事件的 payload.initialCash 派生。
+pub const DEFAULT_INITIAL_CASH: f64 = 20000.0;
+
+/// 向后兼容别名；优先使用 [`DEFAULT_INITIAL_CASH`]。
+pub const INITIAL_CASH: f64 = DEFAULT_INITIAL_CASH;
 
 /// 从 positions + 所有相关 events 派生当前 AccountSnapshot。
 ///

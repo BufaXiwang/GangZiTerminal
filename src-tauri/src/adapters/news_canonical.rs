@@ -152,7 +152,7 @@ pub fn fetch_news(
     })
 }
 
-const ARTICLE_EXCERPT_MAX_CHARS: usize = 500;
+use crate::domain::news::{clean_excerpt, ARTICLE_EXCERPT_MAX_CHARS};
 
 fn to_canonical_item(
     app: &AppHandle,
@@ -215,19 +215,7 @@ fn to_canonical_item(
     }
 }
 
-fn clean_excerpt(content: &str, max: usize) -> String {
-    let joined = content
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if joined.chars().count() <= max {
-        joined
-    } else {
-        joined.chars().take(max).collect::<String>() + "…"
-    }
-}
+// clean_excerpt 抽到 domain::news::excerpt 公共 helper（spec §4 摘要规则）。
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

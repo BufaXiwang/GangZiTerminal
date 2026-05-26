@@ -75,6 +75,61 @@ pub fn has_account_initialized(app: &AppHandle) -> Result<bool, String> {
     Ok(n > 0)
 }
 
+/// 取某 ts_code 的最近一条 watchlist_added 事件的 occurred_at；
+/// 用于 `fetch_account.watchlist` 展示「加入自选时间」。
+pub fn latest_watchlist_added_at(
+    app: &AppHandle,
+    ts_code: &str,
+) -> Result<Option<String>, String> {
+    let conn = open_database(app).map_err(|e| format!("db open: {e}"))?;
+    migrate(&conn).map_err(|e| format!("migrate: {e}"))?;
+    Ok(conn
+        .query_row(
+            "select occurred_at from account_events
+             where ts_code = ?1 and event_type = 'watchlist_added'
+             order by occurred_at desc limit 1",
+            params![ts_code],
+            |r| r.get::<_, String>(0),
+        )
+        .ok())
+}
+
+/// 取某 ts_code 的当前自选备注 —— 派生自最新的
+/// `watchlist_added` / `watchlist_note_updated` 事件 payload。
+/// 若期间有 `watchlist_removed`，返回 None（被删除后再 add 算新的开始）。
+pub fn note_for(app: &AppHandle, ts_code: &str) -> Result<Option<String>, String> {
+    let conn = open_database(app).map_err(|e| format!("db open: {e}"))?;
+    migrate(&conn).map_err(|e| format!("migrate: {e}"))?;
+    // 取该 ts_code 最近一次 add 之后的 add/note_updated/removed 事件链
+    let mut stmt = conn
+        .prepare(
+            "select event_type, payload_json from account_events
+             where ts_code = ?1
+               and event_type in
+                   ('watchlist_added','watchlist_note_updated','watchlist_removed')
+             order by occurred_at desc",
+        )
+        .map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query(params![ts_code])
+        .map_err(|e| format!("query: {e}"))?;
+    while let Some(r) = rows.next().map_err(|e| format!("next: {e}"))? {
+        let et: String = r.get(0).map_err(|e| e.to_string())?;
+        if et == "watchlist_removed" {
+            return Ok(None);
+        }
+        let payload_str: String = r.get(1).map_err(|e| e.to_string())?;
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+            if let Some(note) = v.get("note").and_then(|n| n.as_str()) {
+                if !note.is_empty() {
+                    return Ok(Some(note.to_string()));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// 取初始化事件中的 initialCash 值（用于幂等校验）。
 pub fn get_initial_cash(app: &AppHandle) -> Result<Option<f64>, String> {
     let conn = open_database(app).map_err(|e| format!("db open: {e}"))?;

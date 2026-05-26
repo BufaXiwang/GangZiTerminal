@@ -23,11 +23,12 @@ pub fn run() {
 
             // spec account-module.md §2/§4：账户事件流的首个事实必须是
             // `account_initialized`；幂等，已存在则跳过。
+            // 初始现金 spec settings KV `runtime.account_initial_cash`，缺省 20000。
             {
                 let svc = pipeline::account::AccountService::new(handle.clone());
-                if let Err(e) = svc.initialize_account_if_needed(
-                    infrastructure::account::INITIAL_CASH,
-                ) {
+                let initial_cash =
+                    infrastructure::agent_runtime::settings::account_initial_cash(&handle);
+                if let Err(e) = svc.initialize_account_if_needed(initial_cash) {
                     tracing::warn!(error = %e, "initialize_account_if_needed 失败（继续启动）");
                 }
             }

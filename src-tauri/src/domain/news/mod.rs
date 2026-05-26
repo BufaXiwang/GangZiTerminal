@@ -7,7 +7,9 @@
 
 pub mod canonical_url;
 pub mod errors;
+pub mod excerpt;
 pub mod types;
 
 pub use errors::NewsError;
+pub use excerpt::{clean_excerpt, ARTICLE_EXCERPT_MAX_CHARS};
 pub use types::{ArticleContent, NewsItem};

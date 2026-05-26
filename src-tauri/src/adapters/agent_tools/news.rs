@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-const ARTICLE_EXCERPT_MAX_CHARS: usize = 500;
+use crate::domain::news::{clean_excerpt, ARTICLE_EXCERPT_MAX_CHARS};
 
 pub struct FetchNewsTool {
     app: AppHandle,
@@ -207,18 +207,4 @@ impl Tool for FetchNewsTool {
     }
 }
 
-fn clean_excerpt(content: &str, max: usize) -> String {
-    // 简单清洗：去多余空白行；按字符数截取。
-    let trimmed = content
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if trimmed.chars().count() <= max {
-        trimmed
-    } else {
-        let cut: String = trimmed.chars().take(max).collect();
-        format!("{cut}…")
-    }
-}
+// clean_excerpt 抽到 domain::news::excerpt 公共 helper（spec §4 摘要规则）。

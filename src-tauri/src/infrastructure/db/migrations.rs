@@ -168,26 +168,9 @@ create index if not exists idx_account_orders_status on account_orders(status, u
 create index if not exists idx_account_orders_ts on account_orders(ts_code, status);
 create index if not exists idx_account_orders_position on account_orders(position_id);
 
--- WatchlistEvent（spec account-module.md §2 watchlist_added/removed/note_updated）
--- 当前阶段独立于 position_events，最小可重建集：actor + ts_code + 可选 note
-create table if not exists watchlist_events (
-    event_id text primary key,
-    event_type text not null check (event_type in
-        ('watchlist_added','watchlist_removed','watchlist_note_updated')),
-    actor text not null check (actor in ('agent','system','user')),
-    ts_code text not null,
-    note text,
-    reason text,
-    occurred_at text not null
-);
-create index if not exists idx_watchlist_events_ts on watchlist_events(ts_code, occurred_at desc);
-create index if not exists idx_watchlist_events_occurred on watchlist_events(occurred_at desc);
-
-create table if not exists watchlist_notes (
-    ts_code text primary key,
-    note text not null,
-    updated_at text not null
-);
+-- Watchlist events 已合并到统一 account_events 流（spec account-module.md §2
+-- 「所有账户状态变化必须先 append AccountEvent」）。watchlist_events / watchlist_notes
+-- 两表已废弃；note 由最新 watchlist_added / watchlist_note_updated 事件的 payload 派生。
 
 -- AccountTrigger（spec account-module.md §2）
 create table if not exists account_triggers (

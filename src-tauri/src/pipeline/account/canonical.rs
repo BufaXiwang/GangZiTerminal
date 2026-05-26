@@ -199,8 +199,14 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         Some(n) if n > 0 => n,
         _ => return OperateAccountResult::rejected("invalid_input", "quantity 必须为正整数"),
     };
-    if qty_i64 % 100 != 0 {
-        return OperateAccountResult::rejected("invalid_lot_size", "数量必须是 100 整数倍");
+    if qty_i64 % crate::domain::account::rules::INTEGER_LOT_SIZE != 0 {
+        return OperateAccountResult::rejected(
+            "invalid_lot_size",
+            format!(
+                "数量必须是 {} 整数倍",
+                crate::domain::account::rules::INTEGER_LOT_SIZE
+            ),
+        );
     }
     let limit_price = acc.get("limitPrice").and_then(Value::as_f64);
     if matches!(order_type, OrderType::Limit) && limit_price.unwrap_or(0.0) <= 0.0 {
@@ -686,8 +692,14 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
         Some(n) if n > 0 => n,
         _ => return OperateAccountResult::rejected("invalid_input", "quantity 必须为正整数"),
     };
-    if qty_i64 % 100 != 0 {
-        return OperateAccountResult::rejected("invalid_lot_size", "数量必须是 100 整数倍");
+    if qty_i64 % crate::domain::account::rules::INTEGER_LOT_SIZE != 0 {
+        return OperateAccountResult::rejected(
+            "invalid_lot_size",
+            format!(
+                "数量必须是 {} 整数倍",
+                crate::domain::account::rules::INTEGER_LOT_SIZE
+            ),
+        );
     }
     let order_type = match acc.get("orderType").and_then(Value::as_str).unwrap_or("market") {
         "market" => OrderType::Market,
@@ -1210,5 +1222,62 @@ async fn record_invalidation_signal(app: &AppHandle, acc: &Value) -> OperateAcco
             result.account_event_ids.push(id);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::shared::ErrorCode;
+
+    #[test]
+    fn rejected_parses_known_error_code() {
+        let r = OperateAccountResult::rejected("invalid_input", "qty < 0");
+        assert!(!r.accepted);
+        assert_eq!(r.reason, Some(ErrorCode::InvalidInput));
+        assert_eq!(r.message.as_deref(), Some("qty < 0"));
+        assert!(r.account_event_ids.is_empty());
+    }
+
+    #[test]
+    fn rejected_falls_back_to_parse_error_on_unknown() {
+        let r = OperateAccountResult::rejected("totally_made_up_code", "test");
+        // spec §5: unknown reason 必须 fallback 到 ParseError，不允许自由字符串透传
+        assert_eq!(r.reason, Some(ErrorCode::ParseError));
+    }
+
+    #[test]
+    fn rejected_recognises_all_canonical_error_codes() {
+        // 验证 canonical 流程引用的所有 ErrorCode 都在 ErrorCode::parse 闭集合内
+        for code in [
+            "invalid_input",
+            "not_found",
+            "db_error",
+            "insufficient_cash",
+            "insufficient_sellable_quantity",
+            "invalid_lot_size",
+            "order_not_pending",
+            "instrument_not_tradable",
+            "quote_missing",
+            "quote_stale",
+            "outside_trading_session",
+        ] {
+            let r = OperateAccountResult::rejected(code, "");
+            // 不应 fallback 到 ParseError
+            assert_ne!(
+                r.reason,
+                Some(ErrorCode::ParseError),
+                "code `{code}` 不在 ErrorCode 闭集合"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_position_has_position_id_no_reason() {
+        let r = OperateAccountResult::accepted_position("p1");
+        assert!(r.accepted);
+        assert_eq!(r.position_id.as_deref(), Some("p1"));
+        assert!(r.reason.is_none());
+        assert!(r.account_event_ids.is_empty());
     }
 }

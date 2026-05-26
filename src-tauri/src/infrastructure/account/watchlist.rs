@@ -27,7 +27,12 @@ fn store() -> &'static RwLock<BTreeSet<StockCode>> {
 // 启动 hydrate
 // ============================================================================
 
-/// 进程启动时调一次——从 app_state 把 watchlist 灌进内存单例。
+/// 进程启动时调一次——把 watchlist 灌进内存单例。
+///
+/// 优先读 `app_state` KV 缓存（spec §2 派生读模型的运行时缓存）；
+/// KV 缺失时**回退**到 `account_events` 流回放（spec §2 真源）：
+/// `watchlist_added` / `watchlist_note_updated` 进集合，
+/// `watchlist_removed` 退集合。
 pub fn hydrate(app: &AppHandle) {
     if let Ok(Some(value)) =
         crate::infrastructure::app_state::load_app_state_value(app, KEY_WATCHLIST)
@@ -38,11 +43,68 @@ pub fn hydrate(app: &AppHandle) {
                 .filter_map(|v| v.as_str())
                 .filter_map(|s| StockCode::new(s).ok())
                 .collect();
-            if let Ok(mut g) = store().write() {
-                *g = codes;
+            if !codes.is_empty() {
+                if let Ok(mut g) = store().write() {
+                    *g = codes;
+                }
+                return;
             }
         }
     }
+    // KV 缺失或空 → 从 account_events 真源回放重建。
+    let codes = derive_from_events(app);
+    if let Ok(mut g) = store().write() {
+        *g = codes;
+    }
+    persist(app);
+}
+
+/// spec §2 watchlist 派生：扫 account_events 按 occurred_at 升序回放
+/// add/note_updated/removed，得到当前 watchlist 集合。
+fn derive_from_events(app: &AppHandle) -> BTreeSet<StockCode> {
+    use crate::infrastructure::db::{migrate, open_database};
+    let mut set: BTreeSet<StockCode> = BTreeSet::new();
+    let Ok(c) = open_database(app) else {
+        return set;
+    };
+    if migrate(&c).is_err() {
+        return set;
+    }
+    let Ok(mut stmt) = c.prepare(
+        "select event_type, ts_code from account_events
+         where event_type in ('watchlist_added','watchlist_note_updated','watchlist_removed')
+           and ts_code is not null
+         order by occurred_at asc",
+    ) else {
+        return set;
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(_) => return set,
+    };
+    while let Ok(Some(r)) = rows.next() {
+        let et: String = match r.get(0) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let ts_code: String = match r.get(1) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Ok(code) = StockCode::new(&ts_code) else {
+            continue;
+        };
+        match et.as_str() {
+            "watchlist_added" | "watchlist_note_updated" => {
+                set.insert(code);
+            }
+            "watchlist_removed" => {
+                set.remove(&code);
+            }
+            _ => {}
+        }
+    }
+    set
 }
 
 // ============================================================================
@@ -98,9 +160,18 @@ pub fn replace(app: &AppHandle, codes: Vec<StockCode>) {
 
 fn persist(app: &AppHandle) {
     let codes = list_strings();
-    let _ = crate::infrastructure::app_state::save_app_state_value(
+    if let Err(e) = crate::infrastructure::app_state::save_app_state_value(
         app,
         KEY_WATCHLIST,
-        &Value::from(codes),
-    );
+        &Value::from(codes.clone()),
+    ) {
+        // KV 缓存写失败不破坏内存状态，下次 hydrate 会从 account_events 真源回放；
+        // 但必须显式可观测，便于运维介入（spec §2 真源仍在 account_events 流）。
+        tracing::error!(
+            target = "account.watchlist",
+            error = %e,
+            codes_count = codes.len(),
+            "watchlist KV persist 失败；内存状态保留，重启时由 account_events 流恢复"
+        );
+    }
 }
