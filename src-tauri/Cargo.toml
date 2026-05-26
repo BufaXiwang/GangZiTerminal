@@ -4,38 +4,60 @@ members = [".", "crates/tdx"]
 [package]
 name = "gangzi-terminal"
 version = "0.1.0"
-description = "A macOS desktop app for learning A-share news analysis."
+description = "A 股研究 + 模拟交易学习终端"
 authors = ["local"]
 edition = "2021"
+
+[lib]
+name = "gangzi_terminal"
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
+# Tauri 壳 + IPC
+tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+
+# Rust ↔ TS 类型同步（spec §技术栈：必须走强类型 wrapper）
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+specta = { version = "=2.0.0-rc.22", features = ["derive", "chrono", "rust_decimal", "serde_json"] }
+specta-typescript = "=0.0.9"
+
+# 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
-rss = "2"
-chrono = { version = "0.4", features = ["serde"] }
-encoding_rs = "0.8"
-scraper = "0.24"
-rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 异步运行时
 tokio = { version = "1", features = ["time", "sync", "macros", "rt-multi-thread"] }
-uuid = { version = "1", features = ["v4"] }
-base64 = "0.22"
-sha2 = "0.10"
 async-trait = "0.1"
 futures-util = "0.3"
-eventsource-stream = "0.2"
+
+# HTTP（news / quotes / agent provider 共用）
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
+
+# SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite_migration = "1"
+
+# 时间
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# 货币 / 高精度数
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+
+# 标识与杂项
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1.10"
+encoding_rs = "0.8"
 thiserror = "2"
+
+# 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
-regex = "1.10"
-# 通达信 (TDX) 行情协议——独立 crate，参考 mootdx / pytdx wire format
+
+# TDX 协议（独立 crate，参考 mootdx / pytdx）
 tdx = { path = "crates/tdx" }
-# K 线渲染——为 analyze_chart 工具生成 PNG 给 LLM vision 看
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "line_series", "candlestick"] }
-png = "0.17"
