@@ -85,23 +85,55 @@ pub enum CompactTier {
     Reactive,
 }
 
+/// loop 内部 stop reason —— 比 spec 闭集合更细，便于 provider-specific 诊断；
+/// 通过 [`StopReason::as_spec_str`] 映射到 spec 闭集合 7 值。
+///
+/// spec `agent-infra-module.md §2 AgentStopReason` 闭集合：
+/// `completed | max_turns | cancelled | provider_stop | tool_error | context_limit | error`
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
-    /// 模型主动 end_turn——文本回复完成，无 tool_use。
+    /// 模型主动 end_turn——文本回复完成，无 tool_use。→ spec `completed`
     EndTurn,
-    /// 命中 max_tokens 截断。
+    /// 命中 max_tokens 截断。→ spec `provider_stop`
     MaxTokens,
-    /// 命中 stop_sequence。
+    /// 命中 stop_sequence。→ spec `provider_stop`
     StopSequence,
-    /// 命中 loop 的 max_turns 硬上限。
+    /// 命中 loop 的 max_turns 硬上限。→ spec `max_turns`
     MaxTurns,
-    /// 命中 ContextBudget.max_search_calls。
+    /// 命中 ContextBudget.max_search_calls。→ spec `provider_stop`
     SearchBudgetExhausted,
-    /// 模型拒绝输出（refusal stop reason）。
+    /// 模型拒绝输出（refusal stop reason）。→ spec `provider_stop`
     Refusal,
-    /// pause_turn——长任务暂停，下一轮继续。loop 内部处理，一般不外溢。
+    /// pause_turn——长任务暂停，下一轮继续。loop 内部处理，一般不外溢。→ spec `provider_stop`
     PauseTurn,
+    /// spec `cancelled` 协作式取消终态。
+    Cancelled,
+    /// 工具执行错误终止。→ spec `tool_error`
+    ToolError,
+    /// 命中 spec context budget 硬上限。→ spec `context_limit`
+    ContextLimit,
+    /// 通用错误兜底。→ spec `error`
+    Error,
+}
+
+impl StopReason {
+    /// 映射到 spec `AgentStopReason` 闭集合 7 值。
+    pub fn as_spec_str(self) -> &'static str {
+        match self {
+            StopReason::EndTurn => "completed",
+            StopReason::MaxTurns => "max_turns",
+            StopReason::Cancelled => "cancelled",
+            StopReason::MaxTokens
+            | StopReason::StopSequence
+            | StopReason::SearchBudgetExhausted
+            | StopReason::Refusal
+            | StopReason::PauseTurn => "provider_stop",
+            StopReason::ToolError => "tool_error",
+            StopReason::ContextLimit => "context_limit",
+            StopReason::Error => "error",
+        }
+    }
 }
 
 #[cfg(test)]

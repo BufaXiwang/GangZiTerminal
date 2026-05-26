@@ -3,6 +3,9 @@
 //! 一个 source_id 对应一条 feed（华尔街见闻、财联社、格隆汇、金十数据 等）。
 //! id 加 source_id 前缀避免不同 feed 撞 id。
 
+use crate::domain::news::canonical_url::{
+    canonical_url, fingerprint_news_id, stable_news_id,
+};
 use crate::domain::news::{NewsError, NewsItem};
 use crate::infrastructure::news::util::strip_html;
 use serde_json::Value;
@@ -49,42 +52,73 @@ pub async fn fetch_newsnow_source(
         .and_then(Value::as_array)
         .ok_or_else(|| NewsError::Decode("NewsNow 响应缺少 items".into()))?;
 
+    // spec news-module.md §2：source 必须 namespace:channel 形式。NewsNow 走 `newsnow:{source_id}`。
+    let source_key = format!("newsnow:{source_id}");
     Ok(items
         .iter()
         .take(60)
-        .enumerate()
-        .map(|(index, item)| {
+        .filter_map(|item| {
             let title = string_field(item, "title");
-            let link = item
+            let raw_link = item
                 .get("url")
                 .and_then(Value::as_str)
                 .or_else(|| item.get("mobileUrl").and_then(Value::as_str))
                 .map(str::to_string);
+            let canonical_link = raw_link
+                .as_deref()
+                .map(canonical_url)
+                .filter(|s| !s.is_empty());
             let published = newsnow_pub_date(item);
             let summary = item
                 .pointer("/extra/hover")
                 .and_then(Value::as_str)
                 .map(strip_html)
                 .filter(|value| !value.trim().is_empty());
-            let id = item
-                .get("id")
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .or_else(|| value.as_i64().map(|num| num.to_string()))
-                })
-                .or_else(|| link.clone())
-                .unwrap_or_else(|| format!("{source_id}-{index}-{title}"));
+            let raw_id = item.get("id").and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| value.as_i64().map(|num| num.to_string()))
+            });
+            let id = match stable_news_id(&source_key, canonical_link.as_deref(), raw_id.as_deref())
+            {
+                Ok(id) => id,
+                Err(_) => match fingerprint_news_id(
+                    &source_key,
+                    Some(title.trim()).filter(|s| !s.is_empty()),
+                    published.as_deref(),
+                    summary.as_deref(),
+                ) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        tracing::warn!(
+                            target = "news.newsnow",
+                            source = %source_key,
+                            title = %title,
+                            "NewsNow item 缺 link / id / 可指纹字段，跳过（spec §2）"
+                        );
+                        return None;
+                    }
+                },
+            };
 
-            NewsItem {
-                id: format!("{source_id}-{id}"),
+            let now = chrono::Utc::now().to_rfc3339();
+            let payload = serde_json::json!({
+                "publisher": source_name,
+                "originalUrl": raw_link,
+                "providerItemId": raw_id,
+            });
+            Some(NewsItem {
+                id,
                 title,
-                link,
-                source: source_name.clone(),
+                link: canonical_link,
+                source: source_key.clone(),
                 published,
                 summary,
-            }
+                payload,
+                created_at: now.clone(),
+                updated_at: now,
+            })
         })
         .collect())
 }

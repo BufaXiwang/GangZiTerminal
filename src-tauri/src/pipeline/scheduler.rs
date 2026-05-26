@@ -29,16 +29,14 @@ const KEY_REFRESH_INTERVAL: &str = "gangzi-terminal.refresh-interval";
 
 pub fn spawn_all(app: AppHandle) {
     tauri::async_runtime::spawn(news_refresh_loop(app.clone()));
-    // 注：news 的攒批分析 loop 在 adapters::news_batch_scheduler——它要构造 ToolRegistry
-    // （pipeline 不允许 use adapters），由 main.rs 直接 spawn。
     tauri::async_runtime::spawn(stocks_refresh_loop(app.clone()));
     tauri::async_runtime::spawn(market_quote_loop(app.clone()));
     tauri::async_runtime::spawn(market_universe_loop(app.clone()));
     tauri::async_runtime::spawn(kline_warm_loop(app.clone()));
     tauri::async_runtime::spawn(account_snapshot_loop(app.clone()));
     tauri::async_runtime::spawn(tushare_probe_once(app));
-    // 注：reflection tick + scan tick + news_batch_listener 在 main.rs 直接 spawn——
-    // 它们需要 adapters::agent_tools 构造 registry，而 pipeline 不允许 use adapters。
+    // Agent Runtime 后台 tick（news buffer overflow / account trigger eval /
+    // scheduled review）由 `pipeline::agent_runtime::spawn` 启动。
 }
 
 // ====== 全市场 universe 刷新 loop ======
@@ -150,6 +148,47 @@ async fn refresh_account_snapshot(app: &AppHandle) {
                 app,
                 crate::infrastructure::scheduler_heartbeat::LOOP_ACCOUNT,
             );
+            // spec agent-runtime-module.md §5：snapshot rebuild 之后必须 evaluate triggers，
+            // 并按 has_more / next_cursor 分页直到本轮耗尽。
+            // spec §8 in-flight lock：account.trigger_eval —— 由调度层（pipeline 层）持锁，
+            // Account 模块自己不感知 Agent Runtime 的 lock key（spec 硬约束）。
+            // emit account-triggered 由 service::evaluate_protection_conditions 命中
+            // "新"trigger 时统一触发；scheduler 不再 re-emit pending 集合。
+            use crate::pipeline::agent_runtime::locks::InflightGuard;
+            let cfg = crate::infrastructure::agent_runtime::settings::load(app);
+            if let Some(_guard) = InflightGuard::acquire(
+                crate::infrastructure::agent_runtime::locks_ext::LOCK_ACCOUNT_TRIGGER_EVAL,
+            ) {
+                let mut offset: i64 = 0;
+                let mut failed = false;
+                for _ in 0..50 {
+                    let page = match service
+                        .evaluate_account_triggers_paged(cfg.account_trigger_eval_batch_size, offset)
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "evaluate_account_triggers_paged 失败");
+                            crate::infrastructure::scheduler_heartbeat::record_err(
+                                app,
+                                crate::infrastructure::scheduler_heartbeat::LOOP_ACCOUNT_TRIGGER_EVAL,
+                                &e,
+                            );
+                            failed = true;
+                            break;
+                        }
+                    };
+                    if !page.has_more {
+                        break;
+                    }
+                    offset += cfg.account_trigger_eval_batch_size;
+                }
+                if !failed {
+                    crate::infrastructure::scheduler_heartbeat::record_ok(
+                        app,
+                        crate::infrastructure::scheduler_heartbeat::LOOP_ACCOUNT_TRIGGER_EVAL,
+                    );
+                }
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "account snapshot 刷新失败");
@@ -263,7 +302,7 @@ async fn market_quote_loop(app: AppHandle) {
 
     loop {
         // 先跑一次
-        match crate::pipeline::market::refresh::run_market_quote_refresh(&app).await {
+        match crate::pipeline::agent_runtime::quotes_refresh::refresh_subscribed_quotes(&app).await {
             Ok(summary) => {
                 tracing::info!(
                     total = summary.total,

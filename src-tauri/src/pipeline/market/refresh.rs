@@ -16,12 +16,11 @@
 //! - 盘外：60s
 //! - 周末/节假日：10min
 
-use crate::infrastructure::quotes::core_indexes;
+use crate::domain::shared::TradeDate;
 use crate::infrastructure::quotes::realtime::dispatch;
 use crate::infrastructure::quotes::snapshot::market_snapshot;
-use crate::pipeline::account::subscribed_codes;
 use futures_util::stream::{self, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -37,21 +36,76 @@ pub struct MarketRefreshSummary {
     pub total: usize,
     pub success: usize,
     pub failed_batches: usize,
+    pub scope: RefreshScopeKind,
+    pub purpose: RefreshPurpose,
 }
 
-/// 合并 account::subscribed_codes() + quotes::core_indexes()，分批走 dispatch 多源 fallback。
-/// 成功的写入 MARKET_SNAPSHOT，emit `market-quotes-refreshed`。
-pub async fn run_market_quote_refresh(app: &AppHandle) -> Result<MarketRefreshSummary, String> {
-    // 1. 合并订阅集：account（watchlist + open positions）+ 4 大核心指数（始终订阅）
-    use std::collections::BTreeSet;
-    let mut all_set: BTreeSet<String> = BTreeSet::new();
-    for ts in subscribed_codes(app) {
-        all_set.insert(ts);
-    }
-    for ts in core_indexes::list() {
-        all_set.insert(ts);
-    }
-    let ts_codes: Vec<String> = all_set.into_iter().collect();
+/// `RefreshMarketQuotesRequest` —— spec `quotes-module.md §4`。
+/// scope.kind 决定 ts_codes 来源；调用方必须自行合并订阅集 / 核心指数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RefreshScope {
+    /// 订阅集刷新；调用方传入已合并的 watchlist ∪ open_positions ∪ pending_orders ∪ core_indexes
+    Subscribed { ts_codes: Vec<String> },
+    /// 全市场 universe 刷新
+    Universe,
+    /// 手动指定的 ts_codes
+    Manual { ts_codes: Vec<String> },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshScopeKind {
+    Subscribed,
+    Universe,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshPurpose {
+    Intraday,
+    Close,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshMarketQuotesRequest {
+    pub scope: RefreshScope,
+    pub purpose: RefreshPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_date: Option<TradeDate>,
+}
+
+/// canonical refresh —— spec `quotes-module.md §4`。
+///
+/// 不读取 Account / Agent / News（spec §1 单向依赖）。订阅集合并由调用方
+/// （Agent Runtime / scheduler）完成，再传入 `scope`。
+pub async fn refresh_market_quotes(
+    app: &AppHandle,
+    request: RefreshMarketQuotesRequest,
+) -> Result<MarketRefreshSummary, String> {
+    let scope_kind = match &request.scope {
+        RefreshScope::Subscribed { .. } => RefreshScopeKind::Subscribed,
+        RefreshScope::Universe => RefreshScopeKind::Universe,
+        RefreshScope::Manual { .. } => RefreshScopeKind::Manual,
+    };
+    let purpose = request.purpose;
+    let ts_codes: Vec<String> = match request.scope {
+        RefreshScope::Subscribed { ts_codes } => ts_codes,
+        RefreshScope::Manual { ts_codes } => {
+            if ts_codes.is_empty() {
+                return Err("invalid_input: manual scope ts_codes 不能为空".into());
+            }
+            ts_codes
+        }
+        RefreshScope::Universe => {
+            return Err(
+                "universe scope refresh 由 pipeline::market::universe::run_universe_refresh 处理"
+                    .into(),
+            );
+        }
+    };
     let total = ts_codes.len();
     if total == 0 {
         tracing::info!("订阅集行情刷新：订阅集为空，跳过");
@@ -59,6 +113,8 @@ pub async fn run_market_quote_refresh(app: &AppHandle) -> Result<MarketRefreshSu
             total: 0,
             success: 0,
             failed_batches: 0,
+            scope: scope_kind,
+            purpose,
         });
     }
 
@@ -88,9 +144,24 @@ pub async fn run_market_quote_refresh(app: &AppHandle) -> Result<MarketRefreshSu
     }
     let success = all_pairs.len();
 
-    // 5. 写 MARKET_SNAPSHOT + emit
+    // 5. 写 MARKET_SNAPSHOT + emit (canonical `MarketQuotesRefreshedPayload` per shared-types §6)
+    let affected_ts_codes: Vec<String> =
+        all_pairs.iter().map(|(ts, _)| ts.clone()).collect();
     market_snapshot::put_batch(all_pairs);
+    let scope_str = match scope_kind {
+        RefreshScopeKind::Subscribed => "subscribed",
+        RefreshScopeKind::Universe => "universe",
+        RefreshScopeKind::Manual => "manual",
+    };
+    let purpose_str = match purpose {
+        RefreshPurpose::Intraday => "intraday",
+        RefreshPurpose::Close => "close",
+    };
     let payload = json!({
+        "scope": scope_str,
+        "purpose": purpose_str,
+        "tradeDate": request.trade_date.map(|d| d.to_compact()),
+        "affectedTsCodes": affected_ts_codes,
         "total": total,
         "success": success,
         "failedBatches": failed_batches,
@@ -110,8 +181,11 @@ pub async fn run_market_quote_refresh(app: &AppHandle) -> Result<MarketRefreshSu
         total,
         success,
         failed_batches,
+        scope: scope_kind,
+        purpose,
     })
 }
+
 
 async fn fetch_with_retry(
     idx: usize,

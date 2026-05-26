@@ -1,4 +1,4 @@
-//! SQLite schema 单一来源（v4 position-merged，Expectation 已并入 Position）。
+//! SQLite schema 单一来源。
 //!
 //! 旧 DB 文件在 `connection::open_database` 启动时根据 SCHEMA_VERSION 比对自动备份
 //! （`gangzi-terminal.sqlite3.legacy-{ts}`），本文件**只**负责在空 DB 上建一遍新 schema。
@@ -6,11 +6,13 @@
 //!
 //! 模块归属：
 //! - **Account**: simulated_positions / position_events
-//! - **Agent**: chat_messages / agent_episodes / agent_episode_turns / heuristics / strategies /
-//!              strategy_events / lessons / position_heuristic_links / signal_detections
+//! - **Agent Infra**: chat_messages / agent_episodes / agent_episode_turns
+//! - **Agent Runtime**: agent_runs / decision_episodes / trade_intents /
+//!   agent_order_intent_index / decision_reviews / strategy_cards /
+//!   agent_event_consumption / agent_news_buffer
 //! - **Quotes**: stocks / indexes / funds / klines / kline_meta / minute_klines / minute_kline_meta
-//! - **News**: news_items / article_contents
-//! - **系统**: schema_meta / app_state (KV)
+//! - **News**: news_items / article_contents (+ news_fts)
+//! - **系统**: schema_meta / app_state (KV) / scheduler_heartbeat
 
 use crate::infrastructure::db::connection::SCHEMA_VERSION;
 use crate::infrastructure::db::helpers::now;
@@ -129,6 +131,113 @@ create table if not exists position_events (
 );
 create index if not exists idx_position_events_pos_time on position_events(position_id, occurred_at);
 
+-- 失效信号审计（spec account-module.md §4「调用时必须先写 invalidation_signal_recorded 事件。
+-- 无论保护条件是否启用都要记录该事件」）
+create table if not exists account_signal_audit (
+    id text primary key,
+    position_id text not null,
+    signal text not null,
+    reason text,
+    hit integer not null default 0,
+    occurred_at text not null
+);
+create index if not exists idx_account_signal_audit_pos on account_signal_audit(position_id, occurred_at desc);
+
+-- Orders（spec account-module.md §2 Order）—— canonical 委托模型最小持久化。
+-- 完整 6 态 OrderStatus + intent + actor，便于 operate_account 的所有 7 action 落库。
+create table if not exists account_orders (
+    order_id text primary key,
+    ts_code text not null,
+    side text not null check (side in ('buy','sell')),
+    order_type text not null check (order_type in ('market','limit')),
+    limit_price real,
+    quantity integer not null,
+    filled_quantity integer not null default 0,
+    status text not null check (status in
+        ('pending','partially_filled','filled','cancelled','rejected','expired')),
+    intent text not null check (intent in
+        ('open_position','scale_in','scale_out','close_position','direct_order')),
+    position_id text,
+    reason text,
+    actor text not null check (actor in ('agent','system','user')),
+    created_at text not null,
+    updated_at text not null,
+    expires_at text
+);
+create index if not exists idx_account_orders_status on account_orders(status, updated_at desc);
+create index if not exists idx_account_orders_ts on account_orders(ts_code, status);
+create index if not exists idx_account_orders_position on account_orders(position_id);
+
+-- WatchlistEvent（spec account-module.md §2 watchlist_added/removed/note_updated）
+-- 当前阶段独立于 position_events，最小可重建集：actor + ts_code + 可选 note
+create table if not exists watchlist_events (
+    event_id text primary key,
+    event_type text not null check (event_type in
+        ('watchlist_added','watchlist_removed','watchlist_note_updated')),
+    actor text not null check (actor in ('agent','system','user')),
+    ts_code text not null,
+    note text,
+    reason text,
+    occurred_at text not null
+);
+create index if not exists idx_watchlist_events_ts on watchlist_events(ts_code, occurred_at desc);
+create index if not exists idx_watchlist_events_occurred on watchlist_events(occurred_at desc);
+
+create table if not exists watchlist_notes (
+    ts_code text primary key,
+    note text not null,
+    updated_at text not null
+);
+
+-- AccountTrigger（spec account-module.md §2）
+create table if not exists account_triggers (
+    trigger_id text primary key,
+    trigger_type text not null check (trigger_type in
+        ('stop_loss','take_profit','time_stop','order_filled','order_rejected','order_expired','invalidated')),
+    order_id text,
+    position_id text,
+    ts_code text,
+    price real,
+    threshold_json text,
+    quote_freshness_json text,
+    warnings_json text,
+    event_id text not null,
+    handled integer not null default 0,
+    occurred_at text not null,
+    created_at text not null,
+    updated_at text not null
+);
+create index if not exists idx_account_triggers_handled on account_triggers(handled, occurred_at);
+create index if not exists idx_account_triggers_position on account_triggers(position_id);
+
+-- AccountEvent（spec account-module.md §2 账户事件模型）—— 统一的 21 类型 append-only
+-- 真源。订单 / 成交 / 仓位 / lot / 保护条件 / 自选 / cash 冻结释放 / 触发器都先写到
+-- 这里再更新派生读模型。`PositionEvent` 仍保留为现有 snapshot 派生路径；两者并存
+-- 直到 snapshot 完全迁移到该流。
+create table if not exists account_events (
+    event_id text primary key,
+    event_type text not null check (event_type in (
+        'account_initialized', 'order_placed', 'order_cancelled', 'order_rejected',
+        'order_expired', 'order_partially_filled', 'order_filled',
+        'position_opened', 'position_scaled', 'position_closed', 'protection_adjusted',
+        'watchlist_added', 'watchlist_removed', 'watchlist_note_updated',
+        'cash_frozen', 'cash_released', 'shares_frozen', 'shares_released',
+        'invalidation_signal_recorded', 'trigger_created', 'trigger_handled', 'snapshot_rebuilt'
+    )),
+    order_id text,
+    fill_id text,
+    position_id text,
+    ts_code text,
+    reason text,
+    actor text not null check (actor in ('agent', 'system', 'user')),
+    payload_json text not null,
+    occurred_at text not null
+);
+create index if not exists idx_account_events_occurred on account_events(occurred_at desc);
+create index if not exists idx_account_events_type on account_events(event_type, occurred_at desc);
+create index if not exists idx_account_events_order on account_events(order_id) where order_id is not null;
+create index if not exists idx_account_events_position on account_events(position_id) where position_id is not null;
+
 -- ===== Agent BC =====
 create table if not exists chat_messages (
     id text primary key,
@@ -185,6 +294,30 @@ create table if not exists agent_episode_turns (
     primary key (run_id, turn)
 );
 create index if not exists idx_agent_episode_turns_run on agent_episode_turns(run_id, turn);
+
+-- AgentTooLCall —— spec agent-infra-module.md §2。
+-- 每个 local + server-side tool 调用一行；操作 Account / 写副作用的 tool 必须
+-- 通过 inputPayloadRef / outputPayloadRef 持久化完整结构化 payload。
+create table if not exists agent_tool_calls (
+    tool_call_id text primary key,
+    run_id text not null,
+    name text not null,
+    source text not null check (source in ('local_tool', 'server_side_tool')),
+    input_summary_json text,
+    output_summary_json text,
+    input_payload_ref text,
+    output_payload_ref text,
+    -- spec agent-infra-module.md §2 + agent-runtime-module.md §2:
+    -- 写副作用工具（operate_account）必须落结构化 payload；recovery 不允许依赖
+    -- output_summary_json 解析。本列承载持久化后的结构化 Account result snapshot。
+    output_payload_json text,
+    is_error integer not null default 0,
+    error_code text,
+    started_at text not null,
+    ended_at text,
+    duration_ms integer
+);
+create index if not exists idx_agent_tool_calls_run on agent_tool_calls(run_id, started_at);
 
 -- ===== Quotes BC =====
 create table if not exists stocks (
@@ -269,107 +402,158 @@ create table if not exists minute_kline_meta (
     primary key (ts_code, period)
 );
 
--- Strategy：用户 + agent 共建的规则集
-create table if not exists strategies (
-    id text primary key,
-    name text not null,
-    description text,
-    config_json text not null,             -- 完整 DSL（trigger_when + target + conviction_rule）
-    enabled integer not null default 1,
-    applied_count integer not null default 0,
-    hit_count integer not null default 0,
-    miss_count integer not null default 0,
+-- ===== Agent Runtime BC =====
+-- 对齐 docs/design/agent-runtime-module.md。一次性建表；旧的 heuristic / lesson /
+-- expectation 表已随 spec 重构移除，老 DB 走 SCHEMA_VERSION rename 路径。
+
+-- AgentRun：一次产品语义上的 Agent 运行
+create table if not exists agent_runs (
+    run_id text primary key,
+    profile_id text not null check (profile_id in
+        ('user_chat','news_analysis','account_trigger_response','scheduled_review','manual_replay')),
+    trigger_kind text not null check (trigger_kind in
+        ('user_chat','news_batch','account_trigger','scheduled_review','manual_replay')),
+    trigger_payload_json text not null,
+    provider text not null,
+    wire_format text not null,
+    model text not null,
+    status text not null check (status in ('queued','running','completed','failed','cancelled')),
+    started_at text,
+    ended_at text,
+    error text,
     created_at text not null,
     updated_at text not null
 );
-create index if not exists idx_strategies_enabled on strategies(enabled);
+create index if not exists idx_agent_runs_status on agent_runs(status, created_at desc);
+create index if not exists idx_agent_runs_profile on agent_runs(profile_id, created_at desc);
 
--- Strategy 修改审计
-create table if not exists strategy_events (
-    id integer primary key autoincrement,
-    strategy_id text not null,
-    kind text not null,                    -- created/updated/enabled/disabled/user_comment
-    payload text,                          -- JSON
-    occurred_at text not null
+-- DecisionEpisode：可复盘的最小投资判断单元
+create table if not exists decision_episodes (
+    episode_id text primary key,
+    run_id text not null,
+    trigger_kind text not null,
+    symbols_json text not null,
+    thesis text not null,
+    action text not null check (action in
+        ('no_action','add_watchlist','remove_watchlist','place_order','cancel_order',
+         'open_position','scale_position','close_position','adjust_protection','record_invalidation_signal')),
+    action_status text not null check (action_status in
+        ('no_action','intended','submitted','blocked','deferred')),
+    blocked_reason text,
+    confidence real,
+    risk_plan_json text,
+    strategy_ids_json text not null,
+    evidence_refs_json text not null,
+    created_at text not null,
+    updated_at text not null default ''
 );
-create index if not exists idx_strategy_events_id on strategy_events(strategy_id, occurred_at);
+create index if not exists idx_decision_episodes_run on decision_episodes(run_id);
+create index if not exists idx_decision_episodes_action on decision_episodes(action, action_status);
+create index if not exists idx_decision_episodes_created on decision_episodes(created_at desc);
 
--- Lesson：每个 Position close 自动生成的原子观察（学习闭环底层原料）
-create table if not exists lessons (
-    id text primary key,
-    position_id text not null,
-    code text not null,
-    observation text not null,
-    takeaway text not null,
-    outcome text not null check (outcome in ('hit', 'partial_hit', 'miss', 'expired')),
-    regime_at_close text,
-    signals_in_play text,                  -- JSON array of SignalKind
-    pnl_pct real,
-    source_episode_id text,                -- 追溯到产生此 lesson 的 reflection episode
-    created_at text not null
-);
-create index if not exists idx_lessons_position on lessons(position_id);
-create index if not exists idx_lessons_code_time on lessons(code, created_at desc);
-create index if not exists idx_lessons_empty_takeaway on lessons(created_at desc) where takeaway = '';
-
--- Heuristic：结构化启发式规则 + track record（取代 v2 principles）
-create table if not exists heuristics (
-    id text primary key,
-    body text not null,
-    category text not null check (category in ('principle', 'known_bias', 'risk_preference')),
-    origin text not null check (origin in ('seed', 'user_stated', 'agent_inferred')),
-    regime_tags text,                      -- JSON array
-    supporting_lesson_ids text,            -- JSON array
-    application_count integer not null default 0,
-    hit_count integer not null default 0,
-    miss_count integer not null default 0,
-    last_applied_at text,
-    last_emerged_at text,                  -- v5：最后一次被 emerge 流程"新生成"的时间——前端用来识别"本周新增"
-    retired_at text,
-    retired_reason text,
-    created_at text not null
-);
-create index if not exists idx_heuristics_origin on heuristics(origin);
-create index if not exists idx_heuristics_retired on heuristics(retired_at);
-create index if not exists idx_heuristics_emerged on heuristics(last_emerged_at desc);
-
--- Agent 对 news 的分析状态机——News BC 只存 news 内容，分析状态由 Agent 自管。
--- 状态：pending → processing → consumed / failed → pending(revert by watchdog)
-create table if not exists agent_news_analysis_state (
-    news_id text primary key,
-    status text not null default 'pending'
-        check (status in ('pending', 'processing', 'consumed', 'failed')),
-    processing_started_at text,            -- 进 processing 时戳；watchdog 用来回收孤儿
+-- TradeIntent：operate_account 写工具的持久化意图 / 审计
+create table if not exists trade_intents (
+    intent_id text primary key,
+    run_id text not null,
+    episode_id text not null,
+    tool_call_id text,
+    account_input_json text not null,
+    reason text not null,
+    strategy_ids_json text not null,
+    status text not null check (status in ('proposed','submitted','accepted','rejected','executed')),
+    account_result_ref_json text,
+    created_at text not null,
     updated_at text not null
 );
-create index if not exists idx_ana_status on agent_news_analysis_state(status);
--- 部分索引：只索引 processing 状态的，watchdog 扫超时孤儿用
-create index if not exists idx_ana_processing_at
-    on agent_news_analysis_state(processing_started_at)
-    where status = 'processing';
+create index if not exists idx_trade_intents_run on trade_intents(run_id);
+create index if not exists idx_trade_intents_episode on trade_intents(episode_id);
+create index if not exists idx_trade_intents_status on trade_intents(status, updated_at desc);
 
--- Position ↔ Heuristic link：精确归因 position close 影响哪些 heuristic 的 track record。
--- agent 在 open_position 时显式声明 applied_heuristic_ids → 写入此表。
--- close 时按 CloseReason 反向打标 → heuristic.application_count / hit_count / miss_count。
-create table if not exists position_heuristic_links (
-    position_id text not null,
-    heuristic_id text not null,
-    primary key (position_id, heuristic_id)
+-- Account 反查索引：order_id -> intent_id / episode_id / run_id
+create table if not exists agent_order_intent_index (
+    order_id text primary key,
+    intent_id text not null,
+    episode_id text not null,
+    run_id text not null,
+    tool_call_id text,
+    created_at text not null
 );
-create index if not exists idx_phl_heuristic on position_heuristic_links(heuristic_id);
+create index if not exists idx_aoii_intent on agent_order_intent_index(intent_id);
 
--- Signal detection log（per-tick 检测结果，审计 + 命中率统计）
-create table if not exists signal_detections (
-    id integer primary key autoincrement,
-    tick_id text not null,
-    code text not null,
-    signal_family text not null,           -- 稳定 key（无参数），便于按家族聚合
-    signal_json text not null,             -- 完整 SignalKind 序列化（含参数）
-    detected_at text not null
+-- DecisionReview：复盘记录
+create table if not exists decision_reviews (
+    review_id text primary key,
+    episode_id text not null,
+    trigger text not null check (trigger in
+        ('position_closed','stop_loss','take_profit','time_stop','invalidated',
+         'order_filled','order_rejected','order_expired','scheduled_review','manual_review')),
+    result_json text,
+    conclusion text not null,
+    suggested_change_json text,
+    evidence_refs_json text not null,
+    warnings_json text,
+    created_at text not null
 );
-create index if not exists idx_signal_detections_code_time on signal_detections(code, detected_at desc);
-create index if not exists idx_signal_detections_tick on signal_detections(tick_id);
-create index if not exists idx_signal_detections_family on signal_detections(signal_family, detected_at desc);
+create index if not exists idx_decision_reviews_episode on decision_reviews(episode_id);
+create index if not exists idx_decision_reviews_created on decision_reviews(created_at desc);
+
+-- StrategyCard：注入 Agent 上下文的策略卡
+create table if not exists strategy_cards (
+    strategy_id text primary key,
+    version integer not null default 1,
+    name text not null,
+    description text not null,
+    status text not null check (status in ('active','paused')),
+    config_json text not null,
+    created_at text not null,
+    updated_at text not null
+);
+create index if not exists idx_strategy_cards_status on strategy_cards(status);
+
+-- StrategyCard 历史审计：spec §2「每次策略卡调整必须递增 version，并保留旧版本可追溯」
+create table if not exists strategy_card_audit (
+    strategy_id text not null,
+    version integer not null,
+    name text not null,
+    description text not null,
+    status text not null check (status in ('active','paused')),
+    config_json text not null,
+    reason text not null,
+    recorded_at text not null,
+    primary key (strategy_id, version)
+);
+create index if not exists idx_strategy_card_audit_strategy on strategy_card_audit(strategy_id, version desc);
+
+-- AgentRuntimeEventConsumption：跨模块事件消费幂等记录
+-- (event_type, event_key, consumer) 是 unique
+create table if not exists agent_event_consumption (
+    event_type text not null,
+    event_key text not null,
+    consumer text not null,
+    status text not null check (status in ('processing','consumed','ignored','failed')),
+    run_id text,
+    error text,
+    created_at text not null,
+    updated_at text not null,
+    primary key (event_type, event_key, consumer)
+);
+create index if not exists idx_aec_status on agent_event_consumption(status, updated_at);
+
+-- AgentNewsBufferItem：待分析新闻 buffer（durable）
+create table if not exists agent_news_buffer (
+    news_id text primary key,
+    source_batch_id text not null,
+    status text not null check (status in
+        ('pending','in_batch','consumed','failed','ignored')),
+    run_id text,
+    entered_at text not null,
+    updated_at text not null,
+    retry_count integer not null default 0,
+    next_retry_at text,
+    last_error text
+);
+create index if not exists idx_anb_status_entered on agent_news_buffer(status, entered_at);
+create index if not exists idx_anb_status_retry on agent_news_buffer(status, next_retry_at);
 
 -- ===== News FTS5 全文索引 =====
 --
@@ -412,7 +596,7 @@ create trigger if not exists news_items_ad_fts after delete on news_items begin
     delete from news_fts where news_id = old.id;
 end;
 
--- ===== v5：调度器心跳 + 审计 =====
+-- ===== 调度器心跳 + 审计 =====
 -- 每个后台 loop 一行；每次 tick 完成（成功或失败）upsert 一次。
 -- 前端可以查 "X loop 多久没成功了" → 决定是否告警。
 create table if not exists scheduler_heartbeat (

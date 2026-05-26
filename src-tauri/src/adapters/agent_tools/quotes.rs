@@ -1,448 +1,509 @@
-//! 行情类工具——3 个：get_quote / get_kline / get_market_overview。
+//! `fetch_quotes` —— Quotes 模块 canonical 读取工具。
 //!
-//! 所有数据走 quotes 模块的 snapshot-first 路径：
-//! - `infrastructure::quotes::snapshot::market_snapshot`（scheduler 维护，同步读）
-//! - `infrastructure::quotes::cache::kline_cache`（K 线持久化缓存）
-//! - `pipeline::market::overview`（大盘指数拼装）
+//! 对齐 docs/design/agent-runtime-module.md §4 `FetchQuotesToolInput`：
+//! - `tsCodes` 与 `scan` 二选一；同时出现 / 同时缺失返回 `invalid_input`
+//! - `tsCodes` 路径走 `MARKET_SNAPSHOT` 直读 + universe category 判定，
+//!   返回 spec `PacketQuotes` 形态（snapshotAt/freshness/items[]/scan? 略）
+//! - `scan` 路径走 `infrastructure::quotes::scanner::scan_market_query`，
+//!   只填 `PacketQuotes.scan`，不隐式追加详情
+//!
+//! 不做远端 refresh；本地 snapshot 缺数据时通过 item / response warning 表达。
 
-use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
-use crate::adapters::quotes_commands::StockQuoteDto;
-use crate::domain::agent::types::{PipelineKind, ToolResultContent};
-use crate::domain::agent::ProviderKind;
-use crate::domain::quotes::types::KlinePoint;
-use crate::domain::quotes::KlinePeriod;
-use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
-use crate::infrastructure::quotes::chart_renderer::{
-    klinerow_to_point, render_kline_png, ChartRenderOptions,
+use crate::domain::agent::types::ToolResultContent;
+use crate::domain::quotes::{
+    InstrumentCategory, ScanCondition as DomainScanCondition, ScanOp as DomainScanOp,
+    ScanResult as DomainScanResult, ScanSort as DomainScanSort, StockQuote,
 };
+use crate::domain::shared::WarningCode;
+use crate::infrastructure::quotes::repository as qrepo;
+use crate::infrastructure::quotes::scanner;
 use crate::infrastructure::quotes::snapshot::market_snapshot;
-use crate::pipeline::agent::config::read_agent_config;
-use crate::pipeline::market::overview as market_overview;
+use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use async_trait::async_trait;
-use base64::Engine as _;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-/// 当前 chat channel 是否支持 tool_result 含 Image block？
-/// - Anthropic：原生支持，agent 能看到图
-/// - OpenAI Chat Completions：不支持，provider 把 Image 降级为 `"[image omitted]"`
-/// - OpenAI Responses：tool 消息里也不支持 Image
-///
-/// get_kline 在 chart 模式前调一下这个——非 Anthropic 时自动 fallback 到 data 模式，
-/// 避免给非 Anthropic 用户 agent 看不到图却以为看到了的 bug。
-fn current_chat_supports_vision_in_tool_result(app: &AppHandle) -> bool {
-    let cfg = read_agent_config(app);
-    match cfg.resolve_pipeline(PipelineKind::Chat) {
-        Ok((channel, _)) => matches!(channel.wire_format, ProviderKind::Anthropic),
-        Err(_) => false, // 解析失败保守降级
-    }
-}
+const MAX_TS_CODES: usize = 200;
 
-// ===== 输入校验 ==========================================================
-
-async fn parse_code(input: &Value, app: &AppHandle) -> Result<String, String> {
-    let raw = input
-        .get("code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing code".to_string())?
-        .trim();
-    if raw.is_empty() {
-        return Err("code 为空".into());
-    }
-    let stock = crate::pipeline::stocks::resolve_stock(app, raw).await?;
-    Ok(stock.code)
-}
-
-fn parse_period_enum(input: &Value) -> KlinePeriod {
-    match input.get("period").and_then(Value::as_str) {
-        Some("week") => KlinePeriod::Week,
-        Some("month") => KlinePeriod::Month,
-        _ => KlinePeriod::Day,
-    }
-}
-
-fn period_label(p: KlinePeriod) -> &'static str {
-    match p {
-        KlinePeriod::Day => "day",
-        KlinePeriod::Week => "week",
-        KlinePeriod::Month => "month",
-    }
-}
-
-/// 6 位 code → ts_code，**走 stocks 表 lookup**（TuShare 权威 market），不前缀猜测。
-/// 未命中（新股 / 表空 / 退市）返 None——caller 应该提示用户档案待刷新。
-fn resolve_stock_ts_code(app: &AppHandle, code: &str) -> Option<String> {
-    crate::infrastructure::quotes::repository::resolve_stock_ts_code(app, code)
-}
-
-// ===== get_quote =========================================================
-
-pub struct GetQuoteTool {
+pub struct FetchQuotesTool {
     app: AppHandle,
 }
 
-impl GetQuoteTool {
+impl FetchQuotesTool {
     pub fn new(app: AppHandle) -> Self {
         Self { app }
     }
 }
 
 #[async_trait]
-impl Tool for GetQuoteTool {
+impl Tool for FetchQuotesTool {
     fn name(&self) -> &'static str {
-        "get_quote"
+        "fetch_quotes"
     }
 
     fn description(&self) -> &'static str {
-        "A 股实时行情快照（价 / 涨跌幅 / 成交量 / OHLC）。"
+        "读取行情 / K 线 / 分时 / 技术指标 / 基本面 / 扫描结果。\
+         tsCodes 与 scan 二选一；本地 snapshot 缺数据时返回 warning，不触发远端。"
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "6 位 A 股代码或股票中文名" }
-            },
-            "required": ["code"]
-        })
-    }
-
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let code = match parse_code(&input, &self.app).await {
-            Ok(c) => c,
-            Err(e) => return err_text(e),
-        };
-        let ts_code = match crate::infrastructure::quotes::repository::resolve_stock_ts_code(
-            &self.app, &code,
-        ) {
-            Some(ts) => ts,
-            None => {
-                return err_text(format!(
-                    "stocks 档案找不到 {code}——新股 / 已退市 / 档案未刷新"
-                ))
-            }
-        };
-        // 优先读 MARKET_SNAPSHOT；缺则 lazy ensure 单只（走 dispatch 多源 fallback）
-        let quote = match market_snapshot::get(&ts_code) {
-            Some(q) => q,
-            None => {
-                match crate::infrastructure::quotes::realtime::dispatch()
-                    .fetch(&[ts_code.clone()])
-                    .await
-                {
-                    Ok(mut v) => {
-                        market_snapshot::put_batch(v.clone());
-                        match v.pop() {
-                            Some((_, q)) => q,
-                            None => {
-                                return err_text(format!("{code} 实时报价为空（可能停牌 / 退市）"))
-                            }
-                        }
+                "tsCodes": {"type": "array", "items": {"type": "string"}},
+                "scan": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {"type": "string", "enum": [
+                            "limit_up","limit_down","top_gain","top_loss",
+                            "top_amount","top_volume"
+                        ]},
+                        "conditions": {"type": "array"},
+                        "sortBy": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "category": {"type": "string", "enum": ["stock","index","fund"]}
                     }
-                    Err(e) => return err_text(format!("get_quote 拉取失败：{e}")),
+                },
+                "include": {
+                    "type": "object",
+                    "properties": {
+                        "quote":    {"type": "boolean"},
+                        "intraday": {"type": "boolean"},
+                        "klines":   {"type": "array", "items": {"type": "string"}},
+                        "minuteKlines": {"type": "array", "items": {"type": "string"}},
+                        "indicators": {},
+                        "profile":  {"type": "boolean"},
+                        "dailyBasic": {"type": "boolean"},
+                        "events":   {"type": "boolean"}
+                    }
                 }
             }
-        };
-        match serde_json::to_value(StockQuoteDto::from(quote)) {
-            Ok(json) => (ok_json(json), false),
-            Err(e) => err_text(format!("序列化失败：{e}")),
-        }
-    }
-}
-
-// ===== get_kline =========================================================
-
-pub struct GetKlineTool {
-    app: AppHandle,
-}
-
-impl GetKlineTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for GetKlineTool {
-    fn name(&self) -> &'static str {
-        "get_kline"
-    }
-
-    fn description(&self) -> &'static str {
-        "K 线。默认 mode=chart 返 PNG（蜡烛 + MA20 + 量，红涨绿跌），最适合判断趋势 / 形态。\
-        需要精确数值传 mode=data 拿 OHLC 表；mode=both 两者都返。\
-        chart/both 仅 Anthropic 渠道有效，OpenAI 渠道自动降级 data。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "code":   { "type": "string", "description": "6 位 A 股代码或股票中文名" },
-                "period": { "type": "string", "enum": ["day", "week", "month"], "default": "day" },
-                "limit":  {
-                    "type": "integer",
-                    "minimum": 30,
-                    "maximum": 800,
-                    "default": 120,
-                    "description": "K 线根数。chart 模式建议 60-120 根；data 模式按需"
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["chart", "data", "both"],
-                    "default": "chart",
-                    "description": "chart=渲图给你看（默认，省 token，最直观）；data=OHLC 表（精确数值用）；both=两者都返"
-                }
-            },
-            "required": ["code"]
         })
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let code = match parse_code(&input, &self.app).await {
-            Ok(c) => c,
-            Err(e) => return err_text(e),
-        };
-        let period = parse_period_enum(&input);
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(120)
-            .clamp(30, 800);
-        let requested_mode = input
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("chart");
-        // chart 模式仅 Anthropic 渠道有效——OpenAI Chat / Responses 在 tool_result
-        // 里不支持 Image block，给它返图就是给 agent 一个"[image omitted]"占位，
-        // agent 看不到图却以为能看到，会出乱判断。非 Anthropic 时静默降级到 data。
-        let mode = if requested_mode == "chart" || requested_mode == "both" {
-            if current_chat_supports_vision_in_tool_result(&self.app) {
-                requested_mode
-            } else {
-                tracing::debug!(
-                    requested_mode,
-                    "get_kline: 当前渠道 tool_result 不支持 Image，降级到 data 模式"
-                );
-                "data"
-            }
+        let has_ts_codes = input
+            .get("tsCodes")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        let has_scan = input.get("scan").map(Value::is_object).unwrap_or(false);
+        if has_ts_codes == has_scan {
+            return err_text("invalid_input: tsCodes 和 scan 必须二选一");
+        }
+        if has_scan && input.get("include").is_some() {
+            return err_text("invalid_input: scan 路径不接受 include；如需详情请再调一次 fetch_quotes({tsCodes})");
+        }
+
+        if has_ts_codes {
+            return exec_ts_codes_path(&self.app, &input).await;
+        }
+        exec_scan_path(&self.app, &input).await
+    }
+}
+
+async fn exec_ts_codes_path(app: &AppHandle, input: &Value) -> (Vec<ToolResultContent>, bool) {
+    let raw: Vec<String> = input
+        .get("tsCodes")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_uppercase()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if raw.len() > MAX_TS_CODES {
+        return err_text(format!(
+            "invalid_input: tsCodes 数量超过上限 {MAX_TS_CODES}"
+        ));
+    }
+    // dedup 保留首次出现顺序
+    let mut seen = std::collections::HashSet::new();
+    let codes: Vec<String> = raw.into_iter().filter(|c| seen.insert(c.clone())).collect();
+    // 格式校验：6 位数字 + .SH/.SZ/.BJ
+    let mut errors: Vec<Value> = Vec::new();
+    for c in &codes {
+        if !is_valid_ts_code(c) {
+            errors.push(json!({
+                "code": "invalid_input",
+                "tsCode": c,
+                "message": "TsCode 格式应为 6 位数字 + .SH/.SZ/.BJ"
+            }));
+        }
+    }
+    if !errors.is_empty() {
+        return (
+            ok_json(json!({
+                "snapshotAt": chrono::Utc::now().to_rfc3339(),
+                "freshness": {"status": "missing"},
+                "items": [],
+                "errors": errors,
+            })),
+            true,
+        );
+    }
+
+    // category 判定一次性建表（避免 per-code N+1 调用）
+    let index_codes: std::collections::HashSet<String> =
+        qrepo::list_indexes(app)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.ts_code)
+            .collect();
+    let fund_codes: std::collections::HashSet<String> =
+        qrepo::list_listed_funds(app)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.ts_code)
+            .collect();
+
+    let mut items: Vec<Value> = Vec::with_capacity(codes.len());
+    let mut worst_status = "fresh"; // fresh > stale > missing
+    let mut any_response_warning: Vec<&'static str> = Vec::new();
+
+    // spec quotes-module.md §2 quote 有效性规则共用 helper
+    use crate::domain::quotes::freshness_rules::resolve_quote_view;
+    use crate::domain::shared::market_time::resolve_market_time;
+    use crate::domain::shared::OccurredAt as OA;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mkt = resolve_market_time(OA::new(now_ms));
+
+    for ts in &codes {
+        let snapshot = market_snapshot::get(ts);
+        let category = if index_codes.contains(ts) {
+            InstrumentCategory::Index
+        } else if fund_codes.contains(ts) {
+            InstrumentCategory::Fund
         } else {
-            requested_mode
+            InstrumentCategory::Stock
         };
-        let ts_code = match resolve_stock_ts_code(&self.app, &code) {
-            Some(ts) => ts,
-            None => {
-                return err_text(format!(
-                    "stocks 档案里找不到 {code}——可能是新股 / 已退市，或档案表暂未刷新"
-                ));
+        let resolved = resolve_quote_view(snapshot.as_ref(), &mkt, now_ms);
+        match resolved.quote {
+            Some(q) => {
+                let mut item_warnings = derive_item_warnings(q);
+                if let Some(w) = resolved.warning {
+                    let s = warning_str(w);
+                    if !item_warnings.contains(&s) {
+                        item_warnings.push(s);
+                    }
+                }
+                match resolved.freshness.status {
+                    crate::domain::shared::FreshnessStatus::Stale if worst_status == "fresh" => {
+                        worst_status = "stale";
+                    }
+                    crate::domain::shared::FreshnessStatus::Missing => worst_status = "missing",
+                    _ => {}
+                }
+                items.push(quote_to_packet_item(q, category, item_warnings));
             }
-        };
-
-        let rows = match kline_cache::get_or_refresh(
-            &self.app,
-            &ts_code,
-            Category::Stock,
-            period,
-            Category::Stock.default_adj(),
-            limit,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => return err_text(format!("get_kline 拉取失败：{e}")),
-        };
-        if rows.is_empty() {
-            return err_text(format!("{code} 无 K 线数据"));
+            None => {
+                worst_status = "missing";
+                let w = resolved
+                    .warning
+                    .map(warning_str)
+                    .unwrap_or("quote_missing");
+                any_response_warning.push(w);
+                items.push(json!({
+                    "tsCode": ts,
+                    "name": "",
+                    "category": category_str(category),
+                    "source": "local",
+                    "freshness": {"status": "missing", "warning": w},
+                    "warnings": [w]
+                }));
+            }
         }
+    }
 
-        match mode {
-            "data" => kline_data_payload(&code, period, &rows),
-            "both" => kline_both_payload(&code, period, &rows),
-            _ => kline_chart_payload(&code, period, &rows), // chart / 任何无效值 fallback
+    let mut response = json!({
+        "snapshotAt": chrono::Utc::now().to_rfc3339(),
+        "freshness": {"status": worst_status},
+        "items": items,
+    });
+    if !any_response_warning.is_empty() {
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "warnings".into(),
+                Value::Array(any_response_warning.iter().map(|s| json!(s)).collect()),
+            );
         }
+    }
+    (ok_json(response), false)
+}
+
+fn is_valid_ts_code(c: &str) -> bool {
+    let bytes = c.as_bytes();
+    if bytes.len() != 9 {
+        return false;
+    }
+    bytes[..6].iter().all(|b| b.is_ascii_digit())
+        && bytes[6] == b'.'
+        && matches!(&bytes[7..9], b"SH" | b"SZ" | b"BJ")
+}
+
+fn category_str(c: InstrumentCategory) -> &'static str {
+    match c {
+        InstrumentCategory::Stock => "stock",
+        InstrumentCategory::Index => "index",
+        InstrumentCategory::Fund => "fund",
     }
 }
 
-/// 渲染 PNG + 一段元数据文本（最近 close / MA20 / 区间 / 最近 5 根简表）。
-/// 一次调用约 1500 token（图本身是 vision tokenizer 固定 ~1500），比纯 data 模式
-/// 8-12k 省 80%+。
-fn kline_chart_payload(
-    code: &str,
-    period: KlinePeriod,
-    rows: &[kline_cache::KlineRow],
-) -> (Vec<ToolResultContent>, bool) {
-    let points: Vec<KlinePoint> = rows.iter().filter_map(klinerow_to_point).collect();
-    if points.len() < 5 {
-        return err_text(format!("{code} K 线数据不足 5 根，无法渲染"));
+fn derive_item_warnings(q: &StockQuote) -> Vec<&'static str> {
+    let mut ws: Vec<&'static str> = Vec::new();
+    for w in &q.warnings {
+        ws.push(warning_str(*w));
     }
-    // 标题信息（code / period / bars）放在 format_chart_summary 的文本里给 agent 看，
-    // 不渲到图上——plotters 在无 fontconfig 环境会 panic
-    let png = match render_kline_png(&points, &ChartRenderOptions::default()) {
-        Ok(b) => b,
-        Err(e) => return err_text(format!("渲染失败：{e}")),
-    };
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-    let summary = format_chart_summary(code, period, &points);
-    let blocks = vec![
-        ToolResultContent::Text { text: summary },
-        ToolResultContent::Image {
-            mime: "image/png".into(),
-            data: b64,
-        },
-    ];
-    (blocks, false)
+    if q.bid_levels.is_empty() || q.ask_levels.is_empty() {
+        if !ws.contains(&"depth_missing") {
+            ws.push("depth_missing");
+        }
+    }
+    if q.price.is_none() {
+        if !ws.contains(&"quote_price_missing") {
+            ws.push("quote_price_missing");
+        }
+    }
+    ws
 }
 
-/// 数值表模式——保留兼容性。返回完整 OHLC JSON。
-fn kline_data_payload(
-    code: &str,
-    period: KlinePeriod,
-    rows: &[kline_cache::KlineRow],
-) -> (Vec<ToolResultContent>, bool) {
-    let klines: Vec<Value> = rows
+fn warning_str(w: WarningCode) -> &'static str {
+    use WarningCode::*;
+    match w {
+        QuoteMissing => "quote_missing",
+        QuoteStale => "quote_stale",
+        SnapshotExpired => "snapshot_expired",
+        QuotePriceMissing => "quote_price_missing",
+        DepthMissing => "depth_missing",
+        InstrumentMissing => "instrument_missing",
+        ProviderPartialFailure => "provider_partial_failure",
+        ArticleMissing => "article_missing",
+        QfqMissing => "qfq_missing",
+        UsingUnadjustedKline => "using_unadjusted_kline",
+        DailyBasicMissing => "daily_basic_missing",
+        EventsMissing => "events_missing",
+        StrategyOmitted => "strategy_omitted",
+        MappingMissing => "mapping_missing",
+        DataPartial => "data_partial",
+    }
+}
+
+fn quote_to_packet_item(
+    q: &StockQuote,
+    category: InstrumentCategory,
+    warnings: Vec<&'static str>,
+) -> Value {
+    let bid: Vec<Value> = q
+        .bid_levels
         .iter()
-        .map(|r| {
+        .map(|l| {
             json!({
-                "date": format_iso(&r.date),
-                "open": r.open,
-                "close": r.close,
-                "high": r.high,
-                "low": r.low,
-                "volume": r.volume,
-                "amount": r.amount,
+                "price": l.price.as_ref().map(|p| p.value()),
+                "volume": l.volume.as_ref().map(|v| v.value()),
             })
         })
         .collect();
-    (
-        ok_json(json!({
-            "code": code,
-            "period": period_label(period),
-            "count": klines.len(),
-            "klines": klines,
-        })),
-        false,
-    )
-}
-
-/// 图 + 简表（最近 20 根）。
-fn kline_both_payload(
-    code: &str,
-    period: KlinePeriod,
-    rows: &[kline_cache::KlineRow],
-) -> (Vec<ToolResultContent>, bool) {
-    let (mut chart_blocks, _) = kline_chart_payload(code, period, rows);
-    let tail = rows.iter().rev().take(20).rev();
-    let recent: Vec<Value> = tail
-        .map(|r| {
+    let ask: Vec<Value> = q
+        .ask_levels
+        .iter()
+        .map(|l| {
             json!({
-                "date": format_iso(&r.date),
-                "open": r.open,
-                "close": r.close,
-                "high": r.high,
-                "low": r.low,
-                "volume": r.volume,
+                "price": l.price.as_ref().map(|p| p.value()),
+                "volume": l.volume.as_ref().map(|v| v.value()),
             })
         })
         .collect();
-    let table_block = ToolResultContent::Text {
-        text: format!("最近 20 根 OHLC：\n{}", serde_json::to_string(&recent).unwrap_or_default()),
-    };
-    chart_blocks.push(table_block);
-    (chart_blocks, false)
-}
-
-/// 给 chart 模式生成一段"关键数值"摘要——agent 看图同时拿到精确数字定位。
-fn format_chart_summary(code: &str, period: KlinePeriod, points: &[KlinePoint]) -> String {
-    let first = points.first().unwrap();
-    let last = points.last().unwrap();
-    let close = last.close.value();
-    let range_low = points
-        .iter()
-        .map(|p| p.low.value())
-        .fold(f64::INFINITY, f64::min);
-    let range_high = points
-        .iter()
-        .map(|p| p.high.value())
-        .fold(f64::NEG_INFINITY, f64::max);
-    let ma20 = if points.len() >= 20 {
-        let sum: f64 = points[points.len() - 20..]
-            .iter()
-            .map(|p| p.close.value())
-            .sum();
-        Some(sum / 20.0)
-    } else {
-        None
-    };
-    let change_pct = if first.close.value() > 0.0 {
-        (close - first.close.value()) / first.close.value() * 100.0
-    } else {
-        0.0
-    };
-    let ma20_line = match ma20 {
-        Some(v) => format!("MA20 ¥{:.2}（最新价相对 MA20 {:+.2}%）", v, (close - v) / v * 100.0),
-        None => "MA20 N/A（数据不足 20 根）".into(),
-    };
-    format!(
-        "{} {} {} 根；区间 {} → {}，close ¥{:.2}（区间变化 {:+.2}%）\n\
-         区间高低 ¥{:.2} / ¥{:.2}；{}\n\
-         看图判断趋势 / 形态 / 位置。需要精确数值可调 mode=data。",
-        code,
-        period_label(period),
-        points.len(),
-        first.date.to_compact(),
-        last.date.to_compact(),
-        close,
-        change_pct,
-        range_high,
-        range_low,
-        ma20_line,
-    )
-}
-
-fn format_iso(compact: &str) -> String {
-    if compact.len() == 8 {
-        format!("{}-{}-{}", &compact[0..4], &compact[4..6], &compact[6..8])
-    } else {
-        compact.to_string()
-    }
-}
-
-// ===== get_market_overview ===============================================
-
-pub struct GetMarketOverviewTool {
-    app: AppHandle,
-}
-
-impl GetMarketOverviewTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for GetMarketOverviewTool {
-    fn name(&self) -> &'static str {
-        "get_market_overview"
-    }
-
-    fn description(&self) -> &'static str {
-        "大盘指数快照（上证 / 深证 / 创业板 / 科创 50）。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}})
-    }
-
-    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        match market_overview::fetch_market_overview(&self.app).await {
-            Ok(o) => match serde_json::to_value(
-                crate::adapters::quotes_commands::MarketOverviewDto::from(o),
-            ) {
-                Ok(v) => (ok_json(v), false),
-                Err(e) => err_text(format!("序列化失败：{e}")),
+    json!({
+        "tsCode": q.code.as_str(),
+        "name": q.name,
+        "category": category_str(category),
+        "tradeDate": q.trade_date.to_compact(),
+        "price": q.price.as_ref().map(|p| p.value()),
+        "change": q.change.as_ref().map(|p| p.value()),
+        "changePercent": q.change_percent,
+        "open": q.open.as_ref().map(|p| p.value()),
+        "high": q.high.as_ref().map(|p| p.value()),
+        "low": q.low.as_ref().map(|p| p.value()),
+        "previousClose": q.previous_close.as_ref().map(|p| p.value()),
+        "limitUp": q.limit_up.as_ref().map(|p| p.value()),
+        "limitDown": q.limit_down.as_ref().map(|p| p.value()),
+        "volume": q.day_volume.as_ref().map(|v| v.value()),
+        "amount": q.day_amount.as_ref().map(|v| v.value()),
+        "turnoverRate": q.turnover_rate,
+        "volumeRatio": q.volume_ratio,
+        "tradeStatus": q.trade_status.as_str(),
+        "source": q.source.as_str(),
+        "capturedAt": q.captured_at.value(),
+        "exchangeTime": q.exchange_time.as_ref().map(|t| t.value()),
+        "freshness": {
+            "status": match q.freshness.status {
+                crate::domain::shared::FreshnessStatus::Fresh => "fresh",
+                crate::domain::shared::FreshnessStatus::Stale => "stale",
+                crate::domain::shared::FreshnessStatus::Missing => "missing",
             },
-            Err(e) => err_text(format!("get_market_overview 拉取失败：{e}")),
+            "capturedAt": q.freshness.captured_at.as_ref().map(|t| t.value()),
+            "ageMs": q.freshness.age_ms,
+            "source": q.freshness.source.clone(),
+            "warning": q.freshness.warning.map(|w| warning_str(w)),
+        },
+        "bid": bid,
+        "ask": ask,
+        "warnings": warnings,
+    })
+}
+
+async fn exec_scan_path(app: &AppHandle, input: &Value) -> (Vec<ToolResultContent>, bool) {
+    let scan = input.get("scan").cloned().unwrap_or(Value::Null);
+    let filter_str = scan.get("filter").and_then(Value::as_str);
+    let sort_str = scan.get("sortBy").and_then(Value::as_str);
+    let limit = scan
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(50)
+        .min(500) as usize;
+
+    // 构造 conditions（spec ScanCondition 集合；这里支持核心字段）
+    let mut conditions: Vec<DomainScanCondition> = Vec::new();
+    if let Some(filter) = filter_str {
+        match filter {
+            "limit_up" => conditions.push(DomainScanCondition::LimitUpHit),
+            "limit_down" => conditions.push(DomainScanCondition::LimitDownHit),
+            "top_gain" | "top_loss" | "top_amount" | "top_volume" => {}
+            other => {
+                return err_text(format!("invalid_input: scan.filter 未知 `{other}`"));
+            }
         }
     }
+    if let Some(arr) = scan.get("conditions").and_then(Value::as_array) {
+        for c in arr {
+            let field = c.get("field").and_then(Value::as_str).unwrap_or("");
+            let op = c.get("op").and_then(Value::as_str).unwrap_or("");
+            let value = c.get("value");
+            let cond = parse_user_condition(field, op, value);
+            match cond {
+                Ok(cond) => conditions.push(cond),
+                Err(e) => return err_text(e),
+            }
+        }
+    }
+    let sort_by = match sort_str {
+        Some("change_pct_desc") => DomainScanSort::ChangePctDesc,
+        Some("change_pct_asc") => DomainScanSort::ChangePctAsc,
+        Some("amount_desc") => DomainScanSort::AmountDesc,
+        Some("volume_desc") => DomainScanSort::VolumeDesc,
+        Some("turnover_rate_desc") => DomainScanSort::TurnoverRateDesc,
+        None => match filter_str {
+            Some("limit_up") | Some("limit_down") | Some("top_amount") => {
+                DomainScanSort::AmountDesc
+            }
+            Some("top_loss") => DomainScanSort::ChangePctAsc,
+            Some("top_volume") => DomainScanSort::VolumeDesc,
+            _ => DomainScanSort::ChangePctDesc,
+        },
+        Some(other) => {
+            return err_text(format!("invalid_input: scan.sortBy 未知 `{other}`"));
+        }
+    };
+
+    match scanner::scan_market_query(app, conditions, sort_by, limit).await {
+        Ok(result) => (ok_json(scan_result_to_packet(result, filter_str, sort_str, limit)), false),
+        Err(e) => err_text(format!("scan_market 错误：{e}")),
+    }
+}
+
+fn scan_result_to_packet(
+    result: DomainScanResult,
+    filter_str: Option<&str>,
+    sort_str: Option<&str>,
+    limit: usize,
+) -> Value {
+    let items: Vec<Value> = result
+        .items
+        .iter()
+        .map(|it| {
+            json!({
+                "rank": it.rank,
+                "tsCode": it.code.as_str(),
+                "name": it.name,
+                "category": "stock",
+                "price": it.price.as_ref().map(|p| p.value()),
+                "changePercent": it.change_pct,
+                "amount": it.amount.as_ref().map(|p| p.value()),
+                "volume": it.volume.as_ref().map(|v| v.value()),
+                "turnoverRate": it.turnover_rate,
+                "volumeRatio": it.volume_ratio,
+                "peTtm": it.pe,
+                "pb": it.pb,
+                "totalMv": it.total_mv.as_ref().map(|p| p.value()),
+            })
+        })
+        .collect();
+    json!({
+        "snapshotAt": chrono::Utc::now().to_rfc3339(),
+        "freshness": {"status": "fresh"},
+        "scan": {
+            "generatedAt": chrono::Utc::now().to_rfc3339(),
+            "tradeDate": result.trade_date.to_compact(),
+            "criteria": {
+                "filter": filter_str,
+                "sortBy": sort_str,
+                "limit": limit,
+            },
+            "items": items,
+        },
+    })
+}
+
+fn parse_user_condition(
+    field: &str,
+    op: &str,
+    value: Option<&Value>,
+) -> Result<DomainScanCondition, String> {
+    let scan_op = parse_scan_op(op, value)?;
+    use crate::domain::quotes::ScanCondition as C;
+    Ok(match field {
+        "changePercent" | "change_pct" => C::ChangePct(scan_op),
+        "amount" => C::Amount(scan_op),
+        "volume" => C::Volume(scan_op),
+        "turnoverRate" | "turnover_rate" => C::TurnoverRate(scan_op),
+        "volumeRatio" | "volume_ratio" => C::VolumeRatio(scan_op),
+        "peTtm" | "pe_ttm" => C::PeTtm(scan_op),
+        "pb" => C::Pb(scan_op),
+        "totalMv" | "total_mv" => C::TotalMv(scan_op),
+        "circMv" | "circ_mv" => C::CircMv(scan_op),
+        other => return Err(format!("invalid_input: 未知 field `{other}`")),
+    })
+}
+
+fn parse_scan_op(op: &str, value: Option<&Value>) -> Result<DomainScanOp, String> {
+    let single = || {
+        value
+            .and_then(Value::as_f64)
+            .ok_or_else(|| "invalid_input: value 必须是数字".to_string())
+    };
+    let range = || {
+        value
+            .and_then(|v| v.as_array())
+            .and_then(|a| {
+                if a.len() == 2 {
+                    Some((a[0].as_f64()?, a[1].as_f64()?))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "invalid_input: between 需要 [a,b]".to_string())
+    };
+    Ok(match op {
+        "gt" => DomainScanOp::Gt(single()?),
+        "gte" => DomainScanOp::Gte(single()?),
+        "lt" => DomainScanOp::Lt(single()?),
+        "lte" => DomainScanOp::Lte(single()?),
+        "eq" => DomainScanOp::Eq(single()?),
+        "between" => {
+            let (a, b) = range()?;
+            DomainScanOp::Between(a, b)
+        }
+        other => return Err(format!("invalid_input: 未知 op `{other}`")),
+    })
 }

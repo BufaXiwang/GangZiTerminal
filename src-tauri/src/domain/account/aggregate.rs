@@ -171,6 +171,7 @@ impl Account {
             source_analysis_id: cmd.source_analysis_id,
             entered_at,
             last_acquisition_at: entered_at,
+            warnings: Vec::new(),
         };
 
         let comm = if is_live {

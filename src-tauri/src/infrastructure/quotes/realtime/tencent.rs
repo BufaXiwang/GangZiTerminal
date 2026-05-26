@@ -191,11 +191,16 @@ fn parse_response(body: &str) -> Result<Vec<(String, StockQuote)>, QuotesError> 
             .map(|v| Lots::from_unchecked(v as i64));
         let day_amount = parse_f(37).map(|v| Yuan::from_unchecked(v * 10000.0));
 
+        let captured_at = OccurredAt::now();
+        let trade_date = crate::domain::shared::resolve_market_time(captured_at)
+            .current_trade_date
+            .unwrap_or_else(|| {
+                crate::domain::shared::resolve_market_time(captured_at)
+                    .latest_completed_trade_date
+            });
         result.push((
             ts_code,
             StockQuote {
-                code,
-                name,
                 price,
                 change_percent,
                 change,
@@ -205,12 +210,14 @@ fn parse_response(body: &str) -> Result<Vec<(String, StockQuote)>, QuotesError> 
                 previous_close: prev_close,
                 day_volume,
                 day_amount,
-                captured_at: OccurredAt::now(),
-                bid_levels: Vec::new(),
-                ask_levels: Vec::new(),
-                buy_volume: None,
-                sell_volume: None,
-                order_imbalance: None,
+                ..StockQuote::new_from_provider(
+                    code,
+                    name,
+                    crate::domain::quotes::InstrumentCategory::Stock,
+                    trade_date,
+                    captured_at,
+                    crate::domain::quotes::QuoteSource::Tencent,
+                )
             },
         ));
     }

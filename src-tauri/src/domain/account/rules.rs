@@ -16,14 +16,68 @@ use crate::domain::shared::{Lots, OccurredAt, Shares, Yuan};
 /// 整手大小——100 股。
 pub const INTEGER_LOT_SIZE: i64 = 100;
 
-/// 佣金费率——0.025%（双向）。
-pub const COMMISSION_RATE: f64 = 0.00025;
+/// 佣金费率（双向）—— spec account-module.md §5 default：`commissionRate = 0.0003`。
+pub const COMMISSION_RATE: f64 = 0.0003;
 
-/// 佣金最低收费——5 元（双向）。
+/// 佣金最低收费（双向）—— spec default：`minCommission = 5`。
 pub const COMMISSION_MIN: f64 = 5.0;
 
-/// 印花税费率——0.1%（仅卖出）。
-pub const STAMP_TAX_RATE: f64 = 0.001;
+/// 印花税费率（仅卖出）—— spec default：`stampTaxSellRate = 0.0005`。
+pub const STAMP_TAX_RATE: f64 = 0.0005;
+
+/// 过户费率（spec default：`transferFeeRate = 0`；保留接口，沪市可后续启用）。
+pub const TRANSFER_FEE_RATE: f64 = 0.0;
+
+// ============================================================================
+// AccountRiskPolicy —— spec account-module.md §2/§5。
+// ============================================================================
+
+/// 单票仓位上限（市值 / riskEquity）—— spec default 25%。
+pub const MAX_SINGLE_POSITION_RATIO: f64 = 0.25;
+/// 总仓位上限（总市值 + 在途买单冻结 / riskEquity）—— spec default 95%。
+pub const MAX_GROSS_EXPOSURE_RATIO: f64 = 0.95;
+/// 单笔订单金额上限 / riskEquity —— spec default 25%。
+pub const MAX_ORDER_VALUE_RATIO: f64 = 0.25;
+/// 每自然日 actor=agent 新建订单数上限 —— spec default 20。
+pub const MAX_DAILY_NEW_ORDERS: u32 = 20;
+
+#[derive(Debug, Clone, Copy)]
+pub struct AccountRiskPolicy {
+    pub max_single_position_ratio: f64,
+    pub max_gross_exposure_ratio: f64,
+    pub max_order_value_ratio: f64,
+    pub max_daily_new_orders: u32,
+}
+
+impl Default for AccountRiskPolicy {
+    fn default() -> Self {
+        Self {
+            max_single_position_ratio: MAX_SINGLE_POSITION_RATIO,
+            max_gross_exposure_ratio: MAX_GROSS_EXPOSURE_RATIO,
+            max_order_value_ratio: MAX_ORDER_VALUE_RATIO,
+            max_daily_new_orders: MAX_DAILY_NEW_ORDERS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AccountFeePolicy {
+    pub commission_rate: f64,
+    pub min_commission: f64,
+    pub stamp_tax_sell_rate: f64,
+    pub transfer_fee_rate: f64,
+}
+
+impl Default for AccountFeePolicy {
+    fn default() -> Self {
+        Self {
+            commission_rate: COMMISSION_RATE,
+            min_commission: COMMISSION_MIN,
+            stamp_tax_sell_rate: STAMP_TAX_RATE,
+            transfer_fee_rate: TRANSFER_FEE_RATE,
+        }
+    }
+}
 
 // ============================================================================
 // 校验函数
@@ -209,23 +263,23 @@ mod tests {
 
     #[test]
     fn commission_min_floor() {
-        // 100 股 × 1 元 = 100 元 × 0.025% = 0.025 元 → 触底线 5 元
+        // 100 股 × 1 元 = 100 元 × 0.03% = 0.03 元 → 触底线 5 元
         let fee = commission(Yuan::new(1.0).unwrap(), Shares::new(100).unwrap());
         assert_eq!(fee.value(), 5.0);
     }
 
     #[test]
     fn commission_proportional_when_large() {
-        // 1000 股 × 100 元 = 100000 元 × 0.025% = 25 元
+        // 1000 股 × 100 元 = 100000 元 × 0.03% = 30 元（spec default rate）
         let fee = commission(Yuan::new(100.0).unwrap(), Shares::new(1000).unwrap());
-        assert!((fee.value() - 25.0).abs() < 1e-6);
+        assert!((fee.value() - 30.0).abs() < 1e-6);
     }
 
     #[test]
     fn stamp_tax_only_on_value() {
-        // 1000 股 × 50 元 = 50000 元 × 0.1% = 50 元
+        // 1000 股 × 50 元 = 50000 元 × 0.05% = 25 元（spec default rate）
         let tax = stamp_tax(Yuan::new(50.0).unwrap(), Shares::new(1000).unwrap());
-        assert!((tax.value() - 50.0).abs() < 1e-6);
+        assert!((tax.value() - 25.0).abs() < 1e-6);
     }
 
     #[test]

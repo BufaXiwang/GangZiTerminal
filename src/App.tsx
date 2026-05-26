@@ -2,10 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
   BarChart3,
-  BookOpen,
   Brain,
-  Layers,
-  Lightbulb,
   MessageSquare,
   Newspaper,
   Settings,
@@ -15,9 +12,6 @@ import { useEffect, useMemo, useState } from "react";
 import { NewsPage } from "./components/NewsPage";
 import { SecondaryView } from "./components/SecondaryView";
 import { TodayPage } from "./components/TodayPage";
-import { StrategiesPage } from "./components/StrategiesPage";
-import { LessonsPage } from "./components/LessonsPage";
-import { HeuristicsPage } from "./components/HeuristicsPage";
 import { useAppState } from "./hooks/useAppState";
 import { useChatMessageStream } from "./hooks/useChatMessageStream";
 import { useNewsRefresh } from "./hooks/useNewsRefresh";
@@ -34,15 +28,8 @@ const activeViewKey = "gangzi-terminal.active-view";
 const simulationInitialCash = 20000;
 const messagesPageSize = 50;
 
-/// 一级 nav——Agent 是聚合视图，内部含 5 个子 tab
+/// 一级 nav。
 type ViewId = "agent" | "today" | "news" | "simulation" | "settings";
-
-/// Agent 视图内的子 tab——chat 是默认入口；其他 4 个看 agent 大脑状态
-type AgentSubView =
-  | "chat"
-  | "strategies"
-  | "heuristics"
-  | "lessons";
 
 const navItems: Array<{ id: ViewId; label: string; icon: typeof BarChart3 }> = [
   { id: "agent", label: "Agent", icon: MessageSquare },
@@ -50,19 +37,6 @@ const navItems: Array<{ id: ViewId; label: string; icon: typeof BarChart3 }> = [
   { id: "news", label: "资讯", icon: Newspaper },
   { id: "simulation", label: "模拟账户", icon: WalletCards },
   { id: "settings", label: "设置", icon: Settings },
-];
-
-/// Agent 内子 nav——左侧 rail，跟主 nav 一套视觉系（lucide 图标 + 中文 label）。
-const agentSubTabs: Array<{
-  id: AgentSubView;
-  icon: typeof MessageSquare;
-  label: string;
-  hint: string;
-}> = [
-  { id: "chat", icon: MessageSquare, label: "对话", hint: "和 agent 实时对话——决策入口" },
-  { id: "strategies", icon: Layers, label: "策略", hint: "触发开仓的规则集" },
-  { id: "heuristics", icon: Lightbulb, label: "启发式", hint: "agent 学到的启发式规则" },
-  { id: "lessons", icon: BookOpen, label: "复盘", hint: "每次复盘的原子观察" },
 ];
 
 function App() {
@@ -85,8 +59,6 @@ function App() {
     // 兜底：老视图值落到磁盘上时重置到 agent
     (value) => (navItems.some((nav) => nav.id === value) ? value : "agent"),
   );
-  /// Agent 内子 tab 不持久化——session 内有效，每次进 Agent 默认 chat
-  const [agentSubView, setAgentSubView] = useState<AgentSubView>("chat");
   const [autoRefresh, setAutoRefresh] = useAppState<boolean>(autoRefreshKey, true);
   const [refreshInterval, setRefreshInterval] = useAppState<number>(refreshIntervalKey, 60000);
 
@@ -215,97 +187,42 @@ function App() {
           ) : activeView === "news" ? (
             <NewsPage />
           ) : activeView === "agent" ? (
-            <div className="agent-shell">
-              {/* 顶部横向 tabs——之前是左侧 rail，但 5 个 tab 撑不满全高、
-                  竖条上下大段空白，挤占内容横向空间。改成顶栏更紧凑。 */}
-              <nav className="agent-tabbar">
-                {agentSubTabs.map((tab) => {
-                  const Icon = tab.icon;
-                  return (
-                    <button
-                      key={tab.id}
-                      onClick={() => setAgentSubView(tab.id)}
-                      title={tab.hint}
-                      className={`agent-tabbar-btn${agentSubView === tab.id ? " active" : ""}`}
-                    >
-                      <Icon size={14} />
-                      <span>{tab.label}</span>
-                    </button>
+            <SecondaryView
+              activeView="chat"
+              autoRefresh={autoRefresh}
+              databasePath={databasePath}
+              hasMoreMessages={hasMoreMessages}
+              isChatting={isChatting}
+              loadMoreMessages={() => void loadMoreMessages()}
+              messages={messages}
+              refreshInterval={refreshInterval}
+              riskAlerts={riskAlerts}
+              searchMessages={(query) => void searchMessages(query)}
+              sendChatMessage={(content, images) => {
+                const hasImages = images && images.length > 0;
+                if ((!content.trim() && !hasImages) || isChatting) return;
+                setIsChatting(true);
+                const timeoutId = window.setTimeout(() => {
+                  setIsChatting(false);
+                  setStatus(
+                    "对话超时（5 分钟）。Agent 可能仍在后台运行，请稍后查看对话流。",
                   );
-                })}
-              </nav>
-
-              {/* 主区——根据 sub view 渲染 */}
-              <div className="agent-main">
-                {agentSubView === "chat" ? (
-                  <SecondaryView
-                    activeView="chat"
-                    autoRefresh={autoRefresh}
-                    databasePath={databasePath}
-                    hasMoreMessages={hasMoreMessages}
-                    isChatting={isChatting}
-                    loadMoreMessages={() => void loadMoreMessages()}
-                    messages={messages}
-                    refreshInterval={refreshInterval}
-                    riskAlerts={riskAlerts}
-                    searchMessages={(query) => void searchMessages(query)}
-                    sendChatMessage={(content, images) => {
-                      const hasImages = images && images.length > 0;
-                      if ((!content.trim() && !hasImages) || isChatting) return;
-                      setIsChatting(true);
-                      const timeoutId = window.setTimeout(() => {
-                        setIsChatting(false);
-                        setStatus(
-                          "对话超时（5 分钟）。Agent 可能仍在后台运行，请稍后查看对话流。",
-                        );
-                      }, 5 * 60 * 1000);
-                      void invoke("send_chat_message_now", {
-                        content,
-                        images: images ?? [],
-                      })
-                        // agent 错误后端会推到 chat stream（以 system/assistant 消息形式），
-                        // 这里不再 setStatus 避免侧栏 + 气泡重复展示。只打 console。
-                        .catch((err) =>
-                          console.warn("send_chat_message_now 失败:", err),
-                        )
-                        .finally(() => {
-                          window.clearTimeout(timeoutId);
-                          setIsChatting(false);
-                        });
-                    }}
-                    setAutoRefresh={setAutoRefresh}
-                    setRefreshInterval={setRefreshInterval}
-                  />
-                ) : agentSubView === "strategies" ? (
-                  <StrategiesPage
-                    onAskAgent={(prefill) => {
-                      setAgentSubView("chat");
-                      window.dispatchEvent(
-                        new CustomEvent("agent-prefill", { detail: prefill }),
-                      );
-                    }}
-                  />
-                ) : agentSubView === "heuristics" ? (
-                  <HeuristicsPage
-                    onAskAgent={(prefill) => {
-                      setAgentSubView("chat");
-                      window.dispatchEvent(
-                        new CustomEvent("agent-prefill", { detail: prefill }),
-                      );
-                    }}
-                  />
-                ) : (
-                  <LessonsPage
-                    onAskAgent={(prefill) => {
-                      setAgentSubView("chat");
-                      window.dispatchEvent(
-                        new CustomEvent("agent-prefill", { detail: prefill }),
-                      );
-                    }}
-                  />
-                )}
-              </div>
-            </div>
+                }, 5 * 60 * 1000);
+                void invoke("send_chat_message_now", {
+                  content,
+                  images: images ?? [],
+                })
+                  .catch((err) =>
+                    console.warn("send_chat_message_now 失败:", err),
+                  )
+                  .finally(() => {
+                    window.clearTimeout(timeoutId);
+                    setIsChatting(false);
+                  });
+              }}
+              setAutoRefresh={setAutoRefresh}
+              setRefreshInterval={setRefreshInterval}
+            />
           ) : (
             <SecondaryView
               activeView={activeView as "simulation" | "settings"}

@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)] // 仓位 repo / valuation / migration 提供完整能力面，agent 写工具 Step B 连通
+#![allow(dead_code, unused_imports)] // 仓位 repo / valuation / migration 提供完整能力面
 
 //! Infrastructure `account`——模拟账户子域的 I/O 实现。
 //!
@@ -10,11 +10,15 @@
 //!
 //! 依赖单向：account → quotes（valuation 读 MARKET_SNAPSHOT），spec § 1.3 允许。
 
+pub mod account_events_repo;
 pub mod metrics;
+pub mod orders_repo;
 pub mod repository;
 pub mod snapshot_cache;
+pub mod trigger_repo;
 pub mod valuation;
 pub mod watchlist;
+pub mod watchlist_events;
 
 pub use repository::PositionRepo;
 pub use valuation::{compute_snapshot, INITIAL_CASH};

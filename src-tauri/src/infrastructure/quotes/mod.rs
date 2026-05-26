@@ -11,14 +11,11 @@
 //! - `infrastructure/account/`  —— 模拟账户子域 I/O
 
 pub mod cache;
-pub mod chart_renderer;
 pub mod core_indexes;
 pub mod eastmoney;
 pub mod realtime;
 pub mod repository;
 pub mod scanner;
-pub mod regime_detector_service;
-pub mod signal_detector;
 pub mod snapshot;
 pub mod tdx;
 pub mod tushare;

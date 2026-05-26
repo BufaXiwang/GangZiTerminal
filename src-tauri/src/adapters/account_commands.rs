@@ -154,7 +154,7 @@ fn emit_watchlist_changed(app: &AppHandle, action: &str, code: &str, total: usiz
 fn spawn_immediate_quote_refresh(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        match crate::pipeline::market::refresh::run_market_quote_refresh(&app).await {
+        match crate::pipeline::agent_runtime::quotes_refresh::refresh_subscribed_quotes(&app).await {
             Ok(summary) => tracing::info!(
                 total = summary.total,
                 success = summary.success,

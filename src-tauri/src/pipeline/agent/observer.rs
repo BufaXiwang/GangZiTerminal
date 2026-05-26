@@ -29,12 +29,10 @@ use tauri::AppHandle;
 pub const AGENT_EVENT: &str = "agent-event";
 
 /// 把 PipelineKind 映射到 agent_episodes.trigger_kind。
-/// Phase 1：chat pipeline → 'chat'。reflection / scheduled tick 自己显式传 trigger_kind 字符串。
-fn pipeline_to_trigger_kind(pipeline: PipelineKind) -> &'static str {
-    match pipeline.as_str() {
-        // 旧 briefing / review 已下线，pipeline 已经收缩到 chat；保险起见 fallback 也写 chat
-        _ => "chat",
-    }
+/// 当前只有 chat pipeline；后台 run（news_analysis / account_trigger 等）通过
+/// `start_run_with_trigger` 直接传 trigger_kind 字符串。
+fn pipeline_to_trigger_kind(_pipeline: PipelineKind) -> &'static str {
+    "chat"
 }
 
 pub fn start_run(
@@ -57,7 +55,7 @@ pub fn start_run(
     )
 }
 
-/// 通用 episode 启动入口——reflection / scheduled tick 等非 chat 触发的 run 走这条。
+/// 通用 episode 启动入口——background_run（news_analysis / account_trigger）走这条。
 #[allow(clippy::too_many_arguments)]
 pub fn start_episode(
     app: &AppHandle,
@@ -86,7 +84,7 @@ pub fn start_episode(
 
 pub fn finalize(app: &AppHandle, summary: &RunSummary, error: Option<&str>) -> Result<(), String> {
     let ended_at = Utc::now().to_rfc3339();
-    finalize_agent_episode(
+    let r = finalize_agent_episode(
         app,
         &summary.run_id,
         &ended_at,
@@ -99,41 +97,18 @@ pub fn finalize(app: &AppHandle, summary: &RunSummary, error: Option<&str>) -> R
         summary.server_tool_calls,
         Some(stop_reason_str(summary.stop_reason)),
         error,
-        None, // position_ids — reflection pipeline 会传，chat 暂不写
-        None, // outcome_summary — reflection pipeline 会传，chat 暂不写
-    )
-}
-
-/// reflection / 其他需要写 position_ids + outcome_summary 的 pipeline 用这个。
-pub fn finalize_with_context(
-    app: &AppHandle,
-    summary: &RunSummary,
-    error: Option<&str>,
-    position_ids: Option<&str>,
-    outcome_summary: Option<&str>,
-) -> Result<(), String> {
-    let ended_at = Utc::now().to_rfc3339();
-    finalize_agent_episode(
-        app,
-        &summary.run_id,
-        &ended_at,
-        summary.turns,
-        summary.total_input_tokens,
-        summary.total_output_tokens,
-        summary.total_cache_read_tokens,
-        summary.total_cache_write_tokens,
-        summary.local_tool_calls,
-        summary.server_tool_calls,
-        Some(stop_reason_str(summary.stop_reason)),
-        error,
-        position_ids,
-        outcome_summary,
-    )
+        None, // position_ids — 留给 background_run decision pipeline 接入
+        None, // outcome_summary — 留给 background_run decision pipeline 接入
+    );
+    // spec EvidenceRef 校验只在 run 生命周期内有效；run 结束统一释放 RunScope（避免内存累积）。
+    crate::pipeline::agent_runtime::run_scope::remove(&summary.run_id);
+    r
 }
 
 /// run 启动失败（连模型都没调通）——只补一条 ended_at + error，不带 token 数据。
 pub fn finalize_failure(app: &AppHandle, run_id: &str, error: &str) -> Result<(), String> {
     let ended_at = Utc::now().to_rfc3339();
+    crate::pipeline::agent_runtime::run_scope::remove(run_id);
     finalize_agent_episode(
         app,
         run_id,
@@ -458,14 +433,16 @@ mod tests {
     }
 }
 
+/// spec agent-infra-module.md §201 `AgentStopReason` 闭集合：
+/// `completed | max_turns | cancelled | provider_stop | tool_error | context_limit | error`。
+/// Domain StopReason 内部值（end_turn / max_tokens / stop_sequence / refusal /
+/// pause_turn / search_budget_exhausted）映射到 spec 闭集合：
+/// - EndTurn → completed（模型自然结束）
+/// - MaxTokens / StopSequence / Refusal / PauseTurn → provider_stop（provider 侧 stop）
+/// - SearchBudgetExhausted → tool_error（工具预算上限）
+/// - MaxTurns → max_turns
+/// - Cancelled → cancelled
 pub fn stop_reason_str(sr: StopReason) -> &'static str {
-    match sr {
-        StopReason::EndTurn => "end_turn",
-        StopReason::MaxTokens => "max_tokens",
-        StopReason::StopSequence => "stop_sequence",
-        StopReason::MaxTurns => "max_turns",
-        StopReason::SearchBudgetExhausted => "search_budget_exhausted",
-        StopReason::Refusal => "refusal",
-        StopReason::PauseTurn => "pause_turn",
-    }
+    // spec agent-infra-module.md §2 AgentStopReason 闭集合通过 StopReason::as_spec_str 映射。
+    sr.as_spec_str()
 }

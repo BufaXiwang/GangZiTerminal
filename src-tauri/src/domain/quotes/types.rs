@@ -9,7 +9,7 @@
 //! 4. 个股档案（StockRef）
 //! 5. 元信息（HistorySource）
 
-use crate::domain::shared::{Lots, OccurredAt, StockCode, TradeDate, Yuan};
+use crate::domain::shared::{Freshness, Lots, OccurredAt, StockCode, TradeDate, TsCode, WarningCode, Yuan};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -23,11 +23,22 @@ use serde::{Deserialize, Serialize};
 /// - `captured_at`：本地拉取时间——agent 判断 snapshot 多旧用
 /// - `quote_time`：交易所给的报价时间——和 captured_at 可能差 0-3 秒
 /// - 五档：`bid_*` / `ask_*` 各 5 档，buy 一档是 `bid_prices[0]`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// 行情快照 —— spec `quotes-module.md §2`。
+///
+/// 字段语义：
+/// - `price` 是当前最新价；不能用 `previous_close` 伪造
+/// - `trade_date` 是 quote 对应的交易日（盘中 = currentTradeDate / 盘后 = latestCompletedTradeDate）
+/// - `bid_levels` / `ask_levels` 买卖五档，从近到远排列
+/// - `limit_up` / `limit_down` 涨跌停价（Quotes 基于 previousClose + board + isSt 计算）
+/// - `trade_status` query facade 派生的读取时状态
+/// - `freshness` 由 query facade 派生；snapshot cache 不主动暴露
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StockQuote {
     pub code: StockCode,
     pub name: String,
+    pub category: InstrumentCategory,
+    pub trade_date: TradeDate,
 
     // 价
     pub price: Option<Yuan>,
@@ -37,13 +48,37 @@ pub struct StockQuote {
     pub high: Option<Yuan>,
     pub low: Option<Yuan>,
     pub previous_close: Option<Yuan>,
+    /// 涨停价（A 股规则派生）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_up: Option<Yuan>,
+    /// 跌停价（A 股规则派生）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_down: Option<Yuan>,
 
     // 量额（当日累计）
     pub day_volume: Option<Lots>,
     pub day_amount: Option<Yuan>,
+    /// 换手率（%）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turnover_rate: Option<f64>,
+    /// 量比
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_ratio: Option<f64>,
 
     /// 本地拉取时间（unix ms）——判断 snapshot 多旧
     pub captured_at: OccurredAt,
+    /// 交易所给的报价时间（若有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_time: Option<OccurredAt>,
+    /// 实时数据来源
+    pub source: QuoteSource,
+    /// query facade 派生的读取时状态
+    pub trade_status: TradeStatus,
+    /// 由 query facade 派生
+    pub freshness: Freshness,
+    /// 渲染时的 quote 警告（depth_missing / quote_stale 等）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<WarningCode>,
 
     /// 买盘五档（bid 1..5）。数据源不支持时为空。
     #[serde(default)]
@@ -57,6 +92,106 @@ pub struct StockQuote {
     pub sell_volume: Option<Lots>,
     /// 委比（%）：(买量 - 卖量) / (买量 + 卖量) * 100。
     pub order_imbalance: Option<f64>,
+}
+
+impl StockQuote {
+    /// 构造一个 provider 写入时刻的最小 quote 骨架；调用方填入 price/change 等字段。
+    /// `freshness` / `trade_status` 由 query facade 派生（spec §2 不变量）。
+    pub fn new_from_provider(
+        code: StockCode,
+        name: String,
+        category: InstrumentCategory,
+        trade_date: TradeDate,
+        captured_at: OccurredAt,
+        source: QuoteSource,
+    ) -> Self {
+        Self {
+            code,
+            name,
+            category,
+            trade_date,
+            price: None,
+            change_percent: None,
+            change: None,
+            open: None,
+            high: None,
+            low: None,
+            previous_close: None,
+            limit_up: None,
+            limit_down: None,
+            day_volume: None,
+            day_amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            captured_at,
+            exchange_time: None,
+            source,
+            trade_status: TradeStatus::Unknown,
+            freshness: Freshness::fresh(captured_at, source.as_str()),
+            warnings: Vec::new(),
+            bid_levels: Vec::new(),
+            ask_levels: Vec::new(),
+            buy_volume: None,
+            sell_volume: None,
+            order_imbalance: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteSource {
+    Tdx,
+    Eastmoney,
+    Tencent,
+    Sina,
+    /// fallback 跨源拼装；附带 source 审计字段
+    Mixed,
+}
+
+impl Default for QuoteSource {
+    fn default() -> Self {
+        QuoteSource::Mixed
+    }
+}
+
+impl QuoteSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tdx => "tdx",
+            Self::Eastmoney => "eastmoney",
+            Self::Tencent => "tencent",
+            Self::Sina => "sina",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+/// 读取时 trade status（query facade 派生）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeStatus {
+    Trading,
+    Halted,
+    Closed,
+    Unknown,
+}
+
+impl Default for TradeStatus {
+    fn default() -> Self {
+        TradeStatus::Unknown
+    }
+}
+
+impl TradeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trading => "trading",
+            Self::Halted => "halted",
+            Self::Closed => "closed",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,22 +404,106 @@ pub struct StockRef {
     pub market: String,
 }
 
-/// 全市场标的——股票 / 指数 / 基金的合集，给"今日市场"页面列表用。
+/// 统一标的模型 —— spec `quotes-module.md §2`。
 ///
-/// `ts_code` 是后端唯一键（"000001.SH" / "510300.SH" / "159915.SZ"）；
-/// `code` 是 6 位显示码。`category` 区分类别，前端列表 tab 分流靠它。
+/// `ts_code` 是唯一身份；股票 / 指数 / 场内基金都用同一份模型。
+/// 来源 enrich 字段（publisher / indexCategory / fundType / management 等）
+/// 可缺；`source` 表示档案 / universe 数据源（非实时行情来源）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketInstrument {
-    /// 唯一键，带后缀。stock 表里是 "{code}.{SH|SZ|BJ}"
     pub ts_code: String,
     /// 6 位 code，给用户看
     pub code: String,
     pub name: String,
-    /// "stock" / "index" / "fund"
     pub category: InstrumentCategory,
-    /// 个股 = 行业；指数 = 发布机构（CSI / SSE 等）；基金 = 类别
+    /// 交易所市场：SH / SZ / BJ
+    pub market: Market,
+    /// 个股板块（主板 / 创业板 / 科创板 / 北交所）；指数 / 基金可空
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board: Option<String>,
+    /// 行业（个股）/ 发布机构（指数）/ 基金类别
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sector: Option<String>,
+    /// 上市状态
+    pub status: InstrumentStatus,
+    /// 是否 ST / *ST（用于涨跌停规则）
+    #[serde(default)]
+    pub is_st: bool,
+    /// 指数发布机构（CSI / SSE / SZSE 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// 指数细分类目
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_category: Option<String>,
+    /// 基金细分类型（ETF / LOF / 封基）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fund_type: Option<String>,
+    /// 基金管理人
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management: Option<String>,
+    /// 上市日期 YYYY-MM-DD
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_date: Option<String>,
+    /// 档案来源
+    pub source: InstrumentSource,
+    /// 最后一次 universe 写入时间
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Market {
+    SH,
+    SZ,
+    BJ,
+}
+
+impl Market {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Market::SH => "SH",
+            Market::SZ => "SZ",
+            Market::BJ => "BJ",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_uppercase().as_str() {
+            "SH" => Market::SH,
+            "SZ" => Market::SZ,
+            "BJ" => Market::BJ,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentStatus {
+    Listed,
+    Suspended,
+    Delisted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentSource {
+    Tdx,
+    Eastmoney,
+    Tushare,
+    Mixed,
+}
+
+impl InstrumentSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tdx => "tdx",
+            Self::Eastmoney => "eastmoney",
+            Self::Tushare => "tushare",
+            Self::Mixed => "mixed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -293,6 +512,12 @@ pub enum InstrumentCategory {
     Stock,
     Index,
     Fund,
+}
+
+impl Default for InstrumentCategory {
+    fn default() -> Self {
+        InstrumentCategory::Stock
+    }
 }
 
 impl InstrumentCategory {
@@ -306,9 +531,15 @@ impl InstrumentCategory {
 }
 
 /// 每日基本面指标——PE / PB / 市值 / 换手率 / 量比（TuShare daily_basic）。
+///
+/// spec quotes-module.md §2 `DailyBasic`：以 `(tsCode, tradeDate)` 唯一；
+/// 必须含 `source` / `fetchedAt` 审计字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DailyBasic {
+    pub ts_code: TsCode,
+    /// 6 位本地股票代码 —— 兼容旧 scanner / repository 的纯六位读模型路径。
+    /// 仍可由 ts_code 派生，但避免 caller 每次拆分。
     pub code: StockCode,
     pub trade_date: TradeDate,
     pub pe: Option<f64>,
@@ -330,6 +561,10 @@ pub struct DailyBasic {
     pub total_mv: Yuan,
     /// 流通市值（万元）
     pub circ_mv: Yuan,
+    /// provider 标识，例如 `"tushare:daily_basic"`。spec 审计字段。
+    pub source: String,
+    /// 拉取时刻 RFC3339。spec 审计字段。
+    pub fetched_at: String,
 }
 
 /// 个股全档案 = 基础信息 + 当前基本面 + 指标快照。
@@ -434,53 +669,73 @@ pub struct MarginSummary {
 // 6. 公司动作
 // ============================================================================
 
-/// 公司动作事件——影响交易策略 / 涨跌幅 / 流通盘的关键节点。
+/// 公司动作事件类型 —— spec quotes-module.md §2 `CompanyEvent.eventType` 闭集合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompanyEventType {
+    Dividend,
+    Suspension,
+    Resume,
+    St,
+    EarningsForecast,
+    Unlock,
+    Other,
+}
+
+impl CompanyEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompanyEventType::Dividend => "dividend",
+            CompanyEventType::Suspension => "suspension",
+            CompanyEventType::Resume => "resume",
+            CompanyEventType::St => "st",
+            CompanyEventType::EarningsForecast => "earnings_forecast",
+            CompanyEventType::Unlock => "unlock",
+            CompanyEventType::Other => "other",
+        }
+    }
+}
+
+/// 公司动作事件 —— spec quotes-module.md §2 统一 DTO。
+///
+/// 以 `id` 唯一，必须关联 `tsCode`；provider 原始字段放进 `payload`（保留可审计性），
+/// 对外稳定字段是 `event_type` / `announce_date` / `effective_date` / `source` / `fetched_at`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CompanyEvent {
-    /// 分红 / 送转
-    Dividend {
-        announce_date: TradeDate,
-        ex_date: Option<TradeDate>,
-        /// 每 10 股派现金（元）
-        cash_per_10: f64,
-        /// 每 10 股送股
-        share_per_10: f64,
-        /// 每 10 股转股
-        transfer_per_10: f64,
-    },
-    /// 停复牌
-    Suspension {
-        begin_date: TradeDate,
-        end_date: Option<TradeDate>,
-        reason: String,
-    },
-    /// ST 状态变更
-    StChange {
-        effective_date: TradeDate,
-        new_status: StStatus,
-        previous_name: String,
-        new_name: String,
-    },
-    /// 业绩预告
-    EarningsForecast {
-        period: String,
-        forecast_type: ForecastType,
-        /// 预告净利润下限（元）
-        min_profit: Option<Yuan>,
-        max_profit: Option<Yuan>,
-        change_min_pct: Option<f64>,
-        change_max_pct: Option<f64>,
-        summary: String,
-    },
-    /// 限售股解禁
-    ShareUnlock {
-        unlock_date: TradeDate,
-        /// 解禁股数
-        unlock_shares: Lots,
-        /// 占总股本比（%）
-        unlock_ratio: f64,
-    },
+#[serde(rename_all = "camelCase")]
+pub struct CompanyEvent {
+    pub id: String,
+    pub ts_code: TsCode,
+    pub event_type: CompanyEventType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub announce_date: Option<TradeDate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_date: Option<TradeDate>,
+    /// provider 原始字段（dividend.cash_div_tax、forecast.summary 等）。
+    /// 对外稳定字段保留在 `event_type` / 日期上，扩展字段由消费方按 `event_type` 解读。
+    pub payload: serde_json::Value,
+    /// provider 标识，例如 `"tushare:dividend"` / `"tushare:forecast"`。
+    pub source: String,
+    /// 拉取时刻 RFC3339。
+    pub fetched_at: String,
+}
+
+impl CompanyEvent {
+    /// 构造确定 ID：`{source}:{ts_code}:{event_type}:{primary_date}`。
+    /// `primary_date` 优先用 effective_date，没有就用 announce_date，再没有就用 "unknown"。
+    pub fn make_id(
+        source: &str,
+        ts_code: &str,
+        event_type: CompanyEventType,
+        primary_date: Option<&str>,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            source,
+            ts_code,
+            event_type.as_str(),
+            primary_date.unwrap_or("unknown"),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -492,6 +747,17 @@ pub enum StStatus {
     Delisted,
 }
 
+impl StStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StStatus::Normal => "normal",
+            StStatus::St => "st",
+            StStatus::StarSt => "star_st",
+            StStatus::Delisted => "delisted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForecastType {
@@ -501,6 +767,19 @@ pub enum ForecastType {
     TurnLoss,
     Continued,
     Unknown,
+}
+
+impl ForecastType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForecastType::Increase => "increase",
+            ForecastType::Decrease => "decrease",
+            ForecastType::TurnProfit => "turn_profit",
+            ForecastType::TurnLoss => "turn_loss",
+            ForecastType::Continued => "continued",
+            ForecastType::Unknown => "unknown",
+        }
+    }
 }
 
 // ============================================================================
@@ -558,6 +837,12 @@ pub enum ScanFilter {
     TopVolume,
 }
 
+/// 扫描条件 —— spec `quotes-module.md §2 ScanCondition`。
+///
+/// 字段名只能使用 spec 允许的固定 union；新增字段必须先扩展 spec。
+/// `LimitUpHit` / `LimitDownHit` 表示 `price == limitUp / limitDown` 精确匹配
+/// （处理 ST 5% / 创业板 20% / 科创板 20% 等不同规则），对应 spec §2 预设
+/// filter 的语义。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "field", content = "op")]
 pub enum ScanCondition {
@@ -566,17 +851,25 @@ pub enum ScanCondition {
     Volume(ScanOp),
     TurnoverRate(ScanOp),
     VolumeRatio(ScanOp),
-    Pe(ScanOp),
+    PeTtm(ScanOp),
     Pb(ScanOp),
     TotalMv(ScanOp),
     CircMv(ScanOp),
+    /// `price == limitUp`（精确价格匹配）
+    LimitUpHit,
+    /// `price == limitDown`（精确价格匹配）
+    LimitDownHit,
 }
 
+/// Spec §2 ScanOp.op：gt | gte | lt | lte | eq | between。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "op", content = "value")]
 pub enum ScanOp {
     Gt(f64),
+    Gte(f64),
     Lt(f64),
+    Lte(f64),
+    Eq(f64),
     Between(f64, f64),
 }
 

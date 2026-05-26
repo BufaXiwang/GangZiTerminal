@@ -11,29 +11,17 @@
 //! Empty reply 频率明显高于精简字段；五档需求由 account 模块（持仓平仓）或
 //! 前端详情视图按需 lazy 拉。
 
-use super::client::{fetch_text, fetch_text_with, parse_em_response};
+use super::client::{fetch_text_with, parse_em_response};
 use crate::domain::quotes::{QuotesError, StockQuote};
 use crate::domain::shared::{Lots, OccurredAt, StockCode, Yuan};
 use serde_json::Value;
 
 const FIELDS: &str = "f12,f13,f14,f2,f3,f4,f5,f6,f15,f16,f17,f18,f124";
 
-/// 批量拉实时报价（基础字段）。
+/// 批量拉实时报价（基础字段）+ 自定义 Client（含 proxy）。
 ///
 /// 给 secids 列表（含市场前缀，如 "1.000001" / "0.159915" / "2.920469"），
 /// 返回 `(ts_code, StockQuote)`——ts_code 形如 "{code}.{SH|SZ|BJ}"。
-pub async fn fetch_quotes_by_secids(
-    secids: &[String],
-) -> Result<Vec<(String, StockQuote)>, QuotesError> {
-    if secids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let url = build_url(secids);
-    let body = fetch_text(&url, "实时报价").await?;
-    parse_diff(&body)
-}
-
-/// 同 `fetch_quotes_by_secids`，但允许调用方传入自定义 Client（含 proxy）。
 /// realtime 多源 dispatch 走这个路径，绑 proxy_pool 借出的 client。
 pub async fn fetch_quotes_by_secids_with(
     client: &reqwest::Client,
@@ -86,9 +74,14 @@ fn parse_diff(body: &str) -> Result<Vec<(String, StockQuote)>, QuotesError> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let captured_at = OccurredAt::now();
+            let trade_date = crate::domain::shared::resolve_market_time(captured_at)
+                .current_trade_date
+                .unwrap_or_else(|| {
+                    crate::domain::shared::resolve_market_time(captured_at)
+                        .latest_completed_trade_date
+                });
             let quote = StockQuote {
-                code,
-                name,
                 price: num_f64(item, "f2").map(Yuan::from_unchecked),
                 change_percent: num_f64(item, "f3"),
                 change: num_f64(item, "f4").map(Yuan::from_unchecked),
@@ -98,12 +91,14 @@ fn parse_diff(body: &str) -> Result<Vec<(String, StockQuote)>, QuotesError> {
                 low: num_f64(item, "f16").map(Yuan::from_unchecked),
                 open: num_f64(item, "f17").map(Yuan::from_unchecked),
                 previous_close: num_f64(item, "f18").map(Yuan::from_unchecked),
-                captured_at: OccurredAt::now(),
-                bid_levels: Vec::new(),
-                ask_levels: Vec::new(),
-                buy_volume: None,
-                sell_volume: None,
-                order_imbalance: None,
+                ..StockQuote::new_from_provider(
+                    code,
+                    name,
+                    crate::domain::quotes::InstrumentCategory::Stock,
+                    trade_date,
+                    captured_at,
+                    crate::domain::quotes::QuoteSource::Eastmoney,
+                )
             };
             Some((ts_code, quote))
         })

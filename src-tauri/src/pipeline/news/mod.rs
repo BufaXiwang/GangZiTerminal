@@ -5,4 +5,4 @@
 
 pub mod refresh;
 
-pub use refresh::{run_news_refresh, NewsRefreshResult};
+pub use refresh::{run_news_refresh, run_news_refresh_filtered, NewsRefreshResult};

@@ -89,15 +89,32 @@ pub async fn fetch_article_remote(
         extracted.paragraphs
     };
 
+    let images = extract_images(&document, &url);
+    let content = if paragraphs.is_empty() {
+        None
+    } else {
+        Some(paragraphs.join("\n\n"))
+    };
     Ok(ArticleContent {
         url: url.clone(),
-        title,
+        first_news_id: None,
+        title: Some(title),
+        content,
+        payload: serde_json::json!({
+            "paragraphs": paragraphs,
+            "images": images,
+            "extraction": extracted.extractor,
+            "source": source,
+            "author": extract_author(&document),
+        }),
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+        warning: None,
+        // 旧字段兼容序列化
         source,
         published: extract_published(&document).or(fallback_published),
         author: extract_author(&document),
         paragraphs,
-        images: extract_images(&document, &url),
-        fetched_at: chrono::Utc::now().to_rfc3339(),
+        images,
         extraction: extracted.extractor,
     })
 }

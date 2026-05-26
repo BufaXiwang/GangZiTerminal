@@ -18,19 +18,25 @@
 
 pub mod clock;
 pub mod errors;
+pub mod freshness_rules;
 pub mod indicators;
 pub mod regime;
 pub mod types;
 
 pub use clock::is_a_share_trading_hours;
 pub use errors::QuotesError;
-pub use indicators::{compute_indicators, IndicatorConfig, IndicatorSnapshot};
+pub use indicators::{
+    compute_indicators, make_basis as make_indicator_basis, IndicatorBasis, IndicatorName,
+    IndicatorSnapshot,
+};
 pub use regime::Regime;
 pub use types::{
-    AdjMode, CompanyEvent, ConceptPerformance, ConceptSector, DailyBasic, ForecastType,
-    HistorySource, InstrumentCategory, KlinePeriod, KlinePoint, KlineSeries, ListStatus,
-    MarginSummary, MarketBreadth, MarketIndex, MarketInstrument, MarketOverview, MinuteKlinePoint,
-    MinuteKlineSeries, MinutePeriod, MinutePoint, MoneyFlowItem, NorthHolding, NorthMoneyFlow,
-    OrderBookLevel, ScanCondition, ScanFilter, ScanItem, ScanOp, ScanResult, ScanSort, StStatus,
-    StockProfile, StockQuote, StockRef, TopListItem, TradeCalendar,
+    AdjMode, CompanyEvent, CompanyEventType, ConceptPerformance, ConceptSector, DailyBasic,
+    ForecastType,
+    HistorySource, InstrumentCategory, InstrumentSource, InstrumentStatus, KlinePeriod, KlinePoint,
+    KlineSeries, ListStatus, MarginSummary, Market, MarketBreadth, MarketIndex, MarketInstrument,
+    MarketOverview, MinuteKlinePoint, MinuteKlineSeries, MinutePeriod, MinutePoint, MoneyFlowItem,
+    NorthHolding, NorthMoneyFlow, OrderBookLevel, QuoteSource, ScanCondition, ScanFilter, ScanItem,
+    ScanOp, ScanResult, ScanSort, StStatus, StockProfile, StockQuote, StockRef, TopListItem,
+    TradeCalendar, TradeStatus,
 };

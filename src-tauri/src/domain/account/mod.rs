@@ -21,22 +21,30 @@
 //! 此 mod 只放**纯 domain 类型 + 纯函数**——无 I/O、无 Tauri、无外部副作用。
 //! I/O 实现在 `infrastructure::account`，用例编排在 `pipeline::account`。
 
+pub mod account_event;
 pub mod aggregate;
 pub mod cash;
 pub mod errors;
 pub mod events;
+pub mod order;
 pub mod position;
 pub mod rules;
 pub mod sizing;
 pub mod snapshot;
+pub mod trigger;
 pub mod types;
 
+pub use account_event::{AccountEvent, AccountEventType};
 pub use aggregate::{
     Account, AccountMutation, AdjustStopsCommand, ClosePositionCommand, OpenPositionCommand,
     ScalePositionCommand, TradeQuote,
 };
 pub use errors::{AccountError, RuleError};
-pub use events::{EventSource, PositionEvent, PositionEventKind, PositionSignalKind};
+pub use events::{AccountActor, EventSource, PositionEvent, PositionEventKind, PositionSignalKind};
+pub use order::{
+    Order, OrderIntent, OrderSide, OrderStatus, OrderType, PositionLot, TradeFill,
+};
+pub use rules::{AccountFeePolicy, AccountRiskPolicy};
 pub use position::{
     is_partial_hit, judge_position, CloseReason, Direction, Position, PositionId, PositionKind,
     PositionOutcome, PositionStatus, Side,

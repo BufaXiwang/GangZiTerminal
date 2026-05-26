@@ -12,6 +12,7 @@
 
 pub mod account;
 pub mod agent;
+pub mod agent_runtime;
 pub mod news;
 pub mod quotes;
 pub mod shared;

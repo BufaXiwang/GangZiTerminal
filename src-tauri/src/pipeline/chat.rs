@@ -1,16 +1,16 @@
-//! Chat reply 流水线——v3 expectation-driven agent loop 入口。
+//! Chat reply 流水线——user_chat profile 的 agent loop 入口。
 //!
 //! 流程：
 //! 1. 立刻写 user message（emit chat-message-appended，UI 即刻渲染）
-//! 2. 读上下文（active heuristics by regime / pending expectations / 行情 / 持仓 / 最近消息）
-//! 3. 构 AgentRequest（identity + instructions 进 system，上下文 + 用户输入进 user）
+//! 2. 读上下文（active StrategyCard / 最近 decision episode / 行情 / 持仓 / 最近消息）
+//! 3. 构 AgentRequest（identity + instructions + RealtimeDecisionPacket summary 进 system）
 //! 4. 启 episode（agent_episodes 表先插一行）
 //! 5. spawn forwarder：把 AgentEvent 流转发给前端 + 累计文本
 //! 6. await run_agent → 拿 RunSummary + 最终文本
 //! 7. 写 assistant message + finalize agent_episodes
 //!
-//! Expectation / Heuristic 更新由 agent 通过 create_expectation / propose_heuristic
-//! 等工具自己写——pipeline 不再 parse JSON。
+//! 决策审计（DecisionEpisode / TradeIntent / DecisionReview）由 agent 通过
+//! record_decision_episode / operate_account / record_decision_review 工具落库。
 
 use crate::domain::agent::types::{
     AgentEvent, AgentOptions, AgentRequest, Block, ContextBudget, Message, PipelineKind, Role,
@@ -148,12 +148,6 @@ pub async fn send_chat_message_now(
     let quotes_availability = quotes_status.to_prompt_section();
     let market = fetch_market_overview(&app).await.ok();
 
-    // 当前 active heuristics（按 confidence + regime 过滤）+ 当前 regime
-    let current_regime = crate::infrastructure::quotes::regime_detector_service::current(&app);
-    let heuristics =
-        crate::infrastructure::agent::heuristic_repo::list_for_prompt(&app, current_regime, 15)
-            .unwrap_or_default();
-
     // 3. 构 AgentRequest——multi-turn 结构化形态
     let dynamic_context = build_chat_dynamic_context(&ChatDynamicContextInput {
         market_overview: market.as_ref(),
@@ -161,9 +155,24 @@ pub async fn send_chat_message_now(
         live_quotes: &quotes_status.quotes,
         quotes_availability: quotes_availability.as_deref(),
     });
+    // RealtimeDecisionPacket: 现阶段只把 active StrategyCard + 最近 episode 注入
+    // system context（账户 / 自选 / 行情 / 新闻仍走工具）。
+    // spec §2 evidence hydrate 必须按 run_id 索引 RunScope —— 这里先生成 run_id，
+    // 再 packet::build 注入；避免和后面 observer::start_run 的 run_id 不匹配（fix R6）。
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let runtime_packet = crate::pipeline::agent_runtime::packet::build(
+        &app,
+        &run_id,
+        crate::domain::agent_runtime::runs::AgentRunProfileId::UserChat,
+        "user_chat",
+    )
+    .ok();
+    let strategy_summary = runtime_packet
+        .as_ref()
+        .map(|p| p.to_summary_text())
+        .unwrap_or_default();
     let static_system_context = build_chat_system_context(&ChatSystemContextInput {
-        heuristics: &heuristics,
-        current_regime,
+        strategy_summary: &strategy_summary,
     });
 
     // messages 拼装顺序（旧 → 新）：
@@ -273,7 +282,7 @@ pub async fn send_chat_message_now(
     let req = AgentRequest {
         // system 三段：identity → 指令 → 半静态投资上下文。
         // cache_control 只打在最后一段末尾——整段 system 形成一个 cache prefix，
-        // 跨多轮 chat 复用（直到 propose/retire heuristic 改变 active 集合才失效）。
+        // 跨多轮 chat 复用（直到 active StrategyCard 集合改变才失效）。
         system: vec![
             SystemBlock {
                 text: AGENT_IDENTITY.to_string(),
@@ -304,18 +313,29 @@ pub async fn send_chat_message_now(
             stop_sequences: vec![],
             tool_timeout_secs: Some(cfg.agent.tool_timeout_secs),
         },
-        budget: ContextBudget {
-            soft_limit_tokens: cfg.agent.context_soft_limit_tokens,
-            hard_limit_tokens: cfg.agent.context_hard_limit_tokens,
-            compact_keep_last_n: cfg.agent.compact_keep_last_n_turns,
-            max_search_calls: cfg.agent.max_search_calls_per_run,
+        budget: {
+            // spec §8 runtime settings keys：context_*_tokens 优先于 agent config
+            let rcfg = crate::infrastructure::agent_runtime::settings::load(&app);
+            ContextBudget {
+                soft_limit_tokens: if rcfg.context_soft_limit_tokens > 0 {
+                    rcfg.context_soft_limit_tokens as u32
+                } else {
+                    cfg.agent.context_soft_limit_tokens
+                },
+                hard_limit_tokens: if rcfg.context_hard_limit_tokens > 0 {
+                    rcfg.context_hard_limit_tokens as u32
+                } else {
+                    cfg.agent.context_hard_limit_tokens
+                },
+                compact_keep_last_n: cfg.agent.compact_keep_last_n_turns,
+                max_search_calls: cfg.agent.max_search_calls_per_run,
+            }
         },
         trigger_message_id: Some(user_message_id.clone()),
         pipeline: PipelineKind::Chat,
     };
 
-    // 4. 启 run + observer
-    let run_id = uuid::Uuid::new_v4().to_string();
+    // 4. 启 run + observer（run_id 在 packet::build 之前已生成，复用同一个 id 保证 RunScope 命中）
     observer::start_run(
         &app,
         &run_id,
@@ -324,6 +344,31 @@ pub async fn send_chat_message_now(
         &chat_model,
         Some(&user_message_id),
     )?;
+    // Spec agent-runtime-module.md §2：UserChat 也是一次 AgentRun；写 agent_runs
+    // 让 record_decision_episode trigger_kind 解析、fetch_agent_state 可见。
+    {
+        use crate::domain::agent_runtime::runs::{
+            AgentRun, AgentRunProfileId, AgentRunStatus, AgentRunTrigger,
+        };
+        let run = AgentRun {
+            run_id: run_id.clone(),
+            profile_id: AgentRunProfileId::UserChat,
+            episode_ids: Vec::new(),
+            trigger: AgentRunTrigger::UserChat {
+                message_id: user_message_id.clone(),
+            },
+            provider: chat_channel.wire_format.as_str().to_string(),
+            wire_format: chat_channel.wire_format.as_str().to_string(),
+            model: chat_model.clone(),
+            status: AgentRunStatus::Running,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+            ended_at: None,
+            error: None,
+        };
+        // spec §2：所有 AgentRun 必须落 audit row；失败直接 fail（避免 audit 断链）
+        crate::infrastructure::agent_runtime::runs_repo::insert(&app, &run)
+            .map_err(|e| format!("写 agent_runs(UserChat) 失败：{e}"))?;
+    }
     let provider = build_provider_for_channel(&chat_channel)
         .map_err(|e| format!("构建 provider 失败：{e}"))?;
 
@@ -369,6 +414,8 @@ pub async fn send_chat_message_now(
     emit_status(&app, "running", "Agent 正在回复…");
     let ctx = ToolContext {
         run_id: run_id.clone(),
+        app: Some(app.clone()),
+        tool_call_id: None,
     };
     // chat 是唯一会跨 turn 累积长上下文的 pipeline——启用 LLM 摘要兜底。
     // compact assignment 可能在不同渠道；如果同 chat 渠道则复用 provider，否则单独 build。
@@ -511,6 +558,22 @@ pub async fn send_chat_message_now(
     }
 
     let _ = observer::finalize(&app, &summary, None);
+
+    // Spec agent-runtime-module.md §2: 推进 AgentRun(UserChat) running → 终态。
+    // 终态从 summary.stop_reason 派生：Cancelled → Cancelled，否则 Completed。
+    // SQL guard 兜底终态保护，避免 cancel race。
+    use crate::domain::agent_runtime::runs::AgentRunStatus;
+    let final_status = match summary.stop_reason {
+        StopReason::Cancelled => AgentRunStatus::Cancelled,
+        _ => AgentRunStatus::Completed,
+    };
+    let _ = crate::infrastructure::agent_runtime::runs_repo::update_status(
+        &app,
+        &run_id,
+        final_status,
+        None,
+        Some(&chrono::Utc::now().to_rfc3339()),
+    );
 
     emit_status(&app, "done", "");
 

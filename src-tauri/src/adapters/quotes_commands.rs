@@ -12,18 +12,17 @@
 //! 保持前端兼容。
 
 use crate::domain::quotes::{
-    CompanyEvent, ConceptPerformance, ConceptSector, KlinePeriod, ListStatus, MarginSummary,
-    MoneyFlowItem, NorthHolding, NorthMoneyFlow, ScanCondition, ScanFilter, ScanResult, ScanSort,
-    StockProfile, TopListItem,
+    CompanyEvent, KlinePeriod, ListStatus, ScanCondition, ScanFilter, ScanResult, ScanSort,
+    StockProfile,
 };
-use crate::domain::shared::{StockCode, TradeDate, TsCode};
+use crate::domain::shared::{StockCode, TsCode};
 use crate::infrastructure::quotes::cache::kline_cache::{self, Category};
 use crate::infrastructure::quotes::eastmoney::kline as em_kline;
 use crate::infrastructure::quotes::realtime::dispatch;
 use crate::infrastructure::quotes::scanner as quotes_scanner;
 use crate::infrastructure::quotes::tdx::bars as tdx_bars;
 use crate::infrastructure::quotes::tushare::probe::ProbeResult;
-use crate::infrastructure::quotes::tushare::{concept, events, flow, stock as ts_stock};
+use crate::infrastructure::quotes::tushare::{events, stock as ts_stock};
 use serde::Serialize;
 
 // ============================================================================
@@ -416,58 +415,9 @@ pub async fn get_market_overview(app: tauri::AppHandle) -> Result<MarketOverview
 // Quotes research APIs——资金面 / 公司动作 / 概念 / scanner
 // ============================================================================
 
-#[tauri::command]
-pub async fn fetch_top_list(
-    app: tauri::AppHandle,
-    trade_date: Option<String>,
-) -> Result<Vec<TopListItem>, String> {
-    let date = parse_optional_trade_date(trade_date)?;
-    flow::fetch_top_list(&app, date).await.map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_moneyflow(
-    app: tauri::AppHandle,
-    code: String,
-    days: Option<usize>,
-) -> Result<Vec<MoneyFlowItem>, String> {
-    let code = StockCode::new(code).map_err(|e| e.to_string())?;
-    flow::fetch_moneyflow(&app, &code, days.unwrap_or(20).clamp(1, 120))
-        .await
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_north_flow(
-    app: tauri::AppHandle,
-    days: Option<usize>,
-) -> Result<Vec<NorthMoneyFlow>, String> {
-    flow::fetch_north_flow(&app, days.unwrap_or(20).clamp(1, 120))
-        .await
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_north_top10(
-    app: tauri::AppHandle,
-    trade_date: Option<String>,
-) -> Result<Vec<NorthHolding>, String> {
-    let date = parse_optional_trade_date(trade_date)?
-        .unwrap_or_else(crate::infrastructure::quotes::tushare::calendar::current_trade_date);
-    flow::fetch_north_top10(&app, date)
-        .await
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_margin_summary(
-    app: tauri::AppHandle,
-    days: Option<usize>,
-) -> Result<Vec<MarginSummary>, String> {
-    flow::fetch_margin_summary(&app, days.unwrap_or(20).clamp(1, 120))
-        .await
-        .map_err(String::from)
-}
+// Spec quotes-module.md §7 explicitly out-of-scope：龙虎榜 / 个股资金流 / 北向资金
+// / 融资融券 / 概念 / 板块 不属于 Quotes canonical 读取接口。这些研究扩展能力
+// 若要恢复，需要走独立 `fetch_market_research` 命令或单独模块 spec。
 
 #[tauri::command]
 pub async fn fetch_company_events(
@@ -477,36 +427,6 @@ pub async fn fetch_company_events(
 ) -> Result<Vec<CompanyEvent>, String> {
     let code = StockCode::new(code).map_err(|e| e.to_string())?;
     events::fetch_company_events(&app, &code, days_ahead.unwrap_or(90))
-        .await
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_concept_list(app: tauri::AppHandle) -> Result<Vec<ConceptSector>, String> {
-    concept::fetch_concept_list(&app)
-        .await
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_concept_members(
-    app: tauri::AppHandle,
-    concept_code: String,
-) -> Result<Vec<String>, String> {
-    concept::fetch_concept_members(&app, &concept_code)
-        .await
-        .map(|codes| codes.into_iter().map(|c| c.as_str().to_string()).collect())
-        .map_err(String::from)
-}
-
-#[tauri::command]
-pub async fn fetch_concept_performance(
-    app: tauri::AppHandle,
-    trade_date: Option<String>,
-) -> Result<Vec<ConceptPerformance>, String> {
-    let date = parse_optional_trade_date(trade_date)?
-        .unwrap_or_else(crate::infrastructure::quotes::tushare::calendar::current_trade_date);
-    concept::fetch_concept_performance(&app, date)
         .await
         .map_err(String::from)
 }
@@ -557,16 +477,6 @@ pub async fn fetch_stock_profile(
         list_status: ListStatus::Listed,
         is_st: false,
     })
-}
-
-fn parse_optional_trade_date(input: Option<String>) -> Result<Option<TradeDate>, String> {
-    match input.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) if s.contains('-') => TradeDate::from_iso(s).map(Some).map_err(|e| e.to_string()),
-        Some(s) => TradeDate::from_compact(s)
-            .map(Some)
-            .map_err(|e| e.to_string()),
-        None => Ok(None),
-    }
 }
 
 #[tauri::command]

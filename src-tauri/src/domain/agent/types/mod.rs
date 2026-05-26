@@ -12,10 +12,16 @@
 //!   工具列表组装都集中在 pipeline 完成。
 
 pub mod event;
+pub mod message;
+pub mod provider_channel;
 pub mod request;
 pub mod wire;
 
 pub use event::{AgentEvent, CompactTier, StopReason};
+pub use message::{AgentMessage, InvalidRoleBlock, MessageRole};
+pub use provider_channel::{
+    PrimaryChannelMustSupportTools, ProviderChannel, WireFormat,
+};
 pub use request::{
     AgentOptions, AgentRequest, ContextBudget, EffortLevel, PipelineKind, ProviderKind,
     ServerSideTool, ThinkingConfig, ThinkingDisplay, ToolDef,

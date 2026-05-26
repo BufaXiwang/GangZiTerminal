@@ -123,60 +123,6 @@ pub fn find_stock_by_code(app: &AppHandle, code: &str) -> Result<Option<StockRow
         .map_err(|err| format!("查询 stock by code 失败：{err}"))
 }
 
-/// 按名字找股票——精确匹配优先，没有再走 LIKE %name% 模糊。
-/// 返回最多 `limit` 条，按 code 升序。
-pub fn find_stocks_by_name(
-    app: &AppHandle,
-    name: &str,
-    limit: usize,
-) -> Result<Vec<StockRow>, String> {
-    let connection = open_database(app)?;
-    migrate(&connection)?;
-    // 先精确
-    let exact: Vec<StockRow> = {
-        let mut stmt = connection
-            .prepare(
-                "select code, name, sector, market from stocks where name = ?1 order by code limit ?2",
-            )
-            .map_err(|err| format!("准备精确匹配失败：{err}"))?;
-        let rows: Vec<StockRow> = stmt
-            .query_map(params![name, limit as i64], |row| {
-                Ok(StockRow {
-                    code: row.get(0)?,
-                    name: row.get(1)?,
-                    sector: row.get::<_, Option<String>>(2)?,
-                    market: row.get(3)?,
-                })
-            })
-            .map_err(|err| format!("精确匹配查询失败：{err}"))?
-            .filter_map(|r| r.ok())
-            .collect();
-        rows
-    };
-    if !exact.is_empty() {
-        return Ok(exact);
-    }
-    // 再 LIKE %name%
-    let pattern = format!("%{name}%");
-    let mut stmt = connection
-        .prepare(
-            "select code, name, sector, market from stocks where name like ?1 order by code limit ?2",
-        )
-        .map_err(|err| format!("准备模糊匹配失败：{err}"))?;
-    let rows: Vec<StockRow> = stmt
-        .query_map(params![pattern, limit as i64], |row| {
-            Ok(StockRow {
-                code: row.get(0)?,
-                name: row.get(1)?,
-                sector: row.get::<_, Option<String>>(2)?,
-                market: row.get(3)?,
-            })
-        })
-        .map_err(|err| format!("模糊匹配查询失败：{err}"))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
-}
 
 // ===== indexes 表（大盘 / 行业 / 主题指数档案） =========================
 

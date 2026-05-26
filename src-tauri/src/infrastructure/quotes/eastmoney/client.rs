@@ -37,13 +37,7 @@ fn http_client() -> Result<&'static reqwest::Client, QuotesError> {
     Ok(HTTP_CLIENT.get_or_init(|| c))
 }
 
-/// GET 一次性请求——不重试。push2.eastmoney.com 实时接口用。
-pub async fn fetch_text(url: &str, label: &str) -> Result<String, QuotesError> {
-    let client = http_client()?;
-    fetch_text_with(client, url, label).await
-}
-
-/// 同 `fetch_text`，但允许调用方传入自定义 Client（含 proxy）。
+/// GET 一次性请求 + 自定义 Client（含 proxy）。
 pub async fn fetch_text_with(
     client: &reqwest::Client,
     url: &str,

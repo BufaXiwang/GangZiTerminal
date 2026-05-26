@@ -21,8 +21,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 
-const DEFAULT_TOOL_TIMEOUT_SECS: u32 = 30;
-
 /// Summarize tier 的运行配置。chat pipeline 传 Some；briefing/review 传 None
 /// （那两个 pipeline 输入是 bounded 的，不需要 LLM 摘要）。
 ///
@@ -106,11 +104,8 @@ pub async fn run_agent(
     });
 
     let max_turns = req.options.max_turns.max(1);
-    let tool_timeout = Duration::from_secs(
-        req.options
-            .tool_timeout_secs
-            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS) as u64,
-    );
+    // 工具超时按 spec agent-infra-module.md §2 ToolSpec.timeoutMs：per-tool 自己声明
+    // 硬上限，不再由全局 tool_timeout_secs 统一裁切。
     let mut turn: u32 = 0;
     // Summarize tier 熔断计数——本 run 内连续失败次数。成功则归零。
     let mut summarize_consecutive_failures: u32 = 0;
@@ -134,7 +129,30 @@ pub async fn run_agent(
         summarize_dropped_messages: 0,
     };
 
+    // 协作式取消 token：cancel_agent_run 命令可以把对应 flag 置 true，
+    // loop 在每轮 turn 入口检查。已开始的 tool / provider 流允许跑完。
+    let cancel_flag = crate::infrastructure::agent_runtime::cancellation::register(&run_id);
+    struct CancelGuard<'a>(&'a str);
+    impl<'a> Drop for CancelGuard<'a> {
+        fn drop(&mut self) {
+            crate::infrastructure::agent_runtime::cancellation::unregister(self.0);
+        }
+    }
+    let _cancel_guard = CancelGuard(&run_id);
+
     loop {
+        if crate::infrastructure::agent_runtime::cancellation::is_cancelled(&cancel_flag) {
+            // spec agent-infra-module.md §201 cancelled 独立终态（不复用 EndTurn）
+            summary.stop_reason = StopReason::Cancelled;
+            summary.turns = turn;
+            tracing::info!(turns = turn, %run_id, "agent run 被 cancel_agent_run 取消");
+            let _ = event_tx.send(AgentEvent::Done {
+                run_id: run_id.clone(),
+                stop_reason: StopReason::Cancelled,
+                turns: turn,
+            });
+            return Ok(summary);
+        }
         if turn >= max_turns {
             summary.stop_reason = StopReason::MaxTurns;
             summary.turns = turn;
@@ -163,12 +181,12 @@ pub async fn run_agent(
         // 就回到原来的 Drop 逻辑，不会让 chat 因为远端摘要 API 抽风而挂掉。
         let messages_in = std::mem::take(&mut req.messages);
         let report = compact_if_needed(messages_in, &req.budget);
+        // spec §4：CompactAction → CompactTier 走 CompactAction::tier()。
+        // HardLimit 表示 Drop 阶段已经丢过消息但仍超 hard——tier 上仍属 Drop，
+        // 错误本身通过下面的 Err return 单独传出去。
         let report_tier: Option<CompactTier> = match report.action {
-            CompactAction::NoOp => None,
-            CompactAction::MicroClear => Some(CompactTier::MicroClear),
-            // HardLimit 表示 Drop 阶段已经丢过消息但仍超 hard——tier 上仍属 Drop，
-            // 错误本身通过下面的 Err return 单独传出去。
-            CompactAction::Drop | CompactAction::HardLimit => Some(CompactTier::Drop),
+            CompactAction::HardLimit => Some(CompactTier::Drop),
+            other => other.tier(),
         };
         if let Some(tier) = report_tier {
             let summary_tokens = report
@@ -372,14 +390,13 @@ pub async fn run_agent(
             return Ok(summary);
         }
 
-        // 并行执行所有本地 ToolUse（每个带 tool_timeout）
+        // 并行执行所有本地 ToolUse（每个工具用自己声明的 timeout_ms）
         let results = execute_tools_parallel(
             &registry,
             &tool_ctx,
             &run_id,
             local_tool_uses,
             &event_tx,
-            tool_timeout,
         )
         .await;
         summary.local_tool_calls += results.len() as u32;
@@ -511,7 +528,6 @@ async fn execute_tools_parallel(
     run_id: &str,
     tool_uses: Vec<LocalToolUse>,
     event_tx: &UnboundedSender<AgentEvent>,
-    tool_timeout: Duration,
 ) -> Vec<LocalToolResult> {
     // 关键：保留模型给的 tool_use 顺序——OpenAI Responses 协议虽然按 call_id 匹配，
     // 但 Anthropic 对 messages 里 tool_result 的顺序在某些边界情况会更敏感，且按
@@ -525,7 +541,7 @@ async fn execute_tools_parallel(
         let run_id = run_id.to_string();
         futures.push(async move {
             let r =
-                execute_single_tool(&registry, &ctx, &run_id, tu, &event_tx, tool_timeout).await;
+                execute_single_tool(&registry, &ctx, &run_id, tu, &event_tx).await;
             (idx, r)
         });
     }
@@ -543,7 +559,6 @@ async fn execute_single_tool(
     run_id: &str,
     tu: LocalToolUse,
     event_tx: &UnboundedSender<AgentEvent>,
-    tool_timeout: Duration,
 ) -> LocalToolResult {
     let LocalToolUse { id, name, input } = tu;
     let _ = event_tx.send(AgentEvent::ToolStart {
@@ -553,19 +568,33 @@ async fn execute_single_tool(
         input: input.clone(),
         server_side: false,
     });
+    // 每次 tool dispatch 都给 ctx 注入 tool_call_id（spec §2 ToolCall 关联键）；
+    // tool 实现可用 ctx.tool_call_id 写 agent_tool_calls.output_payload_json 等 audit。
+    let mut call_ctx = ctx.clone();
+    call_ctx.tool_call_id = Some(id.clone());
     let start = Instant::now();
     let (content, is_error) = match registry.get(&name) {
         Some(tool) => {
             let tool: Arc<dyn Tool> = tool.clone();
+            // spec agent-infra-module.md §2 ToolSpec.timeoutMs：per-tool 是工具自己声明
+            // 的硬上限；全局 tool_timeout_secs 只是 fallback (适用于未 override 的工具)。
+            // 当前所有内置工具都 override 了 timeout_ms()，效果等同于直接用 per_tool。
+            let per_tool = Duration::from_millis(tool.timeout_ms());
+            let effective = per_tool;
             // 用 tokio::time::timeout 给 execute 套一层；超时返回 is_error=true，
             // agent 下一轮看到 "tool 超时" 文本可以决定是否换工具或放弃。
-            match tokio::time::timeout(tool_timeout, tool.execute(input.clone(), ctx)).await {
+            match tokio::time::timeout(
+                effective,
+                tool.execute(input.clone(), &call_ctx),
+            )
+            .await
+            {
                 Ok(out) => out,
                 Err(_) => (
                     vec![ToolResultContent::Text {
                         text: format!(
                             "工具 {name} 调用超时（>{}s），可能远端服务卡顿。建议下一轮换个思路。",
-                            tool_timeout.as_secs()
+                            effective.as_secs()
                         ),
                     }],
                     true,
@@ -585,6 +614,44 @@ async fn execute_single_tool(
     // 干净，因为单条 result 还在 working set 里。这里在写进 messages 前先截断，
     // agent 看到 truncation marker 会重新调参/缩小查询。
     let content = cap_tool_result_size(content, &name);
+
+    // Spec agent-infra-module.md §2：持久化 ToolCall audit。
+    if let Some(app) = ctx.app.as_ref() {
+        let started_at = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::milliseconds(duration_ms as i64))
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+        let ended_at = chrono::Utc::now().to_rfc3339();
+        let input_summary = serde_json::to_string(&input).ok();
+        let output_text: String = content
+            .iter()
+            .map(|c| match c {
+                crate::domain::agent::types::ToolResultContent::Text { text } => text.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let output_summary = serde_json::to_string(&output_text).ok();
+        let row = crate::infrastructure::agent::tool_calls_repo::ToolCallRow {
+            tool_call_id: &id,
+            run_id,
+            name: &name,
+            source: "local_tool",
+            input_summary_json: input_summary.as_deref(),
+            output_summary_json: output_summary.as_deref(),
+            input_payload_ref: None,
+            output_payload_ref: None,
+            is_error,
+            error_code: None,
+            started_at: &started_at,
+            ended_at: Some(&ended_at),
+            duration_ms: Some(duration_ms as i64),
+        };
+        if let Err(e) = crate::infrastructure::agent::tool_calls_repo::insert(app, row) {
+            tracing::warn!(error = %e, run_id, tool_call_id = %id, "写 agent_tool_call audit 失败");
+        }
+    }
+
     let _ = event_tx.send(AgentEvent::ToolEnd {
         run_id: run_id.into(),
         tool_use_id: id.clone(),
@@ -1276,8 +1343,7 @@ mod tests {
                 cache_control: false,
             }],
         }]);
-        let ctx = ToolContext {
-            run_id: "run-1".into(),
+        let ctx = ToolContext { run_id: "run-1".into(), app: None, tool_call_id: None
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let summary = run_agent(provider, None, registry, req, ctx, tx)
@@ -1380,8 +1446,7 @@ mod tests {
             None,
             registry,
             req,
-            ToolContext {
-                run_id: "run-2".into(),
+            ToolContext { run_id: "run-2".into(), app: None, tool_call_id: None
             },
             tx,
         )
@@ -1476,8 +1541,7 @@ mod tests {
             None,
             registry,
             req,
-            ToolContext {
-                run_id: "run-3".into(),
+            ToolContext { run_id: "run-3".into(), app: None, tool_call_id: None
             },
             tx,
         )
@@ -1507,12 +1571,16 @@ mod tests {
             fn input_schema(&self) -> serde_json::Value {
                 json!({"type": "object"})
             }
+            // spec agent-infra-module.md §2 ToolSpec.timeoutMs：per-tool 优先
+            fn timeout_ms(&self) -> u64 {
+                1000
+            }
             async fn execute(
                 &self,
                 _input: serde_json::Value,
                 _ctx: &ToolContext,
             ) -> (Vec<ToolResultContent>, bool) {
-                // 故意睡 5s——tool_timeout 设 1s 应该截断
+                // 故意睡 5s——per-tool timeout 1s 应该截断
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 (
                     vec![ToolResultContent::Text {
@@ -1574,8 +1642,7 @@ mod tests {
             None,
             registry,
             req,
-            ToolContext {
-                run_id: "run-timeout".into(),
+            ToolContext { run_id: "run-timeout".into(), app: None, tool_call_id: None
             },
             tx,
         )
@@ -1627,8 +1694,7 @@ mod tests {
             None,
             registry,
             req,
-            ToolContext {
-                run_id: "run-err".into(),
+            ToolContext { run_id: "run-err".into(), app: None, tool_call_id: None
             },
             tx,
         )

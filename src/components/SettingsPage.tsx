@@ -10,6 +10,7 @@ import {
   X as XIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useAgentRuntimeState } from "../hooks/useAgentRuntimeState";
 import { useAppState } from "../hooks/useAppState";
 
 // News batch loop 配置（后端 pipeline/news/batch_loop.rs 同名读取）
@@ -194,19 +195,6 @@ type HeartbeatRow = {
 };
 
 type AgentHealthDto = {
-  positionCompletenessRate: number | null;
-  totalPositions: number;
-  totalClosedPositions: number;
-  reflectionEpisodeCount7d: number;
-  scanTickCount7d: number;
-  lessonsCount7d: number;
-  heuristicCounts: { seed: number; userStated: number; agentInferred: number; retired: number };
-  heuristicOriginShare: { seed: number; userStated: number; agentInferred: number; agentInferredShare: number | null };
-  scanTicksToday: number;
-  positionsOpenedToday: number;
-  lessonsCreatedToday: number;
-  lessonsEmptyTakeaway7d: number;
-  heuristicsEmerged7d: number;
   heartbeats: HeartbeatRow[];
 };
 
@@ -235,11 +223,11 @@ function AgentHealthBlock() {
   return (
     <div className="settings-section">
       <div className="settings-section-head">
-        <h3>Agent 自迭代健康度</h3>
-        <p>每项对应一条审计 SQL；点击「刷新」重拉。红字 = 环断了或 loop 卡死，橙字 = 需关注。</p>
+        <h3>Agent Runtime 健康度</h3>
+        <p>后台 loop 心跳 + 最近 Agent run / decision episode / strategy card 概要。</p>
       </div>
       <div className="settings-rows">
-        <Row title="刷新" hint="拉取最新指标 + loop 心跳">
+        <Row title="刷新" hint="拉取最新心跳 + runtime 状态">
           <button
             type="button"
             className="settings-save-btn"
@@ -255,113 +243,115 @@ function AgentHealthBlock() {
           </Row>
         )}
         {data && (
-          <>
-            <HealthRow
-              title="今日 scan ticks"
-              hint="9 个时刻表，盘中应 ≥ 6；周末 / 盘外为 0"
-              value={data.scanTicksToday}
-              level={pickLevel(data.scanTicksToday, { red: -1, yellow: 3 })}
-            />
-            <HealthRow
-              title="今日新开 position"
-              hint="连续多日为 0 → agent 没在产出新判断"
-              value={data.positionsOpenedToday}
-              level={pickLevel(data.positionsOpenedToday, { red: -1, yellow: 0 })}
-            />
-            <HealthRow
-              title="今日 lesson"
-              hint="reflection 复盘产物——交易日盘后应有"
-              value={data.lessonsCreatedToday}
-            />
-            <HealthRow
-              title="近 7 天空 takeaway lesson"
-              hint="> 0 说明 LLM provider 没接通 / takeaway fill 失败——自迭代环断点"
-              value={data.lessonsEmptyTakeaway7d}
-              level={data.lessonsEmptyTakeaway7d > 0 ? "red" : "ok"}
-            />
-            <HealthRow
-              title="近 7 天新 emerge heuristic"
-              hint="连续 2 周为 0 → emerge 链路死了"
-              value={data.heuristicsEmerged7d}
-              level={pickLevel(data.heuristicsEmerged7d, { red: -1, yellow: 0 })}
-            />
-            <HealthRow
-              title="Heuristic 原创占比"
-              hint={`agent ${data.heuristicOriginShare.agentInferred} · user ${data.heuristicOriginShare.userStated} · seed ${data.heuristicOriginShare.seed}`}
-              value={
-                data.heuristicOriginShare.agentInferredShare != null
-                  ? `${Math.round(data.heuristicOriginShare.agentInferredShare * 100)}%`
-                  : "—"
-              }
-            />
-            <Row title="后台 loop 心跳" hint="每个 loop 的上次成功 / 连续失败计数">
-              <div className="heartbeat-list">
-                {data.heartbeats.length === 0 ? (
-                  <span className="settings-readonly">暂无——loop 还没跑过 / schema 刚建</span>
-                ) : (
-                  data.heartbeats.map((h) => {
-                    const isStale =
-                      h.consecutiveErr >= 3 || (h.lastOkAt == null && h.lastErrAt != null);
-                    return (
-                      <div key={h.loopName} className="heartbeat-row">
-                        <span className="heartbeat-name">{h.loopName}</span>
-                        <span className={`heartbeat-ok ${isStale ? "health-stat-red" : ""}`}>
-                          {relativeTime(h.lastOkAt)}
-                        </span>
-                        <span
-                          className={`heartbeat-err-count ${
-                            h.consecutiveErr > 0 ? "health-stat-red" : ""
-                          }`}
-                        >
-                          {h.consecutiveErr > 0 ? `${h.consecutiveErr}× 连失` : "—"}
-                        </span>
-                        <span className="heartbeat-msg" title={h.lastErrMsg ?? ""}>
-                          {h.lastErrMsg ?? "—"}
-                        </span>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </Row>
-          </>
+          <Row title="后台 loop 心跳" hint="每个 loop 的上次成功 / 连续失败计数">
+            <div className="heartbeat-list">
+              {data.heartbeats.length === 0 ? (
+                <span className="settings-readonly">暂无——loop 还没跑过 / schema 刚建</span>
+              ) : (
+                data.heartbeats.map((h) => {
+                  const isStale =
+                    h.consecutiveErr >= 3 || (h.lastOkAt == null && h.lastErrAt != null);
+                  return (
+                    <div key={h.loopName} className="heartbeat-row">
+                      <span className="heartbeat-name">{h.loopName}</span>
+                      <span className={`heartbeat-ok ${isStale ? "health-stat-red" : ""}`}>
+                        {relativeTime(h.lastOkAt)}
+                      </span>
+                      <span
+                        className={`heartbeat-err-count ${
+                          h.consecutiveErr > 0 ? "health-stat-red" : ""
+                        }`}
+                      >
+                        {h.consecutiveErr > 0 ? `${h.consecutiveErr}× 连失` : "—"}
+                      </span>
+                      <span className="heartbeat-msg" title={h.lastErrMsg ?? ""}>
+                        {h.lastErrMsg ?? "—"}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </Row>
         )}
       </div>
+      <AgentRuntimeStateBlock />
     </div>
   );
 }
 
-type HealthLevel = "ok" | "yellow" | "red";
-
-/// value 落 (yellow, +∞] = ok；(red, yellow] = yellow；≤ red = red。
-/// 用 -1 做"任何 0 都算 yellow / red"的语义。
-function pickLevel(value: number, thresholds: { red: number; yellow: number }): HealthLevel {
-  if (value <= thresholds.red) return "red";
-  if (value <= thresholds.yellow) return "yellow";
-  return "ok";
-}
-
-function HealthRow({
-  title,
-  hint,
-  value,
-  level = "ok",
-}: {
-  title: string;
-  hint: string;
-  value: number | string;
-  level?: HealthLevel;
-}) {
-  const cls =
-    level === "red"
-      ? "settings-readonly health-stat health-stat-red"
-      : level === "yellow"
-        ? "settings-readonly health-stat health-stat-yellow"
-        : "settings-readonly health-stat";
+function AgentRuntimeStateBlock() {
+  const { state, loading, error, refresh } = useAgentRuntimeState();
   return (
-    <Row title={title} hint={hint}>
-      <span className={cls}>{value}</span>
-    </Row>
+    <div className="settings-rows" style={{ marginTop: 12 }}>
+      <Row title="Agent Runtime 状态" hint="最近 AgentRun / DecisionEpisode / DecisionReview / StrategyCard">
+        <button
+          type="button"
+          className="settings-save-btn"
+          onClick={() => void refresh()}
+          disabled={loading}
+        >
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </Row>
+      {error && (
+        <Row title="错误" hint="fetch_agent_state 失败">
+          <span className="settings-readonly health-stat-red">{error}</span>
+        </Row>
+      )}
+      <Row title="最近 AgentRun" hint={`共 ${state.runs.length} 条（最多 50）`}>
+        <div className="heartbeat-list">
+          {state.runs.length === 0 ? (
+            <span className="settings-readonly">暂无 run</span>
+          ) : (
+            state.runs.slice(0, 5).map((r) => (
+              <div key={r.runId} className="heartbeat-row">
+                <span className="heartbeat-name">{r.profileId}</span>
+                <span className="heartbeat-ok">{r.status}</span>
+                <span className="heartbeat-msg" title={r.runId}>
+                  {r.runId.slice(0, 8)}
+                </span>
+                <span className="heartbeat-msg">{r.createdAt}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </Row>
+      <Row title="最近 DecisionEpisode" hint={`共 ${state.episodes.length} 条`}>
+        <div className="heartbeat-list">
+          {state.episodes.length === 0 ? (
+            <span className="settings-readonly">暂无 episode</span>
+          ) : (
+            state.episodes.slice(0, 5).map((e) => (
+              <div key={e.episodeId} className="heartbeat-row">
+                <span className="heartbeat-name">{e.action}</span>
+                <span className="heartbeat-ok">{e.actionStatus}</span>
+                <span className="heartbeat-msg">{e.symbols.join(",") || "—"}</span>
+                <span className="heartbeat-msg" title={e.thesis}>
+                  {e.thesis.slice(0, 50)}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+      </Row>
+      <Row title="StrategyCards" hint={`共 ${state.strategies.length} 条`}>
+        <div className="heartbeat-list">
+          {state.strategies.length === 0 ? (
+            <span className="settings-readonly">暂无（baseline seed 应已自动注入）</span>
+          ) : (
+            state.strategies.map((c) => (
+              <div key={c.strategyId} className="heartbeat-row">
+                <span className="heartbeat-name">{c.name}</span>
+                <span className="heartbeat-ok">{c.status}</span>
+                <span className="heartbeat-msg">v{c.version}</span>
+                <span className="heartbeat-msg">{c.strategyId.slice(0, 24)}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </Row>
+    </div>
   );
 }
 

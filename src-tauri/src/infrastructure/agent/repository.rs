@@ -1,13 +1,16 @@
 //! Agent 子域 DB 访问——chat_messages + agent_episodes + agent_episode_turns 三张表。
 //!
-//! 表设计（v2 重构后）：
+//! 表设计：
 //! - `chat_messages`：对话流（id PK / role / kind / content_md / content_json / source_*）
-//! - `agent_episodes`：每次 run 的统计 + trigger_kind / thesis_ids / outcome_summary
+//! - `agent_episodes`：每次 run 的统计 + trigger_kind / position_ids / outcome_summary
 //!   （run_id PK / trigger_kind / model / turns / tokens / stop_reason）
 //! - `agent_episode_turns`：每个 turn 的细粒度统计（(run_id, turn) PK）
 //!
 //! 写路径：pipeline::chat / pipeline::agent::observer 调 append + finalize。
 //! 读路径：Tauri IPC list/search 给前端 chat UI 用；read_all 给 agent 历史上下文用。
+//!
+//! Agent Runtime 业务审计（AgentRun / DecisionEpisode / TradeIntent / DecisionReview）
+//! 走 `infrastructure::agent_runtime::*_repo`，与本文件解耦。
 
 use crate::infrastructure::db::{json_string, migrate, now, open_database, required_json_string};
 use rusqlite::{params, Connection};
@@ -149,9 +152,8 @@ pub fn search_chat_messages(
 /// agent_episodes 表的写入入口——在 run 启动时插一条 started_at；run 结束时
 /// update token / turns / stop_reason / ended_at。observer.rs 调这两个。
 ///
-/// 参数 `trigger_kind` 取代旧 `pipeline`：取值之一 `scheduled / user_message /
-/// user_instruction / reflection / chat`。Phase 1 用户驱动统一传 'chat'，
-/// 后续 reflection pipeline 传 'reflection'，scheduler 触发的传 'scheduled'。
+/// 参数 `trigger_kind` 取值：`chat` / `news_batch` / `account_trigger` /
+/// `scheduled_review` / `manual_replay`（对齐 spec `AgentRunTrigger.kind`）。
 #[allow(clippy::too_many_arguments)]
 pub fn insert_agent_episode_start(
     app: &AppHandle,

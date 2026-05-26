@@ -234,6 +234,7 @@ fn db_position_to_domain(row: DbPosition) -> Result<Position, AccountError> {
         source_analysis_id: row.source_analysis_id,
         entered_at,
         last_acquisition_at,
+        warnings: Vec::new(),
     })
 }
 
@@ -557,6 +558,7 @@ mod tests {
             source_analysis_id: "a1".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
             last_acquisition_at: OccurredAt::new(1_700_000_000_000),
+            warnings: Vec::new(),
         }
     }
 

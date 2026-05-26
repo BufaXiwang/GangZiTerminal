@@ -34,16 +34,37 @@ pub struct CompactReport {
     pub dropped_messages: u32,
 }
 
+#[allow(dead_code)] // Summarize/Reactive 提供给 compact 流后续阶段使用，目前 emit 路径由 .tier() 统一处理
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactAction {
     /// 在 soft_limit 内，无操作。
     NoOp,
     /// 清理了白名单工具的老 ToolResult 内容（保留 tool_use_id）。
     MicroClear,
+    /// 调便宜模型把老对话摘要成一段。spec `agent-infra-module.md §4 CompactTier::Summarize`。
+    Summarize,
     /// 丢了最老的若干条消息。
     Drop,
+    /// Reactive 兜底：provider 返 prompt_too_long 后丢最老 API round 重试。
+    /// spec `agent-infra-module.md §4 CompactTier::Reactive`。
+    Reactive,
     /// drop 完仍超 hard_limit——调用方应该中止 run。
     HardLimit,
+}
+
+impl CompactAction {
+    /// 映射到 [`crate::domain::agent::types::CompactTier`]，统一 emit 路径。
+    /// `NoOp` / `HardLimit` 没有对应 tier（不 emit Compacted 事件）。
+    pub fn tier(self) -> Option<crate::domain::agent::types::CompactTier> {
+        use crate::domain::agent::types::CompactTier;
+        match self {
+            CompactAction::MicroClear => Some(CompactTier::MicroClear),
+            CompactAction::Summarize => Some(CompactTier::Summarize),
+            CompactAction::Drop => Some(CompactTier::Drop),
+            CompactAction::Reactive => Some(CompactTier::Reactive),
+            CompactAction::NoOp | CompactAction::HardLimit => None,
+        }
+    }
 }
 
 /// 易腐数据工具白名单——这些工具的 ToolResult 在尾窗外**整块**替换成 stub。
@@ -53,18 +74,18 @@ pub enum CompactAction {
 /// agent 真要决策会重新调用。
 ///
 /// **不在白名单**的工具：
-/// - `propose_heuristic` / `apply_heuristic` / `retire_heuristic` / `open_position` /
-///   `close_position` / `adjust_position` / `scale_position`：mutation 工具，结果是确认文本，
+/// - `operate_account` / `update_watchlist` / `record_decision_episode` /
+///   `record_decision_review`：mutation / audit 工具，结果是确认文本，
 ///   清掉反而让 agent 怀疑"我刚才存进去了吗"。
-/// - `list_positions`：状态快照但本来就短，不浪费 token；agent 也可能依赖
+/// - `fetch_account`：状态快照但本来就短，不浪费 token；agent 也可能依赖
 ///   "上一轮看到的持仓状态" 做对比，清掉破坏因果链。
 /// - 未来加新工具默认不在白名单——只有明确"易腐"才加。
 const VOLATILE_TOOL_WHITELIST: &[&str] = &[
-    "get_quote",
-    "get_kline",
-    "get_market_overview",
-    "search_quotes",
-    "search_news",
+    // canonical 7-tool 中的只读工具结果易腐（行情 / 资讯 / 账户随时变）
+    "fetch_quotes",
+    "fetch_news",
+    "fetch_account",
+    // provider server-side web_search 结果同样易腐
     "web_search",
 ];
 
@@ -402,13 +423,13 @@ mod tests {
 
     #[test]
     fn micro_clear_replaces_old_volatile_tool_results() {
-        // 老的 get_quote / search_news 调用——尾窗外，结果应被替换成 stub。
+        // 老的 fetch_quotes / fetch_news 调用——尾窗外，结果应被替换成 stub。
         let big = "x".repeat(4000);
         let mut msgs = Vec::new();
         msgs.push(text_msg(Role::User, "查行情"));
-        msgs.extend(tool_call_pair("toolu_a", "get_quote", &big));
+        msgs.extend(tool_call_pair("toolu_a", "fetch_quotes", &big));
         msgs.push(text_msg(Role::User, "再查新闻"));
-        msgs.extend(tool_call_pair("toolu_b", "search_news", &big));
+        msgs.extend(tool_call_pair("toolu_b", "fetch_news", &big));
         // 尾窗：keep_last_n=1 → 末尾保留 2 条原样
         msgs.push(text_msg(Role::User, "新问题"));
         msgs.push(text_msg(Role::Assistant, "新答"));
@@ -416,7 +437,7 @@ mod tests {
         let report = compact_if_needed(msgs, &budget(before / 2, before * 2, 1));
         assert_eq!(report.action, CompactAction::MicroClear);
         assert_eq!(report.dropped_messages, 2);
-        // 老的 get_quote 结果应被替换成 stub，stub 文案带工具名
+        // 老的 fetch_quotes 结果应被替换成 stub，stub 文案带工具名
         let stubs: Vec<&str> = report
             .messages
             .iter()
@@ -431,12 +452,12 @@ mod tests {
             })
             .collect();
         assert!(
-            stubs.iter().any(|s| s.contains("get_quote")),
-            "stub 应该带 get_quote 工具名，实际：{stubs:?}"
+            stubs.iter().any(|s| s.contains("fetch_quotes")),
+            "stub 应该带 fetch_quotes 工具名，实际：{stubs:?}"
         );
         assert!(
-            stubs.iter().any(|s| s.contains("search_news")),
-            "stub 应该带 search_news 工具名"
+            stubs.iter().any(|s| s.contains("fetch_news")),
+            "stub 应该带 fetch_news 工具名"
         );
     }
 
@@ -512,7 +533,7 @@ mod tests {
         // micro_clear 把白名单工具的 ToolResult 内容换成 stub，但 tool_use_id 必须保留
         let big = "x".repeat(4000);
         let mut msgs = Vec::new();
-        msgs.extend(tool_call_pair("toolu_xyz", "get_kline", &big));
+        msgs.extend(tool_call_pair("toolu_xyz", "fetch_quotes", &big));
         msgs.push(text_msg(Role::User, "新问题"));
         msgs.push(text_msg(Role::Assistant, "新答"));
         let before = estimate_tokens(&msgs);
@@ -533,7 +554,7 @@ mod tests {
         match &content[0] {
             ToolResultContent::Text { text } => {
                 assert!(
-                    text.contains("get_kline"),
+                    text.contains("fetch_quotes"),
                     "stub 应包含工具名，实际：{text}"
                 );
                 assert!(text.contains("过期工具结果已清理"));
@@ -547,7 +568,7 @@ mod tests {
         // 已经是 stub 的 tool_result 再压一次不应该套层
         let big = "x".repeat(4000);
         let mut msgs = Vec::new();
-        msgs.extend(tool_call_pair("toolu_a", "get_quote", &big));
+        msgs.extend(tool_call_pair("toolu_a", "fetch_quotes", &big));
         msgs.push(text_msg(Role::User, "尾"));
         msgs.push(text_msg(Role::Assistant, "答"));
         let before = estimate_tokens(&msgs);
@@ -579,11 +600,11 @@ mod tests {
 
     #[test]
     fn time_based_micro_clear_fires_when_gap_exceeded() {
-        // 4 个 get_quote ToolResult。keep_recent_n=1：保留最末 1 条，清前 3 条
+        // 4 个 fetch_quotes ToolResult。keep_recent_n=1：保留最末 1 条，清前 3 条
         let big = "x".repeat(2000);
         let mut msgs = Vec::new();
         for tag in ["q1", "q2", "q3", "q4"] {
-            msgs.extend(tool_call_pair(tag, "get_quote", &big));
+            msgs.extend(tool_call_pair(tag, "fetch_quotes", &big));
         }
         let now_ms = 1_700_000_000_000i64;
         let last_at = now_ms - 90 * 60_000; // 90 分钟前
@@ -620,7 +641,7 @@ mod tests {
     fn time_based_micro_clear_skips_when_gap_short() {
         let big = "x".repeat(2000);
         let mut msgs = Vec::new();
-        msgs.extend(tool_call_pair("a", "get_quote", &big));
+        msgs.extend(tool_call_pair("a", "fetch_quotes", &big));
         let now_ms = 1_700_000_000_000i64;
         let last_at = now_ms - 10 * 60_000; // 10 分钟前——不到 gap
         let cleared = time_based_micro_clear(&mut msgs, Some(last_at), now_ms, 60, 1);
@@ -646,7 +667,7 @@ mod tests {
     fn time_based_micro_clear_no_last_at() {
         // 没有 last_assistant_at_ms（新对话）→ 不动
         let mut msgs = Vec::new();
-        msgs.extend(tool_call_pair("a", "get_quote", "data"));
+        msgs.extend(tool_call_pair("a", "fetch_quotes", "data"));
         let cleared =
             time_based_micro_clear(&mut msgs, None, 1_700_000_000_000, 60, 0);
         assert_eq!(cleared, 0);

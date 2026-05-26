@@ -162,11 +162,16 @@ fn map_tdx_quotes(
         } else {
             (None, None)
         };
+        let captured_at = OccurredAt::now();
+        let trade_date = crate::domain::shared::resolve_market_time(captured_at)
+            .current_trade_date
+            .unwrap_or_else(|| {
+                crate::domain::shared::resolve_market_time(captured_at)
+                    .latest_completed_trade_date
+            });
         out.push((
             ts_code,
             StockQuote {
-                code,
-                name: String::new(), // TDX 不返；UI 从 stocks/indexes/funds 表查
                 price: if q.price > 0.0 {
                     Some(Yuan::from_unchecked(q.price))
                 } else {
@@ -196,12 +201,14 @@ fn map_tdx_quotes(
                 },
                 day_volume: Some(Lots::from_unchecked(q.vol as i64)),
                 day_amount: Some(Yuan::from_unchecked(q.amount)),
-                captured_at: OccurredAt::now(),
-                bid_levels: Vec::new(),
-                ask_levels: Vec::new(),
-                buy_volume: None,
-                sell_volume: None,
-                order_imbalance: None,
+                ..StockQuote::new_from_provider(
+                    code,
+                    String::new(),
+                    crate::domain::quotes::InstrumentCategory::Stock,
+                    trade_date,
+                    captured_at,
+                    crate::domain::quotes::QuoteSource::Tdx,
+                )
             },
         ));
     }

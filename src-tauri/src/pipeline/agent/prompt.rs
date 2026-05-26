@@ -2,12 +2,10 @@
 //!
 //! - AGENT_IDENTITY：从 identity.md include_str! 进来的人格档案
 //! - CHAT_SYSTEM_INSTRUCTIONS：chat 模式追加的简短指令
-//! - build_chat_system_context：system 块末尾的稳定上下文（active heuristics top-N 注入）
+//! - build_chat_system_context：system 块末尾的稳定上下文（StrategyCard 注入由 Runtime 提供）
 //! - build_chat_dynamic_context：user 块开头的动态上下文（市场 + 持仓）
 
 use crate::domain::account::types::Position;
-use crate::domain::agent::heuristic::Heuristic;
-use crate::domain::quotes::regime::Regime;
 use crate::domain::quotes::{MarketOverview, StockQuote};
 use std::collections::HashMap;
 
@@ -23,17 +21,11 @@ pub(crate) const CHAT_SYSTEM_INSTRUCTIONS: &str = r#"你是 GangZiTerminal 的�
 - 信心不足 → 直说"我不开，因为 X"——这本身就是一个决策，不要把球踢给用户
 - 写工具失败 → 如实告诉用户哪条规则不通 + 下一步可行方案；绝不假装下单成功
 
-## Heuristic 纪律
-- 用户口头说出偏好 / 纠错 → 调 `propose_heuristic(origin="user_stated", ...)`，effective_state 直接 active
-- 不要把一次性指令写成 heuristic，只写「可反复应用于未来场景」的判断
-- 反复打脸 / 用户撤回 / 与新规则冲突且新的更准 → 调 `retire_heuristic`
-
-## Position 纪律（v4 合并 Expectation）
-- 开仓 → `open_position(kind=live/watch, direction, take_profit?, stop_loss?, invalidation_signals, signals_used, reasoning, conviction?)`
-- `kind=watch` 表示"看好但不下注"——shares=0，不动现金，只走 judge → close → lesson 学习闭环
-- 触发条件（take_profit / stop_loss / time_stop / invalidation_signals）由 scheduler tick 自动平仓，agent 只在主观撤回时调 `close_position(reason=manual)`
-- 调整假设 → `adjust_position`（改 target / stop / horizon / invalidation_signals / reasoning）
-- 如果你依赖了上面列出的 heuristic（按 id），就把它们填到 `applied_heuristic_ids`——close 时按这个精确给该 heuristic 计 hit/miss
+## 工具
+- 行情 / 资讯 / 账户读取：fetch_quotes / fetch_news / fetch_account
+- 维护自选：update_watchlist（非交易写）
+- 交易写：operate_account（place_order / cancel_order / open_position / scale_position / close_position / adjust_protection / record_invalidation_signal）
+- 决策审计：record_decision_episode / record_decision_review（形成投资判断必须先 record_decision_episode，再调 operate_account；no_action 也必须落 episode）
 
 ## 不要做
 - 不要包 JSON 整个回答
@@ -42,16 +34,12 @@ pub(crate) const CHAT_SYSTEM_INSTRUCTIONS: &str = r#"你是 GangZiTerminal 的�
 
 // ====== Chat prompt 输入打包 ======
 
-/// Chat 的"稳定"系统上下文输入——active heuristics top-N 注入。
+/// Chat 系统上下文输入（StrategyCard 摘要由 Agent Runtime packet build 注入）。
 pub struct ChatSystemContextInput<'a> {
-    pub heuristics: &'a [Heuristic],
-    pub current_regime: Option<Regime>,
+    pub strategy_summary: &'a str,
 }
 
-/// Chat 的"易变"动态上下文输入——市场快照、持仓。
-///
-/// `live_quotes`：当前 chat run 已 fetch 的实时行情；按 6 位 code 索引用于
-/// format_positions 显示当前价 + 盈亏%。
+/// Chat 动态上下文输入——市场快照 + 持仓。
 pub struct ChatDynamicContextInput<'a> {
     pub market_overview: Option<&'a MarketOverview>,
     pub simulated_positions: &'a [Position],
@@ -68,22 +56,14 @@ fn format_availability_block(availability: Option<&str>) -> String {
     }
 }
 
-/// 构造 chat 的 system 上下文文本（active heuristics + 当前 regime）。
 pub fn build_chat_system_context(input: &ChatSystemContextInput) -> String {
-    let regime_line = match input.current_regime {
-        Some(r) => format!("当前市场状态（regime）：{}\n", r.as_str()),
-        None => String::new(),
-    };
-    format!(
-        r#"{regime_line}
-你当前生效的启发式规则（heuristics——结构化原则 / 已知偏差 / 风险偏好，
-带实战 track record，agent 用 propose_heuristic 写、apply/retire 调整）：
-{heuristics}"#,
-        heuristics = format_heuristics(input.heuristics),
-    )
+    if input.strategy_summary.trim().is_empty() {
+        "当前没有 active StrategyCard。".to_string()
+    } else {
+        format!("Active StrategyCard 摘要：\n{}", input.strategy_summary)
+    }
 }
 
-/// 构造 chat 的动态上下文文本（市场 + 持仓）。
 pub fn build_chat_dynamic_context(input: &ChatDynamicContextInput) -> String {
     format!(
         r#"以下是本次对话开始时的实时上下文，仅作参考——若需要更精准的盘口或 K 线，请用对应工具拉取：
@@ -91,7 +71,7 @@ pub fn build_chat_dynamic_context(input: &ChatDynamicContextInput) -> String {
 当前市场上下文：
 {market}
 
-当前模拟账户持仓（含当前价 / 盈亏 / 假设字段；历史事件链请用 get_position(position_id) 单独拉）：
+当前模拟账户持仓（含当前价 / 盈亏）：
 {positions}"#,
         quotes_availability = format_availability_block(input.quotes_availability),
         market = format_market(input.market_overview),
@@ -135,28 +115,6 @@ fn format_market(market: Option<&MarketOverview>) -> String {
         fall = m.breadth.fall,
         flat = m.breadth.flat,
     )
-}
-
-#[allow(dead_code)]
-fn format_quotes(quotes: &[StockQuote]) -> String {
-    if quotes.is_empty() {
-        return "暂无自选行情。".into();
-    }
-    quotes
-        .iter()
-        .take(20)
-        .map(|q| {
-            format!(
-                "{}({}) 最新价 {}，涨跌幅 {}，成交额 {}",
-                q.name,
-                q.code.as_str(),
-                fmt_num(q.price.map(|v| v.value())),
-                fmt_pct(q.change_percent),
-                fmt_num(q.day_amount.map(|v| v.value())),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> String {
@@ -212,84 +170,32 @@ fn format_positions(positions: &[Position], live_quotes: &[StockQuote]) -> Strin
                 };
                 line.push_str(&format!("  止盈 ¥{:.2} ({:+.2}%)", tp.value(), dist));
             }
-            if !p.invalidation_signals.is_empty() {
-                let fams: Vec<_> = p.invalidation_signals.iter().map(|s| s.family_str()).collect();
-                line.push_str(&format!("\n  失效条件: {}", fams.join(", ")));
-            }
             line.push_str(&format!("\n  入场理由：{}", truncate_chars(&p.reasoning, 200)));
-            if !p.signals_used.is_empty() {
-                let fams: Vec<_> = p.signals_used.iter().map(|s| s.family_str()).collect();
-                line.push_str(&format!("\n  入场信号: {}", fams.join(", ")));
-            }
             line
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-fn format_heuristics(hs: &[Heuristic]) -> String {
-    if hs.is_empty() {
-        return "暂无 active heuristic（启动时应已 seed 10 条；如果这里空说明启动 seed 失败）。"
-            .into();
-    }
-    hs.iter()
-        .map(|h| {
-            let regime_str = if h.regime_tags.is_empty() {
-                String::from("通用")
-            } else {
-                h.regime_tags
-                    .iter()
-                    .map(|r| r.as_str().to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            let origin_icon = match h.origin {
-                crate::domain::agent::heuristic::HeuristicOrigin::Seed => "📚",
-                crate::domain::agent::heuristic::HeuristicOrigin::UserStated => "🧑",
-                crate::domain::agent::heuristic::HeuristicOrigin::AgentInferred => "🤖",
-            };
-            let conf = h
-                .confidence()
-                .map(|c| format!("{:.0}%", c * 100.0))
-                .unwrap_or_else(|| "—".into());
-            format!(
-                "- {} id={} [{}] hit/miss={}/{} conf={} regime={} · {}",
-                origin_icon,
-                h.id.as_str(),
-                h.category.as_str(),
-                h.hit_count,
-                h.miss_count,
-                conf,
-                regime_str,
-                h.body
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-// ====== Helpers ======
-
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
-
 fn fmt_num(v: Option<f64>) -> String {
     match v {
-        Some(x) => {
-            if x.fract() == 0.0 {
-                format!("{}", x as i64)
-            } else {
-                format!("{}", x)
-            }
-        }
-        None => "未知".into(),
+        Some(n) => format!("{:.2}", n),
+        None => "—".into(),
     }
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
     match v {
-        Some(x) => format!("{:+.2}%", x),
+        Some(n) => format!("{:+.2}%", n),
         None => "—".into(),
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{}…", cut)
     }
 }

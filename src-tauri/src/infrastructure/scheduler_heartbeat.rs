@@ -18,17 +18,30 @@ pub const LOOP_MARKET_QUOTE: &str = "market_quote";
 pub const LOOP_MARKET_UNIVERSE: &str = "market_universe";
 pub const LOOP_ACCOUNT: &str = "account_close";
 pub const LOOP_KLINE_WARM: &str = "kline_warm";
-pub const LOOP_REFLECTION: &str = "reflection";
-pub const LOOP_SCAN: &str = "scan";
 pub const LOOP_NEWS_RETENTION: &str = "news_retention";
+// Agent Runtime loops（spec §10 可观测覆盖范围）
+pub const LOOP_AGENT_NEWS_BATCH: &str = "agent_news_batch";
+/// spec §10 可观测 loop——account_trigger_routing 当前在 router 内联，未独立写 heartbeat。
+#[allow(dead_code)]
+pub const LOOP_AGENT_ACCOUNT_TRIGGER_ROUTING: &str = "agent_account_trigger_routing";
+/// spec §10 可观测 loop——scheduled_review tick 启用后写 heartbeat（当前未启用）。
+#[allow(dead_code)]
+pub const LOOP_AGENT_SCHEDULED_REVIEW: &str = "agent_scheduled_review";
+pub const LOOP_ACCOUNT_TRIGGER_EVAL: &str = "account_trigger_eval";
 
+/// SchedulerHeartbeat 行——字段名严格对齐 spec `agent-runtime-module.md §10`：
+/// `loopName / lastOkAt / lastErrorAt / lastError / consecutiveFailures`。
+/// DB 列名沿用旧 schema 不动；只改对外 JSON 字段名。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HeartbeatRow {
     pub loop_name: String,
     pub last_ok_at: Option<String>,
+    #[serde(rename = "lastErrorAt")]
     pub last_err_at: Option<String>,
+    #[serde(rename = "lastError")]
     pub last_err_msg: Option<String>,
+    #[serde(rename = "consecutiveFailures")]
     pub consecutive_err: u32,
     pub updated_at: String,
 }

@@ -4,7 +4,7 @@
 //! - `stock_basic`：全市场股票档案
 //! - `daily` / `weekly` / `monthly`：日 / 周 / 月线（不复权）
 //! - `adj_factor`：复权因子（前复权计算用）
-//! - `daily_basic`：每日指标（PE/PB/换手/市值——Phase 4 用）
+//! - `daily_basic`：每日指标（PE/PB/换手/市值
 
 use super::client::{call, row_f64, row_str};
 use crate::domain::quotes::{
@@ -217,7 +217,10 @@ pub async fn fetch_daily_basic(
         return Ok(None);
     };
     let trade_date = TradeDate::from_compact(&row_str(row, "trade_date").unwrap_or_default())?;
+    let fetched_at = chrono::Utc::now().to_rfc3339();
+    let ts_code = crate::domain::shared::TsCode::from_unchecked(code.to_ts_code());
     Ok(Some(DailyBasic {
+        ts_code,
         code: code.clone(),
         trade_date,
         pe: row_f64(row, "pe"),
@@ -233,6 +236,8 @@ pub async fn fetch_daily_basic(
         // TuShare 给的市值是万元——转 Yuan（× 10000）
         total_mv: Yuan::from_unchecked(row_f64(row, "total_mv").unwrap_or(0.0) * 10000.0),
         circ_mv: Yuan::from_unchecked(row_f64(row, "circ_mv").unwrap_or(0.0) * 10000.0),
+        source: "tushare:daily_basic".into(),
+        fetched_at,
     }))
 }
 
@@ -250,13 +255,16 @@ pub async fn fetch_daily_basic_by_date(
          turnover_rate,turnover_rate_f,volume_ratio,total_mv,circ_mv",
     )
     .await?;
+    let fetched_at = chrono::Utc::now().to_rfc3339();
     Ok(rows
         .iter()
         .filter_map(|row| {
-            let ts_code = row_str(row, "ts_code")?;
-            let six = ts_code.split('.').next()?;
+            let ts_code_raw = row_str(row, "ts_code")?;
+            let six = ts_code_raw.split('.').next()?;
             let code = StockCode::new(six).ok()?;
+            let ts_code = crate::domain::shared::TsCode::from_unchecked(ts_code_raw);
             Some(DailyBasic {
+                ts_code,
                 code,
                 trade_date,
                 pe: row_f64(row, "pe"),
@@ -271,6 +279,8 @@ pub async fn fetch_daily_basic_by_date(
                 volume_ratio: row_f64(row, "volume_ratio").unwrap_or(0.0),
                 total_mv: Yuan::from_unchecked(row_f64(row, "total_mv").unwrap_or(0.0) * 10000.0),
                 circ_mv: Yuan::from_unchecked(row_f64(row, "circ_mv").unwrap_or(0.0) * 10000.0),
+                source: "tushare:daily_basic".into(),
+                fetched_at: fetched_at.clone(),
             })
         })
         .collect())

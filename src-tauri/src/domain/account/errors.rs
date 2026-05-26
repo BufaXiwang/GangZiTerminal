@@ -35,6 +35,23 @@ pub enum RuleError {
     InvalidCode(String),
     /// scale_position 会让仓位归零——caller 应改用 close_position
     ScaleWouldZero,
+    /// spec account-module.md §444：行情 `stale` —— 即时成交 fail closed
+    QuoteStale {
+        code: String,
+        age_ms: Option<i64>,
+    },
+    /// spec account-module.md §444：行情 `missing` —— 即时成交 fail closed
+    QuoteMissing {
+        code: String,
+    },
+    /// spec quotes-module.md §187：`tradeStatus = halted` —— 即时成交 fail closed
+    InstrumentSuspended {
+        code: String,
+    },
+    /// spec quotes-module.md §187：`tradeStatus = closed/unknown` 在非交易时段 —— 即时成交 fail closed
+    OutsideTradingSessionQuote {
+        code: String,
+    },
 }
 
 impl fmt::Display for RuleError {
@@ -78,6 +95,23 @@ impl fmt::Display for RuleError {
                 f,
                 "减仓股数会让仓位归零——请改调 close_position 走标准平仓事件链"
             ),
+            RuleError::QuoteStale { code, age_ms } => write!(
+                f,
+                "{code} 行情 stale（age={}ms）；即时成交 fail closed，等下一轮 fresh 行情",
+                age_ms.unwrap_or(-1)
+            ),
+            RuleError::QuoteMissing { code } => write!(
+                f,
+                "{code} 行情 missing；即时成交 fail closed"
+            ),
+            RuleError::InstrumentSuspended { code } => write!(
+                f,
+                "{code} 停牌（tradeStatus=halted）；即时成交 fail closed"
+            ),
+            RuleError::OutsideTradingSessionQuote { code } => write!(
+                f,
+                "{code} 非交易时段或行情 tradeStatus=closed；即时成交 fail closed"
+            ),
         }
     }
 }
@@ -101,6 +135,35 @@ impl fmt::Display for AccountError {
 }
 
 impl std::error::Error for AccountError {}
+
+impl AccountError {
+    /// 映射成 spec `shared-types.md §5 ErrorCode` 闭集合 —— 给 OperateAccountResult.reason 用。
+    pub fn to_error_code(&self) -> crate::domain::shared::ErrorCode {
+        use crate::domain::shared::ErrorCode;
+        match self {
+            AccountError::Rule(r) => match r {
+                RuleError::InsufficientFunds { .. } => ErrorCode::InsufficientCash,
+                RuleError::TPlusOneViolation { .. } => ErrorCode::InsufficientSellableQuantity,
+                RuleError::OutsideTradingHours => ErrorCode::OutsideTradingSession,
+                RuleError::NotFillable => ErrorCode::DepthMissing,
+                RuleError::SharesNotIntegerLot { .. } => ErrorCode::InvalidLotSize,
+                RuleError::InsufficientShares { .. } => ErrorCode::InsufficientSellableQuantity,
+                RuleError::PositionNotFound(_) => ErrorCode::NotFound,
+                RuleError::PositionAlreadyClosed(_) => ErrorCode::InvalidInput,
+                RuleError::DuplicateOpenCode(_) => ErrorCode::InvalidInput,
+                RuleError::InvalidStops(_) => ErrorCode::InvalidInput,
+                RuleError::NoCurrentPrice(_) => ErrorCode::QuoteMissing,
+                RuleError::InvalidCode(_) => ErrorCode::InvalidInput,
+                RuleError::ScaleWouldZero => ErrorCode::InvalidInput,
+                RuleError::QuoteStale { .. } => ErrorCode::QuoteStale,
+                RuleError::QuoteMissing { .. } => ErrorCode::QuoteMissing,
+                RuleError::InstrumentSuspended { .. } => ErrorCode::InstrumentSuspended,
+                RuleError::OutsideTradingSessionQuote { .. } => ErrorCode::OutsideTradingSession,
+            },
+            AccountError::Io(_) => ErrorCode::DbError,
+        }
+    }
+}
 
 impl From<RuleError> for AccountError {
     fn from(r: RuleError) -> Self {

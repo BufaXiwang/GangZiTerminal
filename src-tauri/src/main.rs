@@ -21,39 +21,81 @@ pub fn run() {
             // 自选股 watchlist：从 KV 恢复到内存（account 模块）
             infrastructure::account::watchlist::hydrate(&handle);
 
-            // Seed v3 heuristics + strategies：表为空时注入
-            // 见 docs/design/agent-v3-expectation-driven.md § 4 + § 9.6
-            if let Err(e) = infrastructure::agent::seed_heuristics::seed_if_empty(&handle) {
-                tracing::warn!(error = %e, "seed heuristics 失败（跳过，不阻塞启动）");
-            }
-            if let Err(e) = infrastructure::agent::seed_strategies::seed_if_empty(&handle) {
-                tracing::warn!(error = %e, "seed strategies 失败（跳过，不阻塞启动）");
+            // spec account-module.md §2/§4：账户事件流的首个事实必须是
+            // `account_initialized`；幂等，已存在则跳过。
+            {
+                let svc = pipeline::account::AccountService::new(handle.clone());
+                if let Err(e) = svc.initialize_account_if_needed(
+                    infrastructure::account::INITIAL_CASH,
+                ) {
+                    tracing::warn!(error = %e, "initialize_account_if_needed 失败（继续启动）");
+                }
             }
 
-            // Tokio 任务：scheduler 启动后台 loop（news / market / account / kline warm）
+            // 注入 Agent tool registry 工厂（pipeline 不依赖 adapters，靠 OnceLock 反转控制）。
+            // factory 按 profile 过滤 allowed tools，spec §2 / §4。
+            pipeline::agent::tools::install_registry_factory(
+                adapters::agent_tools::registry_factory,
+            );
+
+            // StrategyCard：首次启动 seed baseline 策略卡
+            if let Err(e) =
+                infrastructure::agent_runtime::strategy_cards_repo::seed_baseline_if_empty(&handle)
+            {
+                tracing::warn!(error = %e, "seed baseline strategy card 失败（跳过，不阻塞启动）");
+            }
+
+            // Agent Runtime 恢复：把进程退出时还在 running 的 run 标记 failed
+            if let Err(e) = infrastructure::agent_runtime::runs_repo::recover_interrupted(&handle) {
+                tracing::warn!(error = %e, "recover interrupted agent runs 失败");
+            }
+            if let Err(e) = infrastructure::agent_runtime::news_buffer_repo::recover_orphans(&handle)
+            {
+                tracing::warn!(error = %e, "recover news buffer orphans 失败");
+            }
+            match infrastructure::agent_runtime::trade_intents_repo::recover_submitted(&handle) {
+                Ok((scanned, recovered, rejected)) if scanned > 0 => {
+                    tracing::info!(
+                        scanned,
+                        recovered,
+                        rejected,
+                        "TradeIntent submitted recovery 完成"
+                    );
+                    if rejected > 0 {
+                        // spec agent-runtime-module.md §8「不可恢复错误写入失败状态和 UI 可见事件」
+                        use tauri::Emitter;
+                        let _ = handle.emit(
+                            "trade-intent-recovery-failed",
+                            serde_json::json!({
+                                "scanned": scanned,
+                                "recovered": recovered,
+                                "rejected": rejected,
+                                "message": "submission_unknown_no_account_effect",
+                            }),
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "TradeIntent recovery 失败"),
+                _ => {}
+            }
+
+            // 后台 loop：news / market / account / kline warm
             pipeline::scheduler::spawn_all(app.handle().clone());
 
-            // Reflection tick 单独走 adapters/ 入口（需要构造 tool registry，pipeline 不能 use adapters）
-            adapters::reflection_scheduler::spawn(app.handle().clone());
-            // Scan tick（9 ticks/天）—— 自驱观察循环
-            adapters::scan_scheduler::spawn(app.handle().clone());
-            // Agent 对 news 的批量分析调度（timer + buffer overflow listener）
-            adapters::news_batch_scheduler::spawn(app.handle().clone());
+            // Agent Runtime 调度（事件路由 + recovery flows + 后台 run）
+            pipeline::agent_runtime::spawn(app.handle().clone());
             Ok(())
         })
         // IPC surface = "前端真正会调用的 API"。
-        // 内部写命令（append_chat_message / replace_* / save_* / claim/mark/revert news 等）
-        // 不再暴露——它们是 pipeline 的实现细节，只通过 Rust 函数调用。
-        // 把这些从 IPC 拿掉之后，"后端 pipeline 是唯一业务写入口"就从约定变成边界。
         .invoke_handler(tauri::generate_handler![
             // 应用初始化 / 用户 UI 设置
             adapters::app_state_commands::initialize_database,
             adapters::app_state_commands::load_app_state,
             adapters::app_state_commands::save_app_state,
-            // 流水线触发（用户点击 / 计划任务）
+            // Agent Runtime / Chat 入口
             adapters::chat_commands::send_chat_message_now,
             adapters::news_commands::run_news_refresh,
-            // 模拟账户 IPC（adapters/account_commands.rs）
+            // 模拟账户 IPC
             adapters::account_commands::get_account_snapshot,
             adapters::account_commands::list_positions,
             adapters::account_commands::list_simulated_positions,
@@ -71,53 +113,51 @@ pub fn run() {
             adapters::news_commands::list_news_items,
             adapters::chat_commands::search_chat_messages,
             // UI 直接渲染的辅助命令
-            adapters::news_commands::fetch_article_content, // hover 看资讯原文
-            adapters::quotes_commands::fetch_a_share_klines, // 日/周/月 K（TuShare）
-            adapters::quotes_commands::fetch_a_share_minutes, // 分时（EM trends2）
-            adapters::quotes_commands::fetch_minute_klines, // 分钟 K（1/5/15/30/60m, EM klines）
-            adapters::quotes_commands::fetch_a_share_quotes, // 实时报价（基础字段）
-            adapters::quotes_commands::get_market_overview, // 四大指数 + breadth
-            adapters::quotes_commands::fetch_top_list,
-            adapters::quotes_commands::fetch_moneyflow,
-            adapters::quotes_commands::fetch_north_flow,
-            adapters::quotes_commands::fetch_north_top10,
-            adapters::quotes_commands::fetch_margin_summary,
+            adapters::news_commands::fetch_article_content,
+            adapters::quotes_commands::fetch_a_share_klines,
+            adapters::quotes_commands::fetch_a_share_minutes,
+            adapters::quotes_commands::fetch_minute_klines,
+            adapters::quotes_commands::fetch_a_share_quotes,
+            adapters::quotes_commands::get_market_overview,
             adapters::quotes_commands::fetch_company_events,
-            adapters::quotes_commands::fetch_concept_list,
-            adapters::quotes_commands::fetch_concept_members,
-            adapters::quotes_commands::fetch_concept_performance,
             adapters::quotes_commands::scan_market,
             adapters::quotes_commands::scan_market_query,
             adapters::quotes_commands::fetch_stock_profile,
-            // 今日市场——全市场列表 + 旁路实时
-            adapters::market_commands::list_market_instruments, // 全市场静态档案（一次拉）
-            adapters::market_commands::run_market_quote_refresh_cmd, // 手动触发旁路刷新
-            adapters::market_commands::snapshot_market_quotes,  // 首次进页面 hydrate 全部当前快照
+            // 今日市场
+            adapters::market_commands::list_market_instruments,
+            adapters::market_commands::run_market_quote_refresh_cmd,
+            adapters::market_commands::snapshot_market_quotes,
             adapters::market_commands::snapshot_market_quotes_for,
-            // TuShare 能力探测（dev / 一次性）
+            // TuShare 能力探测
             adapters::quotes_commands::probe_tushare_capabilities,
-            adapters::app_commands::open_external_url, // 打开浏览器
-            // 数据源配置（SettingsPage → 数据源）
+            adapters::app_commands::open_external_url,
+            // 数据源配置
             adapters::quotes_commands::save_tushare_token,
-            // Agent provider 配置（SettingsPage → AI 配置）
+            // Agent provider 配置
             adapters::agent_commands::get_agent_config,
             adapters::agent_commands::set_agent_config,
             adapters::agent_commands::verify_provider_model,
             adapters::agent_commands::get_agent_health,
-            // 实时报价代理池 + 三源健康度（SettingsPage → 网络 tab）
+            // 实时报价代理池 + 三源健康度
             adapters::proxy_commands::get_proxy_pool,
             adapters::proxy_commands::set_proxy_pool,
             adapters::proxy_commands::get_realtime_health,
-            // Agent v4 learning loop commands（strategy / lesson / heuristic 读 + retire）
-            adapters::episode_commands::list_agent_episodes,
-            adapters::episode_commands::get_account_metrics,
-            adapters::expectation_commands::list_strategies,
-            adapters::expectation_commands::set_strategy_enabled,
-            adapters::expectation_commands::list_lessons,
-            adapters::expectation_commands::list_lessons_for_position,
-            adapters::expectation_commands::list_heuristics,
-            adapters::expectation_commands::get_heuristic_counts,
-            adapters::expectation_commands::retire_heuristic_cmd,
+            // Agent Runtime 命令
+            adapters::runtime_commands::send_agent_message,
+            adapters::runtime_commands::fetch_agent_state,
+            adapters::runtime_commands::cancel_agent_run,
+            adapters::strategy_commands::fetch_strategy_cards,
+            adapters::strategy_commands::upsert_strategy_card,
+            // Quotes / News / Account canonical commands（spec-aligned 入口）
+            adapters::quotes_canonical::fetch_data,
+            adapters::quotes_canonical::list_market,
+            adapters::news_canonical::fetch_news,
+            adapters::news_canonical::list_news_sources,
+            adapters::news_canonical::refresh_news_canonical,
+            adapters::news_canonical::warm_articles,
+            adapters::account_canonical::fetch_account,
+            adapters::account_canonical::operate_account,
+            adapters::account_canonical::update_watchlist,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

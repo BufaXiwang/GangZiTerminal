@@ -9,6 +9,7 @@
 
 pub mod account;
 pub mod agent;
+pub mod agent_runtime;
 pub mod app_state;
 pub mod db;
 pub mod logging;

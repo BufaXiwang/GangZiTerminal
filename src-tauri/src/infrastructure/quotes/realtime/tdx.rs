@@ -143,11 +143,16 @@ impl RealtimeQuoteSource for TdxSource {
                 continue;
             }
 
+            let captured_at = OccurredAt::now();
+            let trade_date = crate::domain::shared::resolve_market_time(captured_at)
+                .current_trade_date
+                .unwrap_or_else(|| {
+                    crate::domain::shared::resolve_market_time(captured_at)
+                        .latest_completed_trade_date
+                });
             result.push((
                 ts_code,
                 StockQuote {
-                    code,
-                    name: String::new(), // TDX 不返 name
                     price: if q.price > 0.0 {
                         Some(Yuan::from_unchecked(q.price))
                     } else {
@@ -178,7 +183,6 @@ impl RealtimeQuoteSource for TdxSource {
                     // TDX vol 单位是手（与我们的 Lots 一致）
                     day_volume: Some(Lots::from_unchecked(q.vol as i64)),
                     day_amount: Some(Yuan::from_unchecked(q.amount)),
-                    captured_at: OccurredAt::now(),
                     bid_levels: q
                         .book
                         .iter()
@@ -198,6 +202,14 @@ impl RealtimeQuoteSource for TdxSource {
                     buy_volume: positive_lots(q.b_vol),
                     sell_volume: positive_lots(q.s_vol),
                     order_imbalance: order_imbalance(&q),
+                    ..StockQuote::new_from_provider(
+                        code,
+                        String::new(),
+                        crate::domain::quotes::InstrumentCategory::Stock,
+                        trade_date,
+                        captured_at,
+                        crate::domain::quotes::QuoteSource::Tdx,
+                    )
                 },
             ));
         }

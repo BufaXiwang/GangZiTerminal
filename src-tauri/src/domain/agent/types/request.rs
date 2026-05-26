@@ -90,7 +90,7 @@ pub struct AgentRequest {
     /// 便于后续按 chat_messages.id 反查这条 episode 的成本和工具调用。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_message_id: Option<String>,
-    /// 这次 run 的 pipeline 类型——v2 重构后只剩 chat。
+    /// 这次 run 的 pipeline 类型——当前只有 chat（Infra 层统一），Runtime 通过 profile 区分。
     pub pipeline: PipelineKind,
 }
 
@@ -202,8 +202,9 @@ pub struct ContextBudget {
     pub max_search_calls: u32,
 }
 
-/// v2 重构后只剩 chat 一种 pipeline。reflection 是 chat pipeline 的另一种 trigger，
-/// 不是单独的 PipelineKind——它复用 chat 的 loop + tools，只是 prompt 不同。
+/// Agent Infra 当前只有一种 pipeline kind，Runtime 通过 `AgentRunProfileId`
+/// 区分不同 run profile（user_chat / news_analysis / account_trigger_response
+/// 等），共用同一份 loop + tool registry。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum PipelineKind {

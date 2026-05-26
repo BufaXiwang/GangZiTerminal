@@ -34,18 +34,54 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
     let cash = Yuan::from_unchecked(initial_cash.value() + cash_delta.value());
 
     // ----- market_value + unrealized -----
+    // spec §2 AccountSnapshot：pricedPositionCount / unpricedPositionCount 表达估值覆盖
     let mut market_value = 0.0;
     let mut unrealized_pnl = 0.0;
+    let mut priced = 0usize;
+    let mut unpriced = 0usize;
+    let mut worst_freshness: Option<crate::domain::shared::Freshness> = None;
+    use crate::domain::shared::FreshnessStatus;
     for p in positions.iter().filter(|p| p.status.is_open()) {
         let ts_code = p.code.to_ts_code();
-        let current_price = market_snapshot::get(&ts_code)
-            .and_then(|q| q.price)
-            .map(|y| y.value())
-            .unwrap_or(p.avg_entry_price.value()); // 拿不到价就用均价兜底（unrealized 显示 0）
-        let value = current_price * p.current_shares.value() as f64;
-        market_value += value;
-        let cost = p.avg_entry_price.value() * p.current_shares.value() as f64;
-        unrealized_pnl += value - cost;
+        match market_snapshot::get(&ts_code) {
+            Some(q) => {
+                let f = q.freshness.clone();
+                let worse = match (&worst_freshness, &f.status) {
+                    (None, _) => true,
+                    (Some(cur), FreshnessStatus::Missing)
+                        if !matches!(cur.status, FreshnessStatus::Missing) =>
+                    {
+                        true
+                    }
+                    (Some(cur), FreshnessStatus::Stale)
+                        if matches!(cur.status, FreshnessStatus::Fresh) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if worse {
+                    worst_freshness = Some(f);
+                }
+                let current_price = q.price.map(|y| y.value()).unwrap_or_else(|| {
+                    unpriced += 1;
+                    p.avg_entry_price.value()
+                });
+                if q.price.is_some() {
+                    priced += 1;
+                }
+                let value = current_price * p.current_shares.value() as f64;
+                market_value += value;
+                let cost = p.avg_entry_price.value() * p.current_shares.value() as f64;
+                unrealized_pnl += value - cost;
+            }
+            None => {
+                unpriced += 1;
+                // 拿不到价就用均价兜底（unrealized 0）
+                let cost = p.avg_entry_price.value() * p.current_shares.value() as f64;
+                market_value += cost;
+            }
+        }
     }
 
     // ----- realized_pnl: 已平仓 positions 的事件链净 cash 流 -----
@@ -57,6 +93,19 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
     let (open_positions, closed_positions): (Vec<_>, Vec<_>) =
         positions.iter().cloned().partition(|p| p.status.is_open());
 
+    let mut warnings: Vec<crate::domain::shared::WarningCode> = Vec::new();
+    if unpriced > 0 {
+        warnings.push(crate::domain::shared::WarningCode::DataPartial);
+    }
+    if let Some(f) = &worst_freshness {
+        match f.status {
+            FreshnessStatus::Stale => warnings.push(crate::domain::shared::WarningCode::QuoteStale),
+            FreshnessStatus::Missing => {
+                warnings.push(crate::domain::shared::WarningCode::QuoteMissing)
+            }
+            FreshnessStatus::Fresh => {}
+        }
+    }
     AccountSnapshot {
         initial_cash,
         cash,
@@ -68,6 +117,10 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
         total_pnl: Yuan::from_unchecked(total_pnl),
         total_assets: Yuan::from_unchecked(total_assets),
         captured_at: OccurredAt::now(),
+        priced_position_count: priced,
+        unpriced_position_count: unpriced,
+        valuation_freshness: worst_freshness,
+        warnings,
     }
 }
 
@@ -210,6 +263,7 @@ mod tests {
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),
+            warnings: Vec::new(),
         }
     }
 
@@ -236,6 +290,7 @@ mod tests {
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),
+            warnings: Vec::new(),
         }
     }
 

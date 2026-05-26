@@ -1,6 +1,6 @@
 //! Agent 运行时配置——**N 渠道模型**：用户可以加任意多个渠道，每个独立持有
 //! `(wire_format + base_url + token + 可用模型清单)`；2 个 slot（chat / compact）
-//! 各自分配一对 `(channel_id, model_id)`。v2 重构后 briefing / review 已下线。
+//! 各自分配一对 `(channel_id, model_id)`。
 //!
 //! 存在 app_state 表的单 key `agent.config` 下，整个 JSON object 一次读写。
 //! 前端 Settings 页通过 `get_agent_config` / `set_agent_config` 命令访问。
@@ -293,7 +293,7 @@ pub fn read_agent_config(app: &AppHandle) -> AgentConfig {
     }
 }
 
-/// v2 重构后 app_state 跟随 DB 一起备份重建——这里不需要兼容老 schema 的 config JSON。
+/// app_state 跟随 DB 一起备份重建——不需要兼容老 schema 的 config JSON。
 /// 直接 deserialize，失败回 default。
 fn parse_with_migration(v: Value) -> AgentConfig {
     serde_json::from_value::<AgentConfig>(v).unwrap_or_default()

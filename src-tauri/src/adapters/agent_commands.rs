@@ -15,8 +15,8 @@ use crate::pipeline::agent::config::{read_agent_config, write_agent_config, Agen
 use serde_json::Value;
 use tauri::AppHandle;
 
-/// 暴露 agent 自迭代健康度——Settings → Agent 健康面板用。
-/// 把 v3 expectation-driven 几条关键审计 SQL 一次性返回，前端不用拼。
+/// 暴露 Agent Runtime 健康度——Settings → Agent 健康面板用。
+/// 当前返回 scheduler heartbeat 投影；AgentRun / Episode / Review 详情走 `fetch_agent_state`。
 #[tauri::command]
 pub fn get_agent_health(app: AppHandle) -> Result<HealthMetrics, String> {
     compute(&app)

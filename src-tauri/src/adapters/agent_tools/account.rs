@@ -1,507 +1,429 @@
-//! 模拟账户写工具 + 账户读工具——chat 模式下 agent mid-loop 调用。
+//! Account canonical tools：`fetch_account` / `operate_account` / `update_watchlist`。
 //!
-//! v4 工具（合并 Expectation 后）：
-//! - `get_account`：查账户快照（现金 / 总盈亏 / 持仓明细）
-//! - `open_position`：开新仓（含 direction / signals_used / invalidation_signals / reasoning 等假设字段）
-//! - `close_position`：全平（agent 主观撤回；auto_review 会自动平触发条件命中的）
-//! - `scale_position`：加 / 减仓（仅 Live）
-//! - `adjust_position`：调 take_profit / stop_loss / time_stop / invalidation_signals / reasoning
-//!
-//! 写操作全部走 `pipeline::account::AccountService`——唯一写入口，含 mutex、规则校验、
-//! 事件 + state 同事务落盘。失败（涨跌停 / T+1 / 资金不足等）以 is_error=true 返给 agent。
+//! 对齐 docs/design/agent-runtime-module.md §4 + account-module.md §4。
+//! `operate_account` 7 action 全部通过 `pipeline::account::canonical::dispatch`
+//! 落到 `account_orders` + AccountService。
 
-use crate::domain::account::position::{Direction, PositionKind};
-use crate::domain::account::types::{CloseReason, EventSource, Position};
-use crate::domain::agent::heuristic::HeuristicId;
 use crate::domain::agent::types::ToolResultContent;
-use crate::domain::shared::signal::SignalKind;
-use crate::domain::shared::{OccurredAt, Shares, Yuan};
-use crate::infrastructure::agent::position_heuristic_link_repo;
-use crate::pipeline::account::service::{AccountService, OpenRequest};
 use crate::pipeline::agent::tools::{err_text, ok_json, Tool, ToolContext};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tauri::AppHandle;
 
-// ===== 工具间共用 helper ==================================================
+// ============ FetchAccountTool =========================================
 
-fn parse_position_id(input: &Value) -> Result<crate::domain::account::types::PositionId, String> {
-    let id = input
-        .get("position_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing position_id".to_string())?
-        .trim();
-    if id.is_empty() {
-        return Err("position_id 为空".into());
-    }
-    Ok(crate::domain::account::types::PositionId::from_string(
-        id.to_string(),
-    ))
-}
-
-fn parse_required_shares(input: &Value, field: &str) -> Result<i64, String> {
-    input
-        .get(field)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| format!("missing or invalid {field}（必须为整数股数）"))
-}
-
-fn parse_optional_yuan(input: &Value, field: &str) -> Option<Yuan> {
-    input
-        .get(field)
-        .and_then(Value::as_f64)
-        .map(Yuan::from_unchecked)
-}
-
-fn parse_required_string(input: &Value, field: &str) -> Result<String, String> {
-    let s = input
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing {field}"))?
-        .trim();
-    if s.is_empty() {
-        Err(format!("{field} 为空"))
-    } else {
-        Ok(s.to_string())
-    }
-}
-
-fn optional_string(input: &Value, field: &str) -> String {
-    input
-        .get(field)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
-
-fn parse_close_reason(input: &Value) -> CloseReason {
-    match input.get("reason").and_then(Value::as_str) {
-        Some("stop_loss") => CloseReason::StopLoss,
-        Some("take_profit") => CloseReason::TakeProfit,
-        Some("time_stop") => CloseReason::TimeStop,
-        Some("invalidated") => CloseReason::Invalidated,
-        _ => CloseReason::Manual,
-    }
-}
-
-fn parse_signals(input: &Value, field: &str) -> Result<Vec<SignalKind>, String> {
-    let Some(arr) = input.get(field).and_then(|v| v.as_array()) else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let s: SignalKind = serde_json::from_value(item.clone())
-            .map_err(|e| format!("反序列化 {field} 失败：{e}"))?;
-        out.push(s);
-    }
-    Ok(out)
-}
-
-fn position_to_json(p: &Position) -> Value {
-    serde_json::to_value(p).unwrap_or(Value::Null)
-}
-
-fn chat_event_source(ctx: &ToolContext) -> EventSource {
-    EventSource::Chat {
-        message_id: ctx.run_id.clone(),
-    }
-}
-
-// ===== get_account ========================================================
-
-pub struct GetAccountTool {
+pub struct FetchAccountTool {
     app: AppHandle,
 }
 
-impl GetAccountTool {
+impl FetchAccountTool {
     pub fn new(app: AppHandle) -> Self {
         Self { app }
     }
 }
 
 #[async_trait]
-impl Tool for GetAccountTool {
+impl Tool for FetchAccountTool {
     fn name(&self) -> &'static str {
-        "get_account"
+        "fetch_account"
     }
 
     fn description(&self) -> &'static str {
-        "账户快照：现金 / 市值 / PnL / open 持仓（含 live + watch）。开/平/调仓前必查。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {}, "additionalProperties": false })
-    }
-
-    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let service = AccountService::new(self.app.clone());
-        match service.snapshot() {
-            Ok(snap) => {
-                let value =
-                    serde_json::to_value(&snap).unwrap_or_else(|_| json!({"error": "序列化失败"}));
-                (ok_json(value), false)
-            }
-            Err(e) => err_text(format!("读账户快照失败：{e}")),
-        }
-    }
-}
-
-// ===== open_position ======================================================
-
-pub struct OpenPositionTool {
-    app: AppHandle,
-}
-
-impl OpenPositionTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for OpenPositionTool {
-    fn name(&self) -> &'static str {
-        "open_position"
-    }
-
-    fn description(&self) -> &'static str {
-        "开新仓（A 股 100 股整数倍）+ 声明投资假设。\
-        kind=live 真持仓扣现金；kind=watch 观察型不动现金但走完整学习闭环。\
-        direction / take_profit / stop_loss / invalidation_signals 是触发条件——\
-        scheduler tick 命中后自动平仓 + 写 lesson + 反向打标 heuristic。\
-        reasoning 是自然语言决策上下文（无字数限制）。\
-        失败原因看 is_error 文本。"
+        "读取模拟账户：snapshot / 仓位 / 订单 / 自选 / 事件 / 触发。\
+         缺行情时返回 quote_missing / data_partial warning。"
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "A 股 6 位代码或可解析的中文名" },
-                "shares": { "type": "integer", "description": "股数，100 整数倍（kind=watch 时省略或填 0）" },
-                "kind": { "type": "string", "enum": ["live", "watch"], "default": "live", "description": "live=真持仓；watch=看好但不下注（shares=0）" },
-                "direction": { "type": "string", "enum": ["up", "down"], "description": "看涨 / 看跌——决定 take_profit / stop_loss 的语义" },
-                "reasoning": { "type": "string", "description": "自然语言决策上下文（为什么押这一手），无字数限制" },
-                "signals_used": { "type": "array", "description": "触发本次建仓的结构化 SignalKind 数组——close 时反向打标 heuristic" },
-                "invalidation_signals": { "type": "array", "description": "失效条件 SignalKind 数组：scheduler 检测到任一 family 命中即提前判 Invalidated 平仓" },
-                "take_profit": { "type": "number", "description": "目标止盈价（命中自动 close(TakeProfit)）" },
-                "stop_loss": { "type": "number", "description": "价格止损（命中自动 close(StopLoss)）" },
-                "time_stop_days": { "type": "integer", "description": "时间止损：N 个日历日后到期自动 close(TimeStop)；不传默认 7 天" },
-                "name": { "type": "string", "description": "公司名（可省略，会自动拉取）" },
-                "note": { "type": "string", "description": "agent 备注（markdown）" },
-                "applied_heuristic_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "本仓位实际依赖的 heuristic id 列表——close 时按此精确给对应 heuristic 计 hit/miss"
+                "include": {"type": "object"},
+                "positionStatus": {"type": "string", "enum": ["open", "closed", "all"]},
+                "orderActive": {"type": "boolean"},
+                "orderStatusIn": {"type": "array", "items": {"type": "string"}},
+                "triggerHandled": {},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"}
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
+        // 复用 adapter canonical fetch_account 实现，避免双份逻辑。
+        use crate::adapters::account_canonical::{
+            fetch_account as canonical_fetch, FetchAccountInclude, FetchAccountRequest,
+        };
+        let request = FetchAccountRequest {
+            include: input
+                .get("include")
+                .and_then(|v| serde_json::from_value::<FetchAccountInclude>(v.clone()).ok()),
+            position_status: input
+                .get("positionStatus")
+                .and_then(Value::as_str)
+                .map(String::from),
+            order_active: input.get("orderActive").and_then(Value::as_bool),
+            order_status_in: input.get("orderStatusIn").and_then(Value::as_array).map(
+                |arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                },
+            ),
+            trigger_handled: input.get("triggerHandled").cloned(),
+            limit: input.get("limit").and_then(Value::as_i64),
+            offset: input.get("offset").and_then(Value::as_i64),
+        };
+        let app = self.app.clone();
+        match canonical_fetch(app, Some(request)).await {
+            Ok(resp) => (
+                ok_json(serde_json::to_value(resp).unwrap_or(Value::Null)),
+                false,
+            ),
+            Err(e) => err_text(format!("fetch_account 失败：{e}")),
+        }
+    }
+}
+
+// ============ OperateAccountTool =======================================
+
+pub struct OperateAccountTool {
+    app: AppHandle,
+}
+
+impl OperateAccountTool {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+#[async_trait]
+impl Tool for OperateAccountTool {
+    fn name(&self) -> &'static str {
+        "operate_account"
+    }
+    fn side_effect(&self) -> crate::pipeline::agent::tools::SideEffect {
+        crate::pipeline::agent::tools::SideEffect::TradingWrite
+    }
+    fn timeout_ms(&self) -> u64 {
+        60_000
+    }
+
+    fn description(&self) -> &'static str {
+        "模拟账户写操作。action ∈ {place_order, cancel_order, open_position, \
+         scale_position, close_position, adjust_protection, record_invalidation_signal}。\
+         必须先 record_decision_episode 关联 episodeId（actionStatus = intended）。"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "episodeId":   {"type": "string"},
+                "accountInput": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "place_order","cancel_order","open_position",
+                                "scale_position","close_position",
+                                "adjust_protection","record_invalidation_signal"
+                            ]
+                        }
+                    },
+                    "required": ["action"]
                 }
             },
-            "required": ["code", "direction", "reasoning"],
-            "additionalProperties": false
+            "required": ["episodeId", "accountInput"]
         })
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let code = match crate::pipeline::stocks::resolve_stock(
-            &self.app,
-            input.get("code").and_then(Value::as_str).unwrap_or("").trim(),
-        )
+        let episode_id = match input.get("episodeId").and_then(Value::as_str) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return err_text("invalid_input: episodeId 必填（先调 record_decision_episode）"),
+        };
+        let acc = match input.get("accountInput") {
+            Some(v) => v.clone(),
+            None => return err_text("invalid_input: 缺 accountInput"),
+        };
+        let reason = acc
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        // spec §4：episodeId 必须指向同一 run 中已接受的 DecisionEpisode，
+        // 且 actionStatus ∈ {intended, submitted}。fail closed，不调 Account。
+        let app_c = self.app.clone();
+        let ep_c = episode_id.clone();
+        let run_c = ctx.run_id.clone();
+        let validate_r = tokio::task::spawn_blocking(move || {
+            crate::infrastructure::agent_runtime::episodes_repo::validate_for_operate(
+                &app_c, &ep_c, &run_c,
+            )
+        })
         .await
-        {
-            Ok(stock) => stock.code,
-            Err(e) => return err_text(format!("code 解析失败：{e}")),
+        .map_err(|e| format!("validate 任务异常：{e}"));
+        match validate_r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return err_text(e),
+            Err(e) => return err_text(e),
+        }
+
+        // 1. TradeIntent(proposed → submitted)  + 立即推进 episode → submitted。
+        // 把真实 tool_call_id 持久化到 trade_intents（spec §2 「toolCallId 是 Runtime /
+        // Infra 审计关联键」），保证启动恢复时能查到 agent_tool_calls.output_payload_json。
+        let intent_id = match crate::pipeline::agent_runtime::decisions::open_intent(
+            &self.app,
+            &ctx.run_id,
+            &episode_id,
+            ctx.tool_call_id.as_deref(),
+            acc.clone(),
+            reason,
+        ) {
+            Ok(id) => id,
+            Err(msg) => return err_text(format!("db_error: {msg}")),
         };
 
-        let kind_str = optional_string(&input, "kind");
-        let kind = if kind_str.is_empty() {
-            PositionKind::Live
+        // 2. 走 canonical dispatch shim（pipeline/account/canonical）
+        let result =
+            crate::pipeline::account::canonical::dispatch(&self.app, &acc, &episode_id).await;
+
+        // 3. 把 canonical result 映射成 DispatchOutcome 推进 TradeIntent。
+        // spec §2 状态机：
+        // - Account 返回 `accepted=true` 且 limit 还未成交 → AcceptedPending
+        //   （有 orderId，无 fillIds / positionId）
+        // - 其它 accepted → Executed
+        let action_str = acc.get("action").and_then(Value::as_str).unwrap_or("");
+        let order_type = acc.get("orderType").and_then(Value::as_str);
+        // 白名单：spec §2 AcceptedPending 只发生在创建 limit 订单的 action
+        let action_creates_order = matches!(
+            action_str,
+            "place_order" | "open_position" | "scale_position" | "close_position"
+        );
+        let is_limit_pending = result.accepted
+            && action_creates_order
+            && order_type == Some("limit")
+            && result.fill_ids.is_empty()
+            && result.position_id.is_none()
+            && result.order_id.is_some();
+        let outcome = if result.accepted && is_limit_pending {
+            crate::pipeline::agent_runtime::decisions::DispatchOutcome::AcceptedPending {
+                order_id: result.order_id.clone().unwrap_or_default(),
+                account_event_ids: result.account_event_ids.clone(),
+            }
+        } else if result.accepted {
+            crate::pipeline::agent_runtime::decisions::DispatchOutcome::Executed {
+                order_id: result.order_id.clone(),
+                fill_ids: result.fill_ids.clone(),
+                position_id: result.position_id.clone(),
+                account_event_ids: result.account_event_ids.clone(),
+                message: result.message.clone(),
+            }
         } else {
-            match PositionKind::parse(&kind_str) {
-                Some(k) => k,
-                None => return err_text(format!("非法 kind: {kind_str}")),
+            crate::pipeline::agent_runtime::decisions::DispatchOutcome::Rejected {
+                reason: result
+                    .reason
+                    .map(|c| c.as_str().to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                message: result.message.clone(),
             }
         };
+        let _ = crate::pipeline::agent_runtime::decisions::mark_dispatch_outcome(
+            &self.app,
+            &intent_id,
+            &episode_id,
+            &ctx.run_id,
+            ctx.tool_call_id.as_deref(),
+            outcome,
+        );
 
-        let direction_str = match parse_required_string(&input, "direction") {
-            Ok(s) => s,
-            Err(e) => return err_text(e),
-        };
-        let direction = match Direction::parse(&direction_str) {
-            Some(d) => d,
-            None => return err_text(format!("非法 direction: {direction_str}")),
-        };
-
-        let shares_n = if matches!(kind, PositionKind::Watch) {
-            // Watch 强制 0；忽略传入值
-            0i64
-        } else {
-            match parse_required_shares(&input, "shares") {
-                Ok(n) => n,
-                Err(e) => return err_text(e),
+        // 4. 拼 tool 输出（spec agent-runtime-module.md §4 OperateAccountToolOutput）
+        // accepted / reason / message / orderId / fillIds / positionId / triggerId /
+        // rejectionEventId / accountEventIds(必填空数组也要出现) / snapshot(PacketAccountSnapshot,
+        // **required，严格 spec 字段集**) / warnings。
+        // spec §4: snapshot required —— svc.snapshot 失败也必须返回 fail closed empty stub。
+        // 替换 dispatch 内部产出的 raw snapshot 为严格的 PacketAccountSnapshot 投影。
+        let svc_snapshot = crate::pipeline::account::AccountService::new(self.app.clone())
+            .snapshot();
+        let snapshot_value = match &svc_snapshot {
+            Ok(s) => crate::adapters::account_canonical::snapshot_to_packet_value(&self.app, s),
+            Err(e) => {
+                tracing::warn!(error = %e, "tool snapshot 失败，返回 fail-closed empty PacketAccountSnapshot");
+                json!({
+                    "capturedAt": chrono::Utc::now().to_rfc3339(),
+                    "cash": 0.0,
+                    "availableCash": 0.0,
+                    "frozenCash": 0.0,
+                    "marketValue": 0.0,
+                    "totalAssets": 0.0,
+                    "realizedPnl": 0.0,
+                    "unrealizedPnl": 0.0,
+                    "totalPnl": 0.0,
+                    "pricedPositionCount": 0,
+                    "unpricedPositionCount": 0,
+                    "valuationFreshness": {"status": "missing"},
+                    "openPositionCount": 0,
+                    "pendingOrderCount": 0,
+                    "warnings": ["data_partial"],
+                })
             }
         };
+        let mut value = serde_json::to_value(&result).unwrap_or(Value::Null);
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("snapshot".into(), snapshot_value);
+        }
+        let _ = episode_id;
+        // spec §2：operate_account 必须持久化结构化 output_payload_json 到当前
+        // tool_call_id 对应的 agent_tool_calls 行；recover_submitted 通过
+        // trade_intents.tool_call_id 反查它做 TradeIntent 状态恢复。
+        if let Some(tcid) = ctx.tool_call_id.as_deref() {
+            let _ = crate::infrastructure::agent::tool_calls_repo::set_output_payload(
+                &self.app,
+                tcid,
+                &value.to_string(),
+            );
+        }
+        let is_error = !result.accepted;
+        (ok_json(value), is_error)
+    }
+}
+// ============ UpdateWatchlistTool ======================================
 
-        let reasoning = match parse_required_string(&input, "reasoning") {
-            Ok(s) => s,
-            Err(e) => return err_text(e),
-        };
-        let signals_used = match parse_signals(&input, "signals_used") {
-            Ok(s) => s,
-            Err(e) => return err_text(e),
-        };
-        let invalidation_signals = match parse_signals(&input, "invalidation_signals") {
-            Ok(s) => s,
-            Err(e) => return err_text(e),
-        };
-        let stop_loss = parse_optional_yuan(&input, "stop_loss");
-        let take_profit = parse_optional_yuan(&input, "take_profit");
-        let time_stop_at = input
-            .get("time_stop_days")
-            .and_then(Value::as_i64)
-            .map(|days| {
-                OccurredAt::new(OccurredAt::now().value() + days * 24 * 3600 * 1000)
-            });
+pub struct UpdateWatchlistTool {
+    app: AppHandle,
+}
 
-        let name = optional_string(&input, "name");
-        let note = optional_string(&input, "note");
-        let applied_heuristic_ids: Vec<HeuristicId> = input
-            .get("applied_heuristic_ids")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| HeuristicId::from_string(s.to_string()))
-                    .collect()
+impl UpdateWatchlistTool {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+#[async_trait]
+impl Tool for UpdateWatchlistTool {
+    fn name(&self) -> &'static str {
+        "update_watchlist"
+    }
+    fn side_effect(&self) -> crate::pipeline::agent::tools::SideEffect {
+        crate::pipeline::agent::tools::SideEffect::NonTradingWrite
+    }
+
+    fn description(&self) -> &'static str {
+        "维护自选：add / remove / update_note。允许 user/agent/system 任一 actor。"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "episodeId": {"type": "string"},
+                "accountInput": {
+                    "type": "object",
+                    "properties": {
+                        "action":  {"type": "string", "enum": ["add", "remove", "update_note"]},
+                        "tsCode":  {"type": "string"},
+                        "note":    {"type": "string"},
+                        "reason":  {"type": "string"}
+                    },
+                    "required": ["action", "tsCode"]
+                }
+            },
+            "required": ["accountInput"]
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
+        use crate::pipeline::account::{
+            parse_watchlist_action, update_watchlist_dispatch, UpdateWatchlistInput,
+            WatchlistAction,
+        };
+        let episode_id = input
+            .get("episodeId")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let acc = match input.get("accountInput") {
+            Some(v) => v.clone(),
+            None => return err_text("invalid_input: missing accountInput"),
+        };
+        let action_str = acc.get("action").and_then(Value::as_str).unwrap_or("");
+        let Some(action) = parse_watchlist_action(action_str) else {
+            return err_text(format!("invalid_input: unknown action `{action_str}`"));
+        };
+        let ts_code = acc
+            .get("tsCode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if ts_code.is_empty() {
+            return err_text("invalid_input: tsCode 为空");
+        }
+        // spec §4：update_watchlist.episodeId 若存在，必须指向同一 run 的 DecisionEpisode，
+        // 且 action 一致性：accountInput.action = add → episode.action = add_watchlist；
+        // remove → remove_watchlist。
+        if let Some(ep) = &episode_id {
+            // spec §4: episodeId 若存在必须指向同一 run 的 DecisionEpisode +
+            // action 一致性。这里查 (run_id, action) 一次，两条规则都验。
+            let app_c = self.app.clone();
+            let ep_c = ep.clone();
+            let run_c = ctx.run_id.clone();
+            let row: Option<(String, String)> = tokio::task::spawn_blocking(move || {
+                use crate::infrastructure::db::{migrate, open_database};
+                let c = open_database(&app_c).ok()?;
+                migrate(&c).ok()?;
+                c.query_row(
+                    "select run_id, action from decision_episodes where episode_id = ?1",
+                    rusqlite::params![ep_c],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .ok()
             })
-            .unwrap_or_default();
-
-        let req = OpenRequest {
-            code,
-            shares: Shares::from_unchecked(shares_n),
-            name,
-            kind,
-            direction,
-            reasoning,
-            signals_used,
-            invalidation_signals,
-            stop_loss,
-            take_profit,
-            time_stop_at,
-            source: chat_event_source(ctx),
-            source_analysis_id: String::new(),
-            agent_note_md: note,
-        };
-
-        let service = AccountService::new(self.app.clone());
-        match service.open_position(req).await {
-            Ok(position) => {
-                if !applied_heuristic_ids.is_empty() {
-                    if let Err(e) = position_heuristic_link_repo::record(
-                        &self.app,
-                        &position.id,
-                        &applied_heuristic_ids,
-                    ) {
-                        tracing::warn!(error = %e, position = %position.id, "写 position_heuristic_links 失败");
+            .await
+            .ok()
+            .flatten();
+            match row {
+                None => {
+                    return err_text(format!("not_found: episode {ep} 不存在"));
+                }
+                Some((ep_run, _)) if ep_run != run_c => {
+                    return err_text(format!(
+                        "invalid_input: episode {ep} 属于 run {ep_run}，与当前 run {run_c} 不一致"
+                    ));
+                }
+                Some((_, ep_action)) => {
+                    let expected = match action {
+                        WatchlistAction::Add => Some("add_watchlist"),
+                        WatchlistAction::Remove => Some("remove_watchlist"),
+                        WatchlistAction::UpdateNote => None,
+                    };
+                    if let Some(exp) = expected {
+                        if ep_action != exp {
+                            return err_text(format!(
+                                "invalid_input: episode action `{ep_action}` 与 watchlist 动作 `{}` 不匹配",
+                                action_str
+                            ));
+                        }
                     }
                 }
-                (ok_json(position_to_json(&position)), false)
             }
-            Err(e) => err_text(format!("开仓失败：{e}")),
         }
-    }
-}
 
-// ===== close_position =====================================================
-
-pub struct ClosePositionTool {
-    app: AppHandle,
-}
-
-impl ClosePositionTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for ClosePositionTool {
-    fn name(&self) -> &'static str {
-        "close_position"
-    }
-
-    fn description(&self) -> &'static str {
-        "全平 open 持仓。reason 填 manual/stop_loss/take_profit/time_stop/invalidated。\
-        触发条件命中由 scheduler auto_review 自动平仓，agent 仅在主观撤回时调本工具（reason=manual）。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "position_id": { "type": "string", "description": "从 get_account 列表里的 id 字段" },
-                "reason": {
-                    "type": "string",
-                    "enum": ["manual", "stop_loss", "take_profit", "time_stop", "invalidated"],
-                    "description": "平仓归因，缺省 manual"
-                },
-                "note": { "type": "string", "description": "agent 备注（markdown）" }
+        let resp = update_watchlist_dispatch(
+            &self.app,
+            "agent",
+            UpdateWatchlistInput {
+                action,
+                ts_code: ts_code.clone(),
+                note: acc.get("note").and_then(Value::as_str).map(String::from),
+                reason: acc.get("reason").and_then(Value::as_str).map(String::from),
             },
-            "required": ["position_id"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let position_id = match parse_position_id(&input) {
-            Ok(p) => p,
-            Err(e) => return err_text(e),
-        };
-        let reason = parse_close_reason(&input);
-        let note = optional_string(&input, "note");
-
-        let service = AccountService::new(self.app.clone());
-        match service
-            .close_position(&position_id, reason, chat_event_source(ctx), note)
-            .await
-        {
-            Ok(position) => (ok_json(position_to_json(&position)), false),
-            Err(e) => err_text(format!("平仓失败：{e}")),
+        );
+        let mut value = serde_json::to_value(&resp).unwrap_or(Value::Null);
+        if let (Some(ep), Some(obj)) = (episode_id, value.as_object_mut()) {
+            obj.insert("episodeId".into(), Value::String(ep));
         }
-    }
-}
-
-// ===== scale_position =====================================================
-
-pub struct ScalePositionTool {
-    app: AppHandle,
-}
-
-impl ScalePositionTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for ScalePositionTool {
-    fn name(&self) -> &'static str {
-        "scale_position"
-    }
-
-    fn description(&self) -> &'static str {
-        "加减仓 open 持仓（仅 live）。shares_delta 正加负减（100 整数倍）。\
-        全清用 close_position（本工具拒绝全清）。加仓后均价加权平均；减仓不动均价。\
-        Watch 类型不允许 scale——想转 live 请先 close_position 再 open_position。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "position_id": { "type": "string" },
-                "shares_delta": {
-                    "type": "integer",
-                    "description": "正=加仓，负=减仓；绝对值必须 100 整数倍"
-                },
-                "note": { "type": "string" }
-            },
-            "required": ["position_id", "shares_delta"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let position_id = match parse_position_id(&input) {
-            Ok(p) => p,
-            Err(e) => return err_text(e),
-        };
-        let shares_delta = match parse_required_shares(&input, "shares_delta") {
-            Ok(n) => n,
-            Err(e) => return err_text(e),
-        };
-        let note = optional_string(&input, "note");
-
-        let service = AccountService::new(self.app.clone());
-        match service
-            .scale_position(&position_id, shares_delta, note, chat_event_source(ctx))
-            .await
-        {
-            Ok(position) => (ok_json(position_to_json(&position)), false),
-            Err(e) => err_text(format!("加减仓失败：{e}")),
-        }
-    }
-}
-
-// ===== adjust_position ====================================================
-
-pub struct AdjustPositionTool {
-    app: AppHandle,
-}
-
-impl AdjustPositionTool {
-    pub fn new(app: AppHandle) -> Self {
-        Self { app }
-    }
-}
-
-#[async_trait]
-impl Tool for AdjustPositionTool {
-    fn name(&self) -> &'static str {
-        "adjust_position"
-    }
-
-    fn description(&self) -> &'static str {
-        "调止盈 / 止损 / 时间止损（替代旧 adjust_stops）。\
-        各字段独立可选，不传则不改。允许盘外调。\
-        v4 本工具只调 take_profit / stop_loss / time_stop_at——\
-        改 invalidation_signals / reasoning 后续可加（目前未暴露）。"
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "position_id": { "type": "string" },
-                "stop_loss": { "type": "number", "description": "新止损价；不传 = 不改" },
-                "take_profit": { "type": "number", "description": "新止盈价；不传 = 不改" },
-                "time_stop_at_ms": {
-                    "type": "integer",
-                    "description": "新时间止损（Unix 毫秒）；不传 = 不改"
-                },
-                "note": { "type": "string" }
-            },
-            "required": ["position_id"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, input: Value, ctx: &ToolContext) -> (Vec<ToolResultContent>, bool) {
-        let position_id = match parse_position_id(&input) {
-            Ok(p) => p,
-            Err(e) => return err_text(e),
-        };
-        let stop_loss = parse_optional_yuan(&input, "stop_loss");
-        let take_profit = parse_optional_yuan(&input, "take_profit");
-        let time_stop_at = input
-            .get("time_stop_at_ms")
-            .and_then(Value::as_i64)
-            .map(OccurredAt::new);
-        let note = optional_string(&input, "note");
-
-        let service = AccountService::new(self.app.clone());
-        match service
-            .adjust_stops(
-                &position_id,
-                stop_loss,
-                take_profit,
-                time_stop_at,
-                chat_event_source(ctx),
-                note,
-            )
-            .await
-        {
-            Ok(position) => (ok_json(position_to_json(&position)), false),
-            Err(e) => err_text(format!("调止损失败：{e}")),
-        }
+        let is_error = !resp.accepted;
+        (ok_json(value), is_error)
     }
 }

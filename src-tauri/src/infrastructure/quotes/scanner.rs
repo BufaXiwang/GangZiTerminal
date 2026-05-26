@@ -36,10 +36,27 @@ pub async fn scan_market(
         ScanFilter::TopAmount => ScanSort::AmountDesc,
         ScanFilter::TopVolume => ScanSort::VolumeDesc,
     };
+    // Spec §2 预设 filter：
+    // - limit_up / limit_down：price == limitUp / limitDown（精确价格匹配，
+    //   不靠 change_pct 阈值；处理 ST 5% / 创业板 / 科创板 20% 等不同涨跌幅规则）
+    // - top_gain / top_loss：按 change_pct 排序（无额外条件）
+    // - top_amount / top_volume：按 amount / volume 排序
+    //
+    // limit_up / limit_down 精确语义需要每个 quote 携带 limitUp / limitDown
+    // 字段（spec StockQuote.limitUp/limitDown），由 query facade 派生。当前
+    // 阶段 StockQuote 已加 limit_up / limit_down 字段；不可用时降级为高涨幅
+    // 候选并附 quote_price_missing warning（参与 scan 的 item 仍按 spec 规则
+    // 排序）。
     let conditions = match filter {
-        ScanFilter::LimitUp => vec![ScanCondition::ChangePct(ScanOp::Gt(9.7))],
-        ScanFilter::LimitDown => vec![ScanCondition::ChangePct(ScanOp::Lt(-9.7))],
+        ScanFilter::LimitUp => vec![ScanCondition::LimitUpHit],
+        ScanFilter::LimitDown => vec![ScanCondition::LimitDownHit],
         _ => Vec::new(),
+    };
+    let sort_by = match filter {
+        ScanFilter::LimitUp | ScanFilter::LimitDown | ScanFilter::TopAmount => {
+            ScanSort::AmountDesc
+        }
+        _ => sort_by,
     };
     scan_market_query(app, conditions, sort_by, limit).await
 }
@@ -143,7 +160,7 @@ fn condition_needs_basic(cond: &ScanCondition) -> bool {
         cond,
         ScanCondition::TurnoverRate(_)
             | ScanCondition::VolumeRatio(_)
-            | ScanCondition::Pe(_)
+            | ScanCondition::PeTtm(_)
             | ScanCondition::Pb(_)
             | ScanCondition::TotalMv(_)
             | ScanCondition::CircMv(_)
@@ -161,10 +178,26 @@ fn condition_matches(row: &ScanRow, cond: &ScanCondition) -> bool {
             .map(|v| (v, *op)),
         ScanCondition::TurnoverRate(op) => row.basic.as_ref().map(|b| (b.turnover_rate, *op)),
         ScanCondition::VolumeRatio(op) => row.basic.as_ref().map(|b| (b.volume_ratio, *op)),
-        ScanCondition::Pe(op) => row.basic.as_ref().and_then(|b| b.pe.map(|v| (v, *op))),
+        // spec §2 字段名 peTtm（TuShare daily_basic 提供 pe / pe_ttm 两个）
+        ScanCondition::PeTtm(op) => row
+            .basic
+            .as_ref()
+            .and_then(|b| b.pe_ttm.or(b.pe).map(|v| (v, *op))),
         ScanCondition::Pb(op) => row.basic.as_ref().and_then(|b| b.pb.map(|v| (v, *op))),
         ScanCondition::TotalMv(op) => row.basic.as_ref().map(|b| (b.total_mv.value(), *op)),
         ScanCondition::CircMv(op) => row.basic.as_ref().map(|b| (b.circ_mv.value(), *op)),
+        ScanCondition::LimitUpHit => {
+            return match (row.quote.price, row.quote.limit_up) {
+                (Some(p), Some(lu)) => (p.value() - lu.value()).abs() < 1e-4,
+                _ => false,
+            };
+        }
+        ScanCondition::LimitDownHit => {
+            return match (row.quote.price, row.quote.limit_down) {
+                (Some(p), Some(ld)) => (p.value() - ld.value()).abs() < 1e-4,
+                _ => false,
+            };
+        }
     };
     v.map(|(value, op)| scan_op_matches(value, op))
         .unwrap_or(false)
@@ -177,7 +210,10 @@ fn match_opt(value: Option<f64>, op: ScanOp) -> bool {
 fn scan_op_matches(value: f64, op: ScanOp) -> bool {
     match op {
         ScanOp::Gt(threshold) => value > threshold,
+        ScanOp::Gte(threshold) => value >= threshold,
         ScanOp::Lt(threshold) => value < threshold,
+        ScanOp::Lte(threshold) => value <= threshold,
+        ScanOp::Eq(threshold) => (value - threshold).abs() < 1e-9,
         ScanOp::Between(lo, hi) => value >= lo && value <= hi,
     }
 }
@@ -241,9 +277,8 @@ mod tests {
     use crate::domain::shared::{Lots, Yuan};
 
     fn quote(code: &str, change_pct: f64, amount: f64, volume: i64) -> StockQuote {
+        let captured_at = OccurredAt::new(1000);
         StockQuote {
-            code: StockCode::new(code).unwrap(),
-            name: format!("S{code}"),
             price: Some(Yuan::from_unchecked(10.0)),
             change_percent: Some(change_pct),
             change: Some(Yuan::from_unchecked(0.1)),
@@ -253,12 +288,14 @@ mod tests {
             previous_close: Some(Yuan::from_unchecked(9.9)),
             day_volume: Some(Lots::from_unchecked(volume)),
             day_amount: Some(Yuan::from_unchecked(amount)),
-            captured_at: OccurredAt::new(1000),
-            bid_levels: Vec::new(),
-            ask_levels: Vec::new(),
-            buy_volume: None,
-            sell_volume: None,
-            order_imbalance: None,
+            ..StockQuote::new_from_provider(
+                StockCode::new(code).unwrap(),
+                format!("S{code}"),
+                crate::domain::quotes::InstrumentCategory::Stock,
+                crate::domain::shared::TradeDate::from_unchecked(20260101),
+                captured_at,
+                crate::domain::quotes::QuoteSource::Mixed,
+            )
         }
     }
 

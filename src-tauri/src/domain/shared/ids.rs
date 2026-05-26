@@ -120,6 +120,11 @@ impl TsCode {
         &self.0
     }
 
+    /// 跳过校验的构造——只用于 DB 反序列化（DB 是 trusted source）。
+    pub fn from_unchecked(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
     /// 6 位 code 部分（"000001.SZ" → "000001"）。
     pub fn code(&self) -> &str {
         &self.0[..6]

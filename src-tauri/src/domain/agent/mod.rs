@@ -1,37 +1,22 @@
 #![allow(dead_code, unused_imports)] // canonical 类型完整面：部分字段/variants 按 wire format 需要保留
 
-//! Domain `agent`——Agent 决策子域。
+//! Domain `agent` —— Agent Infra 核心类型（canonical wire format 中立）。
 //!
-//! v3 设计（见 docs/design/agent-v3-expectation-driven.md）核心实体：
-//! - `signal`：SignalKind 24 枚举 + EventKind / SignalDetection
-//! - `strategy`：Strategy DSL（trigger_when + target_rule + track record）
-//! - `lesson`：每个 expectation 终态自动生成的原子观察
-//! - `types`：Block / Message / AgentEvent / AgentRequest 等 wire canonical 形态
+//! 对齐 docs/design/agent-infra-module.md：
+//! - `types`：`AgentMessage` / `AgentMessageBlock` / `ToolSpec` / `ToolCall` /
+//!   `AgentEvent` / `ProviderChannel` / `ContextBundle` 等 canonical 类型
+//!   （当前用旧名 Block / Message / AgentRequest，后续可重命名）。
 //!
-//! v2 残留（W22 schema 升级到 v3 时整体下线）：
-//! - `principle`：被 heuristic 取代——heuristic 在 W22 落 infra 时迁移
+//! Agent Runtime 业务类型（AgentRun / AgentRunProfile / DecisionEpisode /
+//! EvidenceRef / TradeIntent / DecisionReview / StrategyCard）见
+//! [`crate::pipeline::agent_runtime::decisions`]。
 //!
 //! `ChatProvider` trait 在 `infrastructure::agent::provider`，`Tool` trait 在
-//! `adapters::agent_tools`——两者都是协议适配，不属于 domain。
-//! identity.md（Agent 人设档案）在 `pipeline::agent`，由 `prompt.rs` `include_str!` 读入。
+//! `pipeline::agent::tools`——两者都是协议适配。
 
-pub mod heuristic;
-pub mod lesson;
-pub mod news_analysis;
-pub mod strategy;
 pub mod types;
 
-pub use heuristic::{
-    EffectiveState, Heuristic, HeuristicCategory, HeuristicId, HeuristicOrigin,
-    HEURISTIC_BODY_MAX_CHARS,
-};
-pub use lesson::{Lesson, LessonId, LessonOutcome};
-pub use news_analysis::NewsAnalysisStatus;
-// SignalKind / EventKind 等迁到 domain/shared::signal
-// （三个 BC 都引用——shared vocabulary）。从这里 re-export 让旧 use 路径仍可工作。
+pub use types::{AgentMessage, MessageRole, ProviderChannel, ProviderKind, WireFormat};
+// SignalKind / EventKind 等迁到 domain/shared::signal（被 Account / Quotes 复用）。
+// 这里 re-export 让历史 use 路径仍可工作。
 pub use crate::domain::shared::{EventKind, SignalDetection, SignalKind};
-pub use strategy::{
-    SignalCondition, Strategy, StrategyEvent, StrategyEventRecord, StrategyId, TargetRule,
-    TriggerLogic,
-};
-pub use types::ProviderKind;

@@ -7,7 +7,7 @@
 //! 把所有具体 tool 实例化，再注入 pipeline。pipeline 只依赖 `Tool` 抽象，不知道有哪些
 //! 具体工具——这条注入方向把"协议 ↔ 领域"的反腐译码留在 adapter 层。
 
-use crate::adapters::agent_tools::build_chat_registry;
+use crate::adapters::agent_tools::build_full_registry;
 use crate::pipeline::chat::ChatReplyResult;
 use serde_json::Value;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ pub async fn send_chat_message_now(
     content: String,
     #[allow(non_snake_case)] images: Option<Vec<String>>,
 ) -> Result<ChatReplyResult, String> {
-    let registry = Arc::new(build_chat_registry(&app));
+    let registry = Arc::new(build_full_registry(&app));
     crate::pipeline::chat::send_chat_message_now(app, content, images, registry).await
 }
 

@@ -145,6 +145,10 @@ pub struct Position {
     /// 为什么不直接用 `entered_at`：用户昨天 open + 今天 ScaledIn 后，`entered_at`
     /// 仍是昨天，但**今天买的那部分股票今天不能卖**。T+1 必须看最近一次买入。
     pub last_acquisition_at: OccurredAt,
+    /// spec `account-module.md §2 Position.warnings: WarningCode[]`。
+    /// 例如缺行情时返回 `quote_missing`、stale 行情 `quote_stale`。空表示无 warning。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::domain::shared::WarningCode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -361,6 +365,7 @@ mod tests {
             source_analysis_id: "".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
             last_acquisition_at: OccurredAt::new(1_700_000_000_000),
+            warnings: Vec::new(),
         }
     }
 
