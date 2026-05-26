@@ -61,3 +61,12 @@ tracing-appender = "0.2"
 
 # TDX 协议（独立 crate，参考 mootdx / pytdx）
 tdx = { path = "crates/tdx" }
+
+# === news deps ===
+# SHA-256 for stable ID hashing (news-module.md §2)
+sha2 = "0.10"
+# RSS / Atom feed parsing (news/rss adapter)
+feed-rs = "2"
+# HTML parsing for article extractor (news/article-extractor adapter)
+scraper = "0.20"
+ego-tree = "0.6"
