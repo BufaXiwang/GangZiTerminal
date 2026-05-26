@@ -35,7 +35,7 @@ impl Default for Freshness {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Freshness {
     pub status: FreshnessStatus,

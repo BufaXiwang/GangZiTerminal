@@ -135,11 +135,55 @@ impl AccountService {
     // ========================================================================
 
     /// 当前账户快照——派生计算，O(N) walk 事件链。
+    ///
+    /// spec `account-module.md §2 AccountSnapshot` 派生字段全部在此填充：
+    /// - `frozen_cash` / `pending_order_count` 来自未完成 buy order 的冻结合计
+    /// - `available_cash = cash - frozen_cash`
+    /// - 每个 open Position 的 `sellable_quantity` / `market_price` /
+    ///   `market_value` / `unrealized_pnl` / `quote_freshness` 由 Quotes
+    ///   snapshot 派生（缺行情 → None；T+1 baseline = current_shares）
     pub fn snapshot(&self) -> Result<AccountSnapshot, AccountError> {
         let positions = self.repo.list_all()?;
         let ids: Vec<PositionId> = positions.iter().map(|p| p.id.clone()).collect();
         let events = self.repo.list_events_batch(&ids)?;
-        Ok(compute_snapshot(&positions, &events))
+        let mut snap = compute_snapshot(&positions, &events);
+
+        // 注入 frozen cash + pending order count（spec §2 派生字段）
+        use crate::infrastructure::account::orders_repo;
+        if let Ok(pending) = orders_repo::list_active(&self.app, 500, 0) {
+            snap.pending_order_count = pending.len();
+            let frozen: f64 = pending
+                .iter()
+                .filter(|o| matches!(o.side, crate::domain::account::OrderSide::Buy))
+                .map(|o| {
+                    let lp = o.limit_price.as_ref().map(|p| p.value()).unwrap_or(0.0);
+                    let remaining = (o.quantity.value() - o.filled_quantity.value()) as f64;
+                    lp * remaining
+                })
+                .sum();
+            snap.frozen_cash = Yuan::from_unchecked(frozen);
+            snap.available_cash = Yuan::from_unchecked((snap.cash.value() - frozen).max(0.0));
+        }
+
+        // 填充每个 open Position 的派生估值字段
+        use crate::infrastructure::quotes::snapshot::market_snapshot;
+        for p in snap.open_positions.iter_mut() {
+            // sellable_quantity：PositionLot + T+1 完整接入前用 current_shares 作为
+            // baseline；spec §2「sellableQuantity 由 PositionLot 和 T+1 规则派生」
+            p.sellable_quantity = p.current_shares.value();
+            if let Some(q) = market_snapshot::get(&p.code.to_ts_code()) {
+                if let Some(price) = q.price.as_ref().map(|v| v.value()) {
+                    let qty = p.current_shares.value() as f64;
+                    let value = price * qty;
+                    let cost = p.avg_entry_price.value() * qty;
+                    p.market_price = Some(price);
+                    p.market_value = Some(value);
+                    p.unrealized_pnl = Some(value - cost);
+                }
+                p.quote_freshness = Some(q.freshness.clone());
+            }
+        }
+        Ok(snap)
     }
 
     /// 当前现金（轻量版——仅 cash，不算 market_value）。
@@ -506,6 +550,8 @@ impl AccountService {
     // 写：调止损 / 止盈 / 时间止损
     // ========================================================================
 
+    /// 兼容入口；新代码应使用 [`AccountService::adjust_stops_atomic`]。
+    #[allow(dead_code)]
     pub async fn adjust_stops(
         &self,
         position_id: &PositionId,

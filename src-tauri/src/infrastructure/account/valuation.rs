@@ -146,9 +146,15 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
             FreshnessStatus::Fresh => {}
         }
     }
+    let open_position_count = open_positions.len();
     AccountSnapshot {
         initial_cash,
         cash,
+        // availableCash / frozenCash / pendingOrderCount 在派生层填充。
+        // compute_snapshot 不依赖 orders_repo（保持纯函数 + AppHandle 隔离）；
+        // 上层调用方（service.snapshot）注入 frozen/pending 后回写这些字段。
+        available_cash: cash,
+        frozen_cash: Yuan::from_unchecked(0.0),
         open_positions,
         closed_positions,
         market_value: Yuan::from_unchecked(market_value),
@@ -159,6 +165,8 @@ pub fn compute_snapshot(positions: &[Position], events: &[PositionEvent]) -> Acc
         captured_at: OccurredAt::now(),
         priced_position_count: priced,
         unpriced_position_count: unpriced,
+        open_position_count,
+        pending_order_count: 0,
         valuation_freshness: worst_freshness,
         warnings,
     }
@@ -303,6 +311,11 @@ mod tests {
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),
+            sellable_quantity: 0,
+            market_price: None,
+            market_value: None,
+            unrealized_pnl: None,
+            quote_freshness: None,
             warnings: Vec::new(),
         }
     }
@@ -330,6 +343,11 @@ mod tests {
             source_analysis_id: String::new(),
             entered_at: OccurredAt::new(1),
             last_acquisition_at: OccurredAt::new(1),
+            sellable_quantity: 0,
+            market_price: None,
+            market_value: None,
+            unrealized_pnl: None,
+            quote_freshness: None,
             warnings: Vec::new(),
         }
     }

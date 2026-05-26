@@ -171,6 +171,11 @@ impl Account {
             source_analysis_id: cmd.source_analysis_id,
             entered_at,
             last_acquisition_at: entered_at,
+            sellable_quantity: 0, // 当日 T+1 不可卖；compute_snapshot 派生时按 PositionLot 重算
+            market_price: None,
+            market_value: None,
+            unrealized_pnl: None,
+            quote_freshness: None,
             warnings: Vec::new(),
         };
 

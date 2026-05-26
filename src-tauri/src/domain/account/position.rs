@@ -138,13 +138,31 @@ pub struct Position {
     #[serde(default)]
     pub reasoning: String,
     pub source_analysis_id: String,
-    /// 首次开仓时间——审计 / UI 展示用。
+    /// 首次开仓时间——审计 / UI 展示用。spec 字段名 `openedAt`。
+    #[serde(alias = "openedAt", rename(serialize = "openedAt"))]
     pub entered_at: OccurredAt,
     /// **最近一次买入时间**（Opened 或 ScaledIn 都更新）——T+1 判定基准。
     ///
     /// 为什么不直接用 `entered_at`：用户昨天 open + 今天 ScaledIn 后，`entered_at`
     /// 仍是昨天，但**今天买的那部分股票今天不能卖**。T+1 必须看最近一次买入。
     pub last_acquisition_at: OccurredAt,
+    // ============ spec §2 派生字段（由 compute_snapshot 填充） ============
+    /// spec `Position.sellableQuantity`：可卖数量（T+1 + 冻结派生）。
+    /// PositionLot 模型完整接入前先用 `current_shares` 作 baseline 近似。
+    #[serde(default)]
+    pub sellable_quantity: i64,
+    /// spec `Position.marketPrice`：来自 Quotes snapshot；缺行情时 None。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub market_price: Option<f64>,
+    /// spec `Position.marketValue` = `marketPrice * quantity`。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub market_value: Option<f64>,
+    /// spec `Position.unrealizedPnl` = `(marketPrice - avgCost) * quantity`。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub unrealized_pnl: Option<f64>,
+    /// spec `Position.quoteFreshness`：估值行情新鲜度。
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quote_freshness: Option<crate::domain::shared::Freshness>,
     /// spec `account-module.md §2 Position.warnings: WarningCode[]`。
     /// 例如缺行情时返回 `quote_missing`、stale 行情 `quote_stale`。空表示无 warning。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -365,6 +383,11 @@ mod tests {
             source_analysis_id: "".into(),
             entered_at: OccurredAt::new(1_700_000_000_000),
             last_acquisition_at: OccurredAt::new(1_700_000_000_000),
+            sellable_quantity: 0,
+            market_price: None,
+            market_value: None,
+            unrealized_pnl: None,
+            quote_freshness: None,
             warnings: Vec::new(),
         }
     }
