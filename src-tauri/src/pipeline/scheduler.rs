@@ -358,14 +358,10 @@ fn market_quote_interval() -> Duration {
 }
 
 // ====== 资讯自动刷新 ======
-
-/// 资讯保留天数——超过该天数的 news_items + 级联表会被每天清一次。
-/// 30 天足够 agent 跨周复盘，又不会让单机 SQLite 无限膨胀。
-const NEWS_RETENTION_DAYS: i64 = 30;
-
-/// 每多少秒尝试一次 retention（实际只有当距上次成功 ≥ 24h 时才真跑）。
-/// 写在常量是为了让 news_refresh_loop 主循环里挂个轻量探测，不用单独开 task。
-const NEWS_RETENTION_CHECK_INTERVAL_SEC: i64 = 24 * 3600;
+//
+// spec news-module.md §65 明确：News 不按默认保留期主动删除历史。
+// 旧实现有 30 天 retention loop 违反 spec，已移除。如果未来需要手动清理，
+// 走 IPC 命令显式触发，不要在后台自动跑。
 
 async fn news_refresh_loop(app: AppHandle) {
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -383,8 +379,6 @@ async fn news_refresh_loop(app: AppHandle) {
             continue;
         }
         run_news_tick(&app, &mut counter).await;
-        // 每轮 refresh 后顺便检查一次 retention——内部会自己控频（≥24h 才真跑）
-        maybe_run_news_retention(&app).await;
     }
 }
 
@@ -411,47 +405,9 @@ async fn run_news_tick(app: &AppHandle, counter: &mut FailureCounter) {
     }
 }
 
-const KEY_NEWS_RETENTION_LAST: &str = "gangzi-terminal.news-retention-last-run";
-
-/// 距上次跑 retention ≥ 24h 时执行一次清理。失败不阻断 refresh loop。
-async fn maybe_run_news_retention(app: &AppHandle) {
-    let last_run: Option<chrono::DateTime<chrono::Utc>> =
-        crate::infrastructure::app_state::load_app_state_value(app, KEY_NEWS_RETENTION_LAST)
-            .ok()
-            .flatten()
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-    let now = chrono::Utc::now();
-    if let Some(prev) = last_run {
-        if now.signed_duration_since(prev).num_seconds() < NEWS_RETENTION_CHECK_INTERVAL_SEC {
-            return;
-        }
-    }
-    let cutoff = (now - chrono::Duration::days(NEWS_RETENTION_DAYS)).to_rfc3339();
-    match crate::infrastructure::news::repository::purge_old_news(app, &cutoff) {
-        Ok(deleted) => {
-            tracing::info!(deleted, cutoff = %cutoff, "news retention 清理完成");
-            crate::infrastructure::scheduler_heartbeat::record_ok(
-                app,
-                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS_RETENTION,
-            );
-            let _ = crate::infrastructure::app_state::save_app_state_value(
-                app,
-                KEY_NEWS_RETENTION_LAST,
-                &serde_json::json!(now.to_rfc3339()),
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "news retention 清理失败");
-            crate::infrastructure::scheduler_heartbeat::record_err(
-                app,
-                crate::infrastructure::scheduler_heartbeat::LOOP_NEWS_RETENTION,
-                &e,
-            );
-        }
-    }
-}
+// spec news-module.md §65：News 不按默认保留期主动删除历史。
+// `maybe_run_news_retention` + `KEY_NEWS_RETENTION_LAST` + `NEWS_RETENTION_*`
+// 已移除（旧实现 30 天 retention 违反 spec）。手动清理走显式 IPC，不在后台跑。
 
 // ====== 失败熔断器 ======
 

@@ -213,7 +213,8 @@ pub struct EvidencePositionSnapshot {
     pub unrealized_pnl: Option<f64>,
 }
 
-/// spec §2 `EvidenceOrderSnapshot`。
+/// spec §2 `EvidenceOrderSnapshot`。`side` / `order_type` / `status` 全部
+/// 走 canonical enum，不接受任意字符串。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceOrderSnapshot {
@@ -221,23 +222,23 @@ pub struct EvidenceOrderSnapshot {
     pub base: EvidenceSnapshotBase,
     pub order_id: String,
     pub ts_code: String,
-    pub side: String,
-    pub order_type: String,
+    pub side: crate::domain::account::OrderSide,
+    pub order_type: crate::domain::account::OrderType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_price: Option<f64>,
     pub quantity: i64,
     pub filled_quantity: i64,
-    pub status: String,
+    pub status: crate::domain::account::OrderStatus,
 }
 
-/// spec §2 `EvidenceAccountTriggerSnapshot`。
+/// spec §2 `EvidenceAccountTriggerSnapshot`。`trigger_type` 走 canonical enum。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceAccountTriggerSnapshot {
     #[serde(flatten)]
     pub base: EvidenceSnapshotBase,
     pub trigger_id: String,
-    pub trigger_type: String,
+    pub trigger_type: crate::domain::shared::AccountTriggerKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ts_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,7 +336,7 @@ mod typed_snapshot_tests {
         let s = EvidenceAccountTriggerSnapshot {
             base: base(),
             trigger_id: "tr1".into(),
-            trigger_type: "stop_loss".into(),
+            trigger_type: crate::domain::shared::AccountTriggerKind::StopLoss,
             ts_code: None,
             position_id: Some("p1".into()),
             order_id: None,
@@ -458,7 +459,7 @@ pub struct DecisionReview {
     pub suggested_change: Option<serde_json::Value>,
     pub evidence_refs: Vec<EvidenceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
+    pub warnings: Vec<crate::domain::shared::WarningCode>,
     pub created_at: String,
 }
 

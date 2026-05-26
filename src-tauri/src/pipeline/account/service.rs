@@ -937,26 +937,23 @@ impl AccountService {
     // 内部 helpers
     // ========================================================================
 
-    /// 拿单股 quote——优先 MARKET_SNAPSHOT，缺则 lazy ensure 一次（走 dispatch 多源 fallback）。
+    /// 拿单股 quote —— **只读 Quotes snapshot**，不调用 provider。
+    ///
+    /// spec `architecture.md §3` + `account-module.md §1.68`：
+    /// 「Account 只能读取 Quotes snapshot，不调用 Quotes provider」。
+    /// snapshot 缺失即 fail closed（`quote_missing`），写动作由调用方按 spec
+    /// §444 拒绝即时成交；订阅集合由 Agent Runtime 编排 Quotes refresh 来补，
+    /// 不在 Account 写路径里 lazy 拉。
     async fn fetch_quote(&self, code: &str) -> Result<StockQuote, AccountError> {
-        let ts_code =
-            crate::infrastructure::quotes::repository::resolve_stock_ts_code(&self.app, code)
-                .ok_or_else(|| AccountError::Io(format!("stocks 档案找不到 {code}")))?;
-        if let Some(q) = market_snapshot::get(&ts_code) {
-            return Ok(q);
+        let ts_code = crate::pipeline::quotes_universe::resolve_stock_ts_code(&self.app, code)
+            .ok_or_else(|| AccountError::Io(format!("stocks 档案找不到 {code}")))?;
+        match market_snapshot::get(&ts_code) {
+            Some(q) => Ok(q),
+            None => Err(RuleError::QuoteMissing {
+                code: code.to_string(),
+            }
+            .into()),
         }
-        let pairs = crate::infrastructure::quotes::realtime::dispatch()
-            .fetch(&[ts_code.clone()])
-            .await
-            .map_err(|e| AccountError::Io(e.to_string()))?;
-        if !pairs.is_empty() {
-            market_snapshot::put_batch(pairs.clone());
-        }
-        pairs
-            .into_iter()
-            .next()
-            .map(|(_, q)| q)
-            .ok_or_else(|| RuleError::NoCurrentPrice(code.to_string()).into())
     }
 
     /// 写操作完成后的收尾 —— emit `account-updated` (canonical spec event with

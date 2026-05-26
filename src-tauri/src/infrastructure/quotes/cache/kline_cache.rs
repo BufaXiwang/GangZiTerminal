@@ -323,6 +323,8 @@ fn next_compact_date(compact: &str) -> Result<String, String> {
 
 // ===== K 线行级缓存（个股 / 指数 / 基金 统一用 ts_code）=================
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KlineRow {
     pub ts_code: String, // "000001.SZ" / "510300.SH" / "399006.SZ"
     pub period: String,  // day / week / month

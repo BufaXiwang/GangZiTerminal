@@ -247,6 +247,15 @@ impl KlinePeriod {
             Self::Month => "month",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "day" | "d" => Self::Day,
+            "week" | "w" => Self::Week,
+            "month" | "M" => Self::Month,
+            _ => return None,
+        })
+    }
 }
 
 /// 复权模式。

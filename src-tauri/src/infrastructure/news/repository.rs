@@ -389,30 +389,8 @@ pub fn load_article_content_ref(app: &AppHandle, url: &str) -> Result<Option<Val
     .transpose()
 }
 
-/// 删除 `published` 早于 cutoff（RFC3339）的 news_items + 级联清 article_contents 孤儿。
-/// 同时清 agent_news_analysis_state 表里指向已删 news 的孤儿（防止该表无限增长）。
-pub fn purge_old_news(app: &AppHandle, cutoff_rfc3339: &str) -> Result<u64, String> {
-    let connection = open_database(app)?;
-    migrate(&connection)?;
-    let deleted_items: usize = connection
-        .execute(
-            "delete from news_items
-             where coalesce(published, updated_at) < ?1",
-            params![cutoff_rfc3339],
-        )
-        .map_err(|err| format!("清理旧资讯失败：{err}"))?;
-    let _ = connection.execute(
-        "delete from article_contents
-         where item_id is not null and item_id not in (select id from news_items)",
-        [],
-    );
-    let _ = connection.execute(
-        "delete from agent_news_analysis_state
-         where news_id not in (select id from news_items)",
-        [],
-    );
-    Ok(deleted_items as u64)
-}
+// spec news-module.md §65：News 不按默认保留期主动删除历史。
+// `purge_old_news` 已移除（旧 30 天 retention 违反 spec）。如需手动清理由 IPC 显式触发。
 
 pub fn save_article_content(
     app: AppHandle,

@@ -26,6 +26,28 @@ pub enum WarningCode {
 }
 
 impl WarningCode {
+    /// 字符串 → enum；用于 adapter / DB 反序列化把内部 spec 字符串收敛到 enum。
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "quote_missing" => Self::QuoteMissing,
+            "quote_stale" => Self::QuoteStale,
+            "snapshot_expired" => Self::SnapshotExpired,
+            "quote_price_missing" => Self::QuotePriceMissing,
+            "depth_missing" => Self::DepthMissing,
+            "instrument_missing" => Self::InstrumentMissing,
+            "provider_partial_failure" => Self::ProviderPartialFailure,
+            "article_missing" => Self::ArticleMissing,
+            "qfq_missing" => Self::QfqMissing,
+            "using_unadjusted_kline" => Self::UsingUnadjustedKline,
+            "daily_basic_missing" => Self::DailyBasicMissing,
+            "events_missing" => Self::EventsMissing,
+            "strategy_omitted" => Self::StrategyOmitted,
+            "mapping_missing" => Self::MappingMissing,
+            "data_partial" => Self::DataPartial,
+            _ => return None,
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WarningCode::QuoteMissing => "quote_missing",

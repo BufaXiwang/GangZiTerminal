@@ -270,29 +270,80 @@ pub struct RefreshNewsRequest {
     pub force: bool,
 }
 
+/// spec news-module.md §307 `RefreshNewsError`：错误码 + 可选 field 提示。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RefreshNewsResponse {
-    pub ok: bool,
-    pub batch_id: String,
-    pub fetched_count: u32,
-    pub saved_count: u32,
+pub struct RefreshNewsError {
+    pub code: crate::domain::shared::ErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
-/// canonical refresh 入口。spec news-module.md §4：`sources` 显式列出时只刷新匹配源。
+/// spec news-module.md §307 `RefreshNewsResponse` discriminated union：
+/// `{ ok: true, result: NewsRefreshedPayload }` | `{ ok: false, error: RefreshNewsError }`。
+/// `#[serde(untagged)]` 让 Variant 自动按字段集分发到对应分支。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RefreshNewsResponse {
+    Ok {
+        ok: bool, // 始终 true
+        result: crate::domain::shared::NewsRefreshedPayload,
+    },
+    Err {
+        ok: bool, // 始终 false
+        error: RefreshNewsError,
+    },
+}
+
+/// canonical refresh 入口。spec news-module.md §4：`sources` 显式列出时只刷新匹配源；
+/// 未知 source / 非法 force 走 `RefreshNewsResponse::Err` 不创建 batchId。
 #[tauri::command]
 pub async fn refresh_news_canonical(
     app: AppHandle,
     request: Option<RefreshNewsRequest>,
 ) -> Result<RefreshNewsResponse, String> {
     let sources = request.and_then(|r| r.sources);
-    let result = crate::pipeline::news::run_news_refresh_filtered(app, sources).await?;
-    Ok(RefreshNewsResponse {
-        ok: true,
-        batch_id: result.batch_id,
-        fetched_count: result.fetched_count as u32,
-        saved_count: result.saved_count as u32,
-    })
+    match crate::pipeline::news::run_news_refresh_filtered(app, sources).await {
+        Ok(result) => Ok(RefreshNewsResponse::Ok {
+            ok: true,
+            result: crate::domain::shared::NewsRefreshedPayload {
+                batch_id: result.batch_id,
+                fetched_count: result.fetched_count,
+                skipped_count: 0,
+                saved_count: result.saved_count,
+                article_updated_count: 0,
+                new_ids: result.new_ids,
+                updated_ids: result.updated_ids,
+                article_updated_news_ids: None,
+                failed_count: result.failed_count,
+                first_failure: None,
+                failures: None,
+                warnings: None,
+            },
+        }),
+        Err(msg) => {
+            // spec §307: unknown source / 非法 force / provider 全失败 → ErrorCode 映射
+            let code = if msg.contains("invalid_input") {
+                crate::domain::shared::ErrorCode::InvalidInput
+            } else {
+                crate::domain::shared::ErrorCode::ProviderUnavailable
+            };
+            Ok(RefreshNewsResponse::Err {
+                ok: false,
+                error: RefreshNewsError {
+                    code,
+                    field: if msg.contains("sources") {
+                        Some("sources".into())
+                    } else {
+                        None
+                    },
+                    message: Some(msg),
+                },
+            })
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -97,9 +97,18 @@ async fn hydrate_evidence(
     run_id: &str,
     selectors: &Value,
 ) -> Result<Vec<EvidenceRef>, String> {
-    let arr = match selectors.as_array() {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
+    // spec agent-runtime-module.md §2「evidenceSelectors 必须是数组；非数组 fail closed」
+    // 旧实现把非数组当空数组通过，违反 fail-closed 契约。
+    let arr = if selectors.is_null() {
+        // null 等同空数组，spec §2 允许 no-evidence episode（仅在 no_action 路径）
+        return Ok(Vec::new());
+    } else {
+        selectors
+            .as_array()
+            .ok_or_else(|| {
+                "invalid_input: evidenceSelectors 必须是数组（spec agent-runtime-module.md §2）"
+                    .to_string()
+            })?
     };
     const KNOWN_KINDS: &[&str] = &[
         "news",
@@ -134,10 +143,17 @@ async fn hydrate_evidence(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("invalid_input: selector[{i}] 缺 id"))?
             .to_string();
+        // spec §2「selector 必须显式声明 source」：旧实现默认 "packet" 让 agent
+        // 可省略 source 字段透传任意 id，绕过校验矩阵 → 改成必填 fail-closed。
         let source = sel
             .get("source")
             .and_then(Value::as_str)
-            .unwrap_or("packet");
+            .ok_or_else(|| {
+                format!(
+                    "invalid_input: selector[{i}] 缺 source（spec §2 必须显式声明：\
+                     packet/tool_result/recent_episode/recent_review/linked_episode/replay_ref）"
+                )
+            })?;
         if !KNOWN_SOURCES.contains(&source) {
             return Err(format!(
                 "invalid_input: selector[{i}] 未知 source `{source}`"
@@ -350,14 +366,15 @@ async fn build_snapshot_for(
                 if let Some(p) = item.published {
                     obj.insert("publishedAt".into(), Value::String(p));
                 }
-            } else if source != "packet" {
-                return Err(format!(
-                    "invalid_input: news evidence id `{id}` 不存在于本地"
-                ));
             } else {
-                snap.as_object_mut()
-                    .unwrap()
-                    .insert("note".into(), Value::String("news_missing".into()));
+                // spec §2「Evidence snapshot 是持久化审计 schema」：news 缺失绝不
+                // 产生 EvidenceRef，否则后续复盘读到 schemaVersion=1 但无业务字段。
+                // 旧实现在 source=packet 时写 note: "news_missing" 通过，违反
+                // fail-closed 契约。
+                return Err(format!(
+                    "invalid_input: news evidence id `{id}` 不存在于本地 news_items；\
+                     不允许产生空 snapshot（spec §2 fail-closed）"
+                ));
             }
         }
         "quote" => {
@@ -857,7 +874,10 @@ impl Tool for RecordDecisionReviewTool {
             .get("result")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         let suggested_change = input.get("suggestedChange").cloned();
-        let warnings: Vec<String> = input
+        // spec runtime §2 DecisionReview.warnings: WarningCode[] —— 走 spec ErrorCode/WarningCode
+        // 闭集合（shared-types §5）。非闭集合的字符串 fail-closed reject。
+        use crate::domain::shared::WarningCode;
+        let warnings_raw: Vec<String> = input
             .get("warnings")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -866,6 +886,17 @@ impl Tool for RecordDecisionReviewTool {
                     .collect()
             })
             .unwrap_or_default();
+        let mut warnings: Vec<WarningCode> = Vec::with_capacity(warnings_raw.len());
+        for s in warnings_raw {
+            match WarningCode::parse(&s) {
+                Some(w) => warnings.push(w),
+                None => {
+                    return err_text(format!(
+                        "invalid_input: warnings 含未知 code `{s}`（spec shared-types §5 闭集合）"
+                    ))
+                }
+            }
+        }
         let evidence_refs = match hydrate_evidence(
             &self.app,
             &ctx.run_id,

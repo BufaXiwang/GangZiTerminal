@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use super::runs::AgentRunProfileId;
 
+/// spec `agent-runtime-module.md §101`：业务工具闭集合 7 个。
+/// 新增业务工具必须先扩 spec，再加 variant。
+///
+/// 注：`compact_now` 是 Agent Infra 层的"上下文控制"工具（spec agent-infra-module.md §4），
+/// 不属于 AgentToolName 业务集合；它由 registry 工厂额外注入（所有 profile 可用），
+/// 不通过 profile.allowedTools 过滤。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolName {
@@ -18,9 +24,6 @@ pub enum AgentToolName {
     UpdateWatchlist,
     RecordDecisionEpisode,
     RecordDecisionReview,
-    /// spec `agent-infra-module.md §4`：agent 主动释放上下文。
-    /// 所有 profile 都可见；loop 检测到调用后设 force_summarize_next_turn。
-    CompactNow,
 }
 
 /// spec §2 默认 profile 的 allowedTools。
@@ -38,14 +41,12 @@ pub fn allowed_tools(profile: AgentRunProfileId) -> Vec<AgentToolName> {
             RecordDecisionEpisode,
             RecordDecisionReview,
             OperateAccount,
-            CompactNow,
         ],
         AgentRunProfileId::ManualReplay => vec![
             FetchAccount,
             FetchQuotes,
             FetchNews,
             RecordDecisionReview,
-            CompactNow,
         ],
     }
 }

@@ -53,7 +53,6 @@ pub fn build_registry_for_profile(
         (AgentToolName::RecordDecisionEpisode, Arc::new(decisions::RecordDecisionEpisodeTool::new(app.clone()))),
         (AgentToolName::RecordDecisionReview, Arc::new(decisions::RecordDecisionReviewTool::new(app.clone()))),
         (AgentToolName::OperateAccount, Arc::new(account::OperateAccountTool::new(app.clone()))),
-        (AgentToolName::CompactNow, Arc::new(compact_now::CompactNowTool::new())),
     ];
     for (kind, tool) in candidates {
         if !allowed.contains(&kind) {
@@ -65,6 +64,10 @@ pub fn build_registry_for_profile(
         }
         reg.register(tool);
     }
+    // spec `agent-infra-module.md §4`：compact_now 是 Infra 层的"上下文控制"工具，
+    // 不在 AgentToolName 业务集合（spec runtime §101）。所有 profile 永远可见，
+    // 不受 profile.allowedTools 过滤。
+    reg.register(Arc::new(compact_now::CompactNowTool::new()));
     reg
 }
 

@@ -144,6 +144,47 @@ async fn exec_ts_codes_path(app: &AppHandle, input: &Value) -> (Vec<ToolResultCo
         );
     }
 
+    // spec §559 fetch_data.include —— 解析 include 选项并 fail-closed 拒绝当前不支持的：
+    let include = input.get("include").cloned().unwrap_or(Value::Null);
+    let want_quote = include
+        .get("quote")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let klines_periods: Vec<String> = include
+        .get("klines")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // 当前 Quotes 模块的本地 query facade 只覆盖 quote + 日 K 线 + 分钟 K 线；
+    // dailyBasic / events / indicators / minuteKlines / profile / intraday 未走
+    // 显式 fetch_data 接入，agent 直接传 include 这些字段会得到不完整数据。
+    // spec §559「不触发远端 provider」+ fail-closed：明确拒绝当前不支持的 include 键。
+    let unsupported_keys: Vec<&str> = ["minuteKlines", "indicators", "dailyBasic", "events", "profile", "intraday"]
+        .iter()
+        .filter(|k| include.get(**k).is_some())
+        .copied()
+        .collect();
+    if !unsupported_keys.is_empty() {
+        return err_text(format!(
+            "invalid_input: include 键 {:?} 当前 fetch_quotes 不支持本地 query facade；\
+             当前仅支持 quote / klines；其它维度待 quotes 模块 fetch_data 完整实装后再开放",
+            unsupported_keys
+        ));
+    }
+    let valid_periods: Vec<crate::domain::quotes::KlinePeriod> = klines_periods
+        .iter()
+        .filter_map(|s| crate::domain::quotes::KlinePeriod::parse(s))
+        .collect();
+    if !klines_periods.is_empty() && valid_periods.len() != klines_periods.len() {
+        return err_text(format!(
+            "invalid_input: include.klines 含未知 period（spec 闭集合：day/week/month）"
+        ));
+    }
+
     // category 判定一次性建表（避免 per-code N+1 调用）
     let index_codes: std::collections::HashSet<String> =
         qrepo::list_indexes(app)
@@ -195,7 +236,41 @@ async fn exec_ts_codes_path(app: &AppHandle, input: &Value) -> (Vec<ToolResultCo
                     crate::domain::shared::FreshnessStatus::Missing => worst_status = "missing",
                     _ => {}
                 }
-                items.push(quote_to_packet_item(q, category, item_warnings));
+                let mut item = quote_to_packet_item(q, category, item_warnings);
+                // spec §559：include.klines 走本地 kline_cache（不触发 provider）
+                if !valid_periods.is_empty() {
+                    let mut klines_obj = serde_json::Map::new();
+                    for period in &valid_periods {
+                        // 取最近 60 根；spec 没硬约束数量，60 覆盖月线 5 年 / 日线 3 月
+                        let rows = crate::infrastructure::quotes::cache::kline_cache::find_klines(
+                            app,
+                            ts,
+                            period.as_str(),
+                            "qfq",
+                            60,
+                        )
+                        .unwrap_or_default();
+                        klines_obj.insert(
+                            period.as_str().into(),
+                            serde_json::to_value(rows).unwrap_or(Value::Null),
+                        );
+                    }
+                    if let Some(o) = item.as_object_mut() {
+                        o.insert("klines".into(), Value::Object(klines_obj));
+                    }
+                }
+                if !want_quote {
+                    // include.quote=false 时调用方仅想要 metadata + 其它 include；
+                    // 保留 category/freshness/warnings/klines，删 quote 字段
+                    if let Some(o) = item.as_object_mut() {
+                        for k in ["price", "change", "changePercent", "open", "high", "low",
+                                  "previousClose", "volume", "amount", "tradeStatus"]
+                        {
+                            o.remove(k);
+                        }
+                    }
+                }
+                items.push(item);
             }
             None => {
                 worst_status = "missing";

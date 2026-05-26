@@ -18,7 +18,7 @@ pub const LOOP_MARKET_QUOTE: &str = "market_quote";
 pub const LOOP_MARKET_UNIVERSE: &str = "market_universe";
 pub const LOOP_ACCOUNT: &str = "account_close";
 pub const LOOP_KLINE_WARM: &str = "kline_warm";
-pub const LOOP_NEWS_RETENTION: &str = "news_retention";
+// LOOP_NEWS_RETENTION 已移除（spec news-module.md §65：News 不主动 retention）。
 // Agent Runtime loops（spec §10 可观测覆盖范围）
 pub const LOOP_AGENT_NEWS_BATCH: &str = "agent_news_batch";
 /// spec §10 可观测 loop——account_trigger_routing 当前在 router 内联，未独立写 heartbeat。

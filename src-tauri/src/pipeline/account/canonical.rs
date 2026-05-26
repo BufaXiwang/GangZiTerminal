@@ -436,36 +436,10 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
             }
         }
         OrderType::Limit => {
-            // pending：spec §2 AcceptedPending 分支
-            let _ = orders_repo::insert(
-                app,
-                &order_row(
-                    &order_id,
-                    &ts_code_obj,
-                    side,
-                    order_type,
-                    limit_price.map(Yuan::from_unchecked),
-                    qty_i64,
-                    OrderStatus::Pending,
-                    OrderIntent::DirectOrder,
-                    None,
-                    &reason,
-                    expires_at,
-                ),
-            );
-            let mut result = OperateAccountResult {
-                accepted: true,
-                reason: None,
-                message: Some("limit_pending".into()),
-                order_id: Some(order_id.clone()),
-                position_id: None,
-                fill_ids: Vec::new(),
-                account_event_ids: Vec::new(),
-                trigger_id: None,
-                rejection_event_id: None,
-                warnings: Vec::new(),
-                snapshot: None,
-            };
+            // spec §519：accepted limit pending 同一事务内必须先写 order_placed
+            // 再写 cash_frozen / shares_frozen；冻结失败事务不得提交 order_placed。
+            // 实现：用 commit_account_events_only 一次性写两条 AccountEvent；
+            // 失败时 SQLite TX 回滚两条都没写；orders_repo 写入只在两条事件成功后进行。
             let placed = AccountEvent::new(
                 AccountEventType::OrderPlaced,
                 AccountActor::Agent,
@@ -482,8 +456,6 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
             .with_order(&order_id)
             .with_ts_code(&ts_code)
             .with_reason(&reason);
-            let _ = append_event(app, &mut result, placed);
-            // spec §2「accepted limit pending 同事务内必须先 order_placed 再 cash_frozen / shares_frozen」
             let freeze_type = match side {
                 OrderSide::Buy => AccountEventType::CashFrozen,
                 OrderSide::Sell => AccountEventType::SharesFrozen,
@@ -498,8 +470,53 @@ async fn place_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
             let frozen = AccountEvent::new(freeze_type, AccountActor::Agent, frozen_payload)
                 .with_order(&order_id)
                 .with_ts_code(&ts_code);
-            let _ = append_event(app, &mut result, frozen);
-            result
+            let event_ids = match svc.repo().commit_account_events_only(&[placed, frozen]) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    // 冻结失败（事务回滚），order_placed 也没写；spec §519 fail closed
+                    return OperateAccountResult::rejected(
+                        "db_error",
+                        format!("limit order 冻结失败，事务已回滚：{e}"),
+                    );
+                }
+            };
+            // 事件已 commit，再持久化 orders 读模型；失败仅日志（读模型可由事件流重建）
+            if let Err(e) = orders_repo::insert(
+                app,
+                &order_row(
+                    &order_id,
+                    &ts_code_obj,
+                    side,
+                    order_type,
+                    limit_price.map(Yuan::from_unchecked),
+                    qty_i64,
+                    OrderStatus::Pending,
+                    OrderIntent::DirectOrder,
+                    None,
+                    &reason,
+                    expires_at,
+                ),
+            ) {
+                tracing::warn!(
+                    target = "account.canonical",
+                    error = %e,
+                    order_id,
+                    "orders_repo::insert 失败（事件已 commit，读模型可由事件流重建）"
+                );
+            }
+            OperateAccountResult {
+                accepted: true,
+                reason: None,
+                message: Some("limit_pending".into()),
+                order_id: Some(order_id),
+                position_id: None,
+                fill_ids: Vec::new(),
+                account_event_ids: event_ids,
+                trigger_id: None,
+                rejection_event_id: None,
+                warnings: Vec::new(),
+                snapshot: None,
+            }
         }
     }
 }
@@ -662,6 +679,7 @@ async fn cancel_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         warnings: Vec::new(),
         snapshot: None,
     };
+    // spec §2：cancel 同事务写 order_cancelled + cash_released / shares_released。
     let cancelled = AccountEvent::new(
         AccountEventType::OrderCancelled,
         AccountActor::Agent,
@@ -669,13 +687,12 @@ async fn cancel_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
     )
     .with_order(&order_id)
     .with_ts_code(order.ts_code.as_str());
-    let _ = append_event(app, &mut result, cancelled);
-    // spec §2「买单撤单时释放该订单剩余未成交数量对应的冻结现金 / 卖单释放冻结持仓」
     let release_type = match order.side {
         OrderSide::Buy => AccountEventType::CashReleased,
         OrderSide::Sell => AccountEventType::SharesReleased,
     };
     let remaining = order.quantity.value() - order.filled_quantity.value();
+    let mut events = vec![cancelled];
     if remaining > 0 {
         let release_payload = match order.side {
             OrderSide::Buy => serde_json::json!({
@@ -687,10 +704,23 @@ async fn cancel_order(app: &AppHandle, acc: &Value) -> OperateAccountResult {
             }),
             OrderSide::Sell => serde_json::json!({ "quantity": remaining }),
         };
-        let released = AccountEvent::new(release_type, AccountActor::Agent, release_payload)
-            .with_order(&order_id)
-            .with_ts_code(order.ts_code.as_str());
-        let _ = append_event(app, &mut result, released);
+        events.push(
+            AccountEvent::new(release_type, AccountActor::Agent, release_payload)
+                .with_order(&order_id)
+                .with_ts_code(order.ts_code.as_str()),
+        );
+    }
+    let svc = AccountService::new(app.clone());
+    match svc.repo().commit_account_events_only(&events) {
+        Ok(ids) => result.account_event_ids = ids,
+        Err(e) => {
+            tracing::warn!(
+                target = "account.canonical",
+                error = %e,
+                order_id,
+                "cancel 事件 commit 失败（orders 状态已更新）"
+            );
+        }
     }
     result
 }
@@ -761,35 +791,7 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
                 "limit 订单必须提供 limitPrice > 0",
             );
         }
-        let _ = orders_repo::insert(
-            app,
-            &order_row(
-                &order_id,
-                &ts_code_obj,
-                OrderSide::Buy,
-                OrderType::Limit,
-                limit_price.map(Yuan::from_unchecked),
-                qty_i64,
-                OrderStatus::Pending,
-                OrderIntent::OpenPosition,
-                None,
-                &reason,
-                None,
-            ),
-        );
-        let mut result = OperateAccountResult {
-            accepted: true,
-            reason: None,
-            message: Some("limit_pending".into()),
-            order_id: Some(order_id.clone()),
-            position_id: None,
-            fill_ids: Vec::new(),
-            account_event_ids: Vec::new(),
-            trigger_id: None,
-            rejection_event_id: None,
-            warnings: Vec::new(),
-            snapshot: None,
-        };
+        // spec §519：order_placed + cash_frozen 同事务；冻结失败不得提交 order_placed。
         let placed = AccountEvent::new(
             AccountEventType::OrderPlaced,
             AccountActor::Agent,
@@ -805,7 +807,6 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
         .with_order(&order_id)
         .with_ts_code(&ts_code)
         .with_reason(&reason);
-        let _ = append_event(app, &mut result, placed);
         let frozen = AccountEvent::new(
             AccountEventType::CashFrozen,
             AccountActor::Agent,
@@ -816,8 +817,52 @@ async fn open_position(app: &AppHandle, acc: &Value, episode_id: &str) -> Operat
         )
         .with_order(&order_id)
         .with_ts_code(&ts_code);
-        let _ = append_event(app, &mut result, frozen);
-        return result;
+        let svc = AccountService::new(app.clone());
+        let event_ids = match svc.repo().commit_account_events_only(&[placed, frozen]) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return OperateAccountResult::rejected(
+                    "db_error",
+                    format!("open_position(limit) 冻结失败，事务已回滚：{e}"),
+                );
+            }
+        };
+        if let Err(e) = orders_repo::insert(
+            app,
+            &order_row(
+                &order_id,
+                &ts_code_obj,
+                OrderSide::Buy,
+                OrderType::Limit,
+                limit_price.map(Yuan::from_unchecked),
+                qty_i64,
+                OrderStatus::Pending,
+                OrderIntent::OpenPosition,
+                None,
+                &reason,
+                None,
+            ),
+        ) {
+            tracing::warn!(
+                target = "account.canonical",
+                error = %e,
+                order_id,
+                "open_position(limit) orders_repo::insert 失败（事件已 commit）"
+            );
+        }
+        return OperateAccountResult {
+            accepted: true,
+            reason: None,
+            message: Some("limit_pending".into()),
+            order_id: Some(order_id),
+            position_id: None,
+            fill_ids: Vec::new(),
+            account_event_ids: event_ids,
+            trigger_id: None,
+            rejection_event_id: None,
+            warnings: Vec::new(),
+            snapshot: None,
+        };
     }
 
     // market 即时
@@ -984,21 +1029,115 @@ async fn scale_position(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         "decrease" => -qty,
         _ => return OperateAccountResult::rejected("invalid_input", "side ∈ {increase, decrease}"),
     };
-    // spec §4：scale_position 支持 orderType / limitPrice / expiresAt（limit 走 pending 路径）
-    // 当前 AccountService 实现立即成交语义；如果调用方传 limit 显式拒绝，避免静默吃 limit。
-    if let Some(ot) = acc.get("orderType").and_then(Value::as_str) {
-        if ot == "limit" {
-            return OperateAccountResult::rejected(
-                "invalid_input",
-                "scale_position(limit) 尚未支持，使用 place_order(limit) 替代",
-            );
-        }
-    }
     let reason = acc
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // spec §832：scale_position 支持 orderType / limitPrice / expiresAt（limit 走 pending 路径）。
+    // 实装：limit 同 place_order(limit) — 写 OrderIntent::ScaleIn/ScaleOut pending 订单 +
+    // order_placed + cash_frozen/shares_frozen 原子事件；不立即变更 Position。
+    let order_type_str = acc.get("orderType").and_then(Value::as_str).unwrap_or("market");
+    if order_type_str == "limit" {
+        let limit_price = acc
+            .get("limitPrice")
+            .and_then(Value::as_f64)
+            .filter(|p| *p > 0.0)
+            .ok_or(());
+        if limit_price.is_err() {
+            return OperateAccountResult::rejected(
+                "invalid_input",
+                "limit 订单必须提供 limitPrice > 0",
+            );
+        }
+        let limit_price = limit_price.unwrap();
+        // 取 position 的 ts_code 给挂单用
+        let svc = AccountService::new(app.clone());
+        let snap = match svc.snapshot() {
+            Ok(s) => s,
+            Err(e) => return OperateAccountResult::rejected("db_error", e.to_string()),
+        };
+        let pos = match snap.open_positions.iter().find(|p| p.id == pid) {
+            Some(p) => p.clone(),
+            None => return OperateAccountResult::rejected("not_found", format!("position {} 不存在", pid.as_str())),
+        };
+        let ts_code = pos.code.as_str().to_string();
+        let ts_code_obj = match TsCode::new(&ts_code) {
+            Ok(t) => t,
+            Err(_) => return OperateAccountResult::rejected("invalid_input", "ts_code 非法"),
+        };
+        let (side_enum, intent_enum, freeze_type) = match side {
+            "increase" => (OrderSide::Buy, OrderIntent::ScaleIn, AccountEventType::CashFrozen),
+            "decrease" => (OrderSide::Sell, OrderIntent::ScaleOut, AccountEventType::SharesFrozen),
+            _ => unreachable!(),
+        };
+        let order_id = new_order_id();
+        let expires_at = acc
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| OccurredAt::new(dt.timestamp_millis()));
+        let placed = AccountEvent::new(
+            AccountEventType::OrderPlaced,
+            AccountActor::Agent,
+            serde_json::json!({
+                "tsCode": ts_code,
+                "side": side_enum.as_str(),
+                "orderType": "limit",
+                "limitPrice": limit_price,
+                "quantity": qty,
+                "intent": intent_enum.as_str(),
+            }),
+        )
+        .with_order(&order_id)
+        .with_ts_code(&ts_code)
+        .with_reason(&reason);
+        let freeze_payload = match side_enum {
+            OrderSide::Buy => serde_json::json!({ "amount": limit_price * qty as f64, "quantity": qty }),
+            OrderSide::Sell => serde_json::json!({ "quantity": qty }),
+        };
+        let frozen = AccountEvent::new(freeze_type, AccountActor::Agent, freeze_payload)
+            .with_order(&order_id)
+            .with_ts_code(&ts_code);
+        let event_ids = match svc.repo().commit_account_events_only(&[placed, frozen]) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return OperateAccountResult::rejected(
+                    "db_error",
+                    format!("scale_position(limit) 冻结失败，事务已回滚：{e}"),
+                );
+            }
+        };
+        let _ = orders_repo::insert(
+            app,
+            &order_row(
+                &order_id,
+                &ts_code_obj,
+                side_enum,
+                OrderType::Limit,
+                Some(Yuan::from_unchecked(limit_price)),
+                qty,
+                OrderStatus::Pending,
+                intent_enum,
+                Some(pid.as_str().to_string()),
+                &reason,
+                expires_at,
+            ),
+        );
+        return OperateAccountResult {
+            accepted: true,
+            reason: None,
+            message: Some("limit_pending".into()),
+            order_id: Some(order_id),
+            position_id: Some(pid.as_str().to_string()),
+            fill_ids: Vec::new(),
+            account_event_ids: event_ids,
+            trigger_id: None,
+            rejection_event_id: None,
+            warnings: Vec::new(),
+            snapshot: None,
+        };
+    }
     // spec §2：scale 成交后 position_scaled event 与 PositionEvent 原子提交
     let side_for_extras = side.to_string();
     let reason_for_extras = reason.clone();
@@ -1028,15 +1167,106 @@ async fn close_position(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         _ => return OperateAccountResult::rejected("invalid_input", "positionId 必填"),
     };
     let pid = PositionId::from_string(pid_str);
-    // spec §4：close_position 可带 quantity（如果不等于全部持仓应改 scale_position(decrease)）；
-    // limit 路径与 scale_position 同样未接，显式拒绝。
-    if let Some(ot) = acc.get("orderType").and_then(Value::as_str) {
-        if ot == "limit" {
-            return OperateAccountResult::rejected(
-                "invalid_input",
-                "close_position(limit) 尚未支持，使用 place_order(limit) 替代",
-            );
-        }
+    let reason = acc
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    // spec §848：close_position 支持 orderType / limitPrice / expiresAt（limit 走 pending 路径）。
+    // 实装：limit 同 place_order(limit) — 写 OrderIntent::ClosePosition pending Sell 订单 +
+    // order_placed + shares_frozen 原子事件；不立即变更 Position。
+    let order_type_str = acc.get("orderType").and_then(Value::as_str).unwrap_or("market");
+    if order_type_str == "limit" {
+        let limit_price = match acc.get("limitPrice").and_then(Value::as_f64).filter(|p| *p > 0.0) {
+            Some(p) => p,
+            None => {
+                return OperateAccountResult::rejected(
+                    "invalid_input",
+                    "limit 订单必须提供 limitPrice > 0",
+                )
+            }
+        };
+        let svc = AccountService::new(app.clone());
+        let snap = match svc.snapshot() {
+            Ok(s) => s,
+            Err(e) => return OperateAccountResult::rejected("db_error", e.to_string()),
+        };
+        let pos = match snap.open_positions.iter().find(|p| p.id == pid) {
+            Some(p) => p.clone(),
+            None => return OperateAccountResult::rejected("not_found", format!("position {} 不存在", pid.as_str())),
+        };
+        let close_qty = pos.current_shares.value();
+        let ts_code = pos.code.as_str().to_string();
+        let ts_code_obj = match TsCode::new(&ts_code) {
+            Ok(t) => t,
+            Err(_) => return OperateAccountResult::rejected("invalid_input", "ts_code 非法"),
+        };
+        let order_id = new_order_id();
+        let expires_at = acc
+            .get("expiresAt")
+            .and_then(Value::as_str)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| OccurredAt::new(dt.timestamp_millis()));
+        let placed = AccountEvent::new(
+            AccountEventType::OrderPlaced,
+            AccountActor::Agent,
+            serde_json::json!({
+                "tsCode": ts_code,
+                "side": "sell",
+                "orderType": "limit",
+                "limitPrice": limit_price,
+                "quantity": close_qty,
+                "intent": OrderIntent::ClosePosition.as_str(),
+            }),
+        )
+        .with_order(&order_id)
+        .with_ts_code(&ts_code)
+        .with_reason(&reason);
+        let frozen = AccountEvent::new(
+            AccountEventType::SharesFrozen,
+            AccountActor::Agent,
+            serde_json::json!({ "quantity": close_qty }),
+        )
+        .with_order(&order_id)
+        .with_ts_code(&ts_code);
+        let event_ids = match svc.repo().commit_account_events_only(&[placed, frozen]) {
+            Ok(ids) => ids,
+            Err(e) => {
+                return OperateAccountResult::rejected(
+                    "db_error",
+                    format!("close_position(limit) 冻结失败，事务已回滚：{e}"),
+                );
+            }
+        };
+        let _ = orders_repo::insert(
+            app,
+            &order_row(
+                &order_id,
+                &ts_code_obj,
+                OrderSide::Sell,
+                OrderType::Limit,
+                Some(Yuan::from_unchecked(limit_price)),
+                close_qty,
+                OrderStatus::Pending,
+                OrderIntent::ClosePosition,
+                Some(pid.as_str().to_string()),
+                &reason,
+                expires_at,
+            ),
+        );
+        return OperateAccountResult {
+            accepted: true,
+            reason: None,
+            message: Some("limit_pending".into()),
+            order_id: Some(order_id),
+            position_id: Some(pid.as_str().to_string()),
+            fill_ids: Vec::new(),
+            account_event_ids: event_ids,
+            trigger_id: None,
+            rejection_event_id: None,
+            warnings: Vec::new(),
+            snapshot: None,
+        };
     }
     // 当前 AccountService 全平；如果传了 quantity 但不等于持仓，按 spec 应当 invalid_input
     // 引导用 scale_position(decrease)。当前 quantity 缺省即全平。
@@ -1044,11 +1274,6 @@ async fn close_position(app: &AppHandle, acc: &Value) -> OperateAccountResult {
         // 调用方显式给 quantity——当前 service 不区分；要做严格 spec 校验需要先 fetch position。
         // 这里走 close all 路径；若 quantity != position.qty，AccountService 内部会按 rule 校验。
     }
-    let reason = acc
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
     // spec §2：position_closed 事件与 PositionEvent 原子提交。
     let reason_for_extras = reason.clone();
     let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
@@ -1219,51 +1444,100 @@ async fn record_invalidation_signal(app: &AppHandle, acc: &Value) -> OperateAcco
         append_event(app, &mut tmp, signal_recorded)
     };
     if hit {
-        // 触发"按 invalidation 派生 trigger"——走 close path with Invalidated reason
-        // 让 maybe_emit_close_trigger 跑。position_closed AccountEvent 与 PositionEvent
-        // 原子提交（spec §2）。
-        let build_extras: ExtraEventsFn = Box::new(move |pos, _pe| {
-            let closed = AccountEvent::new(
-                AccountEventType::PositionClosed,
-                AccountActor::Agent,
-                serde_json::json!({ "reason": "invalidated" }),
-            )
-            .with_position(pos.id.as_str())
-            .with_ts_code(pos.code.as_str());
-            vec![closed]
-        });
-        match svc
-            .close_position_atomic(
-                &pid,
-                CloseReason::Invalidated,
-                EventSource::Manual,
-                format!("invalidation_signal={signal}; {reason}"),
-                build_extras,
-            )
-            .await
-        {
-            Ok((pos, event_ids)) => {
-                let mut result = OperateAccountResult {
-                    accepted: true,
-                    reason: None,
-                    message: Some(format!("invalidation_triggered:{signal}")),
-                    order_id: None,
-                    position_id: Some(pos.id.as_str().to_string()),
-                    trigger_id: None,
-                    rejection_event_id: None,
-                    fill_ids: Vec::new(),
-                    account_event_ids: Vec::new(),
-                    warnings: Vec::new(),
-                    snapshot: None,
-                };
-                if let Some(id) = signal_event_id {
-                    result.account_event_ids.push(id);
+        // spec account-module.md §4 line 885：「enabled = true 且 signal 命中时生成
+        // invalidated trigger，**不自动交易**」。先 append trigger_created 事件
+        // （AccountEvent 真源），再写 AccountTrigger 行 + emit account-triggered。
+        // 旧实现错误地走 close_position，导致仓位被自动平仓 → spec 违反。
+        use crate::domain::account::trigger::{
+            derive_trigger_id_from_close, AccountTrigger, AccountTriggerType,
+        };
+        use crate::pipeline::account::service::emit_account_triggered;
+
+        // trigger_created AccountEvent
+        let created_event = AccountEvent::new(
+            AccountEventType::TriggerCreated,
+            AccountActor::System,
+            serde_json::json!({
+                "triggerType": AccountTriggerType::Invalidated.as_str(),
+                "signal": signal,
+            }),
+        )
+        .with_position(pid.as_str())
+        .with_ts_code(pos.code.as_str())
+        .with_reason(&reason);
+        let trigger_event_id =
+            match svc.repo().commit_account_events_only(&[created_event]) {
+                Ok(ids) => ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| signal_event_id.clone().unwrap_or_default()),
+                Err(e) => {
+                    return OperateAccountResult::rejected("db_error", e.to_string())
                 }
-                result.account_event_ids.extend(event_ids);
-                result
+            };
+
+        // 用 signal+pid+ts+event_id 派生稳定 trigger_id；同信号重复命中幂等。
+        let trigger_id = derive_trigger_id_from_close(
+            AccountTriggerType::Invalidated,
+            pid.as_str(),
+            pos.code.as_str(),
+            &trigger_event_id,
+        );
+        let trig = AccountTrigger {
+            trigger_id: trigger_id.clone(),
+            trigger_type: AccountTriggerType::Invalidated,
+            order_id: None,
+            position_id: Some(pid.as_str().to_string()),
+            ts_code: Some(pos.code.as_str().to_string()),
+            price: None,
+            threshold: None,
+            quote_freshness: None, // invalidated 不依赖 fresh quote (spec §1054 时间型 / invalidated 不依赖)
+            warnings: Vec::new(),
+            event_id: trigger_event_id.clone(),
+            handled: false,
+            occurred_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let trigger_emitted = match crate::infrastructure::account::trigger_repo::upsert_pending(
+            app, &trig,
+        ) {
+            Ok(true) => {
+                emit_account_triggered(app, &trig);
+                true
             }
-            Err(e) => account_err_to_result(e),
+            Ok(false) => false, // 同 trigger_id 已存在，幂等
+            Err(e) => {
+                tracing::warn!(
+                    target = "account.invalidation",
+                    error = %e,
+                    trigger_id = %trigger_id,
+                    "写 invalidated trigger 失败（事件已 commit）"
+                );
+                false
+            }
+        };
+
+        let mut result = OperateAccountResult {
+            accepted: true,
+            reason: None,
+            message: Some(if trigger_emitted {
+                format!("invalidation_triggered:{signal}")
+            } else {
+                format!("invalidation_trigger_duplicate:{signal}")
+            }),
+            order_id: None,
+            position_id: Some(pid.as_str().to_string()),
+            trigger_id: Some(trigger_id),
+            rejection_event_id: None,
+            fill_ids: Vec::new(),
+            account_event_ids: Vec::new(),
+            warnings: Vec::new(),
+            snapshot: None,
+        };
+        if let Some(id) = signal_event_id {
+            result.account_event_ids.push(id);
         }
+        result.account_event_ids.push(trigger_event_id);
+        result
     } else {
         // 未命中：仅审计；spec §4「signal recorded 但不进 invalidated trigger」
         tracing::info!(
