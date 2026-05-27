@@ -21,9 +21,46 @@ pub const ARTICLE_MIN_CONTENT_CHARS: usize = 80;
 
 /// 抽取结果。`error` 仅在彻底失败（fetch / parse）时填充，调用方据此映射到
 /// `NewsFailure(stage="article")`。
+///
+/// Spec: news-module.md §5 failure code 表 — article stage 失败统一 code = `article_extract_failed`，
+/// 细分原因放 `reason`，供 service 层写入 `NewsFailure.details.reason`。
 pub struct ArticleExtractOutput {
     pub article: ArticleContent,
-    pub error: Option<(ErrorCode, String)>,
+    /// `(code, reason, message)`：`code` 固定为 `ArticleExtractFailed`；`reason` 为细分原因
+    /// （`network` / `timeout` / `too_short` / `unsupported_content_type` / `http_status`
+    /// / `parse_error`），调用方写入 `NewsFailure.details.reason`。
+    pub error: Option<ArticleExtractFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArticleExtractFailure {
+    pub code: ErrorCode,
+    pub reason: ArticleExtractReason,
+    pub message: String,
+}
+
+/// article-stage 细分原因（写入 `NewsFailure.details.reason`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleExtractReason {
+    Network,
+    Timeout,
+    TooShort,
+    UnsupportedContentType,
+    HttpStatus,
+    ParseError,
+}
+
+impl ArticleExtractReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArticleExtractReason::Network => "network",
+            ArticleExtractReason::Timeout => "timeout",
+            ArticleExtractReason::TooShort => "too_short",
+            ArticleExtractReason::UnsupportedContentType => "unsupported_content_type",
+            ArticleExtractReason::HttpStatus => "http_status",
+            ArticleExtractReason::ParseError => "parse_error",
+        }
+    }
 }
 
 pub struct ArticleExtractor {
@@ -46,7 +83,7 @@ impl ArticleExtractor {
         let now = Utc::now();
         match self.do_extract(canonical_url, first_news_id, now).await {
             Ok(out) => out,
-            Err(e) => failure(canonical_url, first_news_id, now, e.code, &e.message),
+            Err(e) => failure(canonical_url, first_news_id, now, e.reason, &e.message),
         }
     }
 
@@ -62,17 +99,17 @@ impl ArticleExtractor {
             .send()
             .await
             .map_err(|e| ExtractErr {
-                code: if e.is_timeout() {
-                    ErrorCode::ToolTimeout
+                reason: if e.is_timeout() {
+                    ArticleExtractReason::Timeout
                 } else {
-                    ErrorCode::ProviderUnavailable
+                    ArticleExtractReason::Network
                 },
                 message: e.to_string(),
             })?;
 
         if !resp.status().is_success() {
             return Err(ExtractErr {
-                code: ErrorCode::ProviderUnavailable,
+                reason: ArticleExtractReason::HttpStatus,
                 message: format!("http status {}", resp.status()),
             });
         }
@@ -87,34 +124,21 @@ impl ArticleExtractor {
             .bytes()
             .await
             .map_err(|e| ExtractErr {
-                code: ErrorCode::ProviderUnavailable,
+                reason: ArticleExtractReason::Network,
                 message: e.to_string(),
             })?;
         if body_bytes.len() > ARTICLE_MAX_BODY_BYTES {
             return Err(ExtractErr {
-                code: ErrorCode::ProviderUnavailable,
+                reason: ArticleExtractReason::HttpStatus,
                 message: format!("body exceeds {} bytes", ARTICLE_MAX_BODY_BYTES),
             });
         }
 
-        // Content-Type 不可解析时 → article_missing warning（spec）
+        // Content-Type 不是 HTML-like：返回失败 + 细分原因 unsupported_content_type
         if !ct.is_empty() && !is_html_like(&ct) {
-            let warn_article = ArticleContent {
-                url: canonical_url.to_string(),
-                first_news_id: first_news_id.map(|s| s.to_string()),
-                title: None,
-                content: None,
-                payload: serde_json::json!({
-                    "provider": "article_extractor",
-                    "contentType": ct,
-                    "reason": "unsupported content-type",
-                }),
-                fetched_at: now,
-                warning: Some(WarningCode::ArticleMissing),
-            };
-            return Ok(ArticleExtractOutput {
-                article: warn_article,
-                error: None,
+            return Err(ExtractErr {
+                reason: ArticleExtractReason::UnsupportedContentType,
+                message: format!("unsupported content-type: {}", ct),
             });
         }
 
@@ -128,21 +152,26 @@ impl ArticleExtractor {
             .unwrap_or(true);
 
         if too_short {
-            // 失败缓存：保留 fetched_at 但 content 为空 + warning（spec）
+            // 失败缓存 + 细分原因 too_short（spec §5 article stage failure 必填 reason）
+            let article = ArticleContent {
+                url: canonical_url.to_string(),
+                first_news_id: first_news_id.map(|s| s.to_string()),
+                title,
+                content: None,
+                payload: serde_json::json!({
+                    "provider": "article_extractor",
+                    "reason": ArticleExtractReason::TooShort.as_str(),
+                }),
+                fetched_at: now,
+                warning: Some(WarningCode::ArticleMissing),
+            };
             return Ok(ArticleExtractOutput {
-                article: ArticleContent {
-                    url: canonical_url.to_string(),
-                    first_news_id: first_news_id.map(|s| s.to_string()),
-                    title,
-                    content: None,
-                    payload: serde_json::json!({
-                        "provider": "article_extractor",
-                        "reason": "content empty or too short",
-                    }),
-                    fetched_at: now,
-                    warning: Some(WarningCode::ArticleMissing),
-                },
-                error: None,
+                article,
+                error: Some(ArticleExtractFailure {
+                    code: ErrorCode::ArticleExtractFailed,
+                    reason: ArticleExtractReason::TooShort,
+                    message: "content empty or too short".to_string(),
+                }),
             });
         }
 
@@ -162,7 +191,7 @@ impl ArticleExtractor {
 }
 
 struct ExtractErr {
-    code: ErrorCode,
+    reason: ArticleExtractReason,
     message: String,
 }
 
@@ -170,7 +199,7 @@ fn failure(
     canonical_url: &str,
     first_news_id: Option<&str>,
     now: OccurredAt,
-    code: ErrorCode,
+    reason: ArticleExtractReason,
     message: &str,
 ) -> ArticleExtractOutput {
     // 即使失败也保存失败缓存（spec：避免短时间反复抓取）。
@@ -181,6 +210,7 @@ fn failure(
         content: None,
         payload: serde_json::json!({
             "provider": "article_extractor",
+            "reason": reason.as_str(),
             "error": message,
         }),
         fetched_at: now,
@@ -188,7 +218,11 @@ fn failure(
     };
     ArticleExtractOutput {
         article,
-        error: Some((code, message.to_string())),
+        error: Some(ArticleExtractFailure {
+            code: ErrorCode::ArticleExtractFailed,
+            reason,
+            message: message.to_string(),
+        }),
     }
 }
 
@@ -315,5 +349,45 @@ mod tests {
         let (title, content) = extract_main(html);
         assert_eq!(title.as_deref(), Some("T"));
         assert!(content.as_deref().unwrap().contains("article body"));
+    }
+
+    /// Spec §5: article-stage failure 必须 code = article_extract_failed，
+    /// reason 字段是分类字符串。
+    #[test]
+    fn failure_produces_article_extract_failed_with_reason() {
+        let now = Utc::now();
+        for r in [
+            ArticleExtractReason::Network,
+            ArticleExtractReason::Timeout,
+            ArticleExtractReason::TooShort,
+            ArticleExtractReason::UnsupportedContentType,
+            ArticleExtractReason::HttpStatus,
+            ArticleExtractReason::ParseError,
+        ] {
+            let out = failure("https://a.com/x", None, now, r, "boom");
+            let err = out.error.expect("should have error");
+            assert_eq!(err.code, ErrorCode::ArticleExtractFailed);
+            assert_eq!(err.reason, r);
+            // article cache 写入
+            assert_eq!(out.article.url, "https://a.com/x");
+            assert!(out.article.content.is_none());
+            assert_eq!(out.article.warning, Some(WarningCode::ArticleMissing));
+            // payload.reason 是字符串
+            let payload_reason = out.article.payload.get("reason").and_then(|v| v.as_str());
+            assert_eq!(payload_reason, Some(r.as_str()));
+        }
+    }
+
+    #[test]
+    fn reason_as_str_covers_all_variants() {
+        assert_eq!(ArticleExtractReason::Network.as_str(), "network");
+        assert_eq!(ArticleExtractReason::Timeout.as_str(), "timeout");
+        assert_eq!(ArticleExtractReason::TooShort.as_str(), "too_short");
+        assert_eq!(
+            ArticleExtractReason::UnsupportedContentType.as_str(),
+            "unsupported_content_type"
+        );
+        assert_eq!(ArticleExtractReason::HttpStatus.as_str(), "http_status");
+        assert_eq!(ArticleExtractReason::ParseError.as_str(), "parse_error");
     }
 }

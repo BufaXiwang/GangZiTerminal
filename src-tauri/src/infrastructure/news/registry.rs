@@ -13,10 +13,11 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// 默认 source 配置。
+/// 默认 source 配置（spec §2：NewsSource 编译期常量；不提供运行时配置入口）。
 ///
-/// 当前阶段全部 disabled，避免无网络环境下后台 refresh 反复失败。
-/// 后续在 News 模块外（系统设置 BC 或 onboarding）落地 enable 入口。
+/// 新增 / 删除 / 修改 source 必须改这里并重新部署；`enabled` 字段同样在代码中固化。
+/// `feed_url` 为 None 的 source 在 provider 拉取时会立即失败（写入 NewsFailure），
+/// 但仍然出现在 `list_news_sources` 中，避免 UI 把"未配置"误认为"无新闻"。
 const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
     // (source_id, provider, display_name, feed_url, enabled)
     (
@@ -24,14 +25,14 @@ const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
         "rss",
         "Sample RSS feed",
         Some("https://example.com/feed.xml"),
-        false,
+        true,
     ),
     (
         "newsnow:hot",
         "newsnow",
         "NewsNow hot channel",
         None,
-        false,
+        true,
     ),
 ];
 

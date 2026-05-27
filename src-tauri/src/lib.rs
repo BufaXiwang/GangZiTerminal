@@ -31,7 +31,6 @@ pub fn run() {
         adapters::ping::ping,
         adapters::news::cmd::fetch_news,
         adapters::news::cmd::list_news_sources,
-        adapters::news::cmd::refresh_news,
         adapters::news::cmd::warm_articles,
     ]);
 
@@ -74,15 +73,19 @@ pub fn run() {
             app.manage(db.clone());
             app.manage(Arc::clone(&news_service));
 
-            // -- Scheduler：默认 60s tick
+            // -- Event sink：scheduler + warm_articles 共用同一个 emit 回调
             let app_handle = app.handle().clone();
             let sink: crate::pipeline::news::scheduler::EventSink =
                 Arc::new(move |payload| {
                     let envelope = wrap_news_refreshed(payload, None);
                     if let Err(e) = app_handle.emit(NEWS_REFRESHED_EVENT, envelope) {
-                        tracing::warn!(target: "news.scheduler", error = %e, "failed to emit news-refreshed");
+                        tracing::warn!(target: "news.refresh.emit", error = %e, "failed to emit news-refreshed");
                     }
                 });
+            // 注入给 service：warm_articles 在 articleUpdatedCount > 0 时通过它 emit
+            news_service.set_event_sink(Arc::clone(&sink));
+
+            // -- Scheduler：默认 60s tick
             let handle: NewsSchedulerHandle = spawn_news_refresh_scheduler(
                 Arc::clone(&news_service),
                 Duration::from_secs(NEWS_REFRESH_INTERVAL_SECS),

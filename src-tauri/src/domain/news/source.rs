@@ -1,6 +1,10 @@
 //! NewsSource — 资讯来源配置 + 健康状态。
 //!
 //! Spec: docs/design/news-module.md §2 (NewsSource)
+//!
+//! NewsSource 列表是 **编译期常量**（spec §2）：第一阶段不提供运行时配置入口、
+//! 不提供管理 UI；新增 / 删除 / 修改 source 必须改 `infrastructure/news/registry.rs`
+//! 中的 `DEFAULT_SOURCES` 并重新部署。`enabled` 字段同样在代码中固化。
 
 use crate::domain::shared::{ErrorCode, OccurredAt};
 use serde::{Deserialize, Serialize};

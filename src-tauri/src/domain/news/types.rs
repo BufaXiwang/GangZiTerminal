@@ -6,8 +6,8 @@ use crate::domain::shared::{JsonValue, OccurredAt, WarningCode};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
-use super::events::{NewsRefreshedPayload, NewsRefreshWarning, NewsFailure};
-use super::errors::{RefreshNewsError, WarmArticlesError};
+use super::events::{NewsRefreshWarning, NewsFailure};
+use super::errors::WarmArticlesError;
 use super::source::NewsSource;
 
 // ============================================================================
@@ -68,8 +68,6 @@ pub struct ProviderNewsItem {
 #[derive(Debug, Clone, Deserialize, Serialize, Type, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchNewsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,8 +131,6 @@ pub struct FetchNewsItem {
 #[serde(rename_all = "camelCase")]
 pub struct FetchNewsError {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     pub code: crate::domain::shared::ErrorCode,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,41 +165,8 @@ pub struct ListNewsSourcesResponse {
 }
 
 // ============================================================================
-// refresh_news
+// Untagged ok/err flag helpers — 用于 warm_articles 等 `{ ok: true | false }` 响应形状。
 // ============================================================================
-
-#[derive(Debug, Clone, Deserialize, Serialize, Type, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshNewsRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sources: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub force: Option<bool>,
-}
-
-/// `{ ok: true, result } | { ok: false, error }` —— spec §4 refresh_news 响应。
-///
-/// 采用 untagged + 显式 `ok: bool` 区分，兼容 spec 的 JSON 形状。
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(untagged)]
-pub enum RefreshNewsResponse {
-    Ok(RefreshNewsOk),
-    Err(RefreshNewsErr),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshNewsOk {
-    pub ok: crate::domain::news::types::TrueFlag,
-    pub result: NewsRefreshedPayload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct RefreshNewsErr {
-    pub ok: crate::domain::news::types::FalseFlag,
-    pub error: RefreshNewsError,
-}
 
 /// 序列化为 JSON `true`。用于 untagged enum 的判别字段。
 #[derive(Debug, Clone, Copy, Default)]

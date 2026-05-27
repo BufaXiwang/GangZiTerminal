@@ -14,12 +14,12 @@ pub mod source;
 pub mod types;
 
 pub use canonical_url::{canonicalize_url, CanonicalUrlError};
-pub use errors::{NewsErrorCode, RefreshNewsError, WarmArticlesError};
+pub use errors::{NewsErrorCode, WarmArticlesError};
 pub use events::{NewsFailure, NewsRefreshStage, NewsRefreshWarning, NewsRefreshedPayload};
 pub use ids::{compute_stable_id, IdInput};
 pub use source::{NewsSource, NewsSourceLastError, NewsSourceRef};
 pub use types::{
     ArticleContent, ArticleSnippet, FetchNewsItem, FetchNewsRequest, FetchNewsResponse,
-    ListNewsSourcesResponse, NewsItem, NewsItemFreshness, ProviderNewsItem, RefreshNewsRequest,
-    RefreshNewsResponse, WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
+    ListNewsSourcesResponse, NewsItem, NewsItemFreshness, ProviderNewsItem, WarmArticlesRequest,
+    WarmArticlesResponse, WarmArticlesResult,
 };

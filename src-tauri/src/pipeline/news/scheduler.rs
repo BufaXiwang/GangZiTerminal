@@ -8,8 +8,7 @@
 //! `news-refreshed` 只在 `savedCount > 0 || articleUpdatedCount > 0` 时发布（spec §5）。
 
 use crate::domain::news::events::NewsRefreshedPayload;
-use crate::domain::news::types::{RefreshNewsRequest, RefreshNewsResponse};
-use crate::pipeline::news::service::NewsService;
+use crate::pipeline::news::service::{NewsService, RefreshBatchInput, RefreshBatchOutcome};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -47,18 +46,17 @@ pub fn spawn_news_refresh_scheduler(
                 _ = ticker.tick() => {
                     let svc = Arc::clone(&service);
                     let s = sink.clone();
-                    match svc.refresh_news(RefreshNewsRequest::default()).await {
-                        RefreshNewsResponse::Ok(ok) => {
-                            let payload = ok.result;
+                    match svc.run_refresh(RefreshBatchInput::default()).await {
+                        RefreshBatchOutcome::Ok(payload) => {
                             if payload.saved_count > 0 || payload.article_updated_count > 0 {
                                 s(payload);
                             }
                         }
-                        RefreshNewsResponse::Err(err) => {
+                        RefreshBatchOutcome::Err(err) => {
                             warn!(
                                 target: "news.scheduler",
-                                code = ?err.error.code,
-                                message = ?err.error.message,
+                                code = ?err.code,
+                                message = ?err.message,
                                 "scheduled news refresh rejected",
                             );
                         }

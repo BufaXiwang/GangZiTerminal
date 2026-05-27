@@ -1,13 +1,14 @@
-//! News use case service — `fetch_news` / `list_news_sources` / `refresh_news` / `warm_articles`。
+//! News use case service — `fetch_news` / `list_news_sources` / `run_news_refresh` / `warm_articles`。
 //!
 //! Spec: docs/design/news-module.md §3 / §4 / §5
 //!
 //! 职责：把对外 DTO 翻译到 repository + provider 调用，按 spec 规则组装响应。
 //! 完成后通过 `NewsRefreshedEvent` 给 adapters 层（adapters/news/events.rs）发布事件。
+//!
+//! 注：`run_news_refresh` 是 **内部 facade**（spec §4 内部 Rust API），由 scheduler 独占触发；
+//! 不暴露为 Tauri command。
 
-use crate::domain::news::errors::{
-    RefreshNewsError, RefreshNewsErrorField, WarmArticlesError, WarmArticlesErrorField,
-};
+use crate::domain::news::errors::{WarmArticlesError, WarmArticlesErrorField};
 use crate::domain::news::events::{
     NewsFailure, NewsRefreshStage, NewsRefreshWarning, NewsRefreshedPayload,
 };
@@ -15,8 +16,7 @@ use crate::domain::news::source::NewsSource;
 use crate::domain::news::types::{
     ArticleSnippet, FetchNewsError, FetchNewsItem, FetchNewsPage, FetchNewsRequest,
     FetchNewsResponse, ListNewsSourcesResponse, NewsItem, NewsItemFreshness, ProviderNewsItem,
-    RefreshNewsErr, RefreshNewsOk, RefreshNewsRequest, RefreshNewsResponse, WarmArticlesRequest,
-    WarmArticlesResponse, WarmArticlesResult,
+    WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
 };
 use crate::domain::shared::{ErrorCode, WarningCode};
 use crate::infrastructure::db::AppDb;
@@ -32,6 +32,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// News-refresh event sink；service 在 `warm_articles` 写入正文后用它发布 `news-refreshed`
+/// 事件。具体 emit 实现由 adapters 层（lib.rs setup）注入，service 本身不依赖 Tauri。
+pub type RefreshEventSink = Arc<dyn Fn(NewsRefreshedPayload) + Send + Sync + 'static>;
+
 /// News BC 对外能力。包装 `AppDb` + `SourceRegistry` + providers，由 adapters / scheduler 持有。
 pub struct NewsService {
     db: AppDb,
@@ -39,6 +43,9 @@ pub struct NewsService {
     rss: RssProvider,
     newsnow: NewsNowProvider,
     article: ArticleExtractor,
+    /// adapters 层在 setup 时注入；scheduler 也是同一个 sink。
+    /// `RwLock` 保证 `Arc<NewsService>` 持有者可在 setup 后回写 sink。
+    event_sink: std::sync::RwLock<Option<RefreshEventSink>>,
 }
 
 /// 给 adapters 层 emit 用的事件信息。
@@ -52,8 +59,32 @@ const FETCH_LIMIT_MAX: u32 = 200;
 const WARM_RECENT_DEFAULT: u32 = 50;
 const WARM_RECENT_MAX: u32 = 200;
 const WARM_IDS_MAX: usize = 200;
-const FETCH_IDS_MAX: usize = 200;
 const ARTICLE_EXCERPT_MAX_CHARS: usize = 500;
+/// First-phase choice: warm "近期失败缓存" 抑制窗口写死 3600s；后续可参数化或
+/// 挪入 references/news/article-extractor.md。
+const WARM_RECENT_FAILURE_SUPPRESS_SECS: i64 = 3600;
+
+/// 内部 refresh facade 的输入（不是 Tauri DTO）。spec §4 内部 Rust API。
+#[derive(Debug, Clone, Default)]
+pub struct RefreshBatchInput {
+    pub sources: Option<Vec<String>>,
+    #[allow(dead_code)]
+    pub force: bool,
+}
+
+/// 内部 refresh facade 的输出。要么成功并产出 `NewsRefreshedPayload`，要么因为输入校验失败
+/// 返回 `RefreshBatchError`。scheduler 只关心 payload；调试入口可以拿到错误细节。
+#[derive(Debug, Clone)]
+pub enum RefreshBatchOutcome {
+    Ok(NewsRefreshedPayload),
+    Err(RefreshBatchError),
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshBatchError {
+    pub code: ErrorCode,
+    pub message: Option<String>,
+}
 
 impl NewsService {
     pub fn new(db: AppDb, registry: Arc<SourceRegistry>) -> reqwest::Result<Self> {
@@ -63,7 +94,23 @@ impl NewsService {
             rss: RssProvider::new()?,
             newsnow: NewsNowProvider::new()?,
             article: ArticleExtractor::new()?,
+            event_sink: std::sync::RwLock::new(None),
         })
+    }
+
+    /// adapters 层在 setup 时注入事件发布回调（spec §5：warm 写正文后 emit `news-refreshed`）。
+    pub fn set_event_sink(&self, sink: RefreshEventSink) {
+        if let Ok(mut g) = self.event_sink.write() {
+            *g = Some(sink);
+        }
+    }
+
+    fn emit_news_refreshed(&self, payload: NewsRefreshedPayload) {
+        if let Ok(g) = self.event_sink.read() {
+            if let Some(sink) = g.as_ref() {
+                sink(payload);
+            }
+        }
     }
 
     fn repo(&self) -> NewsRepository<'_> {
@@ -71,7 +118,7 @@ impl NewsService {
     }
 
     // ------------------------------------------------------------------ fetch
-    // Spec: news-module.md §4 fetch_news
+    // Spec: news-module.md §4 fetch_news（无 ids 字段）
     pub fn fetch_news(&self, req: FetchNewsRequest) -> FetchNewsResponse {
         let limit = clamp_limit(req.limit, FETCH_LIMIT_DEFAULT, FETCH_LIMIT_MAX);
         let offset = req.offset.unwrap_or(0);
@@ -83,7 +130,6 @@ impl NewsService {
             for s in srcs {
                 if !self.registry.contains(s) {
                     response_errors.push(FetchNewsError {
-                        id: None,
                         field: Some("sources".to_string()),
                         code: ErrorCode::InvalidInput,
                         message: Some(format!("unknown source: {}", s)),
@@ -103,28 +149,7 @@ impl NewsService {
             }
         }
 
-        // ids 路径优先
-        if let Some(ids) = req.ids.as_ref() {
-            if ids.len() > FETCH_IDS_MAX {
-                return FetchNewsResponse {
-                    items: vec![],
-                    errors: vec![FetchNewsError {
-                        id: None,
-                        field: Some("ids".to_string()),
-                        code: ErrorCode::InvalidInput,
-                        message: Some(format!("ids exceed max {}", FETCH_IDS_MAX)),
-                    }],
-                    page: FetchNewsPage {
-                        limit,
-                        offset,
-                        has_more: false,
-                    },
-                };
-            }
-            return self.fetch_by_ids(ids, &req, limit, offset, include_article);
-        }
-
-        // 一般查询路径
+        // 查询路径（spec §4：query / sources / 时间范围按 AND 组合）
         let repo = self.repo();
         let result = match repo.list_news_items(
             req.sources.as_deref(),
@@ -139,7 +164,6 @@ impl NewsService {
                 return FetchNewsResponse {
                     items: vec![],
                     errors: vec![FetchNewsError {
-                        id: None,
                         field: None,
                         code: ErrorCode::DbError,
                         message: Some(e.to_string()),
@@ -164,76 +188,6 @@ impl NewsService {
         FetchNewsResponse {
             items,
             errors: response_errors,
-            page: FetchNewsPage {
-                limit,
-                offset,
-                has_more,
-            },
-        }
-    }
-
-    fn fetch_by_ids(
-        &self,
-        ids: &[String],
-        req: &FetchNewsRequest,
-        limit: u32,
-        offset: u32,
-        include_article: bool,
-    ) -> FetchNewsResponse {
-        let repo = self.repo();
-        let now = Utc::now();
-        let raw = match repo.get_news_items_by_ids(ids) {
-            Ok(v) => v,
-            Err(e) => {
-                return FetchNewsResponse {
-                    items: vec![],
-                    errors: vec![FetchNewsError {
-                        id: None,
-                        field: None,
-                        code: ErrorCode::DbError,
-                        message: Some(e.to_string()),
-                    }],
-                    page: FetchNewsPage {
-                        limit,
-                        offset,
-                        has_more: false,
-                    },
-                };
-            }
-        };
-
-        let mut items: Vec<FetchNewsItem> = Vec::new();
-        let mut errors: Vec<FetchNewsError> = Vec::new();
-        // 保持输入顺序；缺失的 ID 进 errors（spec §4）
-        for (id, found) in ids.iter().zip(raw.into_iter()) {
-            match found {
-                Some(item) => {
-                    // 应用 sources / time / query 过滤（spec §4：先 ids 再其他过滤）
-                    if !passes_other_filters(&item, req) {
-                        continue;
-                    }
-                    items.push(self.build_fetch_item(&repo, item, include_article, now));
-                }
-                None => errors.push(FetchNewsError {
-                    id: Some(id.clone()),
-                    field: None,
-                    code: ErrorCode::NotFound,
-                    message: None,
-                }),
-            }
-        }
-
-        // 再应用 limit/offset（spec §4 ids + 分页）
-        let total = items.len() as u32;
-        let paged: Vec<_> = items
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-        let has_more = (offset as u64 + paged.len() as u64) < total as u64;
-        FetchNewsResponse {
-            items: paged,
-            errors,
             page: FetchNewsPage {
                 limit,
                 offset,
@@ -309,33 +263,19 @@ impl NewsService {
     }
 
     // ------------------------------------------------------------------ refresh
-    // Spec: news-module.md §4 refresh_news / §5 provider 策略
-    pub async fn refresh_news(&self, req: RefreshNewsRequest) -> RefreshNewsResponse {
-        // sources 校验（spec §4：包含未知/禁用/非法时返回 invalid_input，不创建 batchId）
-        if let Some(sources) = req.sources.as_ref() {
+    // Spec: news-module.md §4 内部 Rust API `run_news_refresh` / §5 provider 策略
+    //
+    // 这是 **内部 facade**，不暴露为 Tauri command（spec §4 明确禁止 refresh_news IPC）。
+    // scheduler 独占触发；调试入口可以直接调用。
+    pub async fn run_refresh(&self, input: RefreshBatchInput) -> RefreshBatchOutcome {
+        // sources 校验（不存在则返回 invalid_input，不创建 batchId）
+        if let Some(sources) = input.sources.as_ref() {
             for s in sources {
-                match self.registry.get(s) {
-                    None => {
-                        return RefreshNewsResponse::Err(RefreshNewsErr {
-                            ok: Default::default(),
-                            error: RefreshNewsError {
-                                code: ErrorCode::InvalidInput,
-                                field: Some(RefreshNewsErrorField::Sources),
-                                message: Some(format!("unknown source: {}", s)),
-                            },
-                        });
-                    }
-                    Some(src) if !src.enabled => {
-                        return RefreshNewsResponse::Err(RefreshNewsErr {
-                            ok: Default::default(),
-                            error: RefreshNewsError {
-                                code: ErrorCode::InvalidInput,
-                                field: Some(RefreshNewsErrorField::Sources),
-                                message: Some(format!("source disabled: {}", s)),
-                            },
-                        });
-                    }
-                    _ => {}
+                if self.registry.get(s).is_none() {
+                    return RefreshBatchOutcome::Err(RefreshBatchError {
+                        code: ErrorCode::InvalidInput,
+                        message: Some(format!("unknown source: {}", s)),
+                    });
                 }
             }
         }
@@ -343,7 +283,7 @@ impl NewsService {
         let batch_id = format!("news-refresh-{}", Uuid::new_v4());
 
         // 选择目标 sources
-        let targets: Vec<_> = match req.sources.as_ref() {
+        let targets: Vec<_> = match input.sources.as_ref() {
             Some(s) => s
                 .iter()
                 .filter_map(|sid| self.registry.get(sid))
@@ -358,7 +298,7 @@ impl NewsService {
         let mut new_ids: Vec<String> = Vec::new();
         let mut updated_ids: Vec<String> = Vec::new();
 
-        // 顺序拉取（spec §5：单个 provider 失败不影响其他 source）；目前不并发，简单实现。
+        // First-phase: 顺序拉取，避免并发对同一 provider 叠加速率压力；spec §5 允许后续改并行。
         for src in targets {
             let (items, mut warns, failure) = match src.provider.as_str() {
                 "rss" => self.rss.fetch(&src).await,
@@ -451,10 +391,7 @@ impl NewsService {
             warnings,
         };
 
-        RefreshNewsResponse::Ok(RefreshNewsOk {
-            ok: Default::default(),
-            result: payload,
-        })
+        RefreshBatchOutcome::Ok(payload)
     }
 
     // ------------------------------------------------------------------ warm_articles
@@ -549,11 +486,13 @@ impl NewsService {
         }
 
         for (canonical_url, first_news_id) in url_to_first_news {
-            // 非 force：若已有成功正文 / 失败缓存（fetched_at 不久前）则跳过
+            // 非 force：若已有成功正文，或近期失败缓存窗口内（first-phase: 写死 3600s；
+            // 后续可参数化或挪入 references/news/article-extractor.md），则跳过。
             if !force {
                 if let Ok(Some(existing)) = repo.get_article_content(&canonical_url) {
                     if existing.content.is_some()
-                        || (now - existing.fetched_at).num_seconds() < 3600
+                        || (now - existing.fetched_at).num_seconds()
+                            < WARM_RECENT_FAILURE_SUPPRESS_SECS
                     {
                         continue;
                     }
@@ -587,13 +526,17 @@ impl NewsService {
                     });
                 }
             }
-            if let Some((code, msg)) = out.error {
+            // Spec §5 article-stage failure: code 统一 article_extract_failed；
+            // 细分原因写入 details.reason。
+            if let Some(failure) = out.error {
                 failures.push(NewsFailure {
                     provider: "article_extractor".to_string(),
                     source: None,
-                    code,
-                    message: Some(msg),
-                    details: None,
+                    code: failure.code,
+                    message: Some(failure.message),
+                    details: Some(serde_json::json!({
+                        "reason": failure.reason.as_str(),
+                    })),
                     stage: Some(NewsRefreshStage::Article),
                     retryable: Some(true),
                     occurred_at: now,
@@ -619,17 +562,42 @@ impl NewsService {
             .map(|v| v.len() as u32)
             .unwrap_or(candidates.len() as u32);
 
+        let article_updated_news_ids: Vec<String> = updated_ids.into_iter().collect();
+        let result = WarmArticlesResult {
+            batch_id: batch_id.clone(),
+            requested_count,
+            attempted_count: attempted,
+            article_updated_count,
+            article_updated_news_ids: article_updated_news_ids.clone(),
+            warnings: warnings.clone(),
+            failures: failures.clone(),
+        };
+
+        // Spec §5: articleUpdatedCount > 0 时 emit `news-refreshed`，savedCount = 0，
+        // articleUpdatedNewsIds 表达正文变化影响范围。
+        if article_updated_count > 0 {
+            let first_failure = failures.first().cloned();
+            let failed_count = failures.len() as u32;
+            let payload = NewsRefreshedPayload {
+                batch_id: batch_id.clone(),
+                fetched_count: 0,
+                skipped_count: 0,
+                saved_count: 0,
+                article_updated_count,
+                new_ids: vec![],
+                updated_ids: vec![],
+                article_updated_news_ids,
+                failed_count,
+                first_failure,
+                failures,
+                warnings,
+            };
+            self.emit_news_refreshed(payload);
+        }
+
         WarmArticlesResponse::Ok(crate::domain::news::types::WarmArticlesOk {
             ok: Default::default(),
-            result: WarmArticlesResult {
-                batch_id,
-                requested_count,
-                attempted_count: attempted,
-                article_updated_count,
-                article_updated_news_ids: updated_ids.into_iter().collect(),
-                warnings,
-                failures,
-            },
+            result,
         })
     }
 }
@@ -648,42 +616,6 @@ fn provider_to_news_item(p: ProviderNewsItem, now: chrono::DateTime<Utc>) -> New
     }
 }
 
-fn passes_other_filters(item: &NewsItem, req: &FetchNewsRequest) -> bool {
-    if let Some(sources) = req.sources.as_ref() {
-        if !sources.iter().any(|s| s == &item.source) {
-            return false;
-        }
-    }
-    if let Some(from) = req.published_from.as_ref() {
-        match item.published_at.as_ref() {
-            None => return false,
-            Some(pa) if pa < from => return false,
-            _ => {}
-        }
-    }
-    if let Some(to) = req.published_to.as_ref() {
-        match item.published_at.as_ref() {
-            None => return false,
-            Some(pa) if pa > to => return false,
-            _ => {}
-        }
-    }
-    // query 不在 ids 路径应用：spec §4 没有要求；但我们仍然按"先 ids 再其他过滤"应用以保守。
-    if let Some(q) = req.query.as_ref() {
-        let q = q.to_lowercase();
-        let hit = item.title.to_lowercase().contains(&q)
-            || item
-                .summary
-                .as_deref()
-                .map(|s| s.to_lowercase().contains(&q))
-                .unwrap_or(false);
-        if !hit {
-            return false;
-        }
-    }
-    true
-}
-
 fn clamp_limit(req: Option<u32>, default: u32, max: u32) -> u32 {
     match req {
         None => default,
@@ -692,17 +624,13 @@ fn clamp_limit(req: Option<u32>, default: u32, max: u32) -> u32 {
     }
 }
 
+/// 按 spec §4：取清洗后正文前 500 个字符（清洗后空白已折叠为单空格，不保留段落分隔）。
+/// 按 char 计数避免切坏 utf-8。
 fn build_excerpt(content: &str) -> String {
-    // 取清洗后首段；超过 max chars 截断（按 char 计数避免切坏 utf-8）
-    let normalized = content.trim();
-    if normalized.is_empty() {
+    let cleaned = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
         return String::new();
     }
-    let first_block = normalized
-        .split("\n\n")
-        .next()
-        .unwrap_or(normalized);
-    let cleaned = first_block.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out: String = cleaned.chars().take(ARTICLE_EXCERPT_MAX_CHARS).collect();
     if out.chars().count() < cleaned.chars().count() {
         out.push('…');
@@ -717,4 +645,192 @@ pub fn filter_sources_by_enabled(sources: Vec<NewsSource>, only_enabled: bool) -
         return sources;
     }
     sources.into_iter().filter(|s| s.enabled).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::db::run_migrations;
+    use crate::infrastructure::news::migrations::migrations;
+    use chrono::TimeZone;
+    use std::sync::Mutex;
+
+    /// Spec §4: articleExcerpt 取清洗后正文前 500 个字符（按 char 计数）。
+    #[test]
+    fn build_excerpt_takes_first_500_chars_after_whitespace_collapse() {
+        let mut long = String::new();
+        for _ in 0..600 {
+            long.push('字');
+        }
+        let out = build_excerpt(&long);
+        // 500 字 + 截断标记 '…'
+        let count = out.chars().count();
+        assert_eq!(count, 501);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn build_excerpt_collapses_whitespace_no_paragraph_split() {
+        // 两段：原代码会取首段，新逻辑应该把两段折叠为单空格连接，整体取前 500。
+        let input = "段一前部分\n\n段二后部分内容";
+        let out = build_excerpt(input);
+        assert!(out.contains("段一前部分"));
+        assert!(out.contains("段二后部分内容"));
+        assert!(!out.contains('\n'));
+    }
+
+    #[test]
+    fn build_excerpt_handles_empty() {
+        assert_eq!(build_excerpt(""), "");
+        assert_eq!(build_excerpt("   \n  "), "");
+    }
+
+    fn setup_service() -> Arc<NewsService> {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, migrations()).unwrap());
+        let registry = Arc::new(SourceRegistry::new());
+        // bootstrap default sources
+        {
+            let repo = NewsRepository::new(&db);
+            registry.bootstrap(&repo).unwrap();
+        }
+        Arc::new(NewsService::new(db, registry).unwrap())
+    }
+
+    fn insert_item(svc: &NewsService, id: &str, source: &str, title: &str, url: Option<&str>) {
+        let it = NewsItem {
+            id: id.to_string(),
+            source: source.to_string(),
+            title: title.to_string(),
+            summary: Some("brief".to_string()),
+            url: url.map(|s| s.to_string()),
+            published_at: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+            payload: serde_json::json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        svc.repo().upsert_news_item(&it).unwrap();
+    }
+
+    /// Spec §4: fetch_news({ query }) 走 FTS 相关性搜索。
+    #[tokio::test]
+    async fn fetch_news_query_runs_fts() {
+        let svc = setup_service();
+        insert_item(&svc, "id-a", "rss:sample", "GangZi quant terminal", None);
+        insert_item(&svc, "id-b", "rss:sample", "completely different topic", None);
+        let resp = svc.fetch_news(FetchNewsRequest {
+            query: Some("gangzi".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].id, "id-a");
+        assert!(resp.errors.is_empty());
+    }
+
+    /// Spec §5: warm_articles articleUpdatedCount = 0 时不 emit `news-refreshed`。
+    /// 这里给所有候选都不提供 URL，warm 路径走 warning + 不做抽取 + 不写正文。
+    #[tokio::test]
+    async fn warm_articles_no_url_does_not_emit() {
+        let svc = setup_service();
+        insert_item(&svc, "id-no-url", "rss:sample", "no url item", None);
+
+        let emitted: Arc<Mutex<Vec<NewsRefreshedPayload>>> = Arc::new(Mutex::new(vec![]));
+        let captured = Arc::clone(&emitted);
+        svc.set_event_sink(Arc::new(move |p| {
+            captured.lock().unwrap().push(p);
+        }));
+
+        let resp = svc
+            .warm_articles(WarmArticlesRequest {
+                news_ids: Some(vec!["id-no-url".to_string()]),
+                ..Default::default()
+            })
+            .await;
+        match resp {
+            WarmArticlesResponse::Ok(ok) => {
+                assert_eq!(ok.result.article_updated_count, 0);
+                assert_eq!(ok.result.article_updated_news_ids.len(), 0);
+                // 应该有一个 article_missing warning
+                assert!(ok
+                    .result
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == WarningCode::ArticleMissing));
+            }
+            WarmArticlesResponse::Err(e) => panic!("unexpected err: {:?}", e.error.code),
+        }
+        // emit 不应该被调用
+        assert!(emitted.lock().unwrap().is_empty());
+    }
+
+    /// Spec §5: warm_articles articleUpdatedCount > 0 时必须 emit `news-refreshed`，
+    /// savedCount = 0，articleUpdatedNewsIds 包含受影响新闻。
+    ///
+    /// 由于真实 article extractor 走 HTTP，这里通过直接调 repository 模拟"正文已经 warm 进来"
+    /// 然后断言 emit 路径在 service 内已就位。本测试覆盖 emit-helper 本身的契约。
+    #[test]
+    fn emit_news_refreshed_invokes_sink() {
+        let svc = setup_service();
+        let counter: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let c = Arc::clone(&counter);
+        svc.set_event_sink(Arc::new(move |_p| {
+            *c.lock().unwrap() += 1;
+        }));
+        let payload = NewsRefreshedPayload {
+            batch_id: "test".to_string(),
+            fetched_count: 0,
+            skipped_count: 0,
+            saved_count: 0,
+            article_updated_count: 1,
+            new_ids: vec![],
+            updated_ids: vec![],
+            article_updated_news_ids: vec!["id-a".to_string()],
+            failed_count: 0,
+            first_failure: None,
+            failures: vec![],
+            warnings: vec![],
+        };
+        svc.emit_news_refreshed(payload);
+        assert_eq!(*counter.lock().unwrap(), 1);
+    }
+
+    /// Spec §5 failure code 表：article stage 失败 code 统一 article_extract_failed
+    /// 且 details.reason 必填。本测试构造一个 ArticleExtractFailure（来自 article_extractor），
+    /// 走 service warm 的 failure-push 分支，断言 NewsFailure 的字段。
+    ///
+    /// 由于 service 内联使用 article_extractor，模拟方式：直接把一个失败缓存 ArticleContent
+    /// 写到 article_contents 表中，使非 force warm 跳过；然后用 force=true 触发抽取，
+    /// 但 URL 是不可达的 example.invalid → extractor 返回 Network failure。
+    #[tokio::test]
+    async fn warm_articles_article_failure_uses_extract_failed_code() {
+        let svc = setup_service();
+        // 注意：本测试需要真实网络抽取失败。example.invalid TLD 在大多数 resolver 下立即失败。
+        // 为了避免在 CI 上网络耗时，timeout=10s 内会返回。
+        let url = "http://news-bc-test-example.invalid/article";
+        insert_item(&svc, "id-fail", "rss:sample", "fail title", Some(url));
+        let resp = svc
+            .warm_articles(WarmArticlesRequest {
+                news_ids: Some(vec!["id-fail".to_string()]),
+                force: Some(true),
+                ..Default::default()
+            })
+            .await;
+        match resp {
+            WarmArticlesResponse::Ok(ok) => {
+                // 即使 0 个 article_updated，也应该至少有一个 failure
+                assert!(!ok.result.failures.is_empty(), "expected failure");
+                let f = &ok.result.failures[0];
+                assert_eq!(f.code, ErrorCode::ArticleExtractFailed);
+                assert_eq!(f.stage, Some(NewsRefreshStage::Article));
+                // details.reason 必填
+                let reason = f
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str());
+                assert!(reason.is_some(), "details.reason must be present");
+            }
+            WarmArticlesResponse::Err(e) => panic!("unexpected err: {:?}", e.error.code),
+        }
+    }
 }

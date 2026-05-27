@@ -65,10 +65,12 @@ pub fn compute_stable_id(input: &IdInput<'_>) -> Option<String> {
         .summary
         .map(|s| normalize_text(s))
         .unwrap_or_default();
-    // 按 UTC 秒级精度
+    // Spec §2：参与 fingerprint 时按 UTC 秒级精度；但多数 provider 时间精度不稳定
+    // （秒级波动会让同一条新闻每次 refresh 生成新 ID），第一阶段保守地降到分钟级。
+    // adapter 可以在传入前自行 truncate，这里再 truncate 一次保证 idempotency。
     let published_norm = input
         .published_at
-        .map(|t| t.timestamp().to_string())
+        .map(|t| (t.timestamp() / 60 * 60).to_string())
         .unwrap_or_default();
 
     let buf = format!("{}\u{1f}{}\u{1f}{}", title_norm, published_norm, summary_norm);

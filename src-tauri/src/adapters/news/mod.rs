@@ -5,5 +5,5 @@
 pub mod cmd;
 pub mod events;
 
-pub use cmd::{fetch_news, list_news_sources, refresh_news, warm_articles};
+pub use cmd::{fetch_news, list_news_sources, warm_articles};
 pub use events::NEWS_REFRESHED_EVENT;

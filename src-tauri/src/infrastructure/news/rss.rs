@@ -7,9 +7,9 @@
 //! - retry 1 次
 //! - max items per feed 100
 //!
-//! 失败映射：
+//! 失败映射（spec §5 failure code 表）：
 //! - 网络失败 → `NewsFailure(provider="rss", code="provider_unavailable", stage="fetch")`
-//! - 解析失败 → `NewsFailure(provider="rss", code="invalid_input", stage="normalize")`
+//! - 解析失败 → `NewsFailure(provider="rss", code="parse_error", stage="normalize")`
 //! - 单条 item 缺 title 或 ID → skip + warning（不阻塞）
 
 use crate::domain::news::canonical_url::canonicalize_url;
@@ -129,13 +129,14 @@ impl RssProvider {
         let feed = match feed_parser::parse(&body[..]) {
             Ok(f) => f,
             Err(e) => {
+                // Spec §5: normalize 阶段失败 → parse_error
                 return (
                     vec![],
                     vec![],
                     Some(NewsFailure {
                         provider: "rss".to_string(),
                         source: Some(source.source_id.clone()),
-                        code: ErrorCode::InvalidInput,
+                        code: ErrorCode::ParseError,
                         message: Some(e.to_string()),
                         details: None,
                         stage: Some(NewsRefreshStage::Normalize),
