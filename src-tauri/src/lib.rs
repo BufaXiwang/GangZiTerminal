@@ -15,14 +15,26 @@ use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tauri_specta::{collect_commands, Builder};
 
+use crate::adapters::account::events::{
+    wrap_account_triggered, wrap_account_updated, ACCOUNT_TRIGGERED_EVENT, ACCOUNT_UPDATED_EVENT,
+};
 use crate::adapters::news::events::{wrap_news_refreshed, NEWS_REFRESHED_EVENT};
 use crate::adapters::quotes::events::{wrap_market_quotes_refreshed, MARKET_QUOTES_REFRESHED_EVENT};
+use crate::domain::shared::Money;
+use crate::infrastructure::account::migrations as account_migrations;
 use crate::infrastructure::agent::{
     bootstrap as bootstrap_agent_infra, migrations as agent_migrations,
 };
 use crate::infrastructure::db::{run_migrations, AppDb};
 use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
 use crate::infrastructure::quotes::{migrations as quotes_migrations, QuotesConfig};
+use crate::pipeline::account::scheduler::{
+    spawn_account_eval_scheduler, AccountSchedulerHandle, ACCOUNT_EVAL_BATCH_SIZE,
+    ACCOUNT_EVAL_INTERVAL_SECS,
+};
+use crate::pipeline::account::{
+    AccountQuoteGateway, AccountService, AccountServiceConfig, QuotesFacadeGateway,
+};
 use crate::pipeline::news::scheduler::{
     spawn_news_refresh_scheduler, NewsSchedulerHandle, NEWS_REFRESH_INTERVAL_SECS,
 };
@@ -32,6 +44,7 @@ use crate::pipeline::quotes::scheduler::{
     QUOTES_REFRESH_INTERVAL_SECS, QUOTES_SUBSCRIBED_INTERVAL_SECS,
 };
 use crate::pipeline::quotes::service::QuotesService;
+use rust_decimal::Decimal;
 
 /// Tauri 主入口。`main.rs` 调用 `gangzi_terminal::run()` 启动 app。
 pub fn run() {
@@ -46,6 +59,11 @@ pub fn run() {
         adapters::quotes::cmd::fetch_data,
         adapters::quotes::cmd::scan_market,
         adapters::agent::cmd::agent_list_skills,
+        adapters::account::cmd::fetch_account,
+        adapters::account::cmd::operate_account,
+        adapters::account::cmd::update_watchlist,
+        adapters::account::cmd::mark_trigger_handled,
+        adapters::account::cmd::rebuild_account_snapshot,
     ]);
 
     #[cfg(debug_assertions)]
@@ -70,6 +88,7 @@ pub fn run() {
                 all.extend(news_migrations());
                 all.extend(quotes_migrations());
                 all.extend(agent_migrations());
+                all.extend(account_migrations());
                 run_migrations(conn, all).expect("failed to apply migrations");
             });
 
@@ -165,6 +184,63 @@ pub fn run() {
             // Quotes / News / Account facade skill，并新增 run_agent / send_user_message command。
             let agent_infra = bootstrap_agent_infra(db.clone());
             app.manage(agent_infra);
+
+            // -- Account BC bootstrap（Phase 2）
+            // Spec: docs/design/account-module.md §3 数据流 + §5 调度期望
+            // Account 通过 Quotes facade 读 snapshot（fail-closed on stale / missing for 即时成交）；
+            // 行情 cache 通过 QuotesFacadeGateway 直接复用 quotes_service.cache()。
+            let account_gateway: std::sync::Arc<dyn AccountQuoteGateway> =
+                std::sync::Arc::new(QuotesFacadeGateway::new(
+                    db.clone(),
+                    std::sync::Arc::clone(quotes_service.cache()),
+                ));
+            let account_service = Arc::new(AccountService::new(
+                db.clone(),
+                account_gateway,
+                AccountServiceConfig {
+                    initial_cash: Money(Decimal::from(1_000_000)),
+                    ..AccountServiceConfig::default()
+                },
+            ));
+            // 初始化账户（幂等）
+            if let Err(code) = account_service
+                .initialize_account_if_needed(Money(Decimal::from(1_000_000)))
+            {
+                tracing::error!(
+                    target: "account.bootstrap",
+                    error = ?code,
+                    "failed to initialize account"
+                );
+            }
+
+            // Account event sinks
+            let app_handle_a = app.handle().clone();
+            let updated_sink: crate::pipeline::account::service::AccountUpdatedSink =
+                Arc::new(move |inner| {
+                    let env = wrap_account_updated(inner, None);
+                    if let Err(e) = app_handle_a.emit(ACCOUNT_UPDATED_EVENT, env) {
+                        tracing::warn!(target: "account.emit", error = %e, "failed to emit account-updated");
+                    }
+                });
+            account_service.set_updated_sink(updated_sink);
+            let app_handle_b = app.handle().clone();
+            let triggered_sink: crate::pipeline::account::service::AccountTriggeredSink =
+                Arc::new(move |inner| {
+                    let env = wrap_account_triggered(inner, None);
+                    if let Err(e) = app_handle_b.emit(ACCOUNT_TRIGGERED_EVENT, env) {
+                        tracing::warn!(target: "account.emit", error = %e, "failed to emit account-triggered");
+                    }
+                });
+            account_service.set_triggered_sink(triggered_sink);
+            app.manage(Arc::clone(&account_service));
+
+            // Account eval scheduler
+            let account_handle: AccountSchedulerHandle = spawn_account_eval_scheduler(
+                Arc::clone(&account_service),
+                std::time::Duration::from_secs(ACCOUNT_EVAL_INTERVAL_SECS),
+                ACCOUNT_EVAL_BATCH_SIZE,
+            );
+            app.manage(account_handle);
 
             // -- Quotes Scheduler（multi-tick）
             let quotes_handle: QuotesSchedulerHandle = spawn_full_scheduler(
