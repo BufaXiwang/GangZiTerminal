@@ -17,6 +17,9 @@ use tauri_specta::{collect_commands, Builder};
 
 use crate::adapters::news::events::{wrap_news_refreshed, NEWS_REFRESHED_EVENT};
 use crate::adapters::quotes::events::{wrap_market_quotes_refreshed, MARKET_QUOTES_REFRESHED_EVENT};
+use crate::infrastructure::agent::{
+    bootstrap as bootstrap_agent_infra, migrations as agent_migrations,
+};
 use crate::infrastructure::db::{run_migrations, AppDb};
 use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
 use crate::infrastructure::quotes::{migrations as quotes_migrations, QuotesConfig};
@@ -42,6 +45,7 @@ pub fn run() {
         adapters::quotes::cmd::list_market,
         adapters::quotes::cmd::fetch_data,
         adapters::quotes::cmd::scan_market,
+        adapters::agent::cmd::agent_list_tools,
     ]);
 
     #[cfg(debug_assertions)]
@@ -65,6 +69,7 @@ pub fn run() {
                 let mut all = Vec::new();
                 all.extend(news_migrations());
                 all.extend(quotes_migrations());
+                all.extend(agent_migrations());
                 run_migrations(conn, all).expect("failed to apply migrations");
             });
 
@@ -153,6 +158,13 @@ pub fn run() {
                     }
                 });
             }
+
+            // -- Agent Infra bootstrap（Phase 1）
+            // Spec: docs/design/agent-infra-module.md §5（ToolRegistry / 持久化）。
+            // Runtime（Phase 3）会通过 `AgentInfra.registry.register_tool(...)` 注入
+            // Quotes / News / Account facade 工具，并新增 run_agent / send_user_message command。
+            let agent_infra = bootstrap_agent_infra(db.clone());
+            app.manage(agent_infra);
 
             // -- Quotes Scheduler（multi-tick）
             let quotes_handle: QuotesSchedulerHandle = spawn_full_scheduler(
