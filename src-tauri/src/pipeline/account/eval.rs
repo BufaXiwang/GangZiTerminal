@@ -447,6 +447,12 @@ fn commit_limit_fill(
         (OrderSide::Buy, None, _) => format!("pos_{}", Uuid::new_v4().simple()),
         (OrderSide::Sell, None, _) => return None,
     };
+    // Lookup instrument name for new position (spec §2 Position.name 来自标的元信息).
+    let instrument_name = crate::pipeline::quotes::facade::get_instrument(&deps.db, &order.ts_code)
+        .ok()
+        .flatten()
+        .map(|i| i.name)
+        .unwrap_or_else(|| order.ts_code.as_str().to_string());
     let trade_amount = exec_price.0 * Decimal::from(exec_quantity.0);
     let cash_delta = match order.side {
         OrderSide::Buy => -trade_amount - commission.0 - transfer_fee.0,
@@ -464,6 +470,7 @@ fn commit_limit_fill(
         transfer_fee,
         now,
         position_id.clone(),
+        instrument_name,
     );
 
     let mut updated_order = order.clone();
@@ -687,6 +694,7 @@ fn derive_position_after_fill(
     transfer_fee: Money,
     now: OccurredAt,
     position_id: String,
+    instrument_name: String,
 ) -> (AccountEventType, Position) {
     match (side, existing) {
         (OrderSide::Buy, None) => {
@@ -703,7 +711,7 @@ fn derive_position_after_fill(
                 Position {
                     position_id,
                     ts_code: ts_code.clone(),
-                    name: ts_code.as_str().into(),
+                    name: instrument_name,
                     status: PositionStatus::Open,
                     quantity,
                     sellable_quantity: Shares(0),
@@ -766,7 +774,7 @@ fn derive_position_after_fill(
                 Position {
                     position_id,
                     ts_code: ts_code.clone(),
-                    name: ts_code.as_str().into(),
+                    name: instrument_name,
                     status: PositionStatus::Closed,
                     quantity: Shares(0),
                     sellable_quantity: Shares(0),
