@@ -7,7 +7,7 @@
 use crate::domain::quotes::{QuoteSource, StockQuote, TradeStatus};
 use crate::domain::shared::{
     Amount, Freshness, FreshnessStatus, InstrumentCategory, Market, OccurredAt, Price, TradeDate,
-    TsCode, Volume, WarningCode,
+    TsCode, Volume,
 };
 use chrono::{NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Asia::Shanghai;
@@ -144,20 +144,21 @@ impl SinaProvider {
             source: QuoteSource::Sina,
             captured_at: now,
             exchange_time,
+            // provider 只填 source / capturedAt；warning 由 query facade 派生（spec §5）。
             freshness: Freshness {
                 status: FreshnessStatus::Fresh,
                 captured_at: Some(now),
                 exchange_time,
                 age_ms: Some(0),
                 source: Some("sina".to_string()),
-                warning: Some(WarningCode::DepthMissing),
+                warning: None,
             },
-            warnings: vec![WarningCode::DepthMissing],
+            warnings: Vec::new(),
         })
     }
 }
 
-fn sina_id(ts_code: &TsCode) -> String {
+pub(crate) fn sina_id(ts_code: &TsCode) -> String {
     let prefix = match ts_code.market() {
         Market::SH => "sh",
         Market::SZ => "sz",
@@ -165,4 +166,31 @@ fn sina_id(ts_code: &TsCode) -> String {
         Market::BJ => "bj",
     };
     format!("{}{}", prefix, &ts_code.as_str()[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use encoding_rs::GBK;
+
+    #[test]
+    fn sina_id_sh_prefix() {
+        let c = TsCode::parse("600519.SH").unwrap();
+        assert_eq!(sina_id(&c), "sh600519");
+    }
+
+    #[test]
+    fn sina_id_sz_prefix() {
+        let c = TsCode::parse("000001.SZ").unwrap();
+        assert_eq!(sina_id(&c), "sz000001");
+    }
+
+    #[test]
+    fn sina_gbk_roundtrips_chinese_name() {
+        // 模拟 Sina 返回 GBK 编码：先编码"贵州茅台"，再用 GBK.decode 解码。
+        let original = "贵州茅台";
+        let (encoded, _, _) = GBK.encode(original);
+        let (decoded, _, _) = GBK.decode(&encoded);
+        assert_eq!(decoded, original);
+    }
 }

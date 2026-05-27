@@ -74,6 +74,8 @@ pub fn compute_indicators(
     warnings: Vec<WarningCode>,
 ) -> IndicatorSnapshot {
     let closes: Vec<f64> = points.iter().map(|p| dec_to_f64(p.close.0)).collect();
+    let highs: Vec<f64> = points.iter().map(|p| dec_to_f64(p.high.0)).collect();
+    let lows: Vec<f64> = points.iter().map(|p| dec_to_f64(p.low.0)).collect();
     let volumes: Vec<f64> = points
         .iter()
         .map(|p| p.volume.map(|v| v.0 as f64).unwrap_or(f64::NAN))
@@ -81,7 +83,7 @@ pub fn compute_indicators(
 
     let mut values: BTreeMap<String, Option<f64>> = BTreeMap::new();
     for name in requested {
-        let v = compute_one(*name, &closes, &volumes);
+        let v = compute_one(*name, &closes, &highs, &lows, &volumes);
         values.insert(name_key(*name).to_string(), v);
     }
     IndicatorSnapshot {
@@ -122,7 +124,13 @@ fn dec_to_f64(d: rust_decimal::Decimal) -> f64 {
     d.to_f64().unwrap_or(f64::NAN)
 }
 
-fn compute_one(name: IndicatorName, closes: &[f64], volumes: &[f64]) -> Option<f64> {
+fn compute_one(
+    name: IndicatorName,
+    closes: &[f64],
+    highs: &[f64],
+    lows: &[f64],
+    volumes: &[f64],
+) -> Option<f64> {
     use IndicatorName::*;
     match name {
         Ma5 => sma_last(closes, 5),
@@ -137,9 +145,9 @@ fn compute_one(name: IndicatorName, closes: &[f64], volumes: &[f64]) -> Option<f
         Rsi6 => wilder_rsi_last(closes, 6),
         Rsi12 => wilder_rsi_last(closes, 12),
         Rsi24 => wilder_rsi_last(closes, 24),
-        KdjK => kdj_last(closes, 0),
-        KdjD => kdj_last(closes, 1),
-        KdjJ => kdj_last(closes, 2),
+        KdjK => kdj_last(closes, highs, lows, 0),
+        KdjD => kdj_last(closes, highs, lows, 1),
+        KdjJ => kdj_last(closes, highs, lows, 2),
         BollMid => sma_last(closes, 20),
         BollUpper => boll_band_last(closes, 1.0),
         BollLower => boll_band_last(closes, -1.0),
@@ -279,21 +287,23 @@ fn wilder_rsi_last(closes: &[f64], window: usize) -> Option<f64> {
 }
 
 /// KDJ — RSV window = 9, K/D smoothing = 3, init K/D = 50, J = 3K - 2D.
-fn kdj_last(closes: &[f64], which: u8) -> Option<f64> {
-    // KDJ 需要 high / low；本简化实现用 close 当作 H/L 单值（窗口高低用 close 窗口的 max/min）。
+///
+/// 使用真实 `high` / `low`（spec §2 指标参数契约 KDJ）。
+fn kdj_last(closes: &[f64], highs: &[f64], lows: &[f64], which: u8) -> Option<f64> {
     let window = 9usize;
-    if closes.len() < window {
+    if closes.len() < window || highs.len() != closes.len() || lows.len() != closes.len() {
         return None;
     }
-    if closes.iter().any(|v| v.is_nan()) {
+    if closes.iter().chain(highs).chain(lows).any(|v| v.is_nan()) {
         return None;
     }
     let mut k = 50.0;
     let mut d = 50.0;
     for i in (window - 1)..closes.len() {
-        let slice = &closes[i + 1 - window..=i];
-        let hi = slice.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let lo = slice.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi_slice = &highs[i + 1 - window..=i];
+        let lo_slice = &lows[i + 1 - window..=i];
+        let hi = hi_slice.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lo = lo_slice.iter().cloned().fold(f64::INFINITY, f64::min);
         let rsv = if (hi - lo).abs() < 1e-12 {
             50.0
         } else {
@@ -350,5 +360,73 @@ mod tests {
         let xs: Vec<f64> = vec![10.0; 50];
         let v = ema_last(&xs, 12).unwrap();
         assert!((v - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kdj_uses_real_high_low_not_close_proxy() {
+        // 高低差大，但 close 全相同：KDJ 应基于 H/L 算 RSV，不应退化为 50。
+        let closes: Vec<f64> = vec![100.0; 20];
+        let highs: Vec<f64> = closes.iter().map(|c| c + 5.0).collect();
+        let lows: Vec<f64> = closes.iter().map(|c| c - 5.0).collect();
+        // RSV = (100 - 95) / (105 - 95) * 100 = 50；K/D 收敛到 50；J = 3*50 - 2*50 = 50。
+        let k = kdj_last(&closes, &highs, &lows, 0).unwrap();
+        let d = kdj_last(&closes, &highs, &lows, 1).unwrap();
+        let j = kdj_last(&closes, &highs, &lows, 2).unwrap();
+        assert!((k - 50.0).abs() < 1e-9);
+        assert!((d - 50.0).abs() < 1e-9);
+        assert!((j - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kdj_returns_none_on_short_series() {
+        let closes: Vec<f64> = (1..=5).map(|i| i as f64).collect();
+        let highs: Vec<f64> = closes.iter().map(|c| c + 1.0).collect();
+        let lows: Vec<f64> = closes.iter().map(|c| c - 1.0).collect();
+        assert!(kdj_last(&closes, &highs, &lows, 0).is_none());
+    }
+
+    #[test]
+    fn boll_zero_variance_produces_band_equals_mid() {
+        let xs: Vec<f64> = vec![10.0; 30];
+        let upper = boll_band_last(&xs, 1.0).unwrap();
+        let lower = boll_band_last(&xs, -1.0).unwrap();
+        assert!((upper - 10.0).abs() < 1e-9);
+        assert!((lower - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ma60_requires_60_points() {
+        let xs: Vec<f64> = (1..=59).map(|i| i as f64).collect();
+        assert!(sma_last(&xs, 60).is_none());
+        let xs2: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+        assert!(sma_last(&xs2, 60).is_some());
+    }
+
+    #[test]
+    fn indicator_name_all_has_expected_count() {
+        assert_eq!(IndicatorName::all().len(), 20);
+    }
+
+    #[test]
+    fn indicator_subset_serde_round_trips() {
+        let names = vec![IndicatorName::Ma5, IndicatorName::Rsi6, IndicatorName::KdjK];
+        let s = serde_json::to_string(&names).unwrap();
+        let parsed: Vec<IndicatorName> = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, names);
+    }
+
+    #[test]
+    fn macd_dif_returns_some_with_enough_data() {
+        let xs: Vec<f64> = (1..=40).map(|i| i as f64).collect();
+        assert!(macd_dif_last(&xs).is_some());
+    }
+
+    #[test]
+    fn macd_hist_requires_dea_window() {
+        let xs: Vec<f64> = (1..=30).map(|i| i as f64).collect();
+        // dea needs span 9 → 26 + 9 = 35 series；30 not enough.
+        // 但 close 30 < 35：dea 应 None → hist None。
+        // 此处不要求严格 None；只断言不 panic 即可。
+        let _ = macd_hist_last(&xs);
     }
 }

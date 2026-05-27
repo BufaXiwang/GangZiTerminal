@@ -10,6 +10,8 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+use super::types::TsCode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningCode {
@@ -60,6 +62,49 @@ pub enum ErrorCode {
     ProviderContextTooLong,
 }
 
+/// Response 级 / item 级错误条目。
+///
+/// Spec: docs/design/quotes-module.md §4 `ResponseError`；shared-types.md §5。
+/// 跨 BC 复用（News / Account / Quotes 都可以返回）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseError {
+    pub code: ErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts_code: Option<TsCode>,
+}
+
+impl ResponseError {
+    pub fn new(code: ErrorCode) -> Self {
+        Self {
+            code,
+            message: None,
+            field: None,
+            ts_code: None,
+        }
+    }
+    pub fn with_message(code: ErrorCode, msg: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: Some(msg.into()),
+            field: None,
+            ts_code: None,
+        }
+    }
+    pub fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+    pub fn with_ts_code(mut self, ts_code: TsCode) -> Self {
+        self.ts_code = Some(ts_code);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +122,21 @@ mod tests {
             serde_json::to_string(&c).unwrap(),
             "\"insufficient_sellable_quantity\""
         );
+    }
+
+    #[test]
+    fn response_error_constructor_attaches_field() {
+        let err = ResponseError::with_message(ErrorCode::InvalidInput, "bad")
+            .with_field("tsCodes");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(err.field.as_deref(), Some("tsCodes"));
+        assert_eq!(err.message.as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn response_error_with_ts_code_round_trips() {
+        let c = TsCode::parse("600519.SH").unwrap();
+        let err = ResponseError::new(ErrorCode::NotFound).with_ts_code(c.clone());
+        assert_eq!(err.ts_code, Some(c));
     }
 }

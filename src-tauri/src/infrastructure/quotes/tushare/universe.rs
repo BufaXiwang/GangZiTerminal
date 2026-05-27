@@ -55,7 +55,12 @@ impl TushareClient {
         Ok(out)
     }
 
-    /// 指数 universe。市场可指定 SSE/SZSE/CSI，分页可空。
+    /// 标准市场列表（SSE / SZSE / BSE）。spec §2 universe 必须覆盖 SH / SZ / BJ。
+    pub fn standard_index_markets() -> &'static [&'static str] {
+        &["SSE", "SZSE", "BSE"]
+    }
+
+    /// 指数 universe。市场可指定 SSE/SZSE/BSE/CSI，分页可空。
     pub async fn fetch_index_basic(
         &self,
         market_param: &str,
@@ -148,5 +153,20 @@ impl TushareClient {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_index_markets_covers_sh_sz_bj() {
+        let v = TushareClient::standard_index_markets();
+        assert_eq!(v.len(), 3);
+        assert!(v.contains(&"SSE"));
+        assert!(v.contains(&"SZSE"));
+        // BSE = 北交所（spec §2 universe 必须覆盖 BJ）
+        assert!(v.contains(&"BSE"));
     }
 }

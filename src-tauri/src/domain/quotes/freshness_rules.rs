@@ -218,4 +218,35 @@ mod tests {
         assert_eq!(f.status, FreshnessStatus::Missing);
         assert_eq!(eligibility, Some(WarningCode::SnapshotExpired));
     }
+
+    #[test]
+    fn intraday_wrong_trade_date_returns_quote_missing() {
+        let now = sh(2026, 5, 26, 10, 0); // 交易时段
+        let ctx = crate::domain::shared::resolve_market_time(now);
+        let td = TradeDate::parse("20260525").unwrap(); // 老 quote
+        let captured = sh(2026, 5, 25, 15, 5);
+        let (f, eligibility) = derive_freshness(&ctx, FreshnessIntent::Detail, td, captured, "tdx");
+        assert_eq!(f.status, FreshnessStatus::Missing);
+        assert_eq!(eligibility, Some(WarningCode::QuoteMissing));
+    }
+
+    #[test]
+    fn freshness_intent_threshold_default_values() {
+        assert_eq!(FreshnessIntent::Detail.stale_threshold_secs(), 30);
+        assert_eq!(FreshnessIntent::Universe.stale_threshold_secs(), 90);
+    }
+
+    #[test]
+    fn universe_intent_uses_90s_threshold() {
+        let now = sh(2026, 5, 26, 10, 0);
+        let ctx = crate::domain::shared::resolve_market_time(now);
+        let td = TradeDate::parse("20260526").unwrap();
+        // 60s ago — 90s threshold → 仍 Fresh
+        let captured = sh_secs(2026, 5, 26, 9, 59, 0);
+        let (f, _) = derive_freshness(&ctx, FreshnessIntent::Universe, td, captured, "tdx");
+        assert_eq!(f.status, FreshnessStatus::Fresh);
+        // 同样 60s ago — Detail 30s threshold → Stale
+        let (f2, _) = derive_freshness(&ctx, FreshnessIntent::Detail, td, captured, "tdx");
+        assert_eq!(f2.status, FreshnessStatus::Stale);
+    }
 }

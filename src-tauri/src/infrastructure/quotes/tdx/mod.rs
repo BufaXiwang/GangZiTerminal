@@ -33,7 +33,10 @@ pub mod client;
 pub mod error;
 pub mod helper;
 pub mod hosts;
+pub mod manager;
 pub mod types;
+
+pub use manager::{TdxConnectionManager, TdxManagerError};
 
 pub use client::TdxHqClient;
 pub use error::{Error, Result};

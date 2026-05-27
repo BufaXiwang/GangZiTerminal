@@ -6,7 +6,8 @@
 //! 失败返回 `EmError`；调用方按 spec 把它翻译成 `provider_partial_failure` / item warning。
 
 use crate::domain::quotes::{
-    KlinePoint, MinuteKlinePeriod, MinuteKlinePoint, QuoteSource, StockQuote, TradeStatus,
+    KlinePoint, MinuteKlinePeriod, MinuteKlinePoint, QuoteDepthLevel, QuoteSource, StockQuote,
+    TradeStatus,
 };
 use crate::domain::shared::{
     Amount, Freshness, FreshnessStatus, InstrumentCategory, OccurredAt, Price, TimestampMs,
@@ -61,8 +62,23 @@ impl EastmoneyProvider {
         now: OccurredAt,
     ) -> Result<StockQuote, EmError> {
         let secid = secid_of(ts_code);
+        // f43-f86 quote 基础；f19/f31/f33/f35/f37/f39 是 bid5..bid1 价；
+        // f20/f32/f34/f36/f38 是 bid5..bid1 量；
+        // f47 已包含成交量；
+        // f31-f42（含奇偶 price/vol）是买盘；
+        // ask 价（f47 是当日成交量；ask 价为 f47..f47 误）-- 正确字段：
+        // ask: f47(成交量)？非；EM push2 fields：
+        //   f31 bid5 price, f32 bid5 vol, f33 bid4, f34 bid4vol, f35 bid3, f36 bid3vol,
+        //   f37 bid2, f38 bid2vol, f39 bid1, f40 bid1vol,
+        //   f47/f48 是 量/额（已用），  ask 在 f41/f42(ask5)、f43... 但 f43=最新价 与文档冲突
+        // mootdx / 实际生产代码：
+        //   bid: f19(b5p),f20(b5v),f17(b4p),f18(b4v),f15(b3p),f16(b3v),f13(b2p),f14(b2v),f11(b1p),f12(b1v)
+        //   ask: f21(a1p),f22(a1v),f23(a2p),f24(a2v),f25(a3p),f26(a3v),f27(a4p),f28(a4v),f29(a5p),f30(a5v)
+        // 价格 * 100 同 f43 / f60。
         let url = format!(
-            "https://push2.eastmoney.com/api/qt/stock/get?secid={}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170,f19,f31,f32,f33,f34,f35,f36,f37,f38,f39,f40,f41,f42,f49,f50,f86,f292",
+            "https://push2.eastmoney.com/api/qt/stock/get?secid={}&fields=f43,f44,f45,f46,f47,f48,f57,f58,f60,f168,f169,f170,f86,f292,\
+             f11,f12,f13,f14,f15,f16,f17,f18,f19,f20,\
+             f21,f22,f23,f24,f25,f26,f27,f28,f29,f30",
             secid
         );
         #[derive(Deserialize)]
@@ -72,32 +88,31 @@ impl EastmoneyProvider {
         #[derive(Deserialize)]
         #[allow(dead_code)]
         struct RespData {
-            #[serde(default)]
-            f43: Option<f64>, // 最新价 * 100
-            #[serde(default)]
-            f44: Option<f64>, // 最高
-            #[serde(default)]
-            f45: Option<f64>, // 最低
-            #[serde(default)]
-            f46: Option<f64>, // 今开
-            #[serde(default)]
-            f47: Option<f64>, // 成交量（手）
-            #[serde(default)]
-            f48: Option<f64>, // 成交额
-            #[serde(default)]
-            f60: Option<f64>, // 昨收 * 100
-            #[serde(default)]
-            f57: Option<String>, // code
-            #[serde(default)]
-            f58: Option<String>, // name
-            #[serde(default)]
-            f169: Option<f64>, // 涨跌额 * 100
-            #[serde(default)]
-            f170: Option<f64>, // 涨跌幅 * 100
-            #[serde(default)]
-            f86: Option<i64>, // exchange time (epoch)
-            #[serde(default)]
-            f168: Option<f64>, // 换手率
+            #[serde(default)] f43: Option<f64>, // 最新价 * 100
+            #[serde(default)] f44: Option<f64>, // 最高
+            #[serde(default)] f45: Option<f64>, // 最低
+            #[serde(default)] f46: Option<f64>, // 今开
+            #[serde(default)] f47: Option<f64>, // 成交量（手）
+            #[serde(default)] f48: Option<f64>, // 成交额
+            #[serde(default)] f60: Option<f64>, // 昨收 * 100
+            #[serde(default)] f57: Option<String>, // code
+            #[serde(default)] f58: Option<String>, // name
+            #[serde(default)] f169: Option<f64>, // 涨跌额 * 100
+            #[serde(default)] f170: Option<f64>, // 涨跌幅 * 100
+            #[serde(default)] f86: Option<i64>, // exchange time (epoch)
+            #[serde(default)] f168: Option<f64>, // 换手率
+            // 买盘 5 档（价 * 100；量是手）
+            #[serde(default)] f11: Option<f64>, #[serde(default)] f12: Option<f64>, // b1 price, b1 vol
+            #[serde(default)] f13: Option<f64>, #[serde(default)] f14: Option<f64>, // b2
+            #[serde(default)] f15: Option<f64>, #[serde(default)] f16: Option<f64>, // b3
+            #[serde(default)] f17: Option<f64>, #[serde(default)] f18: Option<f64>, // b4
+            #[serde(default)] f19: Option<f64>, #[serde(default)] f20: Option<f64>, // b5
+            // 卖盘 5 档
+            #[serde(default)] f21: Option<f64>, #[serde(default)] f22: Option<f64>, // a1
+            #[serde(default)] f23: Option<f64>, #[serde(default)] f24: Option<f64>, // a2
+            #[serde(default)] f25: Option<f64>, #[serde(default)] f26: Option<f64>, // a3
+            #[serde(default)] f27: Option<f64>, #[serde(default)] f28: Option<f64>, // a4
+            #[serde(default)] f29: Option<f64>, #[serde(default)] f30: Option<f64>, // a5
         }
         let req = self.client.get(&url).timeout(QUOTE_TIMEOUT);
         let resp: Resp = req
@@ -128,6 +143,30 @@ impl EastmoneyProvider {
             .filter(|t| *t > 0)
             .and_then(|t| Utc.timestamp_opt(t, 0).single());
 
+        // 五档盘口：EM 价格 ÷100；量 ×100（手 → 股）。bid[0]=买一最接近成交，ask[0]=卖一。
+        let level = |price_raw: Option<f64>, vol_raw: Option<f64>| -> QuoteDepthLevel {
+            QuoteDepthLevel {
+                price: price_raw.and_then(em_div100),
+                volume: vol_raw
+                    .filter(|v| *v > 0.0)
+                    .map(|v| Volume((v * 100.0) as i64)),
+            }
+        };
+        let bid = vec![
+            level(d.f11, d.f12),
+            level(d.f13, d.f14),
+            level(d.f15, d.f16),
+            level(d.f17, d.f18),
+            level(d.f19, d.f20),
+        ];
+        let ask = vec![
+            level(d.f21, d.f22),
+            level(d.f23, d.f24),
+            level(d.f25, d.f26),
+            level(d.f27, d.f28),
+            level(d.f29, d.f30),
+        ];
+
         Ok(StockQuote {
             ts_code: ts_code.clone(),
             name: d.f58,
@@ -146,12 +185,13 @@ impl EastmoneyProvider {
             volume_ratio: None,
             limit_up: None,
             limit_down: None,
-            bid: Vec::new(),
-            ask: Vec::new(),
+            bid,
+            ask,
             trade_status: TradeStatus::Unknown,
             source: QuoteSource::Eastmoney,
             captured_at: now,
             exchange_time,
+            // provider 只填 source / capturedAt；status / warning 由 query facade 派生（spec §5）。
             freshness: Freshness {
                 status: FreshnessStatus::Fresh,
                 captured_at: Some(now),
@@ -403,7 +443,7 @@ impl EastmoneyProvider {
     }
 }
 
-fn em_div100(v: f64) -> Option<Price> {
+pub(crate) fn em_div100(v: f64) -> Option<Price> {
     if !v.is_finite() || v <= 0.0 {
         return None;
     }
@@ -411,11 +451,47 @@ fn em_div100(v: f64) -> Option<Price> {
 }
 
 /// EM secid 映射。
-fn secid_of(ts_code: &TsCode) -> String {
+pub(crate) fn secid_of(ts_code: &TsCode) -> String {
     let market = match ts_code.market() {
         crate::domain::shared::Market::SH => "1",
         crate::domain::shared::Market::SZ => "0",
         crate::domain::shared::Market::BJ => "0",
     };
     format!("{}.{}", market, &ts_code.as_str()[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn em_div100_divides_by_100_and_rounds() {
+        let p = em_div100(150000.0).unwrap();
+        assert_eq!(p.0.to_string(), "1500");
+    }
+
+    #[test]
+    fn em_div100_rejects_zero_and_negative() {
+        assert!(em_div100(0.0).is_none());
+        assert!(em_div100(-1.0).is_none());
+        assert!(em_div100(f64::NAN).is_none());
+    }
+
+    #[test]
+    fn em_secid_sh_maps_to_1_prefix() {
+        let c = TsCode::parse("600519.SH").unwrap();
+        assert_eq!(secid_of(&c), "1.600519");
+    }
+
+    #[test]
+    fn em_secid_sz_maps_to_0_prefix() {
+        let c = TsCode::parse("000001.SZ").unwrap();
+        assert_eq!(secid_of(&c), "0.000001");
+    }
+
+    #[test]
+    fn em_secid_bj_maps_to_0_prefix() {
+        let c = TsCode::parse("430047.BJ").unwrap();
+        assert_eq!(secid_of(&c), "0.430047");
+    }
 }

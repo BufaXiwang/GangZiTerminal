@@ -8,4 +8,5 @@ pub mod events;
 pub mod kline;
 pub mod universe;
 
+pub use calendar::CalendarEntry;
 pub use client::{TushareClient, TushareError};

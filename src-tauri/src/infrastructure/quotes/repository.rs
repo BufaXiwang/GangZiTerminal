@@ -102,7 +102,24 @@ impl<'a> QuotesRepository<'a> {
         offset: u32,
     ) -> rusqlite::Result<(Vec<MarketInstrument>, u32)> {
         self.db.with(|conn| {
-            let q = query.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            // spec §4 list_market: query trim + 折叠连续空白
+            let q = query.map(|s| {
+                let trimmed = s.trim();
+                let mut out = String::with_capacity(trimmed.len());
+                let mut prev_ws = false;
+                for ch in trimmed.chars() {
+                    if ch.is_whitespace() {
+                        if !prev_ws {
+                            out.push(' ');
+                        }
+                        prev_ws = true;
+                    } else {
+                        out.push(ch);
+                        prev_ws = false;
+                    }
+                }
+                out
+            }).filter(|s| !s.is_empty());
             let cat = category.map(category_to_str);
             // 总数
             let (cnt_sql, cnt_params): (String, Vec<SqlValue>) = match (&cat, &q) {
@@ -171,6 +188,8 @@ impl<'a> QuotesRepository<'a> {
                             WHEN name = ?4 THEN 1
                             WHEN name LIKE ?5 THEN 2
                             ELSE 3 END,
+                       CASE WHEN status = 'listed' THEN 0 ELSE 1 END,
+                       CASE category WHEN 'stock' THEN 0 WHEN 'index' THEN 1 WHEN 'fund' THEN 2 ELSE 3 END,
                        ts_code
                      LIMIT ?6 OFFSET ?7".to_string(),
                     vec![
@@ -194,6 +213,7 @@ impl<'a> QuotesRepository<'a> {
                             WHEN name = ?5 THEN 1
                             WHEN name LIKE ?6 THEN 2
                             ELSE 3 END,
+                       CASE WHEN status = 'listed' THEN 0 ELSE 1 END,
                        ts_code
                      LIMIT ?7 OFFSET ?8".to_string(),
                     vec![
@@ -749,6 +769,78 @@ impl<'a> QuotesRepository<'a> {
 
     // ====================================================================== refresh_state
 
+    /// 读取最近一次指定 kind / trade_date 的 refresh 状态。
+    pub fn read_refresh_state(
+        &self,
+        kind: &str,
+        trade_date: TradeDate,
+    ) -> rusqlite::Result<Option<(u32, u32, u32, OccurredAt)>> {
+        self.db.with(|conn| {
+            conn.query_row(
+                "SELECT total, success, failed, completed_at FROM quote_refresh_state
+                 WHERE refresh_kind = ?1 AND trade_date = ?2",
+                params![kind, trade_date.format()],
+                |r| {
+                    let total: i64 = r.get(0)?;
+                    let success: i64 = r.get(1)?;
+                    let failed: i64 = r.get(2)?;
+                    let completed_at: String = r.get(3)?;
+                    Ok((
+                        total as u32,
+                        success as u32,
+                        failed as u32,
+                        DateTime::parse_from_rfc3339(&completed_at)
+                            .map(|d| d.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                    ))
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// 取所有 instruments 的 `(ts_code, category)` map（用于 snapshot cache 类别一致性校验）。
+    pub fn instrument_category_map(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<TsCode, InstrumentCategory>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare("SELECT ts_code, category FROM quote_instruments")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let ts: String = r.get(0)?;
+                    let cat: String = r.get(1)?;
+                    Ok((ts, cat))
+                })?
+                .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
+            let mut out = std::collections::HashMap::with_capacity(rows.len());
+            for (ts, cat) in rows {
+                if let Ok(code) = TsCode::parse(&ts) {
+                    out.insert(code, category_from_str(&cat));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// 仅读取 universe 的 ts_codes 子集（按 status='listed' 过滤；spec §2 — universe 不包含
+    /// delisted 标的）。
+    pub fn list_universe_ts_codes(&self) -> rusqlite::Result<Vec<TsCode>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts_code FROM quote_instruments
+                 WHERE status IS NULL OR status = 'listed'
+                 ORDER BY ts_code",
+            )?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|s| TsCode::parse(&s).ok())
+                .collect())
+        })
+    }
+
     pub fn record_refresh_state(
         &self,
         kind: &str,
@@ -952,6 +1044,159 @@ fn row_to_daily_basic(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyBasic> {
         source,
         fetched_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::quotes::{InstrumentSource, MarketInstrument};
+    use crate::infrastructure::db::run_migrations;
+    use crate::infrastructure::quotes::migrations as quotes_migrations;
+    use chrono::Utc;
+
+    fn make_db() -> AppDb {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| run_migrations(conn, quotes_migrations()).unwrap());
+        db
+    }
+
+    fn inst(ts: &str, name: &str, cat: InstrumentCategory, market: Market, status: InstrumentStatus) -> MarketInstrument {
+        MarketInstrument {
+            ts_code: TsCode::parse(ts).unwrap(),
+            name: name.to_string(),
+            category: cat,
+            market,
+            board: None,
+            sector: None,
+            status: Some(status),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn upsert_and_get_instrument_roundtrips() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let i = inst("600519.SH", "贵州茅台", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Listed);
+        repo.upsert_instruments(&[i.clone()]).unwrap();
+        let got = repo.get_instrument(&i.ts_code).unwrap().unwrap();
+        assert_eq!(got.name, "贵州茅台");
+        assert_eq!(got.category, InstrumentCategory::Stock);
+    }
+
+    #[test]
+    fn list_universe_ts_codes_skips_delisted() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let listed = inst("600519.SH", "L1", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Listed);
+        let delisted = inst("600520.SH", "D1", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Delisted);
+        repo.upsert_instruments(&[listed.clone(), delisted.clone()]).unwrap();
+        let codes = repo.list_universe_ts_codes().unwrap();
+        assert!(codes.iter().any(|c| c.as_str() == "600519.SH"));
+        assert!(!codes.iter().any(|c| c.as_str() == "600520.SH"));
+    }
+
+    #[test]
+    fn list_instruments_total_reflects_filter() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        for i in 0..5 {
+            let mut x = inst(
+                &format!("60000{}.SH", i),
+                &format!("S{}", i),
+                InstrumentCategory::Stock,
+                Market::SH,
+                InstrumentStatus::Listed,
+            );
+            x.name = format!("S{}", i);
+            repo.upsert_instruments(&[x]).unwrap();
+        }
+        let (list, total) = repo
+            .list_instruments(Some(InstrumentCategory::Stock), None, 3, 0)
+            .unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn list_instruments_query_priority_orders_exact_first() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        repo.upsert_instruments(&[
+            inst("600519.SH", "AAA", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Listed),
+            inst("600520.SH", "AAA Holdings", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Listed),
+        ])
+        .unwrap();
+        let (list, _) = repo.list_instruments(None, Some("AAA"), 10, 0).unwrap();
+        assert_eq!(list[0].name, "AAA");
+    }
+
+    #[test]
+    fn record_and_read_refresh_state_roundtrips() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let td = TradeDate::parse("20260526").unwrap();
+        let now = Utc::now();
+        repo.record_refresh_state("close", td, 100, 95, 5, now).unwrap();
+        let got = repo.read_refresh_state("close", td).unwrap().unwrap();
+        assert_eq!(got.0, 100);
+        assert_eq!(got.1, 95);
+        assert_eq!(got.2, 5);
+    }
+
+    #[test]
+    fn upsert_daily_basic_idempotent() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let td = TradeDate::parse("20260526").unwrap();
+        let row = DailyBasic {
+            ts_code: TsCode::parse("600519.SH").unwrap(),
+            trade_date: td,
+            pe: Some(40.0),
+            pe_ttm: Some(38.0),
+            pb: None,
+            ps: None,
+            ps_ttm: None,
+            turnover_rate: None,
+            turnover_rate_float: None,
+            volume_ratio: None,
+            total_mv: None,
+            circ_mv: None,
+            source: "tushare".into(),
+            fetched_at: Utc::now(),
+        };
+        repo.upsert_daily_basic(&[row.clone()]).unwrap();
+        repo.upsert_daily_basic(&[row.clone()]).unwrap();
+        let got = repo.latest_daily_basic(&row.ts_code, td).unwrap().unwrap();
+        assert_eq!(got.pe, Some(40.0));
+    }
+
+    #[test]
+    fn instrument_category_map_returns_all() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        repo.upsert_instruments(&[
+            inst("600519.SH", "S", InstrumentCategory::Stock, Market::SH, InstrumentStatus::Listed),
+            inst("000001.SH", "Idx", InstrumentCategory::Index, Market::SH, InstrumentStatus::Listed),
+        ])
+        .unwrap();
+        let map = repo.instrument_category_map().unwrap();
+        assert_eq!(
+            map.get(&TsCode::parse("600519.SH").unwrap()).copied(),
+            Some(InstrumentCategory::Stock)
+        );
+        assert_eq!(
+            map.get(&TsCode::parse("000001.SH").unwrap()).copied(),
+            Some(InstrumentCategory::Index)
+        );
+    }
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompanyEvent> {

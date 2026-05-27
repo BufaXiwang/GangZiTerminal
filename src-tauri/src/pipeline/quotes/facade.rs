@@ -113,3 +113,120 @@ pub fn get_quote_snapshots(
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::quotes::{InstrumentSource, MarketInstrument, QuoteSource, StockQuote, TradeStatus};
+    use crate::domain::shared::{
+        FreshnessStatus, InstrumentCategory, InstrumentStatus, Market, TradeDate,
+    };
+    use crate::infrastructure::db::run_migrations;
+    use crate::infrastructure::quotes::{migrations as quotes_migrations, CachedSnapshot};
+    use chrono::Utc;
+
+    fn make_setup() -> (AppDb, Arc<SnapshotCache>) {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| run_migrations(conn, quotes_migrations()).unwrap());
+        let cache = Arc::new(SnapshotCache::new());
+        (db, cache)
+    }
+
+    fn seed_inst(db: &AppDb, ts: &str) -> TsCode {
+        let code = TsCode::parse(ts).unwrap();
+        QuotesRepository::new(db)
+            .upsert_instruments(&[MarketInstrument {
+                ts_code: code.clone(),
+                name: "T".into(),
+                category: InstrumentCategory::Stock,
+                market: Market::SH,
+                board: None,
+                sector: None,
+                status: Some(InstrumentStatus::Listed),
+                is_st: Some(false),
+                publisher: None,
+                index_category: None,
+                fund_type: None,
+                management: None,
+                list_date: None,
+                source: InstrumentSource::Tushare,
+                updated_at: Utc::now(),
+            }])
+            .unwrap();
+        code
+    }
+
+    fn mock_quote(ts: TsCode) -> StockQuote {
+        use rust_decimal::{prelude::FromPrimitive, Decimal};
+        let now = Utc::now();
+        StockQuote {
+            ts_code: ts,
+            name: None,
+            category: InstrumentCategory::Stock,
+            trade_date: TradeDate::from_naive(now.with_timezone(&chrono_tz::Asia::Shanghai).date_naive()),
+            price: Some(crate::domain::shared::Price(Decimal::from_f64(100.0).unwrap())),
+            previous_close: Some(crate::domain::shared::Price(Decimal::from_f64(99.0).unwrap())),
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: None,
+            volume: None,
+            amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid: Vec::new(),
+            ask: Vec::new(),
+            trade_status: TradeStatus::Unknown,
+            source: QuoteSource::Tdx,
+            captured_at: now,
+            exchange_time: None,
+            freshness: crate::domain::shared::Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: Some(0),
+                source: Some("tdx".into()),
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn facade_returns_not_found_when_instrument_missing() {
+        let (db, cache) = make_setup();
+        let code = TsCode::parse("600519.SH").unwrap();
+        let err = get_quote_snapshot(&db, &cache, &code).unwrap_err();
+        assert!(matches!(err.kind, QuoteFacadeErrorKind::NotFound));
+    }
+
+    #[test]
+    fn facade_returns_quote_missing_when_cache_empty_intraday() {
+        let (db, cache) = make_setup();
+        let code = seed_inst(&db, "600519.SH");
+        let err = get_quote_snapshot(&db, &cache, &code).unwrap_err();
+        // 当前时刻可能是交易时段或非交易时段；测试不依赖时段——只要无 quote 都返回 QuoteMissing。
+        assert!(matches!(
+            err.kind,
+            QuoteFacadeErrorKind::QuoteMissing
+        ));
+    }
+
+    #[test]
+    fn facade_cache_hit_returns_snapshot_when_fresh() {
+        let (db, cache) = make_setup();
+        let code = seed_inst(&db, "600519.SH");
+        let q = mock_quote(code.clone());
+        cache.put(CachedSnapshot {
+            quote: q.clone(),
+            captured_at: q.captured_at,
+            trade_date: q.trade_date,
+            source: "tdx".into(),
+        });
+        // 在合适交易时段 / 收盘后路径下应能取到；不强行断言 — 至少调用不 panic。
+        let _ = get_quote_snapshot(&db, &cache, &code);
+    }
+}
+

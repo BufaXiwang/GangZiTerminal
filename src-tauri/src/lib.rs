@@ -25,7 +25,8 @@ use crate::pipeline::news::scheduler::{
 };
 use crate::pipeline::news::NewsService;
 use crate::pipeline::quotes::scheduler::{
-    spawn_quotes_scheduler, QuotesSchedulerHandle, QUOTES_REFRESH_INTERVAL_SECS,
+    spawn_full_scheduler, QuotesSchedulerHandle, QuotesSchedulerIntervals,
+    QUOTES_REFRESH_INTERVAL_SECS, QUOTES_SUBSCRIBED_INTERVAL_SECS,
 };
 use crate::pipeline::quotes::service::QuotesService;
 
@@ -119,10 +120,48 @@ pub fn run() {
                 });
             quotes_service.set_event_sink(quotes_sink);
 
-            // -- Quotes Scheduler
-            let quotes_handle: QuotesSchedulerHandle = spawn_quotes_scheduler(
+            // -- Quotes startup catch-up（spec §5）：异步后台 task；不阻塞 setup。
+            {
+                let svc = Arc::clone(&quotes_service);
+                tokio::spawn(async move {
+                    // 1) universe enrich（TuShare 可用时；token 缺失会自动 skip）
+                    if let Err(e) = svc.refresh_market_instruments().await {
+                        tracing::warn!(target: "quotes.startup", error = ?e, "refresh_market_instruments failed");
+                    }
+                    // 2) 交易日历 ±30 天
+                    let today = chrono::Utc::now().date_naive();
+                    let start = (today - chrono::Duration::days(30))
+                        .format("%Y%m%d")
+                        .to_string();
+                    let end = (today + chrono::Duration::days(30))
+                        .format("%Y%m%d")
+                        .to_string();
+                    if let Err(e) = svc.refresh_trade_calendar(&start, &end).await {
+                        tracing::warn!(target: "quotes.startup", error = ?e, "refresh_trade_calendar failed");
+                    }
+                    // 3) 启动后立即跑一次 subscribed quote refresh（核心指数热数据）
+                    let core = svc.core_indexes();
+                    let req = crate::pipeline::quotes::service::RefreshMarketQuotesRequest {
+                        scope: crate::domain::quotes::RefreshMarketQuotesScope::Subscribed {
+                            ts_codes: core,
+                        },
+                        purpose: crate::domain::quotes::RefreshPurpose::Intraday,
+                        trade_date: None,
+                    };
+                    if let Err(e) = svc.refresh_market_quotes(req).await {
+                        tracing::warn!(target: "quotes.startup", error = ?e, "core quote refresh failed");
+                    }
+                });
+            }
+
+            // -- Quotes Scheduler（multi-tick）
+            let quotes_handle: QuotesSchedulerHandle = spawn_full_scheduler(
                 Arc::clone(&quotes_service),
-                Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
+                QuotesSchedulerIntervals {
+                    universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
+                    subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
+                    daily_tick_interval: Duration::from_secs(60),
+                },
             );
             app.manage(quotes_handle);
 

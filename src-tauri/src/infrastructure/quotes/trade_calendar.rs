@@ -132,3 +132,58 @@ impl TradeCalendar for TradeCalendarRepo {
         v
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::db::run_migrations;
+    use crate::infrastructure::quotes::migrations as quotes_migrations;
+    use chrono::Utc;
+
+    fn make_db() -> AppDb {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| run_migrations(conn, quotes_migrations()).unwrap());
+        db
+    }
+
+    #[test]
+    fn weekday_calendar_recognizes_weekend() {
+        let cal = WeekdayCalendar;
+        let sat = NaiveDate::from_ymd_opt(2026, 5, 23).unwrap();
+        let sun = NaiveDate::from_ymd_opt(2026, 5, 24).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 5, 26).unwrap();
+        assert!(!cal.is_trade_day(sat));
+        assert!(!cal.is_trade_day(sun));
+        assert!(cal.is_trade_day(tue));
+    }
+
+    #[test]
+    fn weekday_calendar_previous_skips_weekend() {
+        let cal = WeekdayCalendar;
+        let mon = NaiveDate::from_ymd_opt(2026, 5, 25).unwrap();
+        // 上一个交易日 = 周五 (5/22)
+        let prev = cal.previous_trade_day(mon);
+        assert_eq!(prev, NaiveDate::from_ymd_opt(2026, 5, 22).unwrap());
+    }
+
+    #[test]
+    fn trade_calendar_repo_falls_back_to_weekday_when_db_empty() {
+        let db = make_db();
+        let repo = TradeCalendarRepo::new(db);
+        let sat = NaiveDate::from_ymd_opt(2026, 5, 23).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 5, 26).unwrap();
+        assert!(!repo.is_trade_day(sat));
+        assert!(repo.is_trade_day(tue));
+    }
+
+    #[test]
+    fn trade_calendar_repo_uses_db_when_present() {
+        let db = make_db();
+        let repo = TradeCalendarRepo::new(db);
+        // 把一个周二标成非交易日（节假日 override）
+        let holiday = TradeDate::parse("20260526").unwrap();
+        repo.upsert_batch(&[(holiday, false, None)], "tushare", Utc::now())
+            .unwrap();
+        assert!(!repo.is_trade_day(NaiveDate::from_ymd_opt(2026, 5, 26).unwrap()));
+    }
+}

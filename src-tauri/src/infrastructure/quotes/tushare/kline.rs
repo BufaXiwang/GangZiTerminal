@@ -207,3 +207,63 @@ impl TushareClient {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::prelude::FromPrimitive;
+
+    fn pt(date: &str, close: f64) -> KlinePoint {
+        KlinePoint {
+            date: TradeDate::parse(date).unwrap(),
+            open: Price(Decimal::from_f64(close).unwrap()),
+            close: Price(Decimal::from_f64(close).unwrap()),
+            high: Price(Decimal::from_f64(close).unwrap()),
+            low: Price(Decimal::from_f64(close).unwrap()),
+            volume: Some(Volume(100)),
+            amount: None,
+        }
+    }
+
+    #[test]
+    fn apply_adjust_none_returns_clone() {
+        let bars = vec![pt("20260520", 100.0), pt("20260521", 110.0)];
+        let factors = vec![(TradeDate::parse("20260521").unwrap(), 1.0)];
+        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].close.0, Decimal::from_f64(100.0).unwrap());
+    }
+
+    fn dec(x: f64) -> Decimal {
+        Decimal::from_f64(x).unwrap()
+    }
+
+    #[test]
+    fn apply_adjust_qfq_scales_history_by_factor_ratio() {
+        // factor 0.5 -> latest_adj 1.0 → qfq scale = 0.5；history close 100 → 50。
+        let bars = vec![pt("20260520", 100.0), pt("20260521", 110.0)];
+        let factors = vec![
+            (TradeDate::parse("20260520").unwrap(), 0.5),
+            (TradeDate::parse("20260521").unwrap(), 1.0),
+        ];
+        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Qfq);
+        assert_eq!(out[0].close.0, dec(50.0));
+        assert_eq!(out[1].close.0, dec(110.0));
+    }
+
+    #[test]
+    fn apply_adjust_hfq_uses_factor_directly() {
+        let bars = vec![pt("20260520", 100.0)];
+        let factors = vec![(TradeDate::parse("20260520").unwrap(), 2.0)];
+        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Hfq);
+        assert_eq!(out[0].close.0, dec(200.0));
+    }
+
+    #[test]
+    fn apply_adjust_missing_factor_keeps_bar_unchanged() {
+        let bars = vec![pt("20260520", 100.0)];
+        let factors = vec![(TradeDate::parse("20260521").unwrap(), 0.5)];
+        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Qfq);
+        assert_eq!(out[0].close.0, dec(100.0));
+    }
+}

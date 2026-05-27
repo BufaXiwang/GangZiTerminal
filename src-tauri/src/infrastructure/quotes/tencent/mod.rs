@@ -167,11 +167,34 @@ impl TencentProvider {
     }
 }
 
-fn qq_id(ts_code: &TsCode) -> String {
+pub(crate) fn qq_id(ts_code: &TsCode) -> String {
     let prefix = match ts_code.market() {
         Market::SH => "sh",
         Market::SZ => "sz",
         Market::BJ => "bj",
     };
     format!("{}{}", prefix, &ts_code.as_str()[..6])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qq_id_sh_prefix() {
+        let c = TsCode::parse("600519.SH").unwrap();
+        assert_eq!(qq_id(&c), "sh600519");
+    }
+
+    #[test]
+    fn qq_id_sz_prefix() {
+        let c = TsCode::parse("000001.SZ").unwrap();
+        assert_eq!(qq_id(&c), "sz000001");
+    }
+
+    #[test]
+    fn qq_id_bj_prefix() {
+        let c = TsCode::parse("430047.BJ").unwrap();
+        assert_eq!(qq_id(&c), "bj430047");
+    }
 }

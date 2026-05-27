@@ -11,7 +11,7 @@ pub mod market_time;
 pub mod page;
 pub mod types;
 
-pub use codes::{ErrorCode, WarningCode};
+pub use codes::{ErrorCode, ResponseError, WarningCode};
 pub use events::{AppEventEnvelope, JsonValue};
 pub use freshness::{Freshness, FreshnessStatus};
 pub use market_time::{resolve_market_time, MarketTimeContext};

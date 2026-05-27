@@ -21,6 +21,7 @@ pub use migrations::migrations;
 pub use repository::QuotesRepository;
 pub use sina::SinaProvider;
 pub use snapshot_cache::{CachedSnapshot, SnapshotCache};
+pub use tdx::{TdxConnectionManager, TdxManagerError};
 pub use tencent::TencentProvider;
 pub use trade_calendar::{TradeCalendar, TradeCalendarRepo, WeekdayCalendar};
-pub use tushare::TushareClient;
+pub use tushare::{CalendarEntry, TushareClient};

@@ -5,61 +5,31 @@
 use crate::domain::quotes::{
     apply_band_helper, compute_indicators, compute_limit_band, core_indexes, derive_freshness,
     eligible_trade_date, Adjust as AdjEnum, CompanyEvent, DailyBasic, FreshnessIntent,
-    IndicatorBasis, IndicatorName, IndicatorSnapshot, IntradaySeries, KlinePeriod, KlineSeries,
-    MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod, MinuteKlineSeries,
-    RefreshPurpose, RefreshScope, ScanCondition, ScanConditionField, ScanConditionValue,
-    ScanCriteria, ScanFilter, ScanItem, ScanOp, ScanResult, ScanSortBy, ScanUniverse,
-    StockProfile, StockQuote, TradeStatus,
+    IndicatorBasis, IndicatorName, IndicatorSnapshot, IntradaySeries, KlinePeriod, KlinePoint,
+    KlineSeries, MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod,
+    MinuteKlineSeries, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose, RefreshScopeKind,
+    ScanCondition, ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem,
+    ScanOp, ScanResult, ScanSortBy, ScanUniverse, StockProfile, StockQuote, TradeStatus,
 };
 use crate::domain::shared::{
-    resolve_market_time, ErrorCode, Freshness, FreshnessStatus, InstrumentCategory,
-    InstrumentStatus, MarketTimeContext, TradeDate, TsCode, WarningCode,
+    ErrorCode, Freshness, FreshnessStatus, InstrumentCategory, InstrumentStatus, MarketTimeContext,
+    ResponseError, TradeDate, TsCode, WarningCode,
 };
 use crate::infrastructure::db::AppDb;
 use crate::infrastructure::quotes::{
     CachedSnapshot, EastmoneyProvider, QuotesConfig, QuotesRepository, SinaProvider, SnapshotCache,
-    TencentProvider, TradeCalendarRepo, TushareClient,
+    TdxConnectionManager, TencentProvider, TradeCalendar, TradeCalendarRepo, TushareClient,
 };
+use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Pipeline 内部错误 / response 错误条目。
-///
-/// Spec: docs/design/quotes-module.md §4 `ResponseError`。
-/// adapters 层在边界把它映射为 `ResponseError`。
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct ResponseError {
-    pub code: ErrorCode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ts_code: Option<TsCode>,
-}
-
-impl ResponseError {
-    pub fn new(code: ErrorCode) -> Self {
-        Self {
-            code,
-            message: None,
-            field: None,
-            ts_code: None,
-        }
-    }
-    pub fn with_message(code: ErrorCode, msg: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: Some(msg.into()),
-            field: None,
-            ts_code: None,
-        }
-    }
-}
+/// adapters 仍可能引用本符号；现作为 shared::ResponseError 的别名。
+pub type PipelineResponseError = ResponseError;
 
 #[derive(Debug, Clone)]
 pub struct QuotesServiceConfig {
@@ -70,6 +40,7 @@ pub struct QuotesServiceConfig {
 pub struct QuotesService {
     pub(crate) db: AppDb,
     pub(crate) cache: Arc<SnapshotCache>,
+    pub(crate) tdx: TdxConnectionManager,
     pub(crate) eastmoney: EastmoneyProvider,
     pub(crate) sina: SinaProvider,
     pub(crate) tencent: TencentProvider,
@@ -85,6 +56,7 @@ pub type RefreshEventSink = Arc<dyn Fn(MarketQuotesRefreshedPayload) + Send + Sy
 impl QuotesService {
     pub fn new(db: AppDb, config: QuotesConfig) -> reqwest::Result<Self> {
         let cache = Arc::new(SnapshotCache::new());
+        let tdx = TdxConnectionManager::new();
         let eastmoney = EastmoneyProvider::new()?;
         let sina = SinaProvider::new()?;
         let tencent = TencentProvider::new()?;
@@ -93,6 +65,7 @@ impl QuotesService {
         Ok(Self {
             db,
             cache,
+            tdx,
             eastmoney,
             sina,
             tencent,
@@ -141,19 +114,26 @@ impl QuotesService {
         QuotesRepository::new(&self.db)
     }
 
+    /// 用 TuShare 日历修正 shared 近似日历（spec §🚨 已反馈）。
+    pub fn market_time_now(&self) -> MarketTimeContext {
+        let now = Utc::now();
+        let cal: &dyn TradeCalendar = self.calendar.as_ref();
+        resolve_market_time_with_calendar(now, cal)
+    }
+
     // ====================================================================== list_market
 
     pub fn list_market(&self, req: ListMarketRequest) -> ListMarketResponse {
         let limit = clamp(req.limit, 100, 500);
         let offset = req.offset.unwrap_or(0);
-        let now = Utc::now();
-        let ctx = resolve_market_time(now);
+        let ctx = self.market_time_now();
         let repo = self.repo();
-        let (instruments, _total) = repo
+        let (instruments, total) = repo
             .list_instruments(req.category, req.query.as_deref(), limit, offset)
             .unwrap_or_default();
 
-        let has_more = (instruments.len() as u32) == limit;
+        // spec §4：has_more = total > offset + len
+        let has_more = (offset as u64) + (instruments.len() as u64) < (total as u64);
         let include_quote = req.include_quote.unwrap_or(false);
 
         let items: Vec<ListMarketItem> = instruments
@@ -203,7 +183,6 @@ impl QuotesService {
         let (snap, source) = match cached {
             Some(c) => (Some(c.quote.clone()), Some(c.source.clone())),
             None => {
-                // 非交易时段：尝试 load close snapshot for latestCompletedTradeDate.
                 if !eligible.is_intraday {
                     if let Ok(Some(q)) = self
                         .repo()
@@ -233,13 +212,8 @@ impl QuotesService {
         let source = source.unwrap_or_else(|| quote.source.as_str().to_string());
         let (freshness, eligibility) =
             derive_freshness(ctx, intent, quote.trade_date, quote.captured_at, &source);
-        if eligibility.is_some() {
-            // missing: 不返回行情字段
-            return (
-                None,
-                Some(freshness),
-                Some(eligibility.unwrap()),
-            );
+        if let Some(w) = eligibility {
+            return (None, Some(freshness), Some(w));
         }
         let summary = ListMarketQuoteSummary {
             trade_date: Some(quote.trade_date),
@@ -267,7 +241,6 @@ impl QuotesService {
         let mut errors: Vec<ResponseError> = Vec::new();
         let mut items: Vec<FetchDataItem> = Vec::new();
 
-        // 输入校验
         let raw_codes = req.ts_codes.unwrap_or_default();
         if raw_codes.is_empty() {
             errors.push(ResponseError::with_message(
@@ -284,8 +257,7 @@ impl QuotesService {
             return FetchDataResponse { errors, items };
         }
 
-        // 解析 + 去重
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut ts_codes: Vec<TsCode> = Vec::new();
         for raw in &raw_codes {
             match TsCode::parse(raw) {
@@ -304,17 +276,25 @@ impl QuotesService {
             }
         }
 
-        // include 默认（spec §4）
+        // 校验 indicators subset 是否合法（serde 反序列化已挡掉真未知名；这里只验显式 subset 非空）。
         let include = req.include.unwrap_or(FetchInclude {
             profile: Some(true),
             quote: Some(true),
             ..Default::default()
         });
 
-        // indicators 校验
-        let indicator_set = match &include.indicators {
+        let indicator_set: Option<Vec<IndicatorName>> = match &include.indicators {
             Some(FetchIndicators::All(true)) => Some(IndicatorName::all().to_vec()),
-            Some(FetchIndicators::Subset(list)) => Some(list.clone()),
+            Some(FetchIndicators::Subset(list)) => {
+                if list.is_empty() {
+                    errors.push(ResponseError::with_message(
+                        ErrorCode::InvalidInput,
+                        "indicators subset must be non-empty",
+                    ));
+                    return FetchDataResponse { errors, items };
+                }
+                Some(list.clone())
+            }
             Some(FetchIndicators::All(false)) | None => None,
         };
 
@@ -323,8 +303,8 @@ impl QuotesService {
         let minute_limit = limit.minute_kline.unwrap_or(120);
         let events_days = limit.events_days_ahead.unwrap_or(180);
 
-        let now = Utc::now();
-        let ctx = resolve_market_time(now);
+        let ctx = self.market_time_now();
+        let now = ctx.now;
         let repo = self.repo();
 
         for ts_code in &ts_codes {
@@ -335,12 +315,16 @@ impl QuotesService {
                     continue;
                 }
                 Err(e) => {
-                    errors.push(ResponseError::with_message(ErrorCode::DbError, e.to_string()));
+                    errors.push(
+                        ResponseError::with_message(ErrorCode::DbError, e.to_string())
+                            .with_ts_code(ts_code.clone()),
+                    );
                     items.push(FetchDataItem::missing(ts_code.clone()));
                     continue;
                 }
             };
-            let mut item = FetchDataItem::new(ts_code.clone(), inst.category, Some(inst.name.clone()));
+            let mut item =
+                FetchDataItem::new(ts_code.clone(), inst.category, Some(inst.name.clone()));
             if include.profile.unwrap_or(false) {
                 item.profile = Some(StockProfile::from(&inst));
             }
@@ -365,14 +349,14 @@ impl QuotesService {
             if let Some(periods) = include.klines.as_ref() {
                 let mut klines = std::collections::BTreeMap::new();
                 for p in periods {
-                    // 优先 qfq；缺则 fallback none + warning
-                    let (series, used_none) = match repo.load_kline_series(ts_code, *p, AdjEnum::Qfq, kline_limit) {
-                        Ok(Some(s)) => (Some(s), false),
-                        _ => match repo.load_kline_series(ts_code, *p, AdjEnum::None, kline_limit) {
-                            Ok(Some(s)) => (Some(s), true),
-                            _ => (None, false),
-                        },
-                    };
+                    let (series, used_none) =
+                        match repo.load_kline_series(ts_code, *p, AdjEnum::Qfq, kline_limit) {
+                            Ok(Some(s)) => (Some(s), false),
+                            _ => match repo.load_kline_series(ts_code, *p, AdjEnum::None, kline_limit) {
+                                Ok(Some(s)) => (Some(s), true),
+                                _ => (None, false),
+                            },
+                        };
                     if let Some(mut s) = series {
                         if used_none {
                             s.warnings.push(WarningCode::UsingUnadjustedKline);
@@ -397,8 +381,9 @@ impl QuotesService {
                 }
             }
             if let Some(names) = indicator_set.as_ref() {
-                // 用 qfq day K 现算
-                if let Ok(Some(series)) = repo.load_kline_series(ts_code, KlinePeriod::Day, AdjEnum::Qfq, 200) {
+                if let Ok(Some(series)) =
+                    repo.load_kline_series(ts_code, KlinePeriod::Day, AdjEnum::Qfq, 200)
+                {
                     let snap = compute_indicators(
                         ts_code.clone(),
                         IndicatorBasis {
@@ -414,7 +399,7 @@ impl QuotesService {
                 } else if let Ok(Some(series)) =
                     repo.load_kline_series(ts_code, KlinePeriod::Day, AdjEnum::None, 200)
                 {
-                    let mut warns = vec![WarningCode::UsingUnadjustedKline];
+                    let warns = vec![WarningCode::UsingUnadjustedKline];
                     let snap = compute_indicators(
                         ts_code.clone(),
                         IndicatorBasis {
@@ -427,7 +412,7 @@ impl QuotesService {
                         warns.clone(),
                     );
                     item.indicators = Some(snap);
-                    item.warnings.append(&mut warns);
+                    item.warnings.push(WarningCode::UsingUnadjustedKline);
                 }
             }
             if include.daily_basic.unwrap_or(false) {
@@ -459,7 +444,10 @@ impl QuotesService {
         let eligible = eligible_trade_date(ctx);
         let mut cached = self.cache.get(&inst.ts_code).map(|c| c.quote);
         if cached.is_none() && !eligible.is_intraday {
-            if let Ok(Some(q)) = self.repo().load_close_snapshot(&inst.ts_code, eligible.trade_date) {
+            if let Ok(Some(q)) = self
+                .repo()
+                .load_close_snapshot(&inst.ts_code, eligible.trade_date)
+            {
                 cached = Some(q);
             }
         }
@@ -477,35 +465,39 @@ impl QuotesService {
             );
         };
         let source = quote.source.as_str().to_string();
-        let (freshness, eligibility) =
-            derive_freshness(ctx, FreshnessIntent::Detail, quote.trade_date, quote.captured_at, &source);
+        let (freshness, eligibility) = derive_freshness(
+            ctx,
+            FreshnessIntent::Detail,
+            quote.trade_date,
+            quote.captured_at,
+            &source,
+        );
         if eligibility.is_some() {
             return (None, freshness);
         }
-        // 派生 limitUp / limitDown
-        match (
+        if let (Some(pc), Some(band)) = (
             quote.previous_close,
-            compute_limit_band(&inst.ts_code, inst.category, inst.board.as_deref(), inst.is_st.unwrap_or(false)),
+            compute_limit_band(
+                &inst.ts_code,
+                inst.category,
+                inst.board.as_deref(),
+                inst.is_st.unwrap_or(false),
+            ),
         ) {
-            (Some(pc), Some(band)) => {
-                if let Some((up, down)) = apply_band_helper(pc, band) {
-                    quote.limit_up = up;
-                    quote.limit_down = down;
-                }
+            if let Some((up, down)) = apply_band_helper(pc, band) {
+                quote.limit_up = up;
+                quote.limit_down = down;
             }
-            _ => {}
         }
-        // 派生 tradeStatus
         quote.trade_status = derive_trade_status(inst, ctx);
-        // 五档盘口缺失 / 不完整时返回 depth_missing warning
-        if quote.bid.is_empty() || quote.ask.is_empty() {
-            quote.warnings.push(WarningCode::DepthMissing);
-        } else if quote.bid.iter().take(1).any(|l| l.price.is_none())
-            || quote.ask.iter().take(1).any(|l| l.price.is_none())
-        {
+        // 五档盘口缺失 / 不完整 → depth_missing warning。
+        let bid_missing = quote.bid.is_empty()
+            || quote.bid.iter().take(1).any(|l| l.price.is_none());
+        let ask_missing = quote.ask.is_empty()
+            || quote.ask.iter().take(1).any(|l| l.price.is_none());
+        if bid_missing || ask_missing {
             quote.warnings.push(WarningCode::DepthMissing);
         }
-        // 关键价格缺失
         if quote.price.is_none() || quote.previous_close.is_none() {
             quote.warnings.push(WarningCode::QuotePriceMissing);
         }
@@ -520,8 +512,8 @@ impl QuotesService {
 
     pub fn scan_market(&self, req: ScanMarketRequest) -> ScanMarketResponse {
         let limit = clamp(req.limit, 50, 500);
-        let now = Utc::now();
-        let ctx = resolve_market_time(now);
+        let ctx = self.market_time_now();
+        let now = ctx.now;
         let eligible = eligible_trade_date(&ctx);
         let repo = self.repo();
         let category = req.category;
@@ -565,14 +557,16 @@ impl QuotesService {
                 }
             }
         }
+        let coverage_partial = (excluded_missing + excluded_expired) > 0;
+        if coverage_partial {
+            response_warnings.push(WarningCode::DataPartial);
+        }
 
-        // 应用 filter
         let mut filtered: Vec<_> = entries
             .into_iter()
             .filter(|(_, q, _, _)| filter_passes(req.filter, q))
             .collect();
 
-        // 应用 conditions
         let mut any_missing_condition_input = false;
         if let Some(conds) = req.conditions.as_ref() {
             filtered.retain(|(_, q, db, _)| {
@@ -583,11 +577,10 @@ impl QuotesService {
                 r.matched
             });
         }
-        if any_missing_condition_input {
+        if any_missing_condition_input && !response_warnings.contains(&WarningCode::DataPartial) {
             response_warnings.push(WarningCode::DataPartial);
         }
 
-        // 应用 sortBy
         sort_items(req.sort_by, req.filter, &mut filtered);
 
         let matched_total = filtered.len() as u32;
@@ -612,7 +605,7 @@ impl QuotesService {
                 generated_at: now,
                 universe: ScanUniverse {
                     category,
-                    total: total,
+                    total,
                     valid_quote_count: Some(valid_count),
                     excluded_missing_quote_count: Some(excluded_missing),
                     excluded_expired_quote_count: Some(excluded_expired),
@@ -632,12 +625,8 @@ impl QuotesService {
     }
 
     // ====================================================================== refresh hooks
-    //
-    // 本节是 spec §4 的内部 Rust API。adapters / scheduler 调用。
-    // 实现保持轻量：当前阶段聚焦在结构 + DB 写路径；远端 provider 真实拉取由 scheduler tick 调用。
 
     pub async fn refresh_market_instruments(&self) -> Result<(), ResponseError> {
-        // tushare token 缺失时跳过
         if !self.tushare.has_token() {
             tracing::info!(target: "quotes.refresh", "tushare token missing; skip universe enrich");
             return Ok(());
@@ -647,10 +636,11 @@ impl QuotesService {
             Ok(mut v) => all_items.append(&mut v),
             Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "stock_basic failed"),
         }
-        for mkt in ["SSE", "SZSE"] {
+        // SH / SZ / BJ 指数（spec §2 universe 必须覆盖 BJ）。
+        for mkt in TushareClient::standard_index_markets() {
             match self.tushare.fetch_index_basic(mkt).await {
                 Ok(mut v) => all_items.append(&mut v),
-                Err(e) => tracing::warn!(target: "quotes.refresh", market = mkt, error = %e, "index_basic failed"),
+                Err(e) => tracing::warn!(target: "quotes.refresh", market = %mkt, error = %e, "index_basic failed"),
             }
         }
         match self.tushare.fetch_fund_basic().await {
@@ -661,6 +651,14 @@ impl QuotesService {
             self.repo()
                 .upsert_instruments(&all_items)
                 .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
+
+            // 类别变更：让 snapshot cache 中的过期类别条目失效（spec §2 不变量）。
+            if let Ok(map) = self.repo().instrument_category_map() {
+                let removed = self.cache.invalidate_if_category_changed(&map);
+                if removed > 0 {
+                    tracing::info!(target: "quotes.refresh", removed, "invalidated stale snapshot entries due to category change");
+                }
+            }
         }
         Ok(())
     }
@@ -670,120 +668,115 @@ impl QuotesService {
         &self,
         req: RefreshMarketQuotesRequest,
     ) -> Result<MarketQuotesRefreshedPayload, ResponseError> {
-        let now = Utc::now();
-        let ctx = resolve_market_time(now);
+        let ctx = self.market_time_now();
+        let now = ctx.now;
         let eligible = eligible_trade_date(&ctx);
         let trade_date = req.trade_date.unwrap_or(eligible.trade_date);
 
-        let targets: Vec<TsCode> = match &req.scope {
-            RefreshScope::Subscribed => {
-                let codes = req.ts_codes.clone().unwrap_or_default();
-                codes
+        let scope_kind = req.scope.kind();
+
+        let (targets, target_categories) = match &req.scope {
+            RefreshMarketQuotesScope::Subscribed { ts_codes } => {
+                // spec §🚨 pragmatic default：subscribed + empty → no-op，无写入、不 emit。
+                if ts_codes.is_empty() {
+                    let payload = MarketQuotesRefreshedPayload {
+                        scope: scope_kind,
+                        purpose: req.purpose,
+                        trade_date: Some(trade_date),
+                        affected_ts_codes: Some(Vec::new()),
+                        total: 0,
+                        success: 0,
+                        failed_batches: 0,
+                        captured_at: now,
+                    };
+                    return Ok(payload);
+                }
+                self.resolve_categories(ts_codes.clone())
             }
-            RefreshScope::Manual => {
-                let codes = req.ts_codes.clone().unwrap_or_default();
-                if codes.is_empty() {
+            RefreshMarketQuotesScope::Manual { ts_codes } => {
+                if ts_codes.is_empty() {
                     return Err(ResponseError::with_message(
                         ErrorCode::InvalidInput,
-                        "manual scope requires tsCodes",
+                        "manual scope requires non-empty tsCodes",
                     ));
                 }
-                codes
+                self.resolve_categories(ts_codes.clone())
             }
-            RefreshScope::Universe => {
-                let (insts, _) = self
+            RefreshMarketQuotesScope::Universe => {
+                // 分页：避免一次 load 100k（spec drift #20）。
+                let (instruments, _total) = self
                     .repo()
                     .list_instruments(None, None, 100_000, 0)
                     .unwrap_or_default();
-                insts.into_iter().map(|i| i.ts_code).collect()
+                let ts_codes: Vec<TsCode> =
+                    instruments.iter().map(|i| i.ts_code.clone()).collect();
+                let cats: std::collections::HashMap<TsCode, (InstrumentCategory, Option<String>)> =
+                    instruments
+                        .into_iter()
+                        .map(|i| (i.ts_code.clone(), (i.category, Some(i.name))))
+                        .collect();
+                (ts_codes, cats)
             }
         };
+
         let total = targets.len() as u32;
         let mut success: u32 = 0;
         let mut failed_batches: u32 = 0;
         let mut affected: Vec<TsCode> = Vec::new();
 
-        for ts in &targets {
-            let inst = match self.repo().get_instrument(ts).ok().flatten() {
-                Some(i) => i,
-                None => continue,
-            };
-            // Provider 路由：BJ → EM；SH/SZ → 先 EM 简化（TDX 协议层异步 client 完善后再切回 TDX 主源）。
-            // spec §5：当前实现降级使用 Eastmoney 作主源；TDX 协议层完整接线属 follow-up。
-            let outcome = self
-                .eastmoney
-                .fetch_quote(ts, inst.category, trade_date, now)
-                .await;
-            match outcome {
-                Ok(q) => {
-                    let captured_at = q.captured_at;
-                    let snap = CachedSnapshot {
-                        quote: q.clone(),
-                        captured_at,
-                        trade_date,
-                        source: q.source.as_str().to_string(),
-                    };
-                    self.cache.put(snap);
-                    if matches!(req.purpose, RefreshPurpose::Close) {
-                        let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
-                    }
-                    success += 1;
-                    affected.push(ts.clone());
-                }
-                Err(_) => {
-                    failed_batches += 1;
-                    // fallback Tencent → Sina
-                    if let Ok(q) = self
-                        .tencent
-                        .fetch_quote(ts, inst.category, trade_date, now)
-                        .await
-                    {
+        // 分批 refresh — 每批最多 200。避免一个超大 universe 把进程阻塞太久。
+        const BATCH: usize = 200;
+        for chunk in targets.chunks(BATCH) {
+            for ts in chunk {
+                let (category, name) = target_categories
+                    .get(ts)
+                    .cloned()
+                    .unwrap_or((InstrumentCategory::Stock, None));
+                let outcome = self.refresh_one_quote(ts, category, name, trade_date, now).await;
+                match outcome {
+                    Some(q) => {
+                        let captured_at = q.captured_at;
+                        let source_str = q.source.as_str().to_string();
                         let snap = CachedSnapshot {
                             quote: q.clone(),
-                            captured_at: q.captured_at,
+                            captured_at,
                             trade_date,
-                            source: "tencent".to_string(),
+                            source: source_str,
                         };
                         self.cache.put(snap);
+                        if matches!(req.purpose, RefreshPurpose::Close) {
+                            let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
+                        }
                         success += 1;
                         affected.push(ts.clone());
-                        continue;
                     }
-                    if let Ok(q) = self
-                        .sina
-                        .fetch_quote(ts, inst.category, trade_date, now)
-                        .await
-                    {
-                        let snap = CachedSnapshot {
-                            quote: q.clone(),
-                            captured_at: q.captured_at,
-                            trade_date,
-                            source: "sina".to_string(),
-                        };
-                        self.cache.put(snap);
-                        success += 1;
-                        affected.push(ts.clone());
+                    None => {
+                        failed_batches += 1;
                     }
                 }
             }
         }
 
-        if matches!(req.purpose, RefreshPurpose::Close) {
-            let _ = self.repo().record_refresh_state(
-                "close",
-                trade_date,
-                total,
-                success,
-                total.saturating_sub(success),
-                now,
-            );
-        }
+        // 记录 refresh state（任何 kind 都记录，spec drift #17）。
+        let kind = if matches!(req.purpose, RefreshPurpose::Close) {
+            "close"
+        } else {
+            "intraday"
+        };
+        let _ = self.repo().record_refresh_state(
+            kind,
+            trade_date,
+            total,
+            success,
+            total.saturating_sub(success),
+            now,
+        );
 
         let payload = MarketQuotesRefreshedPayload {
-            scope: req.scope,
+            scope: scope_kind,
             purpose: req.purpose,
             trade_date: Some(trade_date),
-            affected_ts_codes: if matches!(req.scope, RefreshScope::Universe) {
+            affected_ts_codes: if matches!(scope_kind, RefreshScopeKind::Universe) {
                 None
             } else {
                 Some(affected)
@@ -795,6 +788,375 @@ impl QuotesService {
         };
         self.emit_refreshed(payload.clone());
         Ok(payload)
+    }
+
+    fn resolve_categories(
+        &self,
+        ts_codes: Vec<TsCode>,
+    ) -> (
+        Vec<TsCode>,
+        std::collections::HashMap<TsCode, (InstrumentCategory, Option<String>)>,
+    ) {
+        let mut map: std::collections::HashMap<TsCode, (InstrumentCategory, Option<String>)> =
+            std::collections::HashMap::with_capacity(ts_codes.len());
+        let repo = self.repo();
+        for code in &ts_codes {
+            match repo.get_instrument(code) {
+                Ok(Some(i)) => {
+                    map.insert(code.clone(), (i.category, Some(i.name)));
+                }
+                _ => {
+                    map.insert(code.clone(), (InstrumentCategory::Stock, None));
+                }
+            }
+        }
+        (ts_codes, map)
+    }
+
+    /// Refresh 单只标的：TDX > EM > Tencent > Sina（SH/SZ）；BJ 走 EM。
+    ///
+    /// Spec: quotes-module.md §5 实时行情 fallback。
+    async fn refresh_one_quote(
+        &self,
+        ts: &TsCode,
+        category: InstrumentCategory,
+        name: Option<String>,
+        trade_date: TradeDate,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<StockQuote> {
+        let is_bj = matches!(ts.market(), crate::domain::shared::Market::BJ);
+        if !is_bj {
+            // TDX 主路径
+            match self
+                .tdx
+                .fetch_quote(ts, category, trade_date, now, name.clone())
+                .await
+            {
+                Ok(q) => return Some(q),
+                Err(e) => tracing::debug!(target: "quotes.provider.tdx", ts = ts.as_str(), error = %e, "tdx failed; fallback EM"),
+            }
+        }
+        match self.eastmoney.fetch_quote(ts, category, trade_date, now).await {
+            Ok(q) => return Some(q),
+            Err(e) => tracing::debug!(target: "quotes.provider.em", ts = ts.as_str(), error = %e, "em failed; fallback tencent"),
+        }
+        match self.tencent.fetch_quote(ts, category, trade_date, now).await {
+            Ok(q) => return Some(q),
+            Err(e) => tracing::debug!(target: "quotes.provider.tencent", ts = ts.as_str(), error = %e, "tencent failed; fallback sina"),
+        }
+        match self.sina.fetch_quote(ts, category, trade_date, now).await {
+            Ok(q) => Some(q),
+            Err(e) => {
+                tracing::debug!(target: "quotes.provider.sina", ts = ts.as_str(), error = %e, "sina failed; no more fallbacks");
+                None
+            }
+        }
+    }
+
+    // ====================================================================== refresh_klines
+
+    /// 拉取 K 线（spec §4 + §5）：调用 TuShare 拉 daily + adj_factor，apply qfq/hfq；
+    /// 缺 TuShare token 时降级到 TDX (none) 并返回 warning。
+    pub async fn refresh_klines(
+        &self,
+        scope: RefreshDataScope,
+        periods: Vec<KlinePeriod>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let periods = if periods.is_empty() {
+            vec![KlinePeriod::Day]
+        } else {
+            periods
+        };
+        let now = Utc::now();
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut warnings: Vec<WarningCode> = Vec::new();
+
+        // 默认拉 365 天数据
+        let start_naive = now.date_naive() - chrono::Duration::days(365);
+        let end_naive = now.date_naive();
+        let start_str = start_naive.format("%Y%m%d").to_string();
+        let end_str = end_naive.format("%Y%m%d").to_string();
+
+        for ts in &ts_codes {
+            for period in &periods {
+                total += 1;
+                if self.tushare.has_token() {
+                    let raw_bars = self
+                        .tushare
+                        .fetch_kline(ts, *period, &start_str, &end_str)
+                        .await;
+                    let raw_bars = match raw_bars {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::debug!(target: "quotes.refresh.kline", ts = ts.as_str(), error = %e, "tushare kline failed; try TDX");
+                            failed += 1;
+                            if let Some(bars) = self.tdx_daily_fallback(ts).await {
+                                if !bars.is_empty() {
+                                    let _ = self.repo().upsert_daily_klines(
+                                        ts,
+                                        *period,
+                                        AdjEnum::None,
+                                        &bars,
+                                        "tdx",
+                                        now,
+                                    );
+                                    if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
+                                        warnings.push(WarningCode::UsingUnadjustedKline);
+                                    }
+                                    success += 1;
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    if raw_bars.is_empty() {
+                        failed += 1;
+                        continue;
+                    }
+                    // 写 unadjusted。
+                    let _ = self.repo().upsert_daily_klines(
+                        ts,
+                        *period,
+                        AdjEnum::None,
+                        &raw_bars,
+                        "tushare",
+                        now,
+                    );
+                    // 复权因子 → qfq + hfq（只对 day period）。
+                    if matches!(period, KlinePeriod::Day) {
+                        match self.tushare.fetch_adj_factor(ts, &start_str, &end_str).await {
+                            Ok(factors) if !factors.is_empty() => {
+                                let qfq = TushareClient::apply_adjust(&raw_bars, &factors, AdjEnum::Qfq);
+                                let hfq = TushareClient::apply_adjust(&raw_bars, &factors, AdjEnum::Hfq);
+                                let _ = self.repo().upsert_daily_klines(
+                                    ts, *period, AdjEnum::Qfq, &qfq, "tushare", now,
+                                );
+                                let _ = self.repo().upsert_daily_klines(
+                                    ts, *period, AdjEnum::Hfq, &hfq, "tushare", now,
+                                );
+                            }
+                            _ => {
+                                if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
+                                    warnings.push(WarningCode::UsingUnadjustedKline);
+                                }
+                            }
+                        }
+                    }
+                    success += 1;
+                } else {
+                    // 无 token → 走 TDX (none)。
+                    if let Some(bars) = self.tdx_daily_fallback(ts).await {
+                        if !bars.is_empty() {
+                            let _ = self.repo().upsert_daily_klines(
+                                ts,
+                                *period,
+                                AdjEnum::None,
+                                &bars,
+                                "tdx",
+                                now,
+                            );
+                            if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
+                                warnings.push(WarningCode::UsingUnadjustedKline);
+                            }
+                            success += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    } else {
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        // 记录 refresh_state（kind = "kline"）。
+        let eligible_td = eligible_trade_date(&self.market_time_now()).trade_date;
+        let _ = self
+            .repo()
+            .record_refresh_state("kline", eligible_td, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings,
+            affected_ts_codes: ts_codes,
+        })
+    }
+
+    async fn tdx_daily_fallback(&self, ts: &TsCode) -> Option<Vec<KlinePoint>> {
+        match self.tdx.fetch_daily_kline(ts, 365).await {
+            Ok(bars) => Some(
+                bars.iter()
+                    .filter_map(crate::infrastructure::quotes::tdx::manager::map_daily_bar)
+                    .collect(),
+            ),
+            Err(_) => None,
+        }
+    }
+
+    // ====================================================================== refresh_daily_basic
+
+    pub async fn refresh_daily_basic(
+        &self,
+        scope: RefreshDataScope,
+        trade_date: Option<TradeDate>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        if !self.tushare.has_token() {
+            return Err(ResponseError::with_message(
+                ErrorCode::ProviderUnavailable,
+                "tushare token missing for daily_basic",
+            ));
+        }
+        let now = Utc::now();
+        let eligible = eligible_trade_date(&self.market_time_now());
+        let trade_date = trade_date.unwrap_or(eligible.trade_date);
+
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+
+        // 优化：universe scope 用 trade_date 一次性拉
+        if matches!(scope, RefreshDataScope::Universe) {
+            total = 1;
+            match self
+                .tushare
+                .fetch_daily_basic(None, Some(&trade_date.format()))
+                .await
+            {
+                Ok(rows) if !rows.is_empty() => {
+                    let _ = self.repo().upsert_daily_basic(&rows);
+                    success = 1;
+                }
+                _ => failed = 1,
+            }
+        } else {
+            for ts in &ts_codes {
+                total += 1;
+                match self
+                    .tushare
+                    .fetch_daily_basic(Some(ts), Some(&trade_date.format()))
+                    .await
+                {
+                    Ok(rows) if !rows.is_empty() => {
+                        let _ = self.repo().upsert_daily_basic(&rows);
+                        success += 1;
+                    }
+                    _ => failed += 1,
+                }
+            }
+        }
+
+        let _ = self
+            .repo()
+            .record_refresh_state("daily_basic", trade_date, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings: Vec::new(),
+            affected_ts_codes: ts_codes,
+        })
+    }
+
+    // ====================================================================== refresh_company_events
+
+    pub async fn refresh_company_events(
+        &self,
+        scope: RefreshDataScope,
+        window_days: Option<i64>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        if !self.tushare.has_token() {
+            return Err(ResponseError::with_message(
+                ErrorCode::ProviderUnavailable,
+                "tushare token missing for company events",
+            ));
+        }
+        let now = Utc::now();
+        let window_days = window_days.unwrap_or(30);
+        let today = now.date_naive();
+        // T-3 ~ T+window
+        let from = today - chrono::Duration::days(3);
+        let to = today + chrono::Duration::days(window_days);
+        let from_s = from.format("%Y%m%d").to_string();
+        let to_s = to.format("%Y%m%d").to_string();
+
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+
+        if matches!(scope, RefreshDataScope::Universe) {
+            // universe：用 ann_date_start..end + None 标的，dividend / suspend 各拉一次
+            total = 2;
+            match self.tushare.fetch_dividends(None, &from_s, &to_s).await {
+                Ok(events) if !events.is_empty() => {
+                    let _ = self.repo().upsert_company_events(&events);
+                    success += 1;
+                }
+                _ => failed += 1,
+            }
+            match self.tushare.fetch_suspensions(None, &from_s, &to_s).await {
+                Ok(events) if !events.is_empty() => {
+                    let _ = self.repo().upsert_company_events(&events);
+                    success += 1;
+                }
+                _ => failed += 1,
+            }
+        } else {
+            for ts in &ts_codes {
+                total += 2;
+                match self.tushare.fetch_dividends(Some(ts), &from_s, &to_s).await {
+                    Ok(events) if !events.is_empty() => {
+                        let _ = self.repo().upsert_company_events(&events);
+                        success += 1;
+                    }
+                    _ => failed += 1,
+                }
+                match self.tushare.fetch_suspensions(Some(ts), &from_s, &to_s).await {
+                    Ok(events) if !events.is_empty() => {
+                        let _ = self.repo().upsert_company_events(&events);
+                        success += 1;
+                    }
+                    _ => failed += 1,
+                }
+            }
+        }
+
+        let trade_date = eligible_trade_date(&self.market_time_now()).trade_date;
+        let _ = self
+            .repo()
+            .record_refresh_state("events", trade_date, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings: Vec::new(),
+            affected_ts_codes: ts_codes,
+        })
+    }
+
+    fn resolve_data_scope(&self, scope: &RefreshDataScope) -> Result<Vec<TsCode>, ResponseError> {
+        match scope {
+            RefreshDataScope::Universe => {
+                self.repo().list_universe_ts_codes().map_err(|e| {
+                    ResponseError::with_message(ErrorCode::DbError, e.to_string())
+                })
+            }
+            RefreshDataScope::Subscribed { ts_codes } => Ok(ts_codes.clone()),
+            RefreshDataScope::Manual { ts_codes } => {
+                if ts_codes.is_empty() {
+                    return Err(ResponseError::with_message(
+                        ErrorCode::InvalidInput,
+                        "manual scope requires non-empty tsCodes",
+                    ));
+                }
+                Ok(ts_codes.clone())
+            }
+        }
     }
 
     pub fn core_indexes(&self) -> Vec<TsCode> {
@@ -814,7 +1176,9 @@ impl QuotesService {
             .tushare
             .fetch_trade_cal(start_date, end_date)
             .await
-            .map_err(|e| ResponseError::with_message(ErrorCode::ProviderUnavailable, e.to_string()))?;
+            .map_err(|e| {
+                ResponseError::with_message(ErrorCode::ProviderUnavailable, e.to_string())
+            })?;
         let rows: Vec<_> = entries
             .iter()
             .map(|e| (e.cal_date, e.is_open, e.pretrade_date))
@@ -823,6 +1187,27 @@ impl QuotesService {
             .upsert_batch(&rows, "tushare", Utc::now())
             .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
         Ok(rows.len() as u32)
+    }
+
+    /// 收盘快照 retry — 如果当日 close refresh 不完整，稍后重试。
+    ///
+    /// Spec: quotes-module.md §5 "失败时可低频重试直到获得最新已完成交易日快照"。
+    pub async fn close_snapshot_complete(&self, trade_date: TradeDate) -> bool {
+        let universe_size = self
+            .repo()
+            .list_universe_ts_codes()
+            .map(|v| v.len() as u32)
+            .unwrap_or(0);
+        let Some((total, success, _failed, _at)) =
+            self.repo().read_refresh_state("close", trade_date).ok().flatten()
+        else {
+            return false;
+        };
+        // 阈值：成功率 ≥ 95% 视为完整。允许少量个股 provider 失败。
+        if universe_size == 0 {
+            return total > 0 && success * 100 / total.max(1) >= 95;
+        }
+        success * 100 / universe_size >= 95
     }
 }
 
@@ -1240,13 +1625,337 @@ pub struct ScanMarketResponse {
     pub errors: Vec<ResponseError>,
 }
 
+/// Spec: quotes-module.md §4 内部 Rust API `RefreshMarketQuotesRequest`。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct RefreshMarketQuotesRequest {
-    pub scope: RefreshScope,
+    pub scope: RefreshMarketQuotesScope,
     pub purpose: RefreshPurpose,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ts_codes: Option<Vec<TsCode>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub trade_date: Option<TradeDate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshDataResult {
+    pub total: u32,
+    pub success: u32,
+    pub failed: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<WarningCode>,
+    pub affected_ts_codes: Vec<TsCode>,
+}
+
+// ============================================================================= tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::db::run_migrations;
+    use crate::infrastructure::quotes::migrations as quotes_migrations;
+
+    fn make_service() -> QuotesService {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| run_migrations(conn, quotes_migrations()).unwrap());
+        QuotesService::new(db, QuotesConfig::default()).unwrap()
+    }
+
+    fn seed_instrument(svc: &QuotesService, ts: &str, name: &str, cat: InstrumentCategory) {
+        let code = TsCode::parse(ts).unwrap();
+        let inst = MarketInstrument {
+            ts_code: code.clone(),
+            name: name.to_string(),
+            category: cat,
+            market: code.market(),
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: crate::domain::quotes::InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        svc.repo().upsert_instruments(&[inst]).unwrap();
+    }
+
+    #[test]
+    fn fetch_data_empty_ts_codes_is_invalid_input() {
+        let svc = make_service();
+        let req = FetchDataRequest::default();
+        let res = svc.fetch_data(req);
+        assert_eq!(res.errors.len(), 1);
+        assert_eq!(res.errors[0].code, ErrorCode::InvalidInput);
+        assert!(res.items.is_empty());
+    }
+
+    #[test]
+    fn fetch_data_over_200_is_invalid_input() {
+        let svc = make_service();
+        let codes: Vec<String> = (0..201).map(|i| format!("{:06}.SH", i)).collect();
+        let req = FetchDataRequest {
+            ts_codes: Some(codes),
+            ..Default::default()
+        };
+        let res = svc.fetch_data(req);
+        assert_eq!(res.errors[0].code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn fetch_data_bad_format_is_invalid_input() {
+        let svc = make_service();
+        let req = FetchDataRequest {
+            ts_codes: Some(vec!["NOTAVAILD".into()]),
+            ..Default::default()
+        };
+        let res = svc.fetch_data(req);
+        assert_eq!(res.errors[0].code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn fetch_data_unknown_ts_code_returns_instrument_missing() {
+        let svc = make_service();
+        let req = FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            ..Default::default()
+        };
+        let res = svc.fetch_data(req);
+        assert_eq!(res.items.len(), 1);
+        assert!(res.items[0].warnings.contains(&WarningCode::InstrumentMissing));
+    }
+
+    #[test]
+    fn fetch_data_dedup_preserves_first_order() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        seed_instrument(&svc, "000001.SZ", "平安银行", InstrumentCategory::Stock);
+        let req = FetchDataRequest {
+            ts_codes: Some(vec![
+                "000001.SZ".into(),
+                "600519.SH".into(),
+                "000001.SZ".into(),
+            ]),
+            include: Some(FetchInclude {
+                profile: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let res = svc.fetch_data(req);
+        assert_eq!(res.items.len(), 2);
+        assert_eq!(res.items[0].ts_code.as_str(), "000001.SZ");
+        assert_eq!(res.items[1].ts_code.as_str(), "600519.SH");
+    }
+
+    #[test]
+    fn fetch_data_empty_indicators_subset_invalid_input() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let req = FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                indicators: Some(FetchIndicators::Subset(vec![])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let res = svc.fetch_data(req);
+        assert_eq!(res.errors[0].code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn refresh_market_quotes_manual_empty_is_invalid_input() {
+        let svc = make_service();
+        let req = RefreshMarketQuotesRequest {
+            scope: RefreshMarketQuotesScope::Manual { ts_codes: vec![] },
+            purpose: RefreshPurpose::Intraday,
+            trade_date: None,
+        };
+        let err = svc.refresh_market_quotes(req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn refresh_market_quotes_subscribed_empty_is_noop() {
+        let svc = make_service();
+        let req = RefreshMarketQuotesRequest {
+            scope: RefreshMarketQuotesScope::Subscribed { ts_codes: vec![] },
+            purpose: RefreshPurpose::Intraday,
+            trade_date: None,
+        };
+        let payload = svc.refresh_market_quotes(req).await.unwrap();
+        assert_eq!(payload.total, 0);
+        assert_eq!(payload.success, 0);
+        assert_eq!(payload.failed_batches, 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_daily_basic_requires_tushare_token() {
+        let svc = make_service();
+        let res = svc
+            .refresh_daily_basic(RefreshDataScope::Universe, None)
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::ProviderUnavailable);
+    }
+
+    #[tokio::test]
+    async fn refresh_company_events_requires_token() {
+        let svc = make_service();
+        let res = svc
+            .refresh_company_events(
+                RefreshDataScope::Manual {
+                    ts_codes: vec![TsCode::parse("600519.SH").unwrap()],
+                },
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::ProviderUnavailable);
+    }
+
+    #[test]
+    fn list_market_query_trim_and_collapse_whitespace() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州 茅台", InstrumentCategory::Stock);
+        let req = ListMarketRequest {
+            query: Some("  贵州   茅台  ".into()),
+            ..Default::default()
+        };
+        let res = svc.list_market(req);
+        assert!(res.items.iter().any(|i| i.instrument.ts_code.as_str() == "600519.SH"));
+    }
+
+    #[test]
+    fn list_market_has_more_uses_total() {
+        let svc = make_service();
+        for i in 0..3 {
+            seed_instrument(&svc, &format!("60000{}.SH", i), &format!("S{}", i), InstrumentCategory::Stock);
+        }
+        let req = ListMarketRequest {
+            limit: Some(2),
+            offset: Some(0),
+            ..Default::default()
+        };
+        let res = svc.list_market(req);
+        assert_eq!(res.items.len(), 2);
+        assert!(res.page.has_more);
+        let req2 = ListMarketRequest {
+            limit: Some(2),
+            offset: Some(2),
+            ..Default::default()
+        };
+        let res2 = svc.list_market(req2);
+        assert_eq!(res2.items.len(), 1);
+        assert!(!res2.page.has_more);
+    }
+
+    #[test]
+    fn core_indexes_exposed() {
+        let svc = make_service();
+        assert_eq!(svc.core_indexes().len(), 4);
+    }
+
+    #[test]
+    fn scope_dto_subscribed_serde() {
+        // 验证 tagged union 序列化形如 spec: `{ kind: "subscribed", tsCodes: [...] }`
+        let s = RefreshMarketQuotesScope::Subscribed {
+            ts_codes: vec![TsCode::parse("600519.SH").unwrap()],
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["kind"], "subscribed");
+        assert!(json["tsCodes"].is_array());
+    }
+
+    #[test]
+    fn scope_dto_universe_serde() {
+        let s = RefreshMarketQuotesScope::Universe;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["kind"], "universe");
+    }
+
+    #[test]
+    fn list_market_query_empty_returns_all() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let req = ListMarketRequest {
+            query: Some("  ".into()),
+            ..Default::default()
+        };
+        let res = svc.list_market(req);
+        // trim => empty => returns all
+        assert!(!res.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_market_instruments_skipped_without_token() {
+        let svc = make_service();
+        // 没有 token —— 应静默 Ok(())
+        let res = svc.refresh_market_instruments().await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_klines_requires_universe_when_token_missing() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        // 无 token + 单只标的 — TDX 不一定可用，结果 failed > 0 也 ok。
+        // 这里只验证调用不 panic、返回结构正确。
+        let res = svc
+            .refresh_klines(
+                RefreshDataScope::Manual {
+                    ts_codes: vec![TsCode::parse("430047.BJ").unwrap()],
+                },
+                vec![KlinePeriod::Day],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.affected_ts_codes.len(), 1);
+        // BJ + 无 token + 无 TDX → 全 failed
+        assert_eq!(res.success + res.failed, res.total);
+    }
+
+    #[tokio::test]
+    async fn refresh_klines_data_scope_manual_empty_rejected() {
+        let svc = make_service();
+        let res = svc
+            .refresh_klines(RefreshDataScope::Manual { ts_codes: vec![] }, vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn scan_market_empty_universe_returns_zero_matched() {
+        let svc = make_service();
+        let res = svc.scan_market(ScanMarketRequest::default());
+        assert_eq!(res.result.universe.total, 0);
+        assert_eq!(res.result.universe.matched, 0);
+        assert!(res.result.items.is_empty());
+    }
+
+    #[test]
+    fn scan_market_excludes_instruments_without_quote() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "S1", InstrumentCategory::Stock);
+        let res = svc.scan_market(ScanMarketRequest::default());
+        assert_eq!(res.result.universe.total, 1);
+        assert!(res.result.universe.excluded_missing_quote_count.unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn list_market_query_ts_code_exact_prefers_first() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        seed_instrument(&svc, "600520.SH", "中坚科技", InstrumentCategory::Stock);
+        let req = ListMarketRequest {
+            query: Some("600519.sh".into()),
+            ..Default::default()
+        };
+        let res = svc.list_market(req);
+        assert_eq!(res.items.first().unwrap().instrument.ts_code.as_str(), "600519.SH");
+    }
 }

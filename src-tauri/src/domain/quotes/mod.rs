@@ -16,7 +16,10 @@ pub mod scan;
 pub mod sources;
 
 pub use errors::{QuoteFacadeError, QuoteFacadeErrorKind};
-pub use events::{MarketQuotesRefreshedPayload, RefreshPurpose, RefreshScope};
+pub use events::{
+    MarketQuotesRefreshedPayload, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose,
+    RefreshScope, RefreshScopeKind,
+};
 pub use freshness_rules::{
     derive_freshness, eligible_trade_date, EligibleTradeDate, FreshnessIntent,
     DETAIL_STALE_THRESHOLD_SECS, HARD_EXPIRE_SECS, UNIVERSE_STALE_THRESHOLD_SECS,
