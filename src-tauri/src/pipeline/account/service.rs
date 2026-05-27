@@ -1191,6 +1191,7 @@ impl AccountService {
                 &stamp_tax,
                 &transfer_fee,
                 now,
+                Some(reason.clone()),
             );
 
         let mut affected_position_ids: Vec<String> = Vec::new();
@@ -1457,6 +1458,7 @@ impl AccountService {
     }
 
     /// Spec: account-module.md §2 仓位模型 / 成交模型 — PnL 公式必须包含 stamp_tax + transfer_fee。
+    /// reasoning_for_new: 仅在 (Buy, None) 新开仓时填入 Position.reasoning（spec §2 Position.reasoning）。
     #[allow(clippy::too_many_arguments)]
     fn derive_position_after_fill(
         &self,
@@ -1468,6 +1470,7 @@ impl AccountService {
         stamp_tax: &Money,
         transfer_fee: &Money,
         now: OccurredAt,
+        reasoning_for_new: Option<String>,
     ) -> (String, AccountEventType, Position) {
         match (side, existing) {
             (OrderSide::Buy, None) => {
@@ -1501,7 +1504,7 @@ impl AccountService {
                         closed_at: None,
                         protection: None,
                         actor: TradingActor::Agent,
-                        reasoning: None,
+                        reasoning: reasoning_for_new,
                         warnings: vec![],
                     },
                 )
@@ -4704,6 +4707,64 @@ mod tests {
         assert!(
             rr.trigger_id.is_some(),
             "matching signal (trim-equal) should produce invalidated trigger"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Spec §2 Position.reasoning: 开仓理由 traceable to AccountEvent
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn position_opened_via_market_fill_persists_reasoning() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(1000),
+            },
+            "earnings recovery thesis v1".into(),
+            OrderIntent::OpenPosition,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted);
+        let repo = AccountRepository::new(&db);
+        let pos = repo.get_position(&resp.position_id.unwrap()).unwrap().unwrap();
+        assert_eq!(
+            pos.reasoning.as_deref(),
+            Some("earnings recovery thesis v1"),
+            "Position.reasoning must carry the opening reason for audit"
         );
     }
 }

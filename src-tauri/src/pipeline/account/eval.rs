@@ -459,6 +459,9 @@ fn commit_limit_fill(
         OrderSide::Sell => trade_amount - commission.0 - stamp_tax.0 - transfer_fee.0,
     };
     // Build position after — pass stamp_tax + transfer_fee for proper PnL / cost basis.
+    // reason_for_new: limit fill 触发的开仓继承订单的 reason 进 Position.reasoning
+    // (spec §2 Position.reasoning — 来自外部决策方 thesis 或系统说明)。
+    let reason_for_new = order.reason.clone();
     let (position_event, position_after) = derive_position_after_fill(
         order.side,
         &existing,
@@ -471,6 +474,7 @@ fn commit_limit_fill(
         now,
         position_id.clone(),
         instrument_name,
+        reason_for_new,
     );
 
     let mut updated_order = order.clone();
@@ -737,6 +741,7 @@ fn derive_position_after_fill(
     now: OccurredAt,
     position_id: String,
     instrument_name: String,
+    reasoning_for_new: Option<String>,
 ) -> (AccountEventType, Position) {
     match (side, existing) {
         (OrderSide::Buy, None) => {
@@ -767,7 +772,7 @@ fn derive_position_after_fill(
                     closed_at: None,
                     protection: None,
                     actor: TradingActor::Agent,
-                    reasoning: None,
+                    reasoning: reasoning_for_new,
                     warnings: vec![],
                 },
             )
