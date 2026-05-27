@@ -28,11 +28,16 @@ pub struct SnapshotResult {
 /// 重算 AccountSnapshot 派生字段。
 ///
 /// Spec: account-module.md §2 字段说明 / §6 验收。
+///
+/// 当 `account_meta` 缺失（账户未初始化）时，返回空 SnapshotResult，
+/// 让 caller 走 empty_snapshot 路径而不是 panic。
 pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<SnapshotResult> {
-    let meta = input
-        .repo
-        .get_meta()?
-        .expect("snapshot rebuild requires initialized account_meta");
+    let Some(meta) = input.repo.get_meta()? else {
+        return Ok(SnapshotResult {
+            snapshot: empty_snapshot(Money(Decimal::ZERO)),
+            open_positions: Vec::new(),
+        });
+    };
     let frozen_cash = input.repo.total_frozen_cash()?;
     let cash = meta.cash;
     let available_cash = Money(cash.0 - frozen_cash.0);
