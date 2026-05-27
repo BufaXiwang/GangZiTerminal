@@ -911,6 +911,101 @@ mod tests {
         assert_eq!(normalize_query_text("a\t\nb"), "a b");
     }
 
+    /// Spec §4：fetch_news 支持 query / sources / published_from / published_to 按 AND
+    /// 组合。B1 修复前 `fts MATCH ?` placeholder 与其他 clause 的绑定顺序错位，会导致
+    /// SQL 报错或返回错误结果。本测试同时启用 4 个条件，覆盖 lockstep clause+binds 装配
+    /// 防 B1 回归，并断言 FTS rank 优先级（命中度高的优先）。
+    #[test]
+    fn list_news_items_with_query_sources_and_time_range() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+
+        // 时间窗口：2026-03-10 .. 2026-03-20
+        let in_window_1 = Utc.with_ymd_and_hms(2026, 3, 12, 0, 0, 0).unwrap();
+        let in_window_2 = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        let before_window = Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap();
+        let after_window = Utc.with_ymd_and_hms(2026, 3, 25, 0, 0, 0).unwrap();
+        let from = Utc.with_ymd_and_hms(2026, 3, 10, 0, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2026, 3, 20, 0, 0, 0).unwrap();
+
+        // helper: 构造一条 item，定制 source/title/published_at
+        let mk = |id: &str, source: &str, title: &str, pub_at: DateTime<Utc>| NewsItem {
+            id: id.to_string(),
+            source: source.to_string(),
+            title: title.to_string(),
+            summary: Some("brief".to_string()),
+            url: None,
+            published_at: Some(pub_at),
+            payload: serde_json::json!({}),
+            created_at: pub_at,
+            updated_at: pub_at,
+        };
+
+        // ✅ 全部满足：source=rss:sample, 时间在窗口内, title 命中 "match"
+        let target_a = mk("id-target-a", "rss:sample", "match keyword first", in_window_1);
+        // ✅ 全部满足，title 含 match 两次（rank 应更高）
+        let target_b = mk(
+            "id-target-b",
+            "rss:sample",
+            "match match strong relevance",
+            in_window_2,
+        );
+        // ✗ source 不匹配
+        let wrong_source = mk("id-wrong-src", "rss:other", "match keyword", in_window_1);
+        // ✗ 时间在窗口前
+        let before = mk("id-before", "rss:sample", "match keyword", before_window);
+        // ✗ 时间在窗口后
+        let after = mk("id-after", "rss:sample", "match keyword", after_window);
+        // ✗ title 不命中
+        let no_query = mk("id-no-query", "rss:sample", "unrelated topic", in_window_1);
+
+        for it in [
+            &target_a,
+            &target_b,
+            &wrong_source,
+            &before,
+            &after,
+            &no_query,
+        ] {
+            repo.upsert_news_item(it).unwrap();
+        }
+
+        // 4 条件同时启用：query + sources + published_from + published_to
+        let r = repo
+            .list_news_items(
+                Some(&["rss:sample".to_string()]),
+                Some(&from),
+                Some(&to),
+                Some("match"),
+                50,
+                0,
+            )
+            .unwrap();
+
+        // 只命中两条同时满足全部条件的
+        assert_eq!(
+            r.items.len(),
+            2,
+            "expected exactly 2 items, got {:?}",
+            r.items.iter().map(|i| &i.id).collect::<Vec<_>>()
+        );
+        let ids: Vec<&str> = r.items.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&"id-target-a"));
+        assert!(ids.contains(&"id-target-b"));
+
+        // FTS rank：target_b 含两次 "match"，相关性高于 target_a，应排在前面
+        // （ORDER BY rank, published_at DESC）。
+        assert_eq!(
+            r.items[0].id, "id-target-b",
+            "higher relevance (more match occurrences) should rank first; got {:?}",
+            ids
+        );
+        assert_eq!(r.items[1].id, "id-target-a");
+
+        // total 与 items 数对齐
+        assert_eq!(r.total, 2);
+    }
+
     #[test]
     fn article_upsert_syncs_fts() {
         let db = setup();
