@@ -12,7 +12,7 @@
 
 use crate::domain::quotes::{
     apply_band_helper, compute_limit_band, derive_freshness, eligible_trade_date, FreshnessIntent,
-    MarketQuoteSnapshot, QuoteFacadeError, QuoteFacadeErrorKind,
+    MarketInstrument, MarketQuoteSnapshot, QuoteFacadeError, QuoteFacadeErrorKind,
 };
 use crate::domain::shared::{resolve_market_time, FreshnessStatus, TsCode};
 use crate::infrastructure::db::AppDb;
@@ -111,6 +111,25 @@ pub fn get_quote_snapshots(
         .iter()
         .map(|c| get_quote_snapshot(db, cache, c))
         .collect()
+}
+
+/// 同步读取 instrument 元数据（category / status / market / name / 等）。
+///
+/// 调用方（特别是 Account BC）用于：
+/// - 交易性校验（是否上市 / 是否暂停 / category 是否支持）
+/// - 自选 / 显示用名称查询
+///
+/// 设计：Account 等跨 BC 调用者不允许直接访问 `infrastructure::quotes::QuotesRepository`；
+/// 所有 instrument 元数据查询必须走本 facade，保持 BC 边界。
+///
+/// Spec: quotes-module.md §4 内部 Rust API；architecture.md §3（跨 BC：Account → Quotes facade only）。
+pub fn get_instrument(
+    db: &AppDb,
+    ts_code: &TsCode,
+) -> Result<Option<MarketInstrument>, QuoteFacadeError> {
+    let repo = QuotesRepository::new(db);
+    repo.get_instrument(ts_code)
+        .map_err(|e| QuoteFacadeError::with_message(QuoteFacadeErrorKind::DbError, e.to_string()))
 }
 
 #[cfg(test)]

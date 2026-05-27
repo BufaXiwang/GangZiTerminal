@@ -38,7 +38,6 @@ use crate::infrastructure::account::repository::{
     AccountRepository, FreezeEntry, FrozenLot,
 };
 use crate::infrastructure::db::AppDb;
-use crate::infrastructure::quotes::QuotesRepository;
 use crate::pipeline::account::fills::{
     estimate_buy_frozen_cash, simulate_immediate, FillDecision, FillExecution, NotEligibleReason,
 };
@@ -2545,22 +2544,24 @@ impl AccountService {
     }
 
     pub(crate) fn instrument_known(&self, ts_code: &TsCode) -> bool {
-        let repo = QuotesRepository::new(&self.db);
-        matches!(repo.get_instrument(ts_code), Ok(Some(_)))
+        matches!(
+            crate::pipeline::quotes::facade::get_instrument(&self.db, ts_code),
+            Ok(Some(_))
+        )
     }
 
     pub(crate) fn lookup_name(&self, ts_code: &TsCode) -> Option<String> {
-        let repo = QuotesRepository::new(&self.db);
-        repo.get_instrument(ts_code).ok().flatten().map(|i| i.name)
+        crate::pipeline::quotes::facade::get_instrument(&self.db, ts_code)
+            .ok()
+            .flatten()
+            .map(|i| i.name)
     }
 
     pub(crate) fn lookup_tradable_instrument(
         &self,
         ts_code: &TsCode,
     ) -> Result<MarketInstrument, ErrorCode> {
-        let repo = QuotesRepository::new(&self.db);
-        let Some(inst) = repo
-            .get_instrument(ts_code)
+        let Some(inst) = crate::pipeline::quotes::facade::get_instrument(&self.db, ts_code)
             .map_err(|_| ErrorCode::DbError)?
         else {
             return Err(ErrorCode::NotFound);
@@ -2931,6 +2932,8 @@ mod tests {
     };
     use crate::domain::shared::{Market, TradeDate};
     use crate::infrastructure::db::run_migrations;
+    // QuotesRepository 只在测试 setup 里用于直接 seed 数据；生产代码走 quotes::facade。
+    use crate::infrastructure::quotes::QuotesRepository;
     use crate::pipeline::account::quote_gateway::MockQuoteGateway;
 
     fn setup_account(initial_cash: i64) -> (AppDb, Arc<AccountService>, Arc<MockQuoteGateway>) {
