@@ -116,6 +116,9 @@ pub struct TradeFill {
     pub quantity: Shares,
     pub commission: Money,
     pub stamp_tax: Money,
+    /// 过户费 — 仅 SH 标的 stock / fund 双向收取，其他市场为 0。
+    /// Spec: account-module.md §2 成交模型 / 硬风控模型。
+    pub transfer_fee: Money,
     pub occurred_at: OccurredAt,
 }
 

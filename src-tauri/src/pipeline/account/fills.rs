@@ -433,4 +433,116 @@ mod tests {
         let f = estimate_buy_frozen_cash(Price(Decimal::new(100, 0)), Shares(1000), Decimal::new(30, 0));
         assert_eq!(f, Decimal::new(100030, 0));
     }
+
+    // ----------------------------------------------------------------
+    // T4 — market buy/sell blocked at limit_up/down with zero counter-depth.
+    // Spec: account-module.md §5 — 涨停 + 卖盘不可成交 → limit_up_down_blocked。
+    // ----------------------------------------------------------------
+
+    fn make_snapshot_with_limits(
+        bid: Vec<(f64, i64)>,
+        ask: Vec<(f64, i64)>,
+        limit_up: Option<f64>,
+        limit_down: Option<f64>,
+    ) -> MarketQuoteSnapshot {
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let to_levels = |v: Vec<(f64, i64)>| -> Vec<QuoteDepthLevel> {
+            v.into_iter()
+                .map(|(p, q)| QuoteDepthLevel {
+                    price: Some(Price(Decimal::from_str_exact(&p.to_string()).unwrap())),
+                    volume: Some(Volume(q)),
+                })
+                .collect()
+        };
+        let now = Utc::now();
+        MarketQuoteSnapshot {
+            ts_code: ts.clone(),
+            category: InstrumentCategory::Stock,
+            quote: StockQuote {
+                ts_code: ts,
+                name: None,
+                category: InstrumentCategory::Stock,
+                trade_date: TradeDate::parse("20260526").unwrap(),
+                price: Some(Price(Decimal::new(100, 0))),
+                previous_close: Some(Price(Decimal::new(99, 0))),
+                open: None,
+                high: None,
+                low: None,
+                change: None,
+                change_percent: None,
+                volume: None,
+                amount: None,
+                turnover_rate: None,
+                volume_ratio: None,
+                limit_up: limit_up
+                    .map(|v| Price(Decimal::from_str_exact(&v.to_string()).unwrap())),
+                limit_down: limit_down
+                    .map(|v| Price(Decimal::from_str_exact(&v.to_string()).unwrap())),
+                bid: to_levels(bid),
+                ask: to_levels(ask),
+                trade_status: TradeStatus::Trading,
+                source: QuoteSource::Tdx,
+                captured_at: now,
+                exchange_time: None,
+                freshness: Freshness {
+                    status: FreshnessStatus::Fresh,
+                    captured_at: Some(now),
+                    exchange_time: None,
+                    age_ms: None,
+                    source: Some("tdx".into()),
+                    warning: None,
+                },
+                warnings: vec![],
+            },
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn market_buy_blocked_when_limit_up_with_zero_ask_volume() {
+        // ask at limit_up with 0 volume → blocked
+        let s = make_snapshot_with_limits(
+            vec![(99.0, 10_000)],
+            vec![(110.0, 0)],
+            Some(110.0),
+            Some(90.0),
+        );
+        let r = simulate_immediate(&s, OrderSide::Buy, Shares(100), true);
+        assert!(matches!(
+            r,
+            FillDecision::NotEligible(NotEligibleReason::LimitUpDownBlocked)
+        ));
+    }
+
+    #[test]
+    fn market_sell_blocked_when_limit_down_with_zero_bid_volume() {
+        // bid at limit_down with 0 volume → blocked
+        let s = make_snapshot_with_limits(
+            vec![(90.0, 0)],
+            vec![(110.0, 10_000)],
+            Some(110.0),
+            Some(90.0),
+        );
+        let r = simulate_immediate(&s, OrderSide::Sell, Shares(100), true);
+        assert!(matches!(
+            r,
+            FillDecision::NotEligible(NotEligibleReason::LimitUpDownBlocked)
+        ));
+    }
+
+    #[test]
+    fn market_buy_succeeds_when_limit_up_has_volume() {
+        // ask at limit_up WITH volume → spec §5 例外：盘口已经满足即视为可成交
+        let s = make_snapshot_with_limits(
+            vec![(99.0, 10_000)],
+            vec![(110.0, 5_000)],
+            Some(110.0),
+            Some(90.0),
+        );
+        let r = simulate_immediate(&s, OrderSide::Buy, Shares(100), true);
+        match r {
+            FillDecision::Filled(f) => assert_eq!(f.quantity.0, 100),
+            other => panic!("expected filled, got {:?}", other),
+        }
+    }
 }

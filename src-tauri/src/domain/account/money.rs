@@ -1,11 +1,12 @@
-//! 账户金钱计算 — 佣金 / 印花税 / 平均成本 / 已实现盈亏。
+//! 账户金钱计算 — 佣金 / 印花税 / 过户费 / 平均成本 / 已实现盈亏。
 //!
 //! Spec: docs/design/account-module.md §2 (账户估值和仓位价格计算)
+//! Spec: docs/design/account-module.md §2 (成交模型 / 硬风控模型 — 费用公式)
 //!
 //! 设计：金额类计算统一使用 `rust_decimal::Decimal` 避免 f64 精度坑。
 
 use crate::domain::account::policy::AccountFeePolicy;
-use crate::domain::shared::{Money, Price, Shares};
+use crate::domain::shared::{InstrumentCategory, Market, Money, Price, Shares, TsCode};
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 
@@ -31,7 +32,7 @@ impl MoneyMath {
 
 /// 计算佣金（双向收取）。
 ///
-/// Spec: account-module.md §2 成交模型 / §5 费用
+/// Spec: account-module.md §2 成交模型 / 硬风控模型
 /// `commission = max(gross * rate, min_commission)`，保留 2 位分。
 pub fn compute_commission(
     price: Price,
@@ -49,7 +50,7 @@ pub fn compute_commission(
 
 /// 计算印花税（仅卖出）。
 ///
-/// Spec: account-module.md §2 成交模型 / §5 费用
+/// Spec: account-module.md §2 成交模型 / 硬风控模型
 pub fn compute_stamp_tax(price: Price, quantity: Shares, policy: &AccountFeePolicy) -> Money {
     let gross = MoneyMath::gross_amount(price, quantity);
     let rate = Decimal::from_f64(policy.stamp_tax_sell_rate).unwrap_or(Decimal::ZERO);
@@ -57,19 +58,48 @@ pub fn compute_stamp_tax(price: Price, quantity: Shares, policy: &AccountFeePoli
     Money(raw.round_dp(2))
 }
 
+/// 计算过户费。
+///
+/// Spec: account-module.md §2 硬风控模型:
+///   `transferFee = notional × transferFeeRate`，仅 `TsCode.market = "SH"`
+///   且 `InstrumentCategory ∈ {stock, fund}`；其他市场为 0；双向收取。
+pub fn compute_transfer_fee(
+    price: Price,
+    quantity: Shares,
+    policy: &AccountFeePolicy,
+    ts_code: &TsCode,
+    category: InstrumentCategory,
+) -> Money {
+    if !matches!(ts_code.market(), Market::SH) {
+        return Money::ZERO;
+    }
+    if !matches!(category, InstrumentCategory::Stock | InstrumentCategory::Fund) {
+        return Money::ZERO;
+    }
+    let rate_f = policy.transfer_fee_rate.unwrap_or(0.0);
+    let rate = Decimal::from_f64(rate_f).unwrap_or(Decimal::ZERO);
+    let gross = MoneyMath::gross_amount(price, quantity);
+    let raw = gross * rate;
+    Money(raw.round_dp(2))
+}
+
 /// 买入成交后更新平均成本。
 ///
 /// Spec: account-module.md §2 仓位模型规则:
-/// `avgCost` 由买入成交价、买入佣金和剩余持仓数量加权派生。
+/// `avgCost` 由买入成交价、买入佣金 + 买入过户费 和剩余持仓数量加权派生。
 ///
-/// 算法：cost_basis_new = old_qty * old_avg + buy_qty * buy_price + commission
-///       avg_cost_new = cost_basis_new / (old_qty + buy_qty)
+/// 算法：
+///   cost_basis_new = old_qty * old_avg + buy_qty * buy_price + commission + transfer_fee
+///   avg_cost_new = cost_basis_new / (old_qty + buy_qty)
+///
+/// Note: 印花税仅卖出收取，不进入买入 lot cost basis。
 pub fn apply_buy_avg_cost(
     old_quantity: Shares,
     old_avg_cost: Price,
     buy_quantity: Shares,
     buy_price: Price,
     buy_commission: Money,
+    buy_transfer_fee: Money,
 ) -> Price {
     let old_qty = Decimal::from(old_quantity.0);
     let buy_qty = Decimal::from(buy_quantity.0);
@@ -78,7 +108,7 @@ pub fn apply_buy_avg_cost(
         return Price(Decimal::ZERO);
     }
     let old_basis = old_qty * old_avg_cost.0;
-    let new_buy_basis = buy_qty * buy_price.0 + buy_commission.0;
+    let new_buy_basis = buy_qty * buy_price.0 + buy_commission.0 + buy_transfer_fee.0;
     let total = old_basis + new_buy_basis;
     Price((total / total_qty).round_dp(6))
 }
@@ -86,28 +116,30 @@ pub fn apply_buy_avg_cost(
 /// 卖出成交后增量更新已实现盈亏。
 ///
 /// Spec: account-module.md §2 仓位模型规则:
-/// `realizedPnl` 由卖出成交收入减去被卖出 lot 的成本、佣金和印花税派生。
+/// `realizedPnl += (price - lotCost) × quantity - sellCommission - stampTax - sellTransferFee`
 ///
-/// 这里使用平均成本法（avg_cost 已经包含买入佣金的加权）：
-/// realized_pnl_delta = (sell_price - avg_cost) * sell_qty - sell_commission - stamp_tax
+/// 平均成本法（avg_cost 已经包含买入佣金 + 买入过户费的加权）：
+///   realized_pnl_delta = (sell_price - avg_cost) * sell_qty
+///                        - sell_commission - stamp_tax - sell_transfer_fee
 pub fn apply_sell_realized_pnl(
     sell_quantity: Shares,
     sell_price: Price,
     avg_cost: Price,
     sell_commission: Money,
     stamp_tax: Money,
+    sell_transfer_fee: Money,
 ) -> Money {
     let sell_qty = Decimal::from(sell_quantity.0);
     let revenue = sell_qty * sell_price.0;
     let cost = sell_qty * avg_cost.0;
-    let pnl = (revenue - cost) - sell_commission.0 - stamp_tax.0;
+    let pnl = (revenue - cost) - sell_commission.0 - stamp_tax.0 - sell_transfer_fee.0;
     Money(pnl.round_dp(2))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::shared::{Money, Price, Shares};
+    use crate::domain::shared::{Money, Price, Shares, TsCode};
 
     fn fee_policy() -> AccountFeePolicy {
         AccountFeePolicy::default()
@@ -141,56 +173,158 @@ mod tests {
         assert_eq!(s, Money(Decimal::new(5, 2)));
     }
 
+    // ------------------------------------------------------------------
+    // transfer_fee — spec §2 硬风控模型: 仅 SH stock / fund 双向，0.00001
+    // ------------------------------------------------------------------
+
     #[test]
-    fn avg_cost_first_buy_includes_commission() {
-        // 第一次买入：100 元 * 1000 股 + 30 元佣金 → 100,030 / 1000 = 100.03
+    fn transfer_fee_sh_stock_uses_default_rate() {
+        // 100 * 10000 = 1,000,000；0.00001 = 10 元
+        let sh = TsCode::parse("600519.SH").unwrap();
+        let f = compute_transfer_fee(
+            Price(Decimal::new(100, 0)),
+            Shares(10_000),
+            &fee_policy(),
+            &sh,
+            InstrumentCategory::Stock,
+        );
+        assert_eq!(f, Money(Decimal::new(1000, 2)));
+    }
+
+    #[test]
+    fn transfer_fee_sz_zero() {
+        let sz = TsCode::parse("000001.SZ").unwrap();
+        let f = compute_transfer_fee(
+            Price(Decimal::new(100, 0)),
+            Shares(10_000),
+            &fee_policy(),
+            &sz,
+            InstrumentCategory::Stock,
+        );
+        assert_eq!(f, Money::ZERO);
+    }
+
+    #[test]
+    fn transfer_fee_bj_zero() {
+        let bj = TsCode::parse("430047.BJ").unwrap();
+        let f = compute_transfer_fee(
+            Price(Decimal::new(100, 0)),
+            Shares(10_000),
+            &fee_policy(),
+            &bj,
+            InstrumentCategory::Stock,
+        );
+        assert_eq!(f, Money::ZERO);
+    }
+
+    #[test]
+    fn transfer_fee_sh_fund_charged() {
+        let sh = TsCode::parse("510300.SH").unwrap();
+        let f = compute_transfer_fee(
+            Price(Decimal::new(5, 0)),
+            Shares(100_000),
+            &fee_policy(),
+            &sh,
+            InstrumentCategory::Fund,
+        );
+        // 5 * 100000 = 500000；0.00001 = 5 元
+        assert_eq!(f, Money(Decimal::new(500, 2)));
+    }
+
+    #[test]
+    fn transfer_fee_index_zero_even_on_sh() {
+        let sh = TsCode::parse("000300.SH").unwrap();
+        let f = compute_transfer_fee(
+            Price(Decimal::new(100, 0)),
+            Shares(10_000),
+            &fee_policy(),
+            &sh,
+            InstrumentCategory::Index,
+        );
+        assert_eq!(f, Money::ZERO);
+    }
+
+    // ------------------------------------------------------------------
+    // avg_cost — must include commission + transfer_fee
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn avg_cost_first_buy_includes_commission_and_transfer_fee() {
+        // 第一次买入：100 元 * 1000 股 + 30 元佣金 + 1 元过户费 → 100,031 / 1000 = 100.031
         let avg = apply_buy_avg_cost(
             Shares(0),
             Price(Decimal::ZERO),
             Shares(1000),
             Price(Decimal::new(100, 0)),
             Money(Decimal::new(3000, 2)),
+            Money(Decimal::new(100, 2)),
         );
-        assert_eq!(avg, Price(Decimal::new(10003, 2)));
+        assert_eq!(avg, Price(Decimal::new(100031, 3)));
     }
 
     #[test]
     fn avg_cost_second_buy_weighted() {
-        // 已持 1000 股 avg 100；再买 1000 股 110 + 33 元佣金
-        // (1000*100 + 1000*110 + 33) / 2000 = 210033 / 2000 = 105.0165
+        // 已持 1000 股 avg 100；再买 1000 股 110 + 33 元佣金 + 0 transfer (no SH context here)
+        // (1000*100 + 1000*110 + 33 + 0) / 2000 = 210033 / 2000 = 105.0165
         let avg = apply_buy_avg_cost(
             Shares(1000),
             Price(Decimal::new(100, 0)),
             Shares(1000),
             Price(Decimal::new(110, 0)),
             Money(Decimal::new(3300, 2)),
+            Money::ZERO,
         );
         assert_eq!(avg, Price(Decimal::new(1050165, 4)));
     }
 
+    // ------------------------------------------------------------------
+    // realized_pnl — must subtract stamp_tax + transfer_fee
+    // ------------------------------------------------------------------
+
     #[test]
-    fn realized_pnl_profit() {
-        // avg 100，卖 110 * 1000 - 33 佣金 - 55 税 = (110-100)*1000 - 88 = 9912
+    fn realized_pnl_profit_subtracts_all_sell_fees() {
+        // avg 100，卖 110 * 1000 - 33 佣金 - 55 印花税 - 1.1 过户费
+        //   = (110-100)*1000 - 89.1 = 9910.9
         let pnl = apply_sell_realized_pnl(
             Shares(1000),
             Price(Decimal::new(110, 0)),
             Price(Decimal::new(100, 0)),
             Money(Decimal::new(3300, 2)),
             Money(Decimal::new(5500, 2)),
+            Money(Decimal::new(110, 2)),
         );
-        assert_eq!(pnl, Money(Decimal::new(991200, 2)));
+        assert_eq!(pnl, Money(Decimal::new(991090, 2)));
     }
 
     #[test]
-    fn realized_pnl_loss() {
-        // avg 100，卖 90 * 1000 - 27 佣金 - 45 税 = -10000 - 72 = -10072
+    fn realized_pnl_loss_subtracts_all_sell_fees() {
+        // avg 100，卖 90 * 1000 - 27 佣金 - 45 印花税 - 0 过户费
+        //   = -10000 - 72 = -10072
         let pnl = apply_sell_realized_pnl(
             Shares(1000),
             Price(Decimal::new(90, 0)),
             Price(Decimal::new(100, 0)),
             Money(Decimal::new(2700, 2)),
             Money(Decimal::new(4500, 2)),
+            Money::ZERO,
         );
         assert_eq!(pnl, Money(Decimal::new(-1007200, 2)));
+    }
+
+    /// **T1 (review P0)**: 印花税 + 过户费必须计入 realized_pnl。
+    /// 验证 spec §2 仓位规则的 realizedPnl 公式。
+    #[test]
+    fn realized_pnl_subtracts_stamp_tax_and_transfer_fee() {
+        // 平价卖出：avg 100, 卖 100 * 1000 = 10万；
+        //   佣金 30 + 印花税 50 + 过户费 1 → realized = -81
+        let pnl = apply_sell_realized_pnl(
+            Shares(1000),
+            Price(Decimal::new(100, 0)),
+            Price(Decimal::new(100, 0)),
+            Money(Decimal::new(3000, 2)),
+            Money(Decimal::new(5000, 2)),
+            Money(Decimal::new(100, 2)),
+        );
+        assert_eq!(pnl, Money(Decimal::new(-8100, 2)));
     }
 }

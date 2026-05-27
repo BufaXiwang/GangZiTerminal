@@ -131,13 +131,17 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
         }
     }
 
-    let valuation_status = if !any_valued && positions.is_empty() {
-        // 无 open position
-        FreshnessStatus::Missing
+    // Spec: account-module.md §2 账户快照 valuationFreshness:
+    //   - openPositionCount = 0 → fresh（无仓位无估值需求）
+    //   - 有仓位时按子 quote 聚合：全 fresh → fresh；存在 stale 且无 missing → stale；
+    //     存在 missing 子 quote（含完全无可估值）→ missing。
+    let valuation_status = if positions.is_empty() {
+        FreshnessStatus::Fresh
     } else if !any_valued {
         FreshnessStatus::Missing
     } else if unpriced > 0 {
-        FreshnessStatus::Stale
+        // 部分仓位 missing → 整体 missing
+        FreshnessStatus::Missing
     } else {
         weakest_status
     };
@@ -199,7 +203,24 @@ fn weaken_status(a: FreshnessStatus, b: FreshnessStatus) -> FreshnessStatus {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+
+    #[test]
+    fn empty_snapshot_zero_positions_freshness_is_fresh() {
+        // Spec: account-module.md §2 账户快照 — 0 仓位 → fresh
+        let s = empty_snapshot(Money(Decimal::from(1_000_000)));
+        assert_eq!(s.open_position_count, 0);
+        assert_eq!(s.valuation_freshness.status, FreshnessStatus::Fresh);
+        assert!(s.warnings.is_empty());
+    }
+}
+
 /// 空账户的 snapshot（initial_cash 不可用时不应调用此函数）。
+///
+/// Spec: account-module.md §2 账户快照 — `openPositionCount = 0` 时 `status = "fresh"`。
 pub fn empty_snapshot(initial_cash: Money) -> AccountSnapshot {
     AccountSnapshot {
         initial_cash,
@@ -214,7 +235,7 @@ pub fn empty_snapshot(initial_cash: Money) -> AccountSnapshot {
         priced_position_count: 0,
         unpriced_position_count: 0,
         valuation_freshness: Freshness {
-            status: FreshnessStatus::Missing,
+            status: FreshnessStatus::Fresh,
             captured_at: Some(Utc::now()),
             exchange_time: None,
             age_ms: None,

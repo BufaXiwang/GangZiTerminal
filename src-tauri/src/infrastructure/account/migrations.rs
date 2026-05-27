@@ -76,18 +76,20 @@ CREATE INDEX idx_account_orders_pending   ON account_orders (status, expires_at)
     WHERE status IN ('pending', 'partially_filled');
 
 -- account_fills: TradeFill append-only。
+-- Spec: account-module.md §2 成交模型 — transfer_fee 仅 SH stock/fund 双向收取。
 CREATE TABLE account_fills (
-    fill_id      TEXT PRIMARY KEY,
-    order_id     TEXT NOT NULL,
-    position_id  TEXT NOT NULL,
-    ts_code      TEXT NOT NULL,
-    side         TEXT NOT NULL,
-    price        TEXT NOT NULL,
-    quantity     INTEGER NOT NULL,
-    commission   TEXT NOT NULL,
-    stamp_tax    TEXT NOT NULL,
-    occurred_at  TEXT NOT NULL,
-    seq          INTEGER NOT NULL
+    fill_id       TEXT PRIMARY KEY,
+    order_id      TEXT NOT NULL,
+    position_id   TEXT NOT NULL,
+    ts_code       TEXT NOT NULL,
+    side          TEXT NOT NULL,
+    price         TEXT NOT NULL,
+    quantity      INTEGER NOT NULL,
+    commission    TEXT NOT NULL,
+    stamp_tax     TEXT NOT NULL,
+    transfer_fee  TEXT NOT NULL DEFAULT '0',
+    occurred_at   TEXT NOT NULL,
+    seq           INTEGER NOT NULL
 );
 
 CREATE INDEX idx_account_fills_order      ON account_fills (order_id);

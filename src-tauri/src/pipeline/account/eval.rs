@@ -8,7 +8,10 @@
 //! - trigger_id 用 `TriggerKey` 稳定键；同一交易日 + revision + threshold 只生成一次。
 
 use crate::domain::account::events::{AccountEvent, AccountEventType};
-use crate::domain::account::money::{compute_commission, compute_stamp_tax, apply_buy_avg_cost, apply_sell_realized_pnl};
+use crate::domain::account::money::{
+    apply_buy_avg_cost, apply_sell_realized_pnl, compute_commission, compute_stamp_tax,
+    compute_transfer_fee,
+};
 use crate::domain::account::requests::AccountActor;
 use crate::domain::account::triggers::{AccountTrigger, AccountTriggerResult, AccountTriggerType, TriggerKey};
 use crate::domain::account::types::{
@@ -16,7 +19,8 @@ use crate::domain::account::types::{
     PositionStatus, TradeFill, TradingActor,
 };
 use crate::domain::shared::{
-    resolve_market_time, FreshnessStatus, Money, OccurredAt, Price, Shares, TsCode, WarningCode,
+    resolve_market_time, FreshnessStatus, InstrumentCategory, Money, OccurredAt, Price, Shares,
+    TsCode, WarningCode,
 };
 use crate::infrastructure::account::repository::{AccountRepository, FreezeEntry};
 use crate::infrastructure::db::AppDb;
@@ -43,7 +47,66 @@ pub struct EvalInput<'a> {
     pub cursor: Option<String>,
 }
 
+/// Cursor 编码格式 — `phase/updated_at/trigger_key` 持久排序键。
+///
+/// Spec: account-module.md §2 触发事件模型:
+///   `nextCursor` 必须基于持久排序键生成；它必须可跨进程重启后恢复同一批次之后的扫描位置。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EvalCursor {
+    pub phase: EvalPhase,
+    /// `updated_at` (orders) 或 `opened_at` (positions) 的 ISO-8601 字符串。
+    pub anchor_ts: String,
+    /// `order_id` 或 `position_id` — 同 anchor_ts 的稳定 tie-breaker。
+    pub anchor_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvalPhase {
+    Orders,
+    Positions,
+}
+
+impl EvalPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Orders => "orders",
+            Self::Positions => "positions",
+        }
+    }
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "orders" => Some(Self::Orders),
+            "positions" => Some(Self::Positions),
+            _ => None,
+        }
+    }
+}
+
+impl EvalCursor {
+    pub(crate) fn encode(&self) -> String {
+        format!("eval/{}/{}/{}", self.phase.as_str(), self.anchor_ts, self.anchor_key)
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        // expected: eval/<phase>/<ts>/<key>
+        let rest = s.strip_prefix("eval/")?;
+        let parts: Vec<&str> = rest.splitn(3, '/').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        Some(Self {
+            phase: EvalPhase::from_str(parts[0])?,
+            anchor_ts: parts[1].to_string(),
+            anchor_key: parts[2].to_string(),
+        })
+    }
+}
+
 /// 触发评估的同步实现（spec §4 evaluate_account_triggers）。
+///
+/// Spec: account-module.md §2 触发事件模型:
+///   `nextCursor` 基于持久排序键 `(phase, updated_at/opened_at, id)`。
+///   进程重启后调用方传入 cursor，从上一批结束位置之后继续扫描。
 pub fn evaluate_account_triggers(input: EvalInput<'_>) -> AccountTriggerResult {
     let repo = AccountRepository::new(&input.deps.db);
     let mut all_triggers: Vec<AccountTrigger> = Vec::new();
@@ -53,92 +116,127 @@ pub fn evaluate_account_triggers(input: EvalInput<'_>) -> AccountTriggerResult {
     let mut has_more = false;
     let now = input.now;
 
-    // Phase 1: pending orders（按 updated_at asc）
-    let active_orders = repo.list_active_orders().unwrap_or_default();
-    let mut orders_sorted: Vec<_> = active_orders;
-    orders_sorted.sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.order_id.cmp(&b.order_id)));
-    for order in orders_sorted {
-        if processed >= input.batch_size {
-            has_more = true;
-            break;
-        }
-        // Expiration check
-        if let Some(expiry) = order.expires_at {
-            if now >= expiry {
-                if let Some((trig, ev_ids)) = expire_order(&repo, &order) {
-                    all_event_ids.extend(ev_ids);
-                    if let Some(t) = trig {
-                        all_triggers.push(t);
-                    }
+    let cursor = input.cursor.as_deref().and_then(EvalCursor::parse);
+    let start_phase = cursor.as_ref().map(|c| c.phase).unwrap_or(EvalPhase::Orders);
+    // 同 anchor 之后才处理（lexical compare on (anchor_ts, anchor_key)）
+    let resume_after: Option<(String, String)> =
+        cursor.as_ref().map(|c| (c.anchor_ts.clone(), c.anchor_key.clone()));
+
+    let mut last_processed: Option<(EvalPhase, String, String)> = None;
+
+    // Phase 1: pending orders（按 updated_at asc, order_id asc）
+    if matches!(start_phase, EvalPhase::Orders) {
+        let active_orders = repo.list_active_orders().unwrap_or_default();
+        let mut orders_sorted: Vec<_> = active_orders;
+        orders_sorted
+            .sort_by(|a, b| a.updated_at.cmp(&b.updated_at).then(a.order_id.cmp(&b.order_id)));
+        for order in orders_sorted {
+            let order_ts = order.updated_at.to_rfc3339();
+            if let Some((rts, rkey)) = &resume_after {
+                // strict-greater-than: skip until past resume anchor
+                if (order_ts.as_str(), order.order_id.as_str()) <= (rts.as_str(), rkey.as_str()) {
+                    continue;
                 }
-                processed += 1;
-                continue;
             }
-        }
-        // Fill evaluation (limit only — market 已在 operate_account 中处理)
-        if matches!(order.order_type, OrderType::Limit) {
-            let ctx = resolve_market_time(now);
-            let snap = input.deps.gateway.get_snapshot(&order.ts_code);
-            match snap {
-                Ok(snapshot) => {
-                    let limit_price = order.limit_price.expect("limit order has limit_price");
-                    let remaining = Shares(order.quantity.0 - order.filled_quantity.0);
-                    if remaining.0 <= 0 {
-                        continue;
+            if processed >= input.batch_size {
+                has_more = true;
+                break;
+            }
+            // Expiration check
+            if let Some(expiry) = order.expires_at {
+                if now >= expiry {
+                    if let Some((trig, ev_ids)) = expire_order(&repo, &order) {
+                        all_event_ids.extend(ev_ids);
+                        if let Some(t) = trig {
+                            all_triggers.push(t);
+                        }
                     }
-                    let decision = simulate_limit(
-                        &snapshot,
-                        order.side,
-                        limit_price,
-                        remaining,
-                        ctx.is_trading_time,
-                    );
-                    match decision {
-                        FillDecision::Filled(exec) | FillDecision::PartiallyFilled(exec) => {
-                            let full_fill = exec.quantity.0 >= remaining.0;
-                            if let Some((trig, ev_ids)) = commit_limit_fill(
-                                &repo,
-                                input.deps,
-                                &order,
-                                exec.price,
-                                exec.quantity,
-                                full_fill,
-                                now,
-                            ) {
-                                all_event_ids.extend(ev_ids);
-                                if let Some(t) = trig {
-                                    all_triggers.push(t);
+                    processed += 1;
+                    last_processed = Some((EvalPhase::Orders, order_ts, order.order_id.clone()));
+                    continue;
+                }
+            }
+            // Fill evaluation (limit only — market 已在 operate_account 中处理)
+            if matches!(order.order_type, OrderType::Limit) {
+                let ctx = resolve_market_time(now);
+                let snap = input.deps.gateway.get_snapshot(&order.ts_code);
+                match snap {
+                    Ok(snapshot) => {
+                        let limit_price = order.limit_price.expect("limit order has limit_price");
+                        let remaining = Shares(order.quantity.0 - order.filled_quantity.0);
+                        if remaining.0 <= 0 {
+                            last_processed =
+                                Some((EvalPhase::Orders, order_ts, order.order_id.clone()));
+                            continue;
+                        }
+                        let decision = simulate_limit(
+                            &snapshot,
+                            order.side,
+                            limit_price,
+                            remaining,
+                            ctx.is_trading_time,
+                        );
+                        match decision {
+                            FillDecision::Filled(exec) | FillDecision::PartiallyFilled(exec) => {
+                                let full_fill = exec.quantity.0 >= remaining.0;
+                                if let Some((trig, ev_ids)) = commit_limit_fill(
+                                    &repo,
+                                    input.deps,
+                                    &order,
+                                    exec.price,
+                                    exec.quantity,
+                                    full_fill,
+                                    now,
+                                ) {
+                                    all_event_ids.extend(ev_ids);
+                                    if let Some(t) = trig {
+                                        all_triggers.push(t);
+                                    }
                                 }
                             }
-                        }
-                        FillDecision::NotEligible(NotEligibleReason::QuoteMissing) => {
-                            if !warnings.contains(&WarningCode::QuoteMissing) {
-                                warnings.push(WarningCode::QuoteMissing);
+                            FillDecision::NotEligible(NotEligibleReason::QuoteMissing) => {
+                                if !warnings.contains(&WarningCode::QuoteMissing) {
+                                    warnings.push(WarningCode::QuoteMissing);
+                                }
                             }
+                            FillDecision::NotEligible(NotEligibleReason::QuoteStale) => {
+                                // limit pending OK; do nothing
+                            }
+                            _ => {}
                         }
-                        FillDecision::NotEligible(NotEligibleReason::QuoteStale) => {
-                            // limit pending OK; do nothing
-                        }
-                        _ => {}
                     }
-                }
-                Err(e) => {
-                    let w = quote_err_to_warning(e.kind);
-                    if !warnings.contains(&w) {
-                        warnings.push(w);
+                    Err(e) => {
+                        let w = quote_err_to_warning(e.kind);
+                        if !warnings.contains(&w) {
+                            warnings.push(w);
+                        }
                     }
                 }
             }
+            processed += 1;
+            last_processed = Some((EvalPhase::Orders, order_ts, order.order_id.clone()));
         }
-        processed += 1;
     }
 
-    // Phase 2: protection evaluation（同 batch_size 限制）
-    if processed < input.batch_size {
+    // Phase 2: protection evaluation（按 opened_at asc, position_id asc）
+    if !has_more {
         let positions_with_prot = repo
             .list_open_positions_with_protection()
             .unwrap_or_default();
+        // Sort already done in SQL (opened_at ASC, position_id ASC).
+        // Resume only applies when start_phase = Positions AND we are continuing this phase.
+        let positions_resume = if matches!(start_phase, EvalPhase::Positions) {
+            resume_after.clone()
+        } else {
+            None
+        };
         for (pos, prot) in positions_with_prot {
+            let pos_ts = pos.opened_at.to_rfc3339();
+            if let Some((rts, rkey)) = &positions_resume {
+                if (pos_ts.as_str(), pos.position_id.as_str()) <= (rts.as_str(), rkey.as_str()) {
+                    continue;
+                }
+            }
             if processed >= input.batch_size {
                 has_more = true;
                 break;
@@ -154,18 +252,28 @@ pub fn evaluate_account_triggers(input: EvalInput<'_>) -> AccountTriggerResult {
                 &mut warnings,
             );
             processed += 1;
+            last_processed = Some((EvalPhase::Positions, pos_ts, pos.position_id.clone()));
         }
     }
+
+    let next_cursor = if has_more {
+        last_processed.map(|(phase, anchor_ts, anchor_key)| {
+            EvalCursor {
+                phase,
+                anchor_ts,
+                anchor_key,
+            }
+            .encode()
+        })
+    } else {
+        None
+    };
 
     AccountTriggerResult {
         triggers: all_triggers,
         account_event_ids: all_event_ids,
         has_more,
-        next_cursor: if has_more {
-            Some(format!("eval_{}", now.timestamp_millis()))
-        } else {
-            None
-        },
+        next_cursor,
         warnings,
     }
 }
@@ -298,6 +406,7 @@ fn expire_order(
 // commit limit fill (called by eval)
 // ----------------------------------------------------------------------------
 
+/// Spec: account-module.md §2 成交模型 / 仓位模型 — 现金 / PnL / lot cost 必须包含 transferFee。
 fn commit_limit_fill(
     repo: &AccountRepository<'_>,
     deps: &EvalDeps,
@@ -314,6 +423,14 @@ fn commit_limit_fill(
     } else {
         Money(Decimal::ZERO)
     };
+    // Instrument category for transfer_fee — lookup via quotes facade.
+    let category = crate::pipeline::quotes::facade::get_instrument(&deps.db, &order.ts_code)
+        .ok()
+        .flatten()
+        .map(|i| i.category)
+        .unwrap_or(InstrumentCategory::Stock);
+    let transfer_fee =
+        compute_transfer_fee(exec_price, exec_quantity, &deps.fee_policy, &order.ts_code, category);
     let order_id = order.order_id.clone();
     let mut trigger: Option<AccountTrigger> = None;
 
@@ -332,10 +449,10 @@ fn commit_limit_fill(
     };
     let trade_amount = exec_price.0 * Decimal::from(exec_quantity.0);
     let cash_delta = match order.side {
-        OrderSide::Buy => -trade_amount - commission.0,
-        OrderSide::Sell => trade_amount - commission.0 - stamp_tax.0,
+        OrderSide::Buy => -trade_amount - commission.0 - transfer_fee.0,
+        OrderSide::Sell => trade_amount - commission.0 - stamp_tax.0 - transfer_fee.0,
     };
-    // Build position after
+    // Build position after — pass stamp_tax + transfer_fee for proper PnL / cost basis.
     let (position_event, position_after) = derive_position_after_fill(
         order.side,
         &existing,
@@ -343,6 +460,8 @@ fn commit_limit_fill(
         exec_price,
         exec_quantity,
         commission,
+        stamp_tax,
+        transfer_fee,
         now,
         position_id.clone(),
     );
@@ -368,6 +487,7 @@ fn commit_limit_fill(
         quantity: exec_quantity,
         commission,
         stamp_tax,
+        transfer_fee,
         occurred_at: now,
     };
 
@@ -553,6 +673,9 @@ fn commit_limit_fill(
     Some((trigger, event_ids))
 }
 
+/// Spec: account-module.md §2 仓位模型: lot cost = commission + transfer_fee；
+///   realizedPnl = (price - avgCost) * qty - sellCommission - stampTax - sellTransferFee。
+#[allow(clippy::too_many_arguments)]
 fn derive_position_after_fill(
     side: OrderSide,
     existing: &Option<Position>,
@@ -560,12 +683,21 @@ fn derive_position_after_fill(
     price: Price,
     quantity: Shares,
     commission: Money,
+    stamp_tax: Money,
+    transfer_fee: Money,
     now: OccurredAt,
     position_id: String,
 ) -> (AccountEventType, Position) {
     match (side, existing) {
         (OrderSide::Buy, None) => {
-            let avg = apply_buy_avg_cost(Shares(0), Price(Decimal::ZERO), quantity, price, commission);
+            let avg = apply_buy_avg_cost(
+                Shares(0),
+                Price(Decimal::ZERO),
+                quantity,
+                price,
+                commission,
+                transfer_fee,
+            );
             (
                 AccountEventType::PositionOpened,
                 Position {
@@ -592,7 +724,14 @@ fn derive_position_after_fill(
         }
         (OrderSide::Buy, Some(p)) => {
             let new_qty = Shares(p.quantity.0 + quantity.0);
-            let avg = apply_buy_avg_cost(p.quantity, p.avg_cost, quantity, price, commission);
+            let avg = apply_buy_avg_cost(
+                p.quantity,
+                p.avg_cost,
+                quantity,
+                price,
+                commission,
+                transfer_fee,
+            );
             let mut pos = p.clone();
             pos.quantity = new_qty;
             pos.avg_cost = avg;
@@ -604,7 +743,8 @@ fn derive_position_after_fill(
                 price,
                 p.avg_cost,
                 commission,
-                Money(Decimal::ZERO),
+                stamp_tax,
+                transfer_fee,
             );
             let new_qty = Shares(p.quantity.0 - quantity.0);
             let mut pos = p.clone();
@@ -893,5 +1033,318 @@ mod tests {
             cursor: None,
         });
         assert!(r.triggers.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Cursor encode / parse (Drift J)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn eval_cursor_round_trip() {
+        let c = EvalCursor {
+            phase: EvalPhase::Orders,
+            anchor_ts: "2026-05-27T01:23:45+00:00".into(),
+            anchor_key: "ord_abc".into(),
+        };
+        let s = c.encode();
+        assert!(s.starts_with("eval/orders/"));
+        let parsed = EvalCursor::parse(&s).unwrap();
+        assert_eq!(parsed.phase, EvalPhase::Orders);
+        assert_eq!(parsed.anchor_ts, c.anchor_ts);
+        assert_eq!(parsed.anchor_key, c.anchor_key);
+    }
+
+    #[test]
+    fn eval_cursor_phase_positions_encodes() {
+        let c = EvalCursor {
+            phase: EvalPhase::Positions,
+            anchor_ts: "2026-05-27T01:23:45+00:00".into(),
+            anchor_key: "pos_xyz".into(),
+        };
+        let s = c.encode();
+        let parsed = EvalCursor::parse(&s).unwrap();
+        assert_eq!(parsed.phase, EvalPhase::Positions);
+    }
+
+    #[test]
+    fn eval_cursor_bad_format_returns_none() {
+        assert!(EvalCursor::parse("garbage").is_none());
+        assert!(EvalCursor::parse("eval/unknown_phase/ts/key").is_none());
+        assert!(EvalCursor::parse("eval/orders/only_two").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // T6 — protection trigger idempotency within same revision/day.
+    // Spec: §2 触发事件模型 — 同 revision/threshold/tradeDate 最多一次。
+    // ------------------------------------------------------------------
+
+    fn make_position(code: &TsCode, position_id: &str) -> Position {
+        Position {
+            position_id: position_id.into(),
+            ts_code: code.clone(),
+            name: "x".into(),
+            status: PositionStatus::Open,
+            quantity: Shares(1000),
+            sellable_quantity: Shares(1000),
+            avg_cost: Price(Decimal::new(100, 0)),
+            market_price: None,
+            market_value: None,
+            quote_freshness: None,
+            realized_pnl: Money(Decimal::ZERO),
+            unrealized_pnl: None,
+            opened_at: Utc::now(),
+            closed_at: None,
+            protection: None,
+            actor: TradingActor::Agent,
+            reasoning: None,
+            warnings: vec![],
+        }
+    }
+
+    fn make_protection(stop_loss: Option<f64>, revision: u32) -> PositionProtection {
+        PositionProtection {
+            stop_loss: stop_loss.map(|p| Price(Decimal::from_str_exact(&p.to_string()).unwrap())),
+            take_profit: None,
+            time_stop_at: None,
+            invalidation_signals: vec![],
+            enabled: true,
+            revision,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn seed_inst_for_eval(db: &AppDb, ts: &str) -> TsCode {
+        let code = TsCode::parse(ts).unwrap();
+        use crate::domain::quotes::{InstrumentSource as Q_InstrumentSource, MarketInstrument as Q_MarketInstrument};
+        use crate::domain::shared::{InstrumentCategory, InstrumentStatus, Market};
+        crate::infrastructure::quotes::QuotesRepository::new(db)
+            .upsert_instruments(&[Q_MarketInstrument {
+                ts_code: code.clone(),
+                name: "Test".into(),
+                category: InstrumentCategory::Stock,
+                market: Market::SH,
+                board: None,
+                sector: None,
+                status: Some(InstrumentStatus::Listed),
+                is_st: Some(false),
+                publisher: None,
+                index_category: None,
+                fund_type: None,
+                management: None,
+                list_date: None,
+                source: Q_InstrumentSource::Tushare,
+                updated_at: Utc::now(),
+            }])
+            .unwrap();
+        code
+    }
+
+    fn snap_with_price_and_freshness(
+        code: &TsCode,
+        price: f64,
+        freshness: FreshnessStatus,
+    ) -> crate::domain::quotes::MarketQuoteSnapshot {
+        use crate::domain::quotes::{QuoteDepthLevel, QuoteSource, StockQuote, TradeStatus};
+        use crate::domain::shared::{Freshness, InstrumentCategory, TradeDate, Volume};
+        let now = Utc::now();
+        let p = Price(Decimal::from_str_exact(&price.to_string()).unwrap());
+        crate::domain::quotes::MarketQuoteSnapshot {
+            ts_code: code.clone(),
+            category: InstrumentCategory::Stock,
+            quote: StockQuote {
+                ts_code: code.clone(),
+                name: None,
+                category: InstrumentCategory::Stock,
+                trade_date: TradeDate::parse("20260526").unwrap(),
+                price: Some(p),
+                previous_close: None,
+                open: None,
+                high: None,
+                low: None,
+                change: None,
+                change_percent: None,
+                volume: None,
+                amount: None,
+                turnover_rate: None,
+                volume_ratio: None,
+                limit_up: None,
+                limit_down: None,
+                bid: vec![QuoteDepthLevel {
+                    price: Some(p),
+                    volume: Some(Volume(10_000)),
+                }],
+                ask: vec![QuoteDepthLevel {
+                    price: Some(p),
+                    volume: Some(Volume(10_000)),
+                }],
+                trade_status: TradeStatus::Trading,
+                source: QuoteSource::Tdx,
+                captured_at: now,
+                exchange_time: None,
+                freshness: Freshness {
+                    status: freshness,
+                    captured_at: Some(now),
+                    exchange_time: None,
+                    age_ms: None,
+                    source: Some("tdx".into()),
+                    warning: None,
+                },
+                warnings: vec![],
+            },
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn protection_trigger_idempotent_within_same_revision() {
+        let (db, deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos1");
+        let prot = make_protection(Some(95.0), 1);
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos1", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        // Inject fresh quote that triggers stop_loss (price 90 <= stop_loss 95)
+        let gw_mock = crate::pipeline::account::quote_gateway::MockQuoteGateway::new();
+        gw_mock.set(&code, Ok(snap_with_price_and_freshness(&code, 90.0, FreshnessStatus::Fresh)));
+        let deps2 = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw_mock),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r1 = evaluate_account_triggers(EvalInput {
+            deps: &deps2,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        // 1st eval — generates stop_loss trigger
+        let stop_count_1: usize = r1
+            .triggers
+            .iter()
+            .filter(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss))
+            .count();
+        assert_eq!(stop_count_1, 1, "first eval must produce one stop_loss trigger");
+        // 2nd eval — same revision + same threshold + same date → NO new trigger
+        let r2 = evaluate_account_triggers(EvalInput {
+            deps: &deps2,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        let stop_count_2: usize = r2
+            .triggers
+            .iter()
+            .filter(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss))
+            .count();
+        assert_eq!(stop_count_2, 0, "second eval must NOT duplicate stop_loss trigger");
+        let _ = deps;
+    }
+
+    // ------------------------------------------------------------------
+    // T7 — protection trigger on stale quote emits warning.
+    // Spec: §5 行情边界 — stale quote 命中价格型保护条件时仍可以生成 trigger；
+    //   AccountTrigger.warnings 必须包含 quote_stale。
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn protection_trigger_on_stale_quote_emits_warning() {
+        let (db, deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_stale");
+        let prot = make_protection(Some(95.0), 1);
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_stale", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        let gw_mock = crate::pipeline::account::quote_gateway::MockQuoteGateway::new();
+        gw_mock.set(&code, Ok(snap_with_price_and_freshness(&code, 90.0, FreshnessStatus::Stale)));
+        let deps2 = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw_mock),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps2,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        let stop = r
+            .triggers
+            .iter()
+            .find(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss))
+            .expect("stale quote should still produce stop_loss trigger");
+        assert!(
+            stop.warnings.contains(&WarningCode::QuoteStale),
+            "stale-quote trigger must carry quote_stale warning"
+        );
+        let _ = deps;
+    }
+
+    /// Cursor resume — given two orders, request batch_size = 1 first → cursor returned;
+    /// second call with cursor must skip the first and process only the second.
+    #[test]
+    fn evaluate_triggers_resumes_from_cursor() {
+        let (db, deps) = setup();
+        let code = crate::domain::shared::TsCode::parse("600519.SH").unwrap();
+        // Seed two pending limit orders that will both expire (so they're processed)
+        let now = Utc::now();
+        let expired = now - chrono::Duration::seconds(60);
+        let repo = AccountRepository::new(&db);
+        for i in 0..2 {
+            let order = crate::domain::account::types::Order {
+                order_id: format!("ord_{}", i),
+                ts_code: code.clone(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                limit_price: Some(Price(Decimal::new(100, 0))),
+                quantity: Shares(100),
+                filled_quantity: Shares(0),
+                status: OrderStatus::Pending,
+                intent: crate::domain::account::types::OrderIntent::DirectOrder,
+                position_id: None,
+                reason: Some("x".into()),
+                actor: TradingActor::Agent,
+                created_at: now - chrono::Duration::seconds(120 - i * 10),
+                updated_at: now - chrono::Duration::seconds(120 - i * 10),
+                expires_at: Some(expired),
+            };
+            repo.tx(|tx| {
+                AccountRepository::upsert_order(tx, &order)?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        // First call: batch_size = 1 → should return has_more + cursor
+        let r1 = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size: 1,
+            cursor: None,
+        });
+        assert_eq!(r1.triggers.len(), 1, "first batch should yield 1 trigger");
+        assert!(r1.has_more);
+        let cursor = r1.next_cursor.expect("must have cursor when has_more");
+        // Second call: resume → must skip the first, return the second
+        let r2 = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size: 10,
+            cursor: Some(cursor),
+        });
+        assert_eq!(r2.triggers.len(), 1, "resumed batch should yield the remaining order");
+        // ensure not duplicated
+        assert_ne!(
+            r1.triggers[0].order_id, r2.triggers[0].order_id,
+            "resume must process a different order"
+        );
     }
 }

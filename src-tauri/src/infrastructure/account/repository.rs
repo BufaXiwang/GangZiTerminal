@@ -330,6 +330,31 @@ impl<'a> AccountRepository<'a> {
         )
     }
 
+    /// 查找指定 ts_code 的未终态 `open_position` 订单（pending / partially_filled）。
+    ///
+    /// Spec: account-module.md §2 仓位模型规则:
+    ///   同一 ts_code 同时只允许一个未终态的 open_position 订单。
+    pub fn find_pending_open_position_order(
+        &self,
+        ts_code: &TsCode,
+    ) -> rusqlite::Result<Option<Order>> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
+                        filled_quantity, status, intent, position_id, reason,
+                        created_at, updated_at, expires_at
+                 FROM account_orders
+                 WHERE ts_code = ? AND intent = 'open_position'
+                   AND status IN ('pending','partially_filled')
+                 ORDER BY created_at ASC, order_id ASC
+                 LIMIT 1",
+                params![ts_code.as_str()],
+                Self::map_order_row,
+            )
+            .optional()
+        })
+    }
+
     pub fn count_pending_orders(&self) -> rusqlite::Result<u32> {
         self.db.with(|c| {
             c.query_row(
@@ -372,8 +397,8 @@ impl<'a> AccountRepository<'a> {
         tx.execute(
             "INSERT INTO account_fills
              (fill_id, order_id, position_id, ts_code, side, price, quantity,
-              commission, stamp_tax, occurred_at, seq)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              commission, stamp_tax, transfer_fee, occurred_at, seq)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 fill.fill_id,
                 fill.order_id,
@@ -384,6 +409,7 @@ impl<'a> AccountRepository<'a> {
                 fill.quantity.0,
                 fill.commission.0.to_string(),
                 fill.stamp_tax.0.to_string(),
+                fill.transfer_fee.0.to_string(),
                 fill.occurred_at.to_rfc3339(),
                 seq,
             ],
@@ -395,7 +421,7 @@ impl<'a> AccountRepository<'a> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
                 "SELECT fill_id, order_id, position_id, ts_code, side, price, quantity,
-                        commission, stamp_tax, occurred_at
+                        commission, stamp_tax, transfer_fee, occurred_at
                  FROM account_fills WHERE order_id = ? ORDER BY seq",
             )?;
             let rows = stmt
@@ -418,7 +444,8 @@ impl<'a> AccountRepository<'a> {
             quantity: Shares(row.get::<_, i64>(6)?),
             commission: Money(Self::parse_decimal(&row.get::<_, String>(7)?)),
             stamp_tax: Money(Self::parse_decimal(&row.get::<_, String>(8)?)),
-            occurred_at: parse_rfc3339(&row.get::<_, String>(9)?),
+            transfer_fee: Money(Self::parse_decimal(&row.get::<_, String>(9)?)),
+            occurred_at: parse_rfc3339(&row.get::<_, String>(10)?),
         })
     }
 

@@ -23,11 +23,12 @@ pub struct AccountFeePolicy {
 }
 
 /// Spec: account-module.md §2 缺省费用参数
+///   `transferFeeRate = 0.00001`（A 股沪市过户费 0.001%，双向；SZ/BJ 不收）。
 pub const FEE_DEFAULT: FeeDefaults = FeeDefaults {
     commission_rate: 0.0003,
     min_commission_cents: 500, // 5 元
     stamp_tax_sell_rate: 0.0005,
-    transfer_fee_rate: 0.0,
+    transfer_fee_rate: 0.00001,
 };
 
 pub struct FeeDefaults {
@@ -88,7 +89,8 @@ mod tests {
         assert!((p.commission_rate - 0.0003).abs() < 1e-12);
         assert_eq!(p.min_commission, Money(Decimal::new(500, 2)));
         assert!((p.stamp_tax_sell_rate - 0.0005).abs() < 1e-12);
-        assert_eq!(p.transfer_fee_rate, Some(0.0));
+        // Spec: account-module.md §2 — 缺省 transferFeeRate = 0.00001
+        assert_eq!(p.transfer_fee_rate, Some(0.00001));
     }
 
     #[test]

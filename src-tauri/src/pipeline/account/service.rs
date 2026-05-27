@@ -12,6 +12,7 @@
 use crate::domain::account::events::{AccountEvent, AccountEventType};
 use crate::domain::account::money::{
     apply_buy_avg_cost, apply_sell_realized_pnl, compute_commission, compute_stamp_tax,
+    compute_transfer_fee,
 };
 use crate::domain::account::policy::{AccountFeePolicy, AccountRiskPolicy};
 use crate::domain::account::requests::{
@@ -1120,8 +1121,20 @@ impl AccountService {
         )
     }
 
+    /// Commit market fill — full or partial.
+    ///
+    /// Spec: account-module.md §2 订单模型:
+    ///   `market` 即时撮合：盘口量足够则全成交，量不足则按可成交量部分成交、
+    ///   剩余数量立即自动取消并入终态（`partially_filled` 即为终态，同步 emit
+    ///   `order_cancelled` event 表达剩余量取消）。
+    ///
+    /// Spec: account-module.md §2 成交模型 / 硬风控模型:
+    ///   - 现金公式：买入 `cash -= price*qty + commission + transferFee`；
+    ///                 卖出 `cash += price*qty - commission - stampTax - transferFee`。
+    ///   - lot cost basis 包含 commission + transferFee（avg_cost 加权派生）。
+    ///   - realizedPnl 公式包含 stampTax + transferFee。
     #[allow(clippy::too_many_arguments)]
-    fn commit_market_fill(
+    pub(crate) fn commit_market_fill(
         &self,
         ts_code: TsCode,
         instrument: MarketInstrument,
@@ -1130,7 +1143,7 @@ impl AccountService {
         fill_exec: FillExecution,
         reason: String,
         intent: OrderIntent,
-        target_position_id: Option<String>,
+        _target_position_id: Option<String>,
         now: OccurredAt,
         _quote_freshness: Freshness,
     ) -> OperateAccountResponse {
@@ -1144,143 +1157,17 @@ impl AccountService {
         } else {
             Money(Decimal::ZERO)
         };
+        let transfer_fee = compute_transfer_fee(
+            fill_exec.price,
+            fill_exec.quantity,
+            fee_policy,
+            &ts_code,
+            instrument.category,
+        );
 
-        let mut event_ids: Vec<String> = Vec::new();
-        let mut affected_position_ids: Vec<String> = Vec::new();
-        let mut trigger_ids: Vec<String> = Vec::new();
-
-        // Find/Open position
         let is_partial = fill_exec.quantity.0 < order_quantity.0;
-        let final_status = if is_partial {
-            OrderStatus::Rejected // market partial: 因 market 不允许 pending，仅可全部成交或被拒
-            // 但 spec §5 提到部分成交允许 — 但 market 必须 immediate-or-reject。
-            // 这里实际处理：market 部分成交 → reject（不留 pending）。
-        } else {
-            OrderStatus::Filled
-        };
 
-        // 如果 market partial 且没有可成交全量 — spec §2 "market 是 immediate-or-reject" + §5
-        // "盘口量不足时允许部分成交，剩余数量保持 pending" — 与 market 互斥。
-        // 决策：market 部分成交按 reject 处理；要么全成要么不成。
-        if matches!(final_status, OrderStatus::Rejected) {
-            // 写 order_rejected
-            let order = Order {
-                order_id: order_id.clone(),
-                ts_code: ts_code.clone(),
-                side,
-                order_type: OrderType::Market,
-                limit_price: None,
-                quantity: order_quantity,
-                filled_quantity: Shares(0),
-                status: OrderStatus::Rejected,
-                intent,
-                position_id: target_position_id.clone(),
-                reason: Some(reason.clone()),
-                actor: TradingActor::Agent,
-                created_at: now,
-                updated_at: now,
-                expires_at: None,
-            };
-            let rejection_event_id = new_id("evt");
-            let result: rusqlite::Result<()> = repo.tx(|tx| {
-                AccountRepository::upsert_order(tx, &order)?;
-                let placed = AccountEvent {
-                    event_id: new_id("evt"),
-                    event_type: AccountEventType::OrderPlaced,
-                    order_id: Some(order.order_id.clone()),
-                    fill_id: None,
-                    position_id: target_position_id.clone(),
-                    ts_code: Some(ts_code.clone()),
-                    reason: Some(reason.clone()),
-                    actor: AccountActor::Agent.as_str().into(),
-                    payload: json!({
-                        "side": order_side_payload(side),
-                        "orderType": "market",
-                        "quantity": order_quantity.0,
-                        "intent": intent_payload(intent),
-                    }),
-                    occurred_at: now,
-                };
-                AccountRepository::append_event(tx, &placed)?;
-                event_ids.push(placed.event_id);
-                let rej_ev = AccountEvent {
-                    event_id: rejection_event_id.clone(),
-                    event_type: AccountEventType::OrderRejected,
-                    order_id: Some(order.order_id.clone()),
-                    fill_id: None,
-                    position_id: target_position_id.clone(),
-                    ts_code: Some(ts_code.clone()),
-                    reason: Some("market partial fill not allowed".into()),
-                    actor: AccountActor::System.as_str().into(),
-                    payload: json!({ "code": "depth_insufficient_for_market" }),
-                    occurred_at: now,
-                };
-                AccountRepository::append_event(tx, &rej_ev)?;
-                event_ids.push(rej_ev.event_id.clone());
-
-                // Order rejected trigger
-                let trig = AccountTrigger {
-                    trigger_id: TriggerKey::OrderTerminal {
-                        trigger_type: AccountTriggerType::OrderRejected,
-                        order_id: &order.order_id,
-                        ts_code: &ts_code,
-                        event_id: &rej_ev.event_id,
-                    }
-                    .stable_id(),
-                    trigger_type: AccountTriggerType::OrderRejected,
-                    order_id: Some(order.order_id.clone()),
-                    position_id: target_position_id.clone(),
-                    ts_code: Some(ts_code.clone()),
-                    price: None,
-                    threshold: None,
-                    quote_freshness: None,
-                    warnings: vec![],
-                    event_id: rej_ev.event_id.clone(),
-                    handled: false,
-                    occurred_at: now,
-                };
-                if AccountRepository::insert_trigger_if_new(tx, &trig)? {
-                    trigger_ids.push(trig.trigger_id.clone());
-                }
-                Ok(())
-            });
-            if result.is_err() {
-                return self.reject_pre_event(ErrorCode::DbError, "tx failure");
-            }
-            let snapshot = self.snapshot_or_default();
-            // emit
-            if !trigger_ids.is_empty() {
-                if let Some(t) = repo.get_trigger(&trigger_ids[0]).ok().flatten() {
-                    self.emit_triggered(t);
-                }
-            }
-            self.emit_updated(AccountUpdatedPayloadInner {
-                account_event_ids: event_ids.clone(),
-                affected_order_ids: vec![order_id.clone()],
-                affected_position_ids: affected_position_ids.clone(),
-                affected_ts_codes: vec![ts_code.clone()],
-                affected_watchlist_ts_codes: vec![],
-                trigger_ids: trigger_ids.clone(),
-                snapshot_captured_at: snapshot.captured_at,
-            });
-            return OperateAccountResponse {
-                accepted: false,
-                reason: Some(ErrorCode::DepthMissing),
-                message: Some("market order requires full fill; depth insufficient".into()),
-                order_id: Some(order_id),
-                fill_ids: vec![],
-                position_id: target_position_id,
-                trigger_id: trigger_ids.into_iter().next(),
-                rejection_event_id: Some(rejection_event_id),
-                account_event_ids: event_ids,
-                snapshot,
-                warnings: vec![],
-            };
-        }
-
-        // Full fill path
-        let _ = instrument;
-        // 计算 cash 变化
+        // 计算 cash 变化（spec §2 现金公式 — 含 transferFee）
         let meta = match repo.get_meta() {
             Ok(Some(m)) => m,
             _ => {
@@ -1289,21 +1176,38 @@ impl AccountService {
         };
         let trade_amount = fill_exec.price.0 * Decimal::from(fill_exec.quantity.0);
 
-        // 派生 position 状态
+        // 派生 position 状态（含正确的 stamp_tax + transfer_fee）
         let existing_open = repo.find_open_position_by_ts_code(&ts_code).ok().flatten();
-        let (position_id, position_event_type, position_after) =
-            self.derive_position_after_fill(side, &existing_open, &ts_code, &fill_exec, &commission, now);
+        let (position_id, position_event_type, position_after) = self
+            .derive_position_after_fill(
+                side,
+                &existing_open,
+                &ts_code,
+                &fill_exec,
+                &commission,
+                &stamp_tax,
+                &transfer_fee,
+                now,
+            );
 
+        let mut affected_position_ids: Vec<String> = Vec::new();
         affected_position_ids.push(position_id.clone());
 
-        // Cash delta
+        // Cash delta — 含 transferFee（双向）
         let cash_delta: Decimal = match side {
-            OrderSide::Buy => -trade_amount - commission.0,
-            OrderSide::Sell => trade_amount - commission.0 - stamp_tax.0,
+            OrderSide::Buy => -trade_amount - commission.0 - transfer_fee.0,
+            OrderSide::Sell => trade_amount - commission.0 - stamp_tax.0 - transfer_fee.0,
         };
         let new_cash = Money(meta.cash.0 + cash_delta);
 
-        // Build order + fill
+        // partial market = terminal state partially_filled
+        let final_status = if is_partial {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Filled
+        };
+        let cancelled_quantity = order_quantity.0 - fill_exec.quantity.0;
+
         let mut order = Order {
             order_id: order_id.clone(),
             ts_code: ts_code.clone(),
@@ -1312,7 +1216,7 @@ impl AccountService {
             limit_price: None,
             quantity: order_quantity,
             filled_quantity: fill_exec.quantity,
-            status: OrderStatus::Filled,
+            status: final_status,
             intent,
             position_id: Some(position_id.clone()),
             reason: Some(reason.clone()),
@@ -1331,10 +1235,15 @@ impl AccountService {
             quantity: fill_exec.quantity,
             commission,
             stamp_tax,
+            transfer_fee,
             occurred_at: now,
         };
 
         let order_filled_event_id = new_id("evt");
+        let order_cancelled_event_id = new_id("evt");
+        let mut event_ids: Vec<String> = Vec::new();
+        let mut trigger_ids: Vec<String> = Vec::new();
+
         let result: rusqlite::Result<()> = repo.tx(|tx| {
             // 1) order_placed
             let placed = AccountEvent {
@@ -1357,7 +1266,7 @@ impl AccountService {
             AccountRepository::append_event(tx, &placed)?;
             event_ids.push(placed.event_id);
 
-            // 2) upsert order with filled state
+            // 2) upsert order with filled / partially_filled state
             AccountRepository::upsert_order(tx, &order)?;
             AccountRepository::insert_fill(tx, &fill)?;
 
@@ -1408,49 +1317,92 @@ impl AccountService {
                 }
             }
 
-            // 5) order_filled event
-            let filled_ev = AccountEvent {
-                event_id: order_filled_event_id.clone(),
-                event_type: AccountEventType::OrderFilled,
-                order_id: Some(order.order_id.clone()),
-                fill_id: Some(fill.fill_id.clone()),
-                position_id: Some(position_id.clone()),
-                ts_code: Some(ts_code.clone()),
-                reason: Some(reason.clone()),
-                actor: AccountActor::System.as_str().into(),
-                payload: json!({
-                    "fillId": fill.fill_id,
-                    "price": fill.price.0.to_string(),
-                    "quantity": fill.quantity.0,
-                }),
-                occurred_at: now,
-            };
-            AccountRepository::append_event(tx, &filled_ev)?;
-            event_ids.push(filled_ev.event_id.clone());
+            // 5) For partial market fills — write order_partially_filled then
+            // synchronous order_cancelled for remainder. Spec §2: market 部分成交
+            // = terminal `partially_filled`, 同步 emit `order_cancelled` 表达剩余取消。
+            if is_partial {
+                let partial_ev = AccountEvent {
+                    event_id: new_id("evt"),
+                    event_type: AccountEventType::OrderPartiallyFilled,
+                    order_id: Some(order.order_id.clone()),
+                    fill_id: Some(fill.fill_id.clone()),
+                    position_id: Some(position_id.clone()),
+                    ts_code: Some(ts_code.clone()),
+                    reason: Some(reason.clone()),
+                    actor: AccountActor::System.as_str().into(),
+                    payload: json!({
+                        "price": fill.price.0.to_string(),
+                        "filledQuantity": fill.quantity.0,
+                        "remainingQuantity": cancelled_quantity,
+                    }),
+                    occurred_at: now,
+                };
+                AccountRepository::append_event(tx, &partial_ev)?;
+                event_ids.push(partial_ev.event_id);
 
-            // 6) Order-filled trigger
-            let trig = AccountTrigger {
-                trigger_id: TriggerKey::OrderTerminal {
+                // order_cancelled for remainder
+                let cancel_ev = AccountEvent {
+                    event_id: order_cancelled_event_id.clone(),
+                    event_type: AccountEventType::OrderCancelled,
+                    order_id: Some(order.order_id.clone()),
+                    fill_id: None,
+                    position_id: Some(position_id.clone()),
+                    ts_code: Some(ts_code.clone()),
+                    reason: Some("market_remainder_auto_cancel".into()),
+                    actor: AccountActor::System.as_str().into(),
+                    payload: json!({
+                        "code": "market_remainder_auto_cancel",
+                        "cancelledQuantity": cancelled_quantity,
+                    }),
+                    occurred_at: now,
+                };
+                AccountRepository::append_event(tx, &cancel_ev)?;
+                event_ids.push(cancel_ev.event_id);
+            } else {
+                // 6) order_filled event (full fill)
+                let filled_ev = AccountEvent {
+                    event_id: order_filled_event_id.clone(),
+                    event_type: AccountEventType::OrderFilled,
+                    order_id: Some(order.order_id.clone()),
+                    fill_id: Some(fill.fill_id.clone()),
+                    position_id: Some(position_id.clone()),
+                    ts_code: Some(ts_code.clone()),
+                    reason: Some(reason.clone()),
+                    actor: AccountActor::System.as_str().into(),
+                    payload: json!({
+                        "fillId": fill.fill_id,
+                        "price": fill.price.0.to_string(),
+                        "quantity": fill.quantity.0,
+                    }),
+                    occurred_at: now,
+                };
+                AccountRepository::append_event(tx, &filled_ev)?;
+                event_ids.push(filled_ev.event_id.clone());
+
+                // 7) Order-filled trigger (only on full fill; partial does not emit trigger)
+                let trig = AccountTrigger {
+                    trigger_id: TriggerKey::OrderTerminal {
+                        trigger_type: AccountTriggerType::OrderFilled,
+                        order_id: &order.order_id,
+                        ts_code: &ts_code,
+                        event_id: &filled_ev.event_id,
+                    }
+                    .stable_id(),
                     trigger_type: AccountTriggerType::OrderFilled,
-                    order_id: &order.order_id,
-                    ts_code: &ts_code,
-                    event_id: &filled_ev.event_id,
+                    order_id: Some(order.order_id.clone()),
+                    position_id: Some(position_id.clone()),
+                    ts_code: Some(ts_code.clone()),
+                    price: Some(fill.price),
+                    threshold: None,
+                    quote_freshness: None,
+                    warnings: vec![],
+                    event_id: filled_ev.event_id.clone(),
+                    handled: false,
+                    occurred_at: now,
+                };
+                if AccountRepository::insert_trigger_if_new(tx, &trig)? {
+                    trigger_ids.push(trig.trigger_id.clone());
                 }
-                .stable_id(),
-                trigger_type: AccountTriggerType::OrderFilled,
-                order_id: Some(order.order_id.clone()),
-                position_id: Some(position_id.clone()),
-                ts_code: Some(ts_code.clone()),
-                price: Some(fill.price),
-                threshold: None,
-                quote_freshness: None,
-                warnings: vec![],
-                event_id: filled_ev.event_id.clone(),
-                handled: false,
-                occurred_at: now,
-            };
-            if AccountRepository::insert_trigger_if_new(tx, &trig)? {
-                trigger_ids.push(trig.trigger_id.clone());
             }
             Ok(())
         });
@@ -1460,8 +1412,7 @@ impl AccountService {
 
         order.updated_at = now;
         if repo.update_cash(new_cash, now).is_err() {
-            // 已经写完事件 + 持仓；只能记录 db error。fail-closed？保守起见返回 db_error 但
-            // 不撤销事件（事件是真源）。下次 rebuild_snapshot 可重算。
+            // 事件是真源；下次 rebuild_snapshot 可重算。
         }
 
         let snapshot = self.snapshot_or_default();
@@ -1482,6 +1433,12 @@ impl AccountService {
             snapshot_captured_at: snapshot.captured_at,
         });
 
+        let warnings = if is_partial {
+            vec![WarningCode::DataPartial]
+        } else {
+            vec![]
+        };
+
         OperateAccountResponse {
             accepted: true,
             reason: None,
@@ -1493,10 +1450,12 @@ impl AccountService {
             rejection_event_id: None,
             account_event_ids: event_ids,
             snapshot,
-            warnings: vec![],
+            warnings,
         }
     }
 
+    /// Spec: account-module.md §2 仓位模型 / 成交模型 — PnL 公式必须包含 stamp_tax + transfer_fee。
+    #[allow(clippy::too_many_arguments)]
     fn derive_position_after_fill(
         &self,
         side: OrderSide,
@@ -1504,11 +1463,13 @@ impl AccountService {
         ts_code: &TsCode,
         fill: &FillExecution,
         commission: &Money,
+        stamp_tax: &Money,
+        transfer_fee: &Money,
         now: OccurredAt,
     ) -> (String, AccountEventType, Position) {
         match (side, existing) {
             (OrderSide::Buy, None) => {
-                // 新开仓
+                // 新开仓 — lot cost basis = price * qty + commission + transfer_fee。
                 let pid = new_id("pos");
                 let avg = apply_buy_avg_cost(
                     Shares(0),
@@ -1516,6 +1477,7 @@ impl AccountService {
                     fill.quantity,
                     fill.price,
                     *commission,
+                    *transfer_fee,
                 );
                 (
                     pid.clone(),
@@ -1544,19 +1506,28 @@ impl AccountService {
             }
             (OrderSide::Buy, Some(p)) => {
                 let new_qty = Shares(p.quantity.0 + fill.quantity.0);
-                let avg = apply_buy_avg_cost(p.quantity, p.avg_cost, fill.quantity, fill.price, *commission);
+                let avg = apply_buy_avg_cost(
+                    p.quantity,
+                    p.avg_cost,
+                    fill.quantity,
+                    fill.price,
+                    *commission,
+                    *transfer_fee,
+                );
                 let mut pos = p.clone();
                 pos.quantity = new_qty;
                 pos.avg_cost = avg;
                 (p.position_id.clone(), AccountEventType::PositionScaled, pos)
             }
             (OrderSide::Sell, Some(p)) => {
+                // realizedPnl = (price - avgCost) * qty - sellCommission - stampTax - sellTransferFee
                 let realized_delta = apply_sell_realized_pnl(
                     fill.quantity,
                     fill.price,
                     p.avg_cost,
                     *commission,
-                    Money(Decimal::ZERO), // stamp tax handled at caller, included separately
+                    *stamp_tax,
+                    *transfer_fee,
                 );
                 let new_qty = Shares(p.quantity.0 - fill.quantity.0);
                 let mut pos = p.clone();
@@ -1629,7 +1600,17 @@ impl AccountService {
 
             let fee_policy = &self.config.fee_policy;
             let est_commission = compute_commission(limit_price, quantity, fee_policy);
-            let frozen = estimate_buy_frozen_cash(limit_price, quantity, est_commission.0);
+            // Spec §2 冻结和重建规则: limit buy 冻结现金 = `limitPrice * remainingQuantity + estimatedFees`。
+            // estimatedFees 包含 commission + transferFee (SH stock/fund only)。
+            let est_transfer_fee = compute_transfer_fee(
+                limit_price,
+                quantity,
+                fee_policy,
+                &ts_code,
+                instrument.category,
+            );
+            let frozen =
+                estimate_buy_frozen_cash(limit_price, quantity, est_commission.0 + est_transfer_fee.0);
             // 检查现金
             let meta = match repo.get_meta() {
                 Ok(Some(m)) => m,
@@ -2011,6 +1992,9 @@ impl AccountService {
     // OpenPosition
     // ----------------------------------------------------------------
 
+    /// Spec: account-module.md §2 仓位模型 / §4 operate_account:
+    ///   - 已有 open position → `invalid_input`，应使用 `scale_position(increase)`。
+    ///   - 已有同 ts_code 未终态 `open_position` 订单 → `invalid_input`（pending limit 也算）。
     #[allow(clippy::too_many_arguments)]
     fn handle_open_position(
         &self,
@@ -2030,6 +2014,18 @@ impl AccountService {
             return self.reject_pre_event(
                 ErrorCode::InvalidInput,
                 "open position already exists; use scale_position(increase)",
+            );
+        }
+        // Decision 1: 同 ts_code 已有未终态 open_position 订单 → 拒绝。
+        // Spec §2 仓位模型: 第二次 open_position(tsCode) 在第一笔 limit 仍未终态时必须拒绝。
+        if let Some(existing_pending) = repo.find_pending_open_position_order(&ts_code).ok().flatten() {
+            return self.reject_pre_event(
+                ErrorCode::InvalidInput,
+                &format!(
+                    "open_position pending order {} for {} not terminal; cancel or wait first",
+                    existing_pending.order_id,
+                    ts_code.as_str()
+                ),
             );
         }
         let ot = order_type.unwrap_or(OrderType::Market);
@@ -2132,6 +2128,7 @@ impl AccountService {
             return self.reject_pre_event(ErrorCode::InvalidInput, "position not open");
         }
         // decrease: 0 < quantity < pos.quantity；==pos.quantity 应使用 close。
+        // Spec §4: 显式校验 sellable，不依赖下游 sell path 兜底。
         if matches!(side, ScaleSide::Decrease) {
             if quantity.0 == pos.quantity.0 {
                 return self.reject_pre_event(
@@ -2143,6 +2140,13 @@ impl AccountService {
                 return self.reject_pre_event(
                     ErrorCode::InsufficientSellableQuantity,
                     "quantity exceeds position size",
+                );
+            }
+            let sellable = self.compute_sellable(&position_id);
+            if quantity.0 > sellable {
+                return self.reject_pre_event(
+                    ErrorCode::InsufficientSellableQuantity,
+                    "quantity exceeds sellable",
                 );
             }
         }
@@ -2165,6 +2169,13 @@ impl AccountService {
         )
     }
 
+    /// Spec: account-module.md §4 close_position.quantity 语义:
+    ///   - **缺省**：实际下单 = `min(position.quantity, sellableQuantity)`；
+    ///     `sellableQuantity < position.quantity` 时不报错，
+    ///     实际下单 `sellableQuantity`，剩余持仓保留，并加 `data_partial` warning；
+    ///     `sellableQuantity == 0` 时返回 `insufficient_sellable_quantity`。
+    ///   - **显式传入**：要求 `0 < quantity <= position.quantity`，否则 `invalid_input`；
+    ///     `quantity > sellableQuantity` → `insufficient_sellable_quantity`。
     fn handle_close_position(
         &self,
         position_id: String,
@@ -2181,26 +2192,73 @@ impl AccountService {
         if !matches!(pos.status, PositionStatus::Open) {
             return self.reject_pre_event(ErrorCode::InvalidInput, "position not open");
         }
-        let qty = quantity.unwrap_or(pos.quantity);
-        if qty.0 != pos.quantity.0 {
-            return self.reject_pre_event(
-                ErrorCode::InvalidInput,
-                "close_position quantity must equal position.quantity; use scale_position",
-            );
-        }
+        // 计算 sellable
+        let sellable = self.compute_sellable(&position_id);
+        let (effective_qty, partial_warning) = match quantity {
+            None => {
+                // 缺省：min(position.quantity, sellable)
+                if sellable <= 0 {
+                    return self.reject_pre_event(
+                        ErrorCode::InsufficientSellableQuantity,
+                        "sellable quantity is zero (T+1 lock)",
+                    );
+                }
+                let q = sellable.min(pos.quantity.0);
+                let warn = q < pos.quantity.0;
+                (Shares(q), warn)
+            }
+            Some(req_qty) => {
+                if req_qty.0 <= 0 || req_qty.0 > pos.quantity.0 {
+                    return self.reject_pre_event(
+                        ErrorCode::InvalidInput,
+                        "close_position quantity must satisfy 0 < quantity <= position.quantity; \
+                         use scale_position(decrease) for partial reductions",
+                    );
+                }
+                if req_qty.0 > sellable {
+                    return self.reject_pre_event(
+                        ErrorCode::InsufficientSellableQuantity,
+                        "explicit quantity exceeds sellable",
+                    );
+                }
+                (req_qty, false)
+            }
+        };
         let ot = order_type.unwrap_or(OrderType::Market);
-        self.handle_place_order(
+        let mut response = self.handle_place_order(
             pos.ts_code,
             OrderSide::Sell,
             ot,
             limit_price,
-            qty,
+            effective_qty,
             expires_at,
             reason,
             OrderIntent::ClosePosition,
             Some(position_id),
             Some(pos.quantity),
-        )
+        );
+        if partial_warning && response.accepted && !response.warnings.contains(&WarningCode::DataPartial) {
+            response.warnings.push(WarningCode::DataPartial);
+        }
+        response
+    }
+
+    /// 计算指定 position 当前可卖数量（lots 派生）。
+    fn compute_sellable(&self, position_id: &str) -> i64 {
+        let repo = AccountRepository::new(&self.db);
+        let now = Utc::now();
+        let ctx = resolve_market_time(now);
+        let date = ctx
+            .current_trade_date
+            .unwrap_or(ctx.latest_completed_trade_date);
+        let lots = match repo.list_lots_by_position(position_id) {
+            Ok(l) => l,
+            Err(_) => return 0,
+        };
+        lots.iter()
+            .filter(|l| l.sellable_from.as_naive() <= date.as_naive())
+            .map(|l| (l.remaining_quantity.0 - l.frozen_quantity.0).max(0))
+            .sum()
     }
 
     // ----------------------------------------------------------------
@@ -2400,6 +2458,11 @@ impl AccountService {
         evidence_ref: Option<String>,
         reason: String,
     ) -> OperateAccountResponse {
+        // Spec §4: signal 非空（trim 后空字符串拒绝）。
+        let signal = signal.trim().to_string();
+        if signal.is_empty() {
+            return self.reject_pre_event(ErrorCode::InvalidInput, "signal must be non-empty");
+        }
         let repo = AccountRepository::new(&self.db);
         let Some(pos) = repo.get_position(&position_id).ok().flatten() else {
             return self.reject_pre_event(ErrorCode::NotFound, "position not found");
@@ -2645,7 +2708,7 @@ impl AccountService {
         price: Price,
         quantity: Shares,
         snapshot: Option<&MarketQuoteSnapshot>,
-        _instrument: &MarketInstrument,
+        instrument: &MarketInstrument,
     ) -> Result<(), (ErrorCode, String)> {
         let policy = &self.config.risk_policy;
         let repo = AccountRepository::new(&self.db);
@@ -2654,9 +2717,12 @@ impl AccountService {
             .map_err(|_| (ErrorCode::DbError, "meta missing".into()))?
             .ok_or((ErrorCode::DbError, "account not initialized".into()))?;
 
-        // Cash sufficiency（单笔基础检查 — 风控会再算）。
-        let fee = compute_commission(price, quantity, &self.config.fee_policy);
-        let order_value = price.0 * Decimal::from(quantity.0) + fee.0;
+        // Cash sufficiency（含 transferFee 双向）。
+        let commission = compute_commission(price, quantity, &self.config.fee_policy);
+        let transfer_fee =
+            compute_transfer_fee(price, quantity, &self.config.fee_policy, ts_code, instrument.category);
+        let order_value =
+            price.0 * Decimal::from(quantity.0) + commission.0 + transfer_fee.0;
         let total_frozen = repo
             .total_frozen_cash()
             .map_err(|_| (ErrorCode::DbError, "frozen cash query".into()))?;
@@ -3517,5 +3583,866 @@ mod tests {
         assert_eq!(s.initial_cash.0, Decimal::from(5_000_000));
         assert_eq!(s.cash.0, Decimal::from(5_000_000));
         assert_eq!(s.total_assets.0, Decimal::from(5_000_000));
+    }
+
+    // ========================================================================
+    // Spec-aligned tests added in this iteration:
+    //   - market partial → accept + auto-cancel remainder (Decision 3)
+    //   - close_position quantity semantics (Decision 2)
+    //   - open_position pending lockout (Decision 1)
+    //   - scale_position(decrease) explicit sellable check (Warning D4)
+    //   - empty signal rejection (Warning D6)
+    //   - 0-position snapshot freshness = fresh (Decision 5)
+    //   - transfer_fee in fills + lot cost basis (Decision 4)
+    //   - stamp_tax + transfer_fee in realized_pnl (P0 fix)
+    //   - risk policy gates with correct reason codes (T5)
+    // ========================================================================
+
+    fn seed_inst_in_market(
+        db: &AppDb,
+        ts: &str,
+        category: InstrumentCategory,
+        market: Market,
+    ) -> TsCode {
+        let code = TsCode::parse(ts).unwrap();
+        QuotesRepository::new(db)
+            .upsert_instruments(&[Q_MarketInstrument {
+                ts_code: code.clone(),
+                name: "Test".into(),
+                category,
+                market,
+                board: None,
+                sector: None,
+                status: Some(InstrumentStatus::Listed),
+                is_st: Some(false),
+                publisher: None,
+                index_category: None,
+                fund_type: None,
+                management: None,
+                list_date: None,
+                source: Q_InstrumentSource::Tushare,
+                updated_at: Utc::now(),
+            }])
+            .unwrap();
+        code
+    }
+
+    // ------------------------------------------------------------------
+    // T2 — market partial fill auto-cancels remainder (Decision 3)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn market_partial_fill_auto_cancels_remainder() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // Build a fill scenario directly via commit_market_fill to avoid trading-time gating.
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        // Order qty 1000；fill qty 300 → partially_filled + 700 auto cancelled.
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(300),
+            },
+            "test".into(),
+            OrderIntent::DirectOrder,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: Some("test".into()),
+                warning: None,
+            },
+        );
+        assert!(resp.accepted, "market partial should be accepted: {:?}", resp);
+        assert_eq!(resp.fill_ids.len(), 1, "must write the partial fill");
+        // events: order_placed + position_opened + order_partially_filled + order_cancelled (≥ 4)
+        assert!(
+            resp.account_event_ids.len() >= 4,
+            "expected ≥4 events (placed/position/partial/cancelled), got {:?}",
+            resp.account_event_ids
+        );
+        assert!(
+            resp.warnings.contains(&WarningCode::DataPartial),
+            "partial fill must emit data_partial warning"
+        );
+        // Verify order status persisted as partially_filled
+        let order_id = resp.order_id.unwrap();
+        let repo = AccountRepository::new(&db);
+        let order = repo.get_order(&order_id).unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_quantity.0, 300);
+        // Verify both order_partially_filled and order_cancelled events exist for this order
+        let events = repo.list_events(100, 0).unwrap();
+        let order_evs: Vec<_> = events
+            .iter()
+            .filter(|e| e.order_id.as_deref() == Some(order_id.as_str()))
+            .collect();
+        assert!(order_evs
+            .iter()
+            .any(|e| matches!(e.event_type, AccountEventType::OrderPartiallyFilled)));
+        assert!(order_evs
+            .iter()
+            .any(|e| matches!(e.event_type, AccountEventType::OrderCancelled)));
+        // Lot only created for filled qty
+        let pos_id = resp.position_id.unwrap();
+        let lots = repo.list_lots_by_position(&pos_id).unwrap();
+        assert_eq!(lots.len(), 1);
+        assert_eq!(lots[0].quantity.0, 300);
+    }
+
+    // ------------------------------------------------------------------
+    // T1 — sell PnL must subtract stamp_tax + transfer_fee (P0 fix)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sell_realized_pnl_subtracts_stamp_tax_and_transfer_fee() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH"); // SH → transfer_fee applies
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        // Step 1: buy 1000 @ 100
+        let buy = svc.commit_market_fill(
+            code.clone(),
+            instrument.clone(),
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(1000),
+            },
+            "buy".into(),
+            OrderIntent::OpenPosition,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(buy.accepted);
+        let pos_id = buy.position_id.clone().unwrap();
+        // Make lots sellable (set sellable_from to past) — direct repo update
+        let repo = AccountRepository::new(&db);
+        let lots = repo.list_lots_by_position(&pos_id).unwrap();
+        for l in lots {
+            repo.tx(|tx| {
+                tx.execute(
+                    "UPDATE account_lots SET sellable_from = '20200101' WHERE lot_id = ?",
+                    [&l.lot_id],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+        }
+
+        // Step 2: sell 1000 @ 100 (flat) — pnl should equal -(commission + stamp_tax + transfer_fee) - buy fees in cost basis
+        let sell = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Sell,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(1000),
+            },
+            "sell".into(),
+            OrderIntent::ClosePosition,
+            Some(pos_id.clone()),
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(sell.accepted, "sell should accept: {:?}", sell);
+
+        // Position realized_pnl must be < 0 (fees) and must reflect stamp_tax + transfer_fee deduction.
+        let pos = repo.get_position(&pos_id).unwrap().unwrap();
+        // Numerically:
+        //   buy commission = max(100*1000*0.0003, 5) = 30
+        //   buy transfer_fee = 100*1000*0.00001 = 1
+        //   avg_cost = (1000*100 + 30 + 1) / 1000 = 100.031
+        //   sell commission = 30; stamp_tax = 100*1000*0.0005 = 50; sell_transfer_fee = 1
+        //   realized = (100 - 100.031) * 1000 - 30 - 50 - 1 = -31 - 81 = -112
+        // Note round_dp(2): -31 - 81 = -112 exactly.
+        assert_eq!(
+            pos.realized_pnl.0,
+            Decimal::new(-11200, 2),
+            "realized_pnl must subtract stamp_tax + transfer_fee + buy fees from cost basis"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Decision 4 — transfer_fee included for SH; zero for SZ/BJ
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn buy_includes_transfer_fee_for_sh() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst_in_market(&db, "600519.SH", InstrumentCategory::Stock, Market::SH);
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(1000),
+            },
+            "buy".into(),
+            OrderIntent::DirectOrder,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted);
+        let repo = AccountRepository::new(&db);
+        let fill = repo
+            .list_fills_by_order(resp.order_id.as_ref().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        // 100 * 1000 * 0.00001 = 1.00
+        assert_eq!(fill.transfer_fee.0, Decimal::new(100, 2));
+    }
+
+    #[test]
+    fn sz_zero_transfer_fee() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst_in_market(&db, "000001.SZ", InstrumentCategory::Stock, Market::SZ);
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SZ,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(1000),
+            },
+            "buy".into(),
+            OrderIntent::DirectOrder,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted);
+        let repo = AccountRepository::new(&db);
+        let fill = repo
+            .list_fills_by_order(resp.order_id.as_ref().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(fill.transfer_fee.0, Decimal::ZERO);
+    }
+
+    #[test]
+    fn fund_sh_transfer_fee() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst_in_market(&db, "510300.SH", InstrumentCategory::Fund, Market::SH);
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Fund".into(),
+            category: InstrumentCategory::Fund,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution {
+                price: Price(Decimal::new(5, 0)),
+                quantity: Shares(1000),
+            },
+            "buy".into(),
+            OrderIntent::DirectOrder,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted);
+        let repo = AccountRepository::new(&db);
+        let fill = repo
+            .list_fills_by_order(resp.order_id.as_ref().unwrap())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        // 5 * 1000 * 0.00001 = 0.05
+        assert_eq!(fill.transfer_fee.0, Decimal::new(5, 2));
+    }
+
+    // ------------------------------------------------------------------
+    // Decision 1 — open_position rejected when pending exists
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_position_rejected_when_pending_exists() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // First open_position with limit → enters pending
+        let r1 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::OpenPosition {
+                    ts_code: code.clone(),
+                    quantity: Shares(100),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(50, 0))),
+                    expires_at: None,
+                    stop_loss: None,
+                    take_profit: None,
+                    time_stop_at: None,
+                    reason: "first".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(r1.accepted, "first open_position should succeed: {:?}", r1);
+        assert!(r1.order_id.is_some());
+        // Second open_position must be rejected
+        let r2 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::OpenPosition {
+                    ts_code: code,
+                    quantity: Shares(100),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(50, 0))),
+                    expires_at: None,
+                    stop_loss: None,
+                    take_profit: None,
+                    time_stop_at: None,
+                    reason: "second".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!r2.accepted);
+        assert_eq!(r2.reason, Some(ErrorCode::InvalidInput));
+        assert!(r2
+            .message
+            .as_deref()
+            .map(|m| m.contains("pending"))
+            .unwrap_or(false));
+    }
+
+    // ------------------------------------------------------------------
+    // Decision 2 — close_position quantity semantics
+    // ------------------------------------------------------------------
+
+    fn open_position_via_buy_fill(
+        db: &AppDb,
+        svc: &AccountService,
+        ts_code: TsCode,
+        qty: i64,
+    ) -> String {
+        let instrument = MarketInstrument {
+            ts_code: ts_code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let resp = svc.commit_market_fill(
+            ts_code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(qty),
+            FillExecution {
+                price: Price(Decimal::new(100, 0)),
+                quantity: Shares(qty),
+            },
+            "seed".into(),
+            OrderIntent::OpenPosition,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted, "seed buy fill should accept");
+        let _ = db;
+        resp.position_id.unwrap()
+    }
+
+    #[test]
+    fn close_position_default_with_t1_lock_returns_partial() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        // Default close — T+1 not satisfied, sellable=0 → reject InsufficientSellableQuantity
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: pos_id,
+                    quantity: None,
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(99, 0))),
+                    expires_at: None,
+                    reason: "close".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        // T+1 means sellable_from = next trade date → 0 sellable → reject
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InsufficientSellableQuantity));
+    }
+
+    #[test]
+    fn close_position_explicit_qty_exceeds_sellable_rejected() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        // Explicit quantity > sellable (sellable = 0 due to T+1)
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: pos_id,
+                    quantity: Some(Shares(500)),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(99, 0))),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InsufficientSellableQuantity));
+    }
+
+    #[test]
+    fn close_position_explicit_qty_exceeds_position_invalid_input() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: pos_id,
+                    quantity: Some(Shares(1500)),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(99, 0))),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InvalidInput));
+    }
+
+    // ------------------------------------------------------------------
+    // T8 — scale_position(decrease) explicit sellable check
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn scale_position_decrease_with_sellable_lt_quantity_rejected() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        // Decrease 500 but sellable = 0 (T+1)
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ScalePosition {
+                    position_id: pos_id,
+                    side: ScaleSide::Decrease,
+                    quantity: Shares(500),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(99, 0))),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InsufficientSellableQuantity));
+    }
+
+    // ------------------------------------------------------------------
+    // Warning D6 — empty signal rejection
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn record_invalidation_signal_rejects_empty() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        // Empty signal
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id.clone(),
+                    signal: "".into(),
+                    evidence_ref: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InvalidInput));
+        // Whitespace-only signal
+        let resp2 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id,
+                    signal: "   ".into(),
+                    evidence_ref: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp2.accepted);
+        assert_eq!(resp2.reason, Some(ErrorCode::InvalidInput));
+    }
+
+    // ------------------------------------------------------------------
+    // Decision 5 — valuationFreshness fresh when 0 positions
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn account_snapshot_zero_position_freshness_is_fresh() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let resp = svc.fetch_account(FetchAccountRequest {
+            include: Some(crate::domain::account::requests::FetchAccountInclude {
+                snapshot: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let snap = resp.snapshot.unwrap();
+        assert_eq!(snap.open_position_count, 0);
+        assert_eq!(snap.valuation_freshness.status, FreshnessStatus::Fresh);
+    }
+
+    // ------------------------------------------------------------------
+    // T5 — risk policy: max_order_value_ratio distinct from insufficient_cash
+    // ------------------------------------------------------------------
+
+    fn setup_account_with_tight_risk(
+        initial_cash: i64,
+        risk: AccountRiskPolicy,
+    ) -> (AppDb, Arc<AccountService>, Arc<MockQuoteGateway>) {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| {
+            let mut all = Vec::new();
+            all.extend(crate::infrastructure::quotes::migrations());
+            all.extend(crate::infrastructure::account::migrations());
+            run_migrations(c, all).unwrap();
+        });
+        let gw = Arc::new(MockQuoteGateway::new());
+        let svc = Arc::new(AccountService::new(
+            db.clone(),
+            gw.clone(),
+            AccountServiceConfig {
+                fee_policy: AccountFeePolicy::default(),
+                risk_policy: risk,
+                initial_cash: Money(Decimal::from(initial_cash)),
+            },
+        ));
+        svc.initialize_account_if_needed(Money(Decimal::from(initial_cash)))
+            .unwrap();
+        (db, svc, gw)
+    }
+
+    #[test]
+    fn risk_max_order_value_ratio_rejects_oversized_order() {
+        // 100k cash; max_order_value_ratio = 0.05 → max single order ~5000
+        let (db, svc, _gw) = setup_account_with_tight_risk(
+            100_000,
+            AccountRiskPolicy {
+                max_single_position_ratio: 0.95,
+                max_gross_exposure_ratio: 0.99,
+                max_order_value_ratio: 0.05,
+                max_daily_new_orders: 100,
+            },
+        );
+        let code = seed_inst(&db, "600519.SH");
+        // 100 * 100 = 10_000 > 0.05 * 100_000 = 5_000 → RiskLimitExceeded
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::RiskLimitExceeded));
+    }
+
+    #[test]
+    fn risk_max_single_position_ratio_rejects() {
+        let (db, svc, _gw) = setup_account_with_tight_risk(
+            1_000_000,
+            AccountRiskPolicy {
+                max_single_position_ratio: 0.02, // 2% → 单票限额 ~20000
+                max_gross_exposure_ratio: 0.99,
+                max_order_value_ratio: 0.99,
+                max_daily_new_orders: 100,
+            },
+        );
+        let code = seed_inst(&db, "600519.SH");
+        // 100 * 300 = 30_000 > 0.02 * 1_000_000 = 20_000
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(300),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::RiskLimitExceeded));
+    }
+
+    #[test]
+    fn risk_max_gross_exposure_ratio_rejects() {
+        // 高 single position + low gross → 设 single=0.99, gross=0.02
+        let (db, svc, _gw) = setup_account_with_tight_risk(
+            1_000_000,
+            AccountRiskPolicy {
+                max_single_position_ratio: 0.99,
+                max_gross_exposure_ratio: 0.02,
+                max_order_value_ratio: 0.99,
+                max_daily_new_orders: 100,
+            },
+        );
+        let code = seed_inst(&db, "600519.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(300),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::RiskLimitExceeded));
+    }
+
+    // ------------------------------------------------------------------
+    // T3 — limit partial fill then cancel releases correct cash
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn limit_partial_fill_then_cancel_releases_correct_cash() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(1000),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted);
+        let order_id = resp.order_id.clone().unwrap();
+        let snap = resp.snapshot;
+        // frozen_cash = 100 * 1000 + fees ≥ 100_000
+        assert!(snap.frozen_cash.0 >= Decimal::from(100_000));
+        // Cancel
+        let c = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::CancelOrder {
+                    order_id,
+                    reason: "stop".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(c.accepted);
+        assert_eq!(c.snapshot.frozen_cash.0, Decimal::ZERO);
+    }
+
+    // ------------------------------------------------------------------
+    // T10 — subscribed_codes includes pending order ts_codes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn subscribed_codes_includes_pending_order_ts_codes() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted);
+        let subs = svc.subscribed_codes();
+        assert!(subs.contains(&code), "subscribed_codes should include pending order ts_code");
     }
 }
