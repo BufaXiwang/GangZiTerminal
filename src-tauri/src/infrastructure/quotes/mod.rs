@@ -4,14 +4,23 @@
 //!
 //! 铁律：infrastructure/quotes 不允许 use pipeline | adapters。
 
+pub mod config;
+pub mod eastmoney;
 pub mod migrations;
+pub mod repository;
+pub mod sina;
 pub mod snapshot_cache;
 pub mod tdx;
+pub mod tencent;
 pub mod trade_calendar;
+pub mod tushare;
 
+pub use config::QuotesConfig;
+pub use eastmoney::EastmoneyProvider;
 pub use migrations::migrations;
+pub use repository::QuotesRepository;
+pub use sina::SinaProvider;
 pub use snapshot_cache::{CachedSnapshot, SnapshotCache};
-pub use trade_calendar::{TradeCalendar, TradeCalendarRepo};
-
-// 后续 sub-agent 实现 provider adapter（eastmoney / sina / tencent / tushare）
-// 和 repository 时在此处补 `pub mod ...` 声明。
+pub use tencent::TencentProvider;
+pub use trade_calendar::{TradeCalendar, TradeCalendarRepo, WeekdayCalendar};
+pub use tushare::TushareClient;

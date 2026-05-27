@@ -62,10 +62,21 @@ byteorder = "1.5"
 flate2 = "1.0"
 
 # === news deps ===
-# SHA-256 for stable ID hashing (news-module.md §2)
+# SHA-256 for stable ID hashing (news-module.md §2; reused by quotes/tushare events)
 sha2 = "0.10"
 # RSS / Atom feed parsing (news/rss adapter)
 feed-rs = "2"
 # HTML parsing for article extractor (news/article-extractor adapter)
 scraper = "0.20"
 ego-tree = "0.6"
+
+# === quotes deps ===
+# Quotes BC 复用如下已有依赖（无新增 crate）：
+# - reqwest / tokio / async-trait：provider HTTP / async wrapper
+# - chrono / chrono-tz：交易时段 / Asia/Shanghai
+# - encoding_rs：Sina / Tencent / TDX security_list GBK 解码
+# - rust_decimal：Price / Amount / Money
+# - byteorder / flate2：TDX 协议层二进制 + gzip
+# - sha2：tushare 公司事件 stable id
+# - rusqlite / rusqlite_migration：quotes 持久化
+

@@ -21,17 +21,21 @@ pub use freshness_rules::{
     derive_freshness, eligible_trade_date, EligibleTradeDate, FreshnessIntent,
     DETAIL_STALE_THRESHOLD_SECS, HARD_EXPIRE_SECS, UNIVERSE_STALE_THRESHOLD_SECS,
 };
-pub use indicators::{compute_indicators, IndicatorName, IndicatorSnapshot};
-pub use instrument::{MarketInstrument, StockProfile};
+pub use indicators::{compute_indicators, IndicatorBasis, IndicatorName, IndicatorSnapshot};
+pub use instrument::{InstrumentSource, MarketInstrument, StockProfile};
 pub use kline::{
     Adjust, IntradaySeries, KlinePeriod, KlinePoint, KlineSeries, MinuteKlinePeriod,
     MinuteKlinePoint, MinuteKlineSeries, MinutePoint,
 };
-pub use limit::{compute_limit_band, LimitBand};
+pub use limit::{apply_band as apply_band_helper, compute_limit_band, LimitBand};
 pub use quote::{
-    DailyBasic, MarketQuoteSnapshot, QuoteDepthLevel, QuoteSource, StockQuote, TradeStatus,
+    CompanyEvent, CompanyEventType, DailyBasic, MarketQuoteSnapshot, QuoteDepthLevel, QuoteSource,
+    StockQuote, TradeStatus,
 };
-pub use scan::{ScanCondition, ScanConditionField, ScanFilter, ScanOp, ScanResult, ScanSortBy};
+pub use scan::{
+    ScanCondition, ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem,
+    ScanOp, ScanResult, ScanSortBy, ScanUniverse,
+};
 pub use sources::core_indexes;
 
 // Spec: quotes-module.md §1 / §4

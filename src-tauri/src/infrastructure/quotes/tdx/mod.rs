@@ -28,6 +28,7 @@
 //! 翻译、北交所 fallback、async wrapper 等）由 Quotes BC 在同目录下其他文件实现，
 //! 不污染本协议子模块。
 
+pub mod adapter;
 pub mod client;
 pub mod error;
 pub mod helper;

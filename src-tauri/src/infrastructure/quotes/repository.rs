@@ -1,0 +1,979 @@
+//! Quotes SQLite repository — universe / kline / minute / intraday / daily_basic / events /
+//! close_snapshot / refresh_state。
+//!
+//! Spec: docs/design/quotes-module.md §3 / §5
+
+use crate::domain::quotes::quote::{CompanyEvent, CompanyEventType};
+use crate::domain::quotes::{
+    Adjust, DailyBasic, InstrumentSource, IntradaySeries, KlinePeriod, KlinePoint, KlineSeries,
+    MarketInstrument, MinuteKlinePeriod, MinuteKlinePoint, MinuteKlineSeries, MinutePoint,
+    StockQuote,
+};
+use crate::domain::shared::{
+    Amount, Freshness, FreshnessStatus, InstrumentCategory, InstrumentStatus, Market, Money,
+    OccurredAt, Percent, Price, TradeDate, TsCode, Volume,
+};
+use crate::infrastructure::db::AppDb;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, types::Value as SqlValue, OptionalExtension};
+use rust_decimal::{prelude::FromStr, Decimal};
+
+pub struct QuotesRepository<'a> {
+    db: &'a AppDb,
+}
+
+impl<'a> QuotesRepository<'a> {
+    pub fn new(db: &'a AppDb) -> Self {
+        Self { db }
+    }
+
+    // ====================================================================== instruments
+
+    pub fn upsert_instruments(&self, items: &[MarketInstrument]) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_instruments (
+                        ts_code, name, category, market, board, sector, status, is_st,
+                        publisher, index_category, fund_type, management, list_date,
+                        source, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                     ON CONFLICT(ts_code) DO UPDATE SET
+                        name = excluded.name,
+                        category = excluded.category,
+                        market = excluded.market,
+                        board = COALESCE(excluded.board, quote_instruments.board),
+                        sector = COALESCE(excluded.sector, quote_instruments.sector),
+                        status = COALESCE(excluded.status, quote_instruments.status),
+                        is_st = COALESCE(excluded.is_st, quote_instruments.is_st),
+                        publisher = COALESCE(excluded.publisher, quote_instruments.publisher),
+                        index_category = COALESCE(excluded.index_category, quote_instruments.index_category),
+                        fund_type = COALESCE(excluded.fund_type, quote_instruments.fund_type),
+                        management = COALESCE(excluded.management, quote_instruments.management),
+                        list_date = COALESCE(excluded.list_date, quote_instruments.list_date),
+                        source = excluded.source,
+                        updated_at = excluded.updated_at",
+                )?;
+                for inst in items {
+                    stmt.execute(params![
+                        inst.ts_code.as_str(),
+                        inst.name,
+                        category_to_str(inst.category),
+                        market_to_str(inst.market),
+                        inst.board,
+                        inst.sector,
+                        inst.status.map(status_to_str),
+                        inst.is_st.map(|b| if b { 1i64 } else { 0i64 }),
+                        inst.publisher,
+                        inst.index_category,
+                        inst.fund_type,
+                        inst.management,
+                        inst.list_date,
+                        instrument_source_to_str(inst.source),
+                        inst.updated_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn get_instrument(&self, ts_code: &TsCode) -> rusqlite::Result<Option<MarketInstrument>> {
+        self.db.with(|conn| {
+            conn.query_row(
+                "SELECT ts_code, name, category, market, board, sector, status, is_st,
+                        publisher, index_category, fund_type, management, list_date,
+                        source, updated_at
+                 FROM quote_instruments WHERE ts_code = ?1",
+                [ts_code.as_str()],
+                row_to_instrument,
+            )
+            .optional()
+        })
+    }
+
+    pub fn list_instruments(
+        &self,
+        category: Option<InstrumentCategory>,
+        query: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> rusqlite::Result<(Vec<MarketInstrument>, u32)> {
+        self.db.with(|conn| {
+            let q = query.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let cat = category.map(category_to_str);
+            // 总数
+            let (cnt_sql, cnt_params): (String, Vec<SqlValue>) = match (&cat, &q) {
+                (None, None) => (
+                    "SELECT COUNT(*) FROM quote_instruments".to_string(),
+                    vec![],
+                ),
+                (Some(c), None) => (
+                    "SELECT COUNT(*) FROM quote_instruments WHERE category = ?1".to_string(),
+                    vec![SqlValue::Text((*c).to_string())],
+                ),
+                (None, Some(q)) => (
+                    "SELECT COUNT(*) FROM quote_instruments WHERE UPPER(ts_code) LIKE ?1 OR name LIKE ?2".to_string(),
+                    vec![
+                        SqlValue::Text(format!("%{}%", q.to_ascii_uppercase())),
+                        SqlValue::Text(format!("%{}%", q)),
+                    ],
+                ),
+                (Some(c), Some(q)) => (
+                    "SELECT COUNT(*) FROM quote_instruments WHERE category = ?1 AND (UPPER(ts_code) LIKE ?2 OR name LIKE ?3)".to_string(),
+                    vec![
+                        SqlValue::Text((*c).to_string()),
+                        SqlValue::Text(format!("%{}%", q.to_ascii_uppercase())),
+                        SqlValue::Text(format!("%{}%", q)),
+                    ],
+                ),
+            };
+            let total: u32 = conn
+                .query_row(&cnt_sql, rusqlite::params_from_iter(cnt_params.iter()), |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .try_into()
+                .unwrap_or(0);
+
+            // 列表
+            let (list_sql, list_params): (String, Vec<SqlValue>) = match (&cat, &q) {
+                (None, None) => (
+                    "SELECT ts_code, name, category, market, board, sector, status, is_st,
+                            publisher, index_category, fund_type, management, list_date,
+                            source, updated_at
+                     FROM quote_instruments ORDER BY ts_code LIMIT ?1 OFFSET ?2".to_string(),
+                    vec![
+                        SqlValue::Integer(limit as i64),
+                        SqlValue::Integer(offset as i64),
+                    ],
+                ),
+                (Some(c), None) => (
+                    "SELECT ts_code, name, category, market, board, sector, status, is_st,
+                            publisher, index_category, fund_type, management, list_date,
+                            source, updated_at
+                     FROM quote_instruments WHERE category = ?1 ORDER BY ts_code LIMIT ?2 OFFSET ?3".to_string(),
+                    vec![
+                        SqlValue::Text((*c).to_string()),
+                        SqlValue::Integer(limit as i64),
+                        SqlValue::Integer(offset as i64),
+                    ],
+                ),
+                (None, Some(q)) => (
+                    "SELECT ts_code, name, category, market, board, sector, status, is_st,
+                            publisher, index_category, fund_type, management, list_date,
+                            source, updated_at
+                     FROM quote_instruments
+                     WHERE UPPER(ts_code) LIKE ?1 OR name LIKE ?2
+                     ORDER BY
+                       CASE WHEN UPPER(ts_code) = ?3 THEN 0
+                            WHEN name = ?4 THEN 1
+                            WHEN name LIKE ?5 THEN 2
+                            ELSE 3 END,
+                       ts_code
+                     LIMIT ?6 OFFSET ?7".to_string(),
+                    vec![
+                        SqlValue::Text(format!("%{}%", q.to_ascii_uppercase())),
+                        SqlValue::Text(format!("%{}%", q)),
+                        SqlValue::Text(q.to_ascii_uppercase()),
+                        SqlValue::Text(q.clone()),
+                        SqlValue::Text(format!("{}%", q)),
+                        SqlValue::Integer(limit as i64),
+                        SqlValue::Integer(offset as i64),
+                    ],
+                ),
+                (Some(c), Some(q)) => (
+                    "SELECT ts_code, name, category, market, board, sector, status, is_st,
+                            publisher, index_category, fund_type, management, list_date,
+                            source, updated_at
+                     FROM quote_instruments
+                     WHERE category = ?1 AND (UPPER(ts_code) LIKE ?2 OR name LIKE ?3)
+                     ORDER BY
+                       CASE WHEN UPPER(ts_code) = ?4 THEN 0
+                            WHEN name = ?5 THEN 1
+                            WHEN name LIKE ?6 THEN 2
+                            ELSE 3 END,
+                       ts_code
+                     LIMIT ?7 OFFSET ?8".to_string(),
+                    vec![
+                        SqlValue::Text((*c).to_string()),
+                        SqlValue::Text(format!("%{}%", q.to_ascii_uppercase())),
+                        SqlValue::Text(format!("%{}%", q)),
+                        SqlValue::Text(q.to_ascii_uppercase()),
+                        SqlValue::Text(q.clone()),
+                        SqlValue::Text(format!("{}%", q)),
+                        SqlValue::Integer(limit as i64),
+                        SqlValue::Integer(offset as i64),
+                    ],
+                ),
+            };
+            let mut stmt = conn.prepare(&list_sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(list_params.iter()), row_to_instrument)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((rows, total))
+        })
+    }
+
+    // ====================================================================== klines (daily)
+
+    pub fn upsert_daily_klines(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+        adjust: Adjust,
+        points: &[KlinePoint],
+        source: &str,
+        fetched_at: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_klines_daily (
+                        ts_code, period, adjust, trade_date, open, close, high, low,
+                        volume, amount, source, fetched_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(ts_code, period, adjust, trade_date) DO UPDATE SET
+                        open = excluded.open,
+                        close = excluded.close,
+                        high = excluded.high,
+                        low = excluded.low,
+                        volume = excluded.volume,
+                        amount = excluded.amount,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at",
+                )?;
+                for p in points {
+                    stmt.execute(params![
+                        ts_code.as_str(),
+                        period.as_str(),
+                        adjust.as_str(),
+                        p.date.format(),
+                        p.open.0.to_string(),
+                        p.close.0.to_string(),
+                        p.high.0.to_string(),
+                        p.low.0.to_string(),
+                        p.volume.map(|v| v.0),
+                        p.amount.map(|a| a.0.to_string()),
+                        source,
+                        fetched_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn load_kline_series(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+        adjust: Adjust,
+        limit: u32,
+    ) -> rusqlite::Result<Option<KlineSeries>> {
+        let (points, fetched_at, source) = self.db.with(|conn| -> rusqlite::Result<_> {
+            let mut stmt = conn.prepare(
+                "SELECT trade_date, open, close, high, low, volume, amount, source, fetched_at
+                 FROM quote_klines_daily
+                 WHERE ts_code = ?1 AND period = ?2 AND adjust = ?3
+                 ORDER BY trade_date DESC LIMIT ?4",
+            )?;
+            let mut points: Vec<KlinePoint> = Vec::new();
+            let mut latest_fetched: Option<DateTime<Utc>> = None;
+            let mut latest_source: Option<String> = None;
+            let mut rows = stmt.query(params![
+                ts_code.as_str(),
+                period.as_str(),
+                adjust.as_str(),
+                limit as i64
+            ])?;
+            while let Some(row) = rows.next()? {
+                let td: String = row.get(0)?;
+                let open: String = row.get(1)?;
+                let close: String = row.get(2)?;
+                let high: String = row.get(3)?;
+                let low: String = row.get(4)?;
+                let volume: Option<i64> = row.get(5)?;
+                let amount: Option<String> = row.get(6)?;
+                let source: String = row.get(7)?;
+                let fetched: String = row.get(8)?;
+                let p = KlinePoint {
+                    date: TradeDate::parse(&td).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    open: Price(Decimal::from_str(&open).unwrap_or_default()),
+                    close: Price(Decimal::from_str(&close).unwrap_or_default()),
+                    high: Price(Decimal::from_str(&high).unwrap_or_default()),
+                    low: Price(Decimal::from_str(&low).unwrap_or_default()),
+                    volume: volume.map(Volume),
+                    amount: amount
+                        .and_then(|s| Decimal::from_str(&s).ok())
+                        .map(Amount),
+                };
+                points.push(p);
+                if latest_fetched.is_none() {
+                    latest_fetched = DateTime::parse_from_rfc3339(&fetched)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc));
+                    latest_source = Some(source);
+                }
+            }
+            Ok((points, latest_fetched, latest_source))
+        })?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+        let mut sorted = points;
+        sorted.reverse(); // ascending
+        Ok(Some(KlineSeries {
+            period,
+            adjust,
+            points: sorted,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: fetched_at,
+                exchange_time: None,
+                age_ms: fetched_at.map(|t| (Utc::now() - t).num_milliseconds()),
+                source: source,
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }))
+    }
+
+    // ====================================================================== klines (minute)
+
+    pub fn upsert_minute_klines(
+        &self,
+        ts_code: &TsCode,
+        period: MinuteKlinePeriod,
+        points: &[MinuteKlinePoint],
+        source: &str,
+        fetched_at: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_klines_minute (
+                        ts_code, period, ts_ms, open, close, high, low, volume, amount,
+                        source, fetched_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(ts_code, period, ts_ms) DO UPDATE SET
+                        open = excluded.open,
+                        close = excluded.close,
+                        high = excluded.high,
+                        low = excluded.low,
+                        volume = excluded.volume,
+                        amount = excluded.amount,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at",
+                )?;
+                for p in points {
+                    stmt.execute(params![
+                        ts_code.as_str(),
+                        period.as_str(),
+                        p.timestamp_ms,
+                        p.open.0.to_string(),
+                        p.close.0.to_string(),
+                        p.high.0.to_string(),
+                        p.low.0.to_string(),
+                        p.volume.0,
+                        p.amount.0.to_string(),
+                        source,
+                        fetched_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn load_minute_series(
+        &self,
+        ts_code: &TsCode,
+        period: MinuteKlinePeriod,
+        limit: u32,
+    ) -> rusqlite::Result<Option<MinuteKlineSeries>> {
+        let (points, fetched_at, source) = self.db.with(|conn| -> rusqlite::Result<_> {
+            let mut stmt = conn.prepare(
+                "SELECT ts_ms, open, close, high, low, volume, amount, source, fetched_at
+                 FROM quote_klines_minute
+                 WHERE ts_code = ?1 AND period = ?2
+                 ORDER BY ts_ms DESC LIMIT ?3",
+            )?;
+            let mut points: Vec<MinuteKlinePoint> = Vec::new();
+            let mut latest_fetched: Option<DateTime<Utc>> = None;
+            let mut latest_source: Option<String> = None;
+            let mut rows = stmt.query(params![
+                ts_code.as_str(),
+                period.as_str(),
+                limit as i64
+            ])?;
+            while let Some(row) = rows.next()? {
+                let ts_ms: i64 = row.get(0)?;
+                let open: String = row.get(1)?;
+                let close: String = row.get(2)?;
+                let high: String = row.get(3)?;
+                let low: String = row.get(4)?;
+                let volume: i64 = row.get(5)?;
+                let amount: String = row.get(6)?;
+                let src: String = row.get(7)?;
+                let fetched: String = row.get(8)?;
+                points.push(MinuteKlinePoint {
+                    timestamp_ms: ts_ms,
+                    open: Price(Decimal::from_str(&open).unwrap_or_default()),
+                    close: Price(Decimal::from_str(&close).unwrap_or_default()),
+                    high: Price(Decimal::from_str(&high).unwrap_or_default()),
+                    low: Price(Decimal::from_str(&low).unwrap_or_default()),
+                    volume: Volume(volume),
+                    amount: Amount(Decimal::from_str(&amount).unwrap_or_default()),
+                });
+                if latest_fetched.is_none() {
+                    latest_fetched = DateTime::parse_from_rfc3339(&fetched)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc));
+                    latest_source = Some(src);
+                }
+            }
+            Ok((points, latest_fetched, latest_source))
+        })?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+        let mut sorted = points;
+        sorted.reverse();
+        Ok(Some(MinuteKlineSeries {
+            period,
+            points: sorted,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: fetched_at,
+                exchange_time: None,
+                age_ms: fetched_at.map(|t| (Utc::now() - t).num_milliseconds()),
+                source: source,
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }))
+    }
+
+    // ====================================================================== intraday
+
+    pub fn upsert_intraday(
+        &self,
+        ts_code: &TsCode,
+        trade_date: TradeDate,
+        points: &[(String, Price, Option<Volume>, Option<Amount>)],
+        source: &str,
+        fetched_at: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_intraday (
+                        ts_code, trade_date, time, price, average, volume, amount,
+                        source, fetched_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(ts_code, trade_date, time) DO UPDATE SET
+                        price = excluded.price,
+                        volume = excluded.volume,
+                        amount = excluded.amount,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at",
+                )?;
+                for (time, price, volume, amount) in points {
+                    stmt.execute(params![
+                        ts_code.as_str(),
+                        trade_date.format(),
+                        time,
+                        price.0.to_string(),
+                        Option::<String>::None,
+                        volume.map(|v| v.0),
+                        amount.map(|a| a.0.to_string()),
+                        source,
+                        fetched_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn load_intraday(
+        &self,
+        ts_code: &TsCode,
+        trade_date: TradeDate,
+    ) -> rusqlite::Result<Option<IntradaySeries>> {
+        let (points, fetched_at, source) = self.db.with(|conn| -> rusqlite::Result<_> {
+            let mut stmt = conn.prepare(
+                "SELECT time, price, average, volume, amount, source, fetched_at
+                 FROM quote_intraday
+                 WHERE ts_code = ?1 AND trade_date = ?2
+                 ORDER BY time ASC",
+            )?;
+            let mut points: Vec<MinutePoint> = Vec::new();
+            let mut latest_fetched: Option<DateTime<Utc>> = None;
+            let mut latest_source: Option<String> = None;
+            let mut rows =
+                stmt.query(params![ts_code.as_str(), trade_date.format()])?;
+            while let Some(row) = rows.next()? {
+                let time: String = row.get(0)?;
+                let price: String = row.get(1)?;
+                let avg: Option<String> = row.get(2)?;
+                let volume: Option<i64> = row.get(3)?;
+                let amount: Option<String> = row.get(4)?;
+                let src: String = row.get(5)?;
+                let fetched: String = row.get(6)?;
+                points.push(MinutePoint {
+                    trade_date,
+                    time,
+                    price: Price(Decimal::from_str(&price).unwrap_or_default()),
+                    average: avg.and_then(|s| Decimal::from_str(&s).ok()).map(Price),
+                    volume: volume.map(Volume),
+                    amount: amount.and_then(|s| Decimal::from_str(&s).ok()).map(Amount),
+                });
+                if latest_fetched.is_none() {
+                    latest_fetched = DateTime::parse_from_rfc3339(&fetched)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc));
+                    latest_source = Some(src);
+                }
+            }
+            Ok((points, latest_fetched, latest_source))
+        })?;
+        if points.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(IntradaySeries {
+            trade_date,
+            points,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: fetched_at,
+                exchange_time: None,
+                age_ms: fetched_at.map(|t| (Utc::now() - t).num_milliseconds()),
+                source: source,
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }))
+    }
+
+    // ====================================================================== daily_basic
+
+    pub fn upsert_daily_basic(&self, rows: &[DailyBasic]) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_daily_basic (
+                        ts_code, trade_date, pe, pe_ttm, pb, ps, ps_ttm,
+                        turnover_rate, turnover_rate_float, volume_ratio,
+                        total_mv, circ_mv, source, fetched_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     ON CONFLICT(ts_code, trade_date) DO UPDATE SET
+                        pe = excluded.pe, pe_ttm = excluded.pe_ttm,
+                        pb = excluded.pb, ps = excluded.ps, ps_ttm = excluded.ps_ttm,
+                        turnover_rate = excluded.turnover_rate,
+                        turnover_rate_float = excluded.turnover_rate_float,
+                        volume_ratio = excluded.volume_ratio,
+                        total_mv = excluded.total_mv,
+                        circ_mv = excluded.circ_mv,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at",
+                )?;
+                for d in rows {
+                    stmt.execute(params![
+                        d.ts_code.as_str(),
+                        d.trade_date.format(),
+                        d.pe,
+                        d.pe_ttm,
+                        d.pb,
+                        d.ps,
+                        d.ps_ttm,
+                        d.turnover_rate,
+                        d.turnover_rate_float,
+                        d.volume_ratio,
+                        d.total_mv.map(|m| m.0.to_string()),
+                        d.circ_mv.map(|m| m.0.to_string()),
+                        d.source,
+                        d.fetched_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 取 `<= trade_date` 的最新一条 DailyBasic（spec §2：扫描使用最近一条）。
+    pub fn latest_daily_basic(
+        &self,
+        ts_code: &TsCode,
+        trade_date: TradeDate,
+    ) -> rusqlite::Result<Option<DailyBasic>> {
+        self.db.with(|conn| {
+            conn.query_row(
+                "SELECT ts_code, trade_date, pe, pe_ttm, pb, ps, ps_ttm,
+                        turnover_rate, turnover_rate_float, volume_ratio,
+                        total_mv, circ_mv, source, fetched_at
+                 FROM quote_daily_basic
+                 WHERE ts_code = ?1 AND trade_date <= ?2
+                 ORDER BY trade_date DESC LIMIT 1",
+                params![ts_code.as_str(), trade_date.format()],
+                row_to_daily_basic,
+            )
+            .optional()
+        })
+    }
+
+    // ====================================================================== company events
+
+    pub fn upsert_company_events(&self, events: &[CompanyEvent]) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_company_events (
+                        id, ts_code, event_type, announce_date, effective_date,
+                        payload, source, fetched_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(id) DO UPDATE SET
+                        announce_date = excluded.announce_date,
+                        effective_date = excluded.effective_date,
+                        payload = excluded.payload,
+                        source = excluded.source,
+                        fetched_at = excluded.fetched_at",
+                )?;
+                for ev in events {
+                    stmt.execute(params![
+                        ev.id,
+                        ev.ts_code.as_str(),
+                        event_type_to_str(ev.event_type),
+                        ev.announce_date.map(|d| d.format()),
+                        ev.effective_date.map(|d| d.format()),
+                        ev.payload.to_string(),
+                        ev.source,
+                        ev.fetched_at.to_rfc3339(),
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn list_company_events(
+        &self,
+        ts_code: &TsCode,
+        days_ahead: i64,
+    ) -> rusqlite::Result<Vec<CompanyEvent>> {
+        let today = chrono::Utc::now().date_naive();
+        let from = TradeDate::from_naive(today)
+            .as_naive()
+            .pred_opt()
+            .unwrap()
+            .format("%Y%m%d")
+            .to_string();
+        let to = TradeDate::from_naive(
+            today.checked_add_days(chrono::Days::new(days_ahead as u64)).unwrap_or(today),
+        )
+        .format();
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, ts_code, event_type, announce_date, effective_date,
+                        payload, source, fetched_at
+                 FROM quote_company_events
+                 WHERE ts_code = ?1
+                   AND ( (effective_date IS NOT NULL AND effective_date BETWEEN ?2 AND ?3)
+                      OR (announce_date IS NOT NULL AND announce_date BETWEEN ?2 AND ?3) )
+                 ORDER BY COALESCE(effective_date, announce_date) DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![ts_code.as_str(), from, to], row_to_event)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    // ====================================================================== close snapshot
+
+    pub fn upsert_close_snapshot(
+        &self,
+        ts_code: &TsCode,
+        trade_date: TradeDate,
+        quote: &StockQuote,
+    ) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(quote).unwrap_or_else(|_| "{}".to_string());
+        self.db.with(|conn| {
+            conn.execute(
+                "INSERT INTO quote_close_snapshot (ts_code, trade_date, payload, captured_at, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(ts_code, trade_date) DO UPDATE SET
+                    payload = excluded.payload,
+                    captured_at = excluded.captured_at,
+                    source = excluded.source",
+                params![
+                    ts_code.as_str(),
+                    trade_date.format(),
+                    json,
+                    quote.captured_at.to_rfc3339(),
+                    quote.source.as_str(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn load_close_snapshot(
+        &self,
+        ts_code: &TsCode,
+        trade_date: TradeDate,
+    ) -> rusqlite::Result<Option<StockQuote>> {
+        self.db.with(|conn| {
+            let payload: Option<String> = conn
+                .query_row(
+                    "SELECT payload FROM quote_close_snapshot WHERE ts_code = ?1 AND trade_date = ?2",
+                    params![ts_code.as_str(), trade_date.format()],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(payload.and_then(|s| serde_json::from_str(&s).ok()))
+        })
+    }
+
+    // ====================================================================== refresh_state
+
+    pub fn record_refresh_state(
+        &self,
+        kind: &str,
+        trade_date: TradeDate,
+        total: u32,
+        success: u32,
+        failed: u32,
+        completed_at: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            conn.execute(
+                "INSERT INTO quote_refresh_state (refresh_kind, trade_date, total, success, failed, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(refresh_kind, trade_date) DO UPDATE SET
+                    total = excluded.total,
+                    success = excluded.success,
+                    failed = excluded.failed,
+                    completed_at = excluded.completed_at",
+                params![
+                    kind,
+                    trade_date.format(),
+                    total as i64,
+                    success as i64,
+                    failed as i64,
+                    completed_at.to_rfc3339(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn category_to_str(c: InstrumentCategory) -> &'static str {
+    match c {
+        InstrumentCategory::Stock => "stock",
+        InstrumentCategory::Index => "index",
+        InstrumentCategory::Fund => "fund",
+    }
+}
+
+fn category_from_str(s: &str) -> InstrumentCategory {
+    match s {
+        "index" => InstrumentCategory::Index,
+        "fund" => InstrumentCategory::Fund,
+        _ => InstrumentCategory::Stock,
+    }
+}
+
+fn market_to_str(m: Market) -> &'static str {
+    match m {
+        Market::SH => "SH",
+        Market::SZ => "SZ",
+        Market::BJ => "BJ",
+    }
+}
+
+fn market_from_str(s: &str) -> Market {
+    match s {
+        "SZ" => Market::SZ,
+        "BJ" => Market::BJ,
+        _ => Market::SH,
+    }
+}
+
+fn status_to_str(s: InstrumentStatus) -> &'static str {
+    match s {
+        InstrumentStatus::Listed => "listed",
+        InstrumentStatus::Suspended => "suspended",
+        InstrumentStatus::Delisted => "delisted",
+        InstrumentStatus::Unknown => "unknown",
+    }
+}
+
+fn status_from_str(s: &str) -> InstrumentStatus {
+    match s {
+        "suspended" => InstrumentStatus::Suspended,
+        "delisted" => InstrumentStatus::Delisted,
+        "unknown" => InstrumentStatus::Unknown,
+        _ => InstrumentStatus::Listed,
+    }
+}
+
+fn instrument_source_to_str(s: InstrumentSource) -> &'static str {
+    match s {
+        InstrumentSource::Tdx => "tdx",
+        InstrumentSource::Eastmoney => "eastmoney",
+        InstrumentSource::Tushare => "tushare",
+        InstrumentSource::Mixed => "mixed",
+    }
+}
+
+fn instrument_source_from_str(s: &str) -> InstrumentSource {
+    match s {
+        "eastmoney" => InstrumentSource::Eastmoney,
+        "tushare" => InstrumentSource::Tushare,
+        "mixed" => InstrumentSource::Mixed,
+        _ => InstrumentSource::Tdx,
+    }
+}
+
+fn event_type_to_str(t: CompanyEventType) -> &'static str {
+    match t {
+        CompanyEventType::Dividend => "dividend",
+        CompanyEventType::Suspension => "suspension",
+        CompanyEventType::Resume => "resume",
+        CompanyEventType::St => "st",
+        CompanyEventType::EarningsForecast => "earnings_forecast",
+        CompanyEventType::Unlock => "unlock",
+        CompanyEventType::Other => "other",
+    }
+}
+
+fn event_type_from_str(s: &str) -> CompanyEventType {
+    match s {
+        "dividend" => CompanyEventType::Dividend,
+        "suspension" => CompanyEventType::Suspension,
+        "resume" => CompanyEventType::Resume,
+        "st" => CompanyEventType::St,
+        "earnings_forecast" => CompanyEventType::EarningsForecast,
+        "unlock" => CompanyEventType::Unlock,
+        _ => CompanyEventType::Other,
+    }
+}
+
+fn row_to_instrument(row: &rusqlite::Row<'_>) -> rusqlite::Result<MarketInstrument> {
+    let ts_code: String = row.get(0)?;
+    let ts_code = TsCode::parse(&ts_code).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let name: String = row.get(1)?;
+    let category: String = row.get(2)?;
+    let market: String = row.get(3)?;
+    let board: Option<String> = row.get(4)?;
+    let sector: Option<String> = row.get(5)?;
+    let status: Option<String> = row.get(6)?;
+    let is_st: Option<i64> = row.get(7)?;
+    let publisher: Option<String> = row.get(8)?;
+    let index_category: Option<String> = row.get(9)?;
+    let fund_type: Option<String> = row.get(10)?;
+    let management: Option<String> = row.get(11)?;
+    let list_date: Option<String> = row.get(12)?;
+    let source: String = row.get(13)?;
+    let updated_at: String = row.get(14)?;
+    let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    Ok(MarketInstrument {
+        ts_code,
+        name,
+        category: category_from_str(&category),
+        market: market_from_str(&market),
+        board,
+        sector,
+        status: status.as_deref().map(status_from_str),
+        is_st: is_st.map(|v| v != 0),
+        publisher,
+        index_category,
+        fund_type,
+        management,
+        list_date,
+        source: instrument_source_from_str(&source),
+        updated_at,
+    })
+}
+
+fn row_to_daily_basic(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyBasic> {
+    let ts_code: String = row.get(0)?;
+    let ts_code = TsCode::parse(&ts_code).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let trade_date: String = row.get(1)?;
+    let trade_date = TradeDate::parse(&trade_date).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let pe: Option<f64> = row.get(2)?;
+    let pe_ttm: Option<f64> = row.get(3)?;
+    let pb: Option<f64> = row.get(4)?;
+    let ps: Option<f64> = row.get(5)?;
+    let ps_ttm: Option<f64> = row.get(6)?;
+    let turnover_rate: Option<f64> = row.get(7)?;
+    let turnover_rate_float: Option<f64> = row.get(8)?;
+    let volume_ratio: Option<f64> = row.get(9)?;
+    let total_mv: Option<String> = row.get(10)?;
+    let circ_mv: Option<String> = row.get(11)?;
+    let source: String = row.get(12)?;
+    let fetched_at: String = row.get(13)?;
+    let fetched_at = DateTime::parse_from_rfc3339(&fetched_at)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    Ok(DailyBasic {
+        ts_code,
+        trade_date,
+        pe,
+        pe_ttm,
+        pb,
+        ps,
+        ps_ttm,
+        turnover_rate: turnover_rate.map(|v| v as Percent),
+        turnover_rate_float: turnover_rate_float.map(|v| v as Percent),
+        volume_ratio,
+        total_mv: total_mv
+            .and_then(|s| Decimal::from_str(&s).ok())
+            .map(Money),
+        circ_mv: circ_mv.and_then(|s| Decimal::from_str(&s).ok()).map(Money),
+        source,
+        fetched_at,
+    })
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<CompanyEvent> {
+    let id: String = row.get(0)?;
+    let ts_code: String = row.get(1)?;
+    let ts_code = TsCode::parse(&ts_code).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let event_type: String = row.get(2)?;
+    let announce_date: Option<String> = row.get(3)?;
+    let effective_date: Option<String> = row.get(4)?;
+    let payload: String = row.get(5)?;
+    let source: String = row.get(6)?;
+    let fetched_at: String = row.get(7)?;
+    Ok(CompanyEvent {
+        id,
+        ts_code,
+        event_type: event_type_from_str(&event_type),
+        announce_date: announce_date.and_then(|s| TradeDate::parse(&s).ok()),
+        effective_date: effective_date.and_then(|s| TradeDate::parse(&s).ok()),
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        source,
+        fetched_at: DateTime::parse_from_rfc3339(&fetched_at)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}

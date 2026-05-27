@@ -16,12 +16,18 @@ use tauri::{Emitter, Manager};
 use tauri_specta::{collect_commands, Builder};
 
 use crate::adapters::news::events::{wrap_news_refreshed, NEWS_REFRESHED_EVENT};
+use crate::adapters::quotes::events::{wrap_market_quotes_refreshed, MARKET_QUOTES_REFRESHED_EVENT};
 use crate::infrastructure::db::{run_migrations, AppDb};
 use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
+use crate::infrastructure::quotes::{migrations as quotes_migrations, QuotesConfig};
 use crate::pipeline::news::scheduler::{
     spawn_news_refresh_scheduler, NewsSchedulerHandle, NEWS_REFRESH_INTERVAL_SECS,
 };
 use crate::pipeline::news::NewsService;
+use crate::pipeline::quotes::scheduler::{
+    spawn_quotes_scheduler, QuotesSchedulerHandle, QUOTES_REFRESH_INTERVAL_SECS,
+};
+use crate::pipeline::quotes::service::QuotesService;
 
 /// Tauri 主入口。`main.rs` 调用 `gangzi_terminal::run()` 启动 app。
 pub fn run() {
@@ -32,6 +38,9 @@ pub fn run() {
         adapters::news::cmd::fetch_news,
         adapters::news::cmd::list_news_sources,
         adapters::news::cmd::warm_articles,
+        adapters::quotes::cmd::list_market,
+        adapters::quotes::cmd::fetch_data,
+        adapters::quotes::cmd::scan_market,
     ]);
 
     #[cfg(debug_assertions)]
@@ -54,6 +63,7 @@ pub fn run() {
             db.with(|conn| {
                 let mut all = Vec::new();
                 all.extend(news_migrations());
+                all.extend(quotes_migrations());
                 run_migrations(conn, all).expect("failed to apply migrations");
             });
 
@@ -73,7 +83,7 @@ pub fn run() {
             app.manage(db.clone());
             app.manage(Arc::clone(&news_service));
 
-            // -- Event sink：scheduler + warm_articles 共用同一个 emit 回调
+            // -- News Event sink
             let app_handle = app.handle().clone();
             let sink: crate::pipeline::news::scheduler::EventSink =
                 Arc::new(move |payload| {
@@ -82,16 +92,39 @@ pub fn run() {
                         tracing::warn!(target: "news.refresh.emit", error = %e, "failed to emit news-refreshed");
                     }
                 });
-            // 注入给 service：warm_articles 在 articleUpdatedCount > 0 时通过它 emit
             news_service.set_event_sink(Arc::clone(&sink));
 
-            // -- Scheduler：默认 60s tick
-            let handle: NewsSchedulerHandle = spawn_news_refresh_scheduler(
+            let news_handle: NewsSchedulerHandle = spawn_news_refresh_scheduler(
                 Arc::clone(&news_service),
                 Duration::from_secs(NEWS_REFRESH_INTERVAL_SECS),
                 sink,
             );
-            app.manage(handle);
+            app.manage(news_handle);
+
+            // -- Quotes BC bootstrap
+            let quotes_service = Arc::new(
+                QuotesService::new(db.clone(), QuotesConfig::default())
+                    .expect("failed to build QuotesService"),
+            );
+            app.manage(Arc::clone(&quotes_service));
+
+            // -- Quotes Event sink
+            let app_handle = app.handle().clone();
+            let quotes_sink: crate::pipeline::quotes::service::RefreshEventSink =
+                Arc::new(move |payload| {
+                    let envelope = wrap_market_quotes_refreshed(payload, None);
+                    if let Err(e) = app_handle.emit(MARKET_QUOTES_REFRESHED_EVENT, envelope) {
+                        tracing::warn!(target: "quotes.refresh.emit", error = %e, "failed to emit market-quotes-refreshed");
+                    }
+                });
+            quotes_service.set_event_sink(quotes_sink);
+
+            // -- Quotes Scheduler
+            let quotes_handle: QuotesSchedulerHandle = spawn_quotes_scheduler(
+                Arc::clone(&quotes_service),
+                Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
+            );
+            app.manage(quotes_handle);
 
             Ok(())
         })
