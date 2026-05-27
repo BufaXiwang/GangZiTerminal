@@ -120,7 +120,7 @@ Actor 命名规则：
 | `orderId` | 委托唯一 ID | 创建后不可变 |
 | `tsCode` | 标准标的代码 | 必须是 Quotes 已知且 Account 可交易的 `TsCode` |
 | `side` | 买入 / 卖出方向 | 买入冻结现金，卖出冻结可卖数量 |
-| `orderType` | 市价 / 限价 | `market` immediate-or-reject；`limit` 可 pending |
+| `orderType` | 市价 / 限价 | `market` 即时撮合：盘口量足够则全成交，量不足则按可成交量部分成交、剩余数量立即自动取消并入终态；不进入 `pending`。`limit` 可 pending |
 | `limitPrice` | 限价价格 | `orderType = limit` 时必填 |
 | `quantity` | 委托股 / 份数量 | 股票和场内基金必须 100 股 / 份整数倍 |
 | `filledQuantity` | 已成交数量 | 由成交回报累加，不能超过 `quantity` |
@@ -135,7 +135,7 @@ Actor 命名规则：
 规则：
 
 - `open_position` / `scale_position` / `close_position` 可以作为写入口的便捷动作，但 Account 内部仍应落为订单 + 成交 + 仓位事件。
-- `market` 表示用当前 fresh Quotes snapshot 模拟即时成交；它是 immediate-or-reject，不允许进入 pending。
+- `market` 表示用当前 fresh Quotes snapshot 模拟即时成交。盘口量足够时全部成交（`filled`）；盘口量不足时按可成交量部分成交、**剩余数量立即自动取消**进入终态（`partially_filled` 即为终态，同步 emit `order_cancelled` event 表达剩余量取消，且释放对应冻结资金 / 持仓）。**`market` 订单在任何情况下都不进入 `pending`**。
 - `market` 订单不得携带 `limitPrice` 或 `expiresAt`；调用方传入时写入口必须返回 `accepted = false` / `invalid_input`，且不得创建 `Order`。
 - `limit` 表示挂单；由定时任务根据 Quotes snapshot 判断是否成交、部分成交、过期。
 - `limit` 订单可以在 quote stale 时创建为 pending，但不能在 stale quote 上成交。
@@ -154,22 +154,27 @@ Actor 命名规则：
 
 | 当前阶段 / 持久状态 | 允许转换到 | 触发 |
 |---|---|---|
-| `creating` | `filled` | `market` 订单即时成交 |
+| `creating` | `filled` | `market` 订单全量即时成交 |
+| `creating` | `partially_filled` | `market` 订单按可成交量部分成交，剩余自动取消（终态） |
 | `creating` | `rejected` | 参数、交易时段、行情、现金、持仓、风控等校验失败且订单已创建 |
 | `creating` | `pending` | `limit` 订单创建并冻结资金 / 持仓成功 |
-| `pending` | `partially_filled` | 挂单部分成交 |
+| `pending` | `partially_filled` | 挂单部分成交（剩余仍在 `pending`） |
 | `pending` | `filled` | 挂单全部成交 |
 | `pending` | `cancelled` | 显式撤单 |
 | `pending` | `expired` | 到期未完全成交 |
-| `partially_filled` | `filled` | 剩余数量继续成交完成 |
-| `partially_filled` | `cancelled` | 显式撤销剩余数量 |
-| `partially_filled` | `expired` | 剩余数量到期 |
+| `partially_filled` | `filled` | 剩余数量继续成交完成（仅限 `limit`） |
+| `partially_filled` | `cancelled` | 显式撤销剩余数量（仅限 `limit`） |
+| `partially_filled` | `expired` | 剩余数量到期（仅限 `limit`） |
+
+注意 `partially_filled` 在 `market` 与 `limit` 下语义不同：
+- **`market`**：`partially_filled` 是终态，剩余量已自动取消并释放冻结；`order_cancelled` event 同步写入审计。
+- **`limit`**：`partially_filled` 是中间态，剩余量仍 `pending`，可继续撮合、显式撤单或过期。
 
 规则：
 
 - `creating` 是创建命令内部的评估阶段，不是 `Order.status`，不得持久化或对外返回。
 - `filled`、`cancelled`、`rejected`、`expired` 是终态，不能再转换。
-- `market` 订单只能从 `creating` 到 `filled` 或 `rejected`，不得持久化为 `pending`。
+- `market` 订单只能从 `creating` 到 `filled` / `partially_filled`（终态）/ `rejected`，不得持久化为 `pending`。`partially_filled` 时，剩余量必须在同一事务内自动 cancel 并释放冻结。
 - `limit` 订单进入 `pending` 前必须完成冻结；冻结失败则拒绝，不得留下可成交挂单。
 - `partially_filled` 的 `filledQuantity` 必须大于 0 且小于 `quantity`。
 
@@ -186,6 +191,7 @@ type TradeFill = {
   quantity: Shares;
   commission: Money;
   stampTax: Money;
+  transferFee: Money;
   occurredAt: OccurredAt;
 };
 ```
@@ -203,12 +209,16 @@ type TradeFill = {
 | `quantity` | 成交数量 | 不得超过订单剩余数量 |
 | `commission` | 佣金 | 双向收取 |
 | `stampTax` | 印花税 | 仅卖出收取 |
+| `transferFee` | 过户费 | 仅 SH 市场 stock / fund 双向收取（按 `AccountFeePolicy.transferFeeRate` × notional）；SZ / BJ 为 0 |
 | `occurredAt` | 成交时间 | 必须在可成交交易时段内 |
 
 规则：
 
 - 买入成交减少现金，卖出成交增加现金。
-- 佣金双向收取，印花税仅卖出收取。
+- 佣金双向收取，印花税仅卖出收取，过户费仅 SH 标的双向收取。
+- 现金变动公式：
+  - 买入：`cash -= price × quantity + commission + transferFee`
+  - 卖出：`cash += price × quantity - commission - stampTax - transferFee`
 - 买入成交生成新的 `PositionLot`，成交日当天不可卖。
 - 卖出成交按可卖 lot 扣减，减少或关闭对应仓位。
 
@@ -307,6 +317,7 @@ type Position = {
 - `marketPrice`、`marketValue`、`unrealizedPnl` 来自 Quotes snapshot 派生。
 - 同一 `ts_code` 默认只有一个 open position；新增买入成交若已有 open position，读模型合并为加仓。
 - 高阶 `open_position(tsCode)` 如果该标的已有 open position，必须拒绝并返回 `invalid_input`；下游决策方需要显式调用 `scale_position(side = "increase")`，避免新的开仓理由被隐式挂到既有仓位上。
+- **同一 `ts_code` 同时只允许一个未终态的 `open_position` 订单（`pending` 或 `partially_filled` 中的 limit 单都计入）**。第二次 `open_position(tsCode)` 在第一笔 limit 仍未终态时必须拒绝并返回 `invalid_input`（`field: "tsCode"`，附带 hint 指向首笔 pending order）。否则多笔 limit 开仓同时挂出后第二笔成交时会被合并为隐式加仓，违反"开仓理由不能隐式挂到既有仓位"的不变量。
 - `Position.actor` 固定表示初始开仓发起者；后续调仓、平仓、保护条件调整由 `AccountEvent.actor` 审计，不回写为“当前管理者”。未来若支持系统导入持仓或系统再平衡，必须先扩展 Position actor 契约。
 - 全部数量卖出后仓位关闭。
 
@@ -419,7 +430,7 @@ type AccountSnapshot = {
 | `totalPnl` | 总盈亏 | `realizedPnl + unrealizedPnl` |
 | `pricedPositionCount` | 已成功估值仓位数 | 有可展示行情并计入 `marketValue` |
 | `unpricedPositionCount` | 未成功估值仓位数 | 缺行情或行情不可用，未计入 `marketValue` |
-| `valuationFreshness` | 账户估值新鲜度 | 由参与估值的 Quotes snapshot 派生 |
+| `valuationFreshness` | 账户估值新鲜度 | 由参与估值的 Quotes snapshot 派生。**`openPositionCount = 0` 时 `status = "fresh"`**（无仓位无估值需求，不会误导用户行情坏了）；有仓位时按子 quote freshness 聚合：全部 fresh → fresh；存在 stale 且无 missing → stale；存在 missing → missing |
 | `openPositionCount` | 开仓中仓位数 | 查询派生 |
 | `pendingOrderCount` | 未完成订单数 | 查询派生 |
 | `capturedAt` | 快照生成时间 | 不是真源时间 |
@@ -435,11 +446,15 @@ Account 拥有账户估值计算。Quotes 只提供标的价格、盘口、状�
 - `marketPrice` 使用 Quotes snapshot 的当前价；行情缺失时 `marketPrice`、`marketValue`、`unrealizedPnl` 可以为空，但仓位基础数量和成本仍必须返回。
 - `marketValue = quantity * marketPrice`，仅在 `marketPrice` 存在时计算。
 - `remainingCostBasis = quantity * avgCost`；`unrealizedPnl = marketValue - remainingCostBasis`，等价于 `(marketPrice - avgCost) * quantity`。未实现盈亏不预扣未来卖出佣金或印花税，仅在 fresh 或可展示的 stale quote 存在时计算；响应必须携带 quote freshness。
-- `realizedPnl` 由卖出成交收入减去被卖出 lot 的成本、佣金和印花税派生。
+- `realizedPnl` 由卖出成交收入减去被卖出 lot 的成本、佣金、印花税和过户费派生。具体：`realizedPnl += (price - lotCost) × quantity - sellCommission - stampTax - sellTransferFee`。买入侧的佣金 / 过户费已计入 `lotCost`（通过 `avgCost`），不在卖出公式中重复扣减。
 - `AccountSnapshot.marketValue` 只汇总成功估值的 open positions；缺行情或不可用行情的仓位不按 0 伪造估值，必须计入 `unpricedPositionCount`。
 - `AccountSnapshot.totalAssets = cash + marketValue`；当 `unpricedPositionCount > 0` 时这是部分估值结果，`warnings` 必须包含 `data_partial`，不能被解释为完整账户净值。
 - `AccountSnapshot.unrealizedPnl` 只汇总成功估值的 open positions；`totalPnl = realizedPnl + unrealizedPnl`。当 `unpricedPositionCount > 0` 时，`unrealizedPnl` 和 `totalPnl` 同样是部分估值结果，必须共用 `data_partial` warning，不能当作完整账户盈亏。
-- `valuationFreshness.status` 反映本次估值使用行情的最弱 freshness：全部可估值且 fresh 为 `fresh`，使用 stale 展示行情为 `stale`，无任何 open position 可估值或全部缺失时为 `missing`。
+- `valuationFreshness.status` 规则：
+  - `openPositionCount = 0` → `fresh`（无仓位无估值需求；不视为缺失）
+  - `openPositionCount > 0` 且全部可估值且子 quote 全 fresh → `fresh`
+  - `openPositionCount > 0` 且存在 stale 子 quote 且无 missing → `stale`
+  - `openPositionCount > 0` 且存在 missing 子 quote（含完全无可估值）→ `missing`
 - `cash`、`frozenCash`、`availableCash`、`totalAssets` 不得由前端或 Agent 自行计算后写回。
 - Account 读取接口可以返回 stale quote 参与展示估值，但交易写路径必须 fail closed，不能用 stale / missing quote 成交。
 
@@ -640,7 +655,12 @@ type AccountRiskPolicy = {
 
 默认规则：
 
-- 缺省费用参数：`commissionRate = 0.0003`，`minCommission = 5`，`stampTaxSellRate = 0.0005`，`transferFeeRate = 0`。
+- 缺省费用参数：`commissionRate = 0.0003`（万 3，双向）、`minCommission = 5`（最低 5 元）、`stampTaxSellRate = 0.0005`（千五，仅卖）、`transferFeeRate = 0.00001`（A 股沪市过户费 0.001%，双向；SZ / BJ 不收，由 adapter 按 `TsCode.market` 决定是否乘入）。
+- 费用计算公式：
+  - `commission = max(notional × commissionRate, minCommission)`，双向。
+  - `stampTax = notional × stampTaxSellRate`，仅 `side = "sell"`。
+  - `transferFee = notional × transferFeeRate`，仅 `TsCode.market = "SH"` 且 `InstrumentCategory ∈ {stock, fund}`；其他市场为 0。
+  - `notional = price × quantity`。
 - 缺省风控阈值：`maxSinglePositionRatio = 0.25`，`maxGrossExposureRatio = 0.95`，`maxOrderValueRatio = 0.25`，`maxDailyNewOrders = 20`。
 - 自动化交易写动作必须携带可审计 reason；是否存在 active strategy 由下游决策纪律保证，不属于 Account 依赖。
 - 风控估值不得直接使用部分估值的 `AccountSnapshot.totalAssets` 做分母。买入风控必须计算独立的 `riskEquity = cash + sum(positionRiskValue)`：已估值仓位用 `marketValue`，未估值仓位用 `remainingCostBasis`；任何仓位不得按 0 计入风险敞口。
@@ -875,7 +895,10 @@ type OperateAccountInput =
 - `cancel_order` 只允许撤销 `pending` / `partially_filled` 订单；未知订单返回 `not_found`，终态订单返回 `order_not_pending`。撤销部分成交订单只释放剩余未成交数量对应的冻结现金 / 持仓，不回滚已成交部分。
 - `scale_position.side = "increase"` 内部生成买入 / 加仓订单，`side = "decrease"` 内部生成卖出 / 减仓订单；`quantity` 必须为正数，不能用负数表达方向。
 - `scale_position.side = "decrease"` 默认只做部分减仓；`quantity` 必须满足 `0 < quantity < position.quantity`。若 `quantity` 等于全部持仓，返回 `accepted = false` / `invalid_input`，应改用 `close_position`；若 `quantity > position.quantity` 或 `quantity > sellableQuantity`，返回 `accepted = false` / `insufficient_sellable_quantity`。
-- `close_position.quantity` 缺省时表示尝试卖出全部当前持仓；显式传入时必须等于 `position.quantity`，否则返回 `invalid_input` 并提示使用 `scale_position(side = "decrease")`。若全部持仓数量大于 `sellableQuantity`，返回 `insufficient_sellable_quantity`。
+- `close_position.quantity` 语义：
+  - **缺省**：尝试卖出**当前可卖部分**——实际下单数量 = `min(position.quantity, sellableQuantity)`。若 `sellableQuantity < position.quantity`（T+1 锁仓未到次日），不报错；实际下单 `sellableQuantity`，剩余持仓保留，并在响应 `warnings` 中加 `data_partial` (`field: "quantity"`)；只有当 `sellableQuantity == 0` 时返回 `insufficient_sellable_quantity`。
+  - **显式传入**：必须 `0 < quantity <= position.quantity`，否则 `invalid_input` 并提示使用 `scale_position(side = "decrease")`。若 `quantity > sellableQuantity`，返回 `insufficient_sellable_quantity`（显式数量要求精确，不做隐式裁剪）。
+  - 设计意图：缺省语义对应"卖能卖的"（UX 友好）；显式语义对应"我要卖这么多"（精确，不允许隐式部分）。
 - `adjust_protection` 只调整保护条件，不直接下单。
 - `adjust_protection` 字段缺省表示“不修改该字段”；`stopLoss` / `takeProfit` / `timeStopAt` 传 `null` 表示清除该条件，传具体值表示设置或替换；`enabled` 缺省表示不修改，传 `true` / `false` 表示启用 / 禁用整组保护条件。
 - `open_position` / `scale_position` / `close_position` 的 `orderType` 缺省时必须按 `"market"` 处理；`place_order` 必须显式传 `orderType`。
