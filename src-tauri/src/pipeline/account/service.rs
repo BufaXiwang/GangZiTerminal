@@ -2038,7 +2038,48 @@ impl AccountService {
                 "open_position limit cannot carry protection",
             );
         }
-        let response = self.handle_place_order(
+        // Spec §2 line 352-353: 多头仓位 stop_loss < currentPrice, take_profit > currentPrice。
+        // 初始保护条件使用 fresh quote 当前价 / 成交价做校验。market 路径 fill price = ask[0]，
+        // 用 fresh quote 当前价做预校验是合理近似；stale quote 校验时允许写入但携带 warning。
+        let mut pre_warnings: Vec<WarningCode> = vec![];
+        if matches!(ot, OrderType::Market)
+            && (stop_loss.is_some() || take_profit.is_some())
+        {
+            match self.gateway.get_snapshot(&ts_code) {
+                Ok(snap) => {
+                    let Some(ref_price) = snap.quote.price else {
+                        return self.reject_pre_event(
+                            ErrorCode::QuotePriceMissing,
+                            "reference price missing for initial protection",
+                        );
+                    };
+                    if let Some(sl) = stop_loss {
+                        if sl.0 >= ref_price.0 {
+                            return self.reject_pre_event(
+                                ErrorCode::InvalidInput,
+                                "initial stop_loss must be below reference price for long positions",
+                            );
+                        }
+                    }
+                    if let Some(tp) = take_profit {
+                        if tp.0 <= ref_price.0 {
+                            return self.reject_pre_event(
+                                ErrorCode::InvalidInput,
+                                "initial take_profit must be above reference price for long positions",
+                            );
+                        }
+                    }
+                    if matches!(snap.quote.freshness.status, FreshnessStatus::Stale) {
+                        pre_warnings.push(WarningCode::QuoteStale);
+                    }
+                }
+                Err(e) => {
+                    let code = quote_err_to_error_code(e.kind);
+                    return self.reject_pre_event(code, "reference quote unavailable for initial protection");
+                }
+            }
+        }
+        let mut response = self.handle_place_order(
             ts_code.clone(),
             OrderSide::Buy,
             ot,
@@ -2050,11 +2091,16 @@ impl AccountService {
             None,
             None,
         );
-        // 如果 accepted + market filled + 携带 protection → 立即写 protection。
+        // accepted + market filled + 携带 protection → 立即写 protection。
         if response.accepted && matches!(ot, OrderType::Market) {
             if stop_loss.is_some() || take_profit.is_some() || time_stop_at.is_some() {
-                if let Some(pid) = &response.position_id {
-                    let _ = self.apply_initial_protection(pid, stop_loss, take_profit, time_stop_at);
+                if let Some(pid) = response.position_id.clone() {
+                    let _ = self.apply_initial_protection(&pid, stop_loss, take_profit, time_stop_at);
+                }
+            }
+            for w in pre_warnings {
+                if !response.warnings.contains(&w) {
+                    response.warnings.push(w);
                 }
             }
         }
@@ -4444,5 +4490,109 @@ mod tests {
         assert!(resp.accepted);
         let subs = svc.subscribed_codes();
         assert!(subs.contains(&code), "subscribed_codes should include pending order ts_code");
+    }
+
+    // ------------------------------------------------------------------
+    // Initial protection validation (spec §2 line 352-353)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn open_position_market_invalid_stop_loss_rejected() {
+        // 当 stop_loss >= 当前价时，初始保护条件违反多头不变量 → invalid_input
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::OpenPosition {
+                    ts_code: code,
+                    quantity: Shares(100),
+                    order_type: Some(OrderType::Market),
+                    limit_price: None,
+                    expires_at: None,
+                    stop_loss: Some(Price(Decimal::from(150))), // >= ref price 100
+                    take_profit: None,
+                    time_stop_at: None,
+                    reason: "test".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InvalidInput));
+        // 没有 side effect - no order created
+        assert!(resp.account_event_ids.is_empty());
+    }
+
+    #[test]
+    fn open_position_market_invalid_take_profit_rejected() {
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::OpenPosition {
+                    ts_code: code,
+                    quantity: Shares(100),
+                    order_type: Some(OrderType::Market),
+                    limit_price: None,
+                    expires_at: None,
+                    stop_loss: None,
+                    take_profit: Some(Price(Decimal::from(50))), // <= ref price 100
+                    time_stop_at: None,
+                    reason: "test".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InvalidInput));
+    }
+
+    #[test]
+    fn open_position_market_missing_quote_for_initial_protection_rejected() {
+        // 没有 quote → 不能校验初始保护条件 → quote_missing
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::OpenPosition {
+                    ts_code: code,
+                    quantity: Shares(100),
+                    order_type: Some(OrderType::Market),
+                    limit_price: None,
+                    expires_at: None,
+                    stop_loss: Some(Price(Decimal::from(80))),
+                    take_profit: None,
+                    time_stop_at: None,
+                    reason: "test".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        // quote 缺失走 quote_missing；不应允许下单又应用保护条件。
+        assert!(matches!(
+            resp.reason,
+            Some(ErrorCode::QuoteMissing) | Some(ErrorCode::QuotePriceMissing)
+        ));
     }
 }
