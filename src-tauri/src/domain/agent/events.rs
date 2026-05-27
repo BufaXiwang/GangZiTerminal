@@ -4,6 +4,7 @@
 //!
 //! Runtime / 前端通过 `AgentEvent` 订阅 loop 状态；Infra emit。
 
+use crate::domain::shared::ErrorCode;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -19,7 +20,7 @@ pub enum AgentStopReason {
     MaxTurns,
     Cancelled,
     ProviderStop,
-    ToolError,
+    SkillError,
     ContextLimit,
     Error,
 }
@@ -68,20 +69,20 @@ pub enum AgentEvent {
         run_id: String,
         delta: String,
     },
-    ToolStart {
+    SkillStart {
         #[serde(rename = "runId")]
         run_id: String,
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
+        #[serde(rename = "skillCallId")]
+        skill_call_id: String,
         name: String,
         #[serde(rename = "inputSummary")]
         input_summary: JsonSummary,
     },
-    ToolEnd {
+    SkillEnd {
         #[serde(rename = "runId")]
         run_id: String,
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
+        #[serde(rename = "skillCallId")]
+        skill_call_id: String,
         name: String,
         #[serde(rename = "outputSummary")]
         output_summary: JsonSummary,
@@ -130,9 +131,11 @@ pub enum AgentEvent {
         stop_reason: AgentStopReason,
         turns: u32,
     },
+    /// 错误事件。Spec §2: `error.code` 必填，取自 shared `ErrorCode` 封闭集合。
     Error {
         #[serde(rename = "runId")]
         run_id: String,
+        code: ErrorCode,
         message: String,
     },
 }
@@ -143,8 +146,8 @@ impl AgentEvent {
             AgentEvent::RunStart { run_id, .. }
             | AgentEvent::TextDelta { run_id, .. }
             | AgentEvent::ThinkingDelta { run_id, .. }
-            | AgentEvent::ToolStart { run_id, .. }
-            | AgentEvent::ToolEnd { run_id, .. }
+            | AgentEvent::SkillStart { run_id, .. }
+            | AgentEvent::SkillEnd { run_id, .. }
             | AgentEvent::Compacted { run_id, .. }
             | AgentEvent::Usage { run_id, .. }
             | AgentEvent::Done { run_id, .. }
@@ -196,9 +199,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_event_error_requires_code() {
+        let e = AgentEvent::Error {
+            run_id: "r1".into(),
+            code: ErrorCode::ProviderContextTooLong,
+            message: "context too long".into(),
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["type"], "error");
+        assert_eq!(j["code"], "provider_context_too_long");
+        assert_eq!(j["message"], "context too long");
+    }
+
+    #[test]
+    fn agent_event_skill_start_and_end_serialize() {
+        let s = AgentEvent::SkillStart {
+            run_id: "r1".into(),
+            skill_call_id: "sc_1".into(),
+            name: "fetch_quote".into(),
+            input_summary: serde_json::json!({"tsCode": "600519.SH"}),
+        };
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(j["type"], "skill_start");
+        assert_eq!(j["skillCallId"], "sc_1");
+        let e = AgentEvent::SkillEnd {
+            run_id: "r1".into(),
+            skill_call_id: "sc_1".into(),
+            name: "fetch_quote".into(),
+            output_summary: serde_json::json!({"ok": true}),
+            is_error: false,
+            duration_ms: 30,
+        };
+        let j = serde_json::to_value(&e).unwrap();
+        assert_eq!(j["type"], "skill_end");
+        assert_eq!(j["durationMs"], 30);
+    }
+
+    #[test]
     fn agent_event_run_id_helper() {
         let e = AgentEvent::Error {
             run_id: "rZ".into(),
+            code: ErrorCode::ParseError,
             message: "boom".into(),
         };
         assert_eq!(e.run_id(), "rZ");

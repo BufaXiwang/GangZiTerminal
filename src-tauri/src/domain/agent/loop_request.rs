@@ -14,6 +14,9 @@ use super::messages::AgentMessage;
 /// 单次 Agent run 的执行参数。
 ///
 /// Spec: agent-infra-module.md §5 Infra Loop API
+///
+/// 注：spec §5 明确"request 不含 server-side tool 字段"——所有 chat-completable provider
+/// 都通过 Skill 文本协议提供工具能力。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunRequest {
@@ -21,9 +24,6 @@ pub struct AgentRunRequest {
     pub trigger: String,
     pub channel: ProviderChannel,
     pub max_turns: u32,
-    /// Runtime 本次允许的 server-side tools；Infra 不主动启用。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_server_side_tools: Vec<String>,
     /// 把已有聊天历史 / 续接消息一起带入；Infra 不负责拉取历史。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_messages: Vec<AgentMessage>,
@@ -44,9 +44,9 @@ pub struct RunSummary {
     pub cache_read_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
-    /// 本次产生的 tool_call_id 列表（Runtime 据此找审计）。
+    /// 本次产生的 skill_call_id 列表（Runtime 据此找审计）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_call_ids: Vec<String>,
+    pub skill_call_ids: Vec<String>,
 }
 
 impl RunSummary {
@@ -59,7 +59,7 @@ impl RunSummary {
             output_tokens: 0,
             cache_read_tokens: None,
             cache_write_tokens: None,
-            tool_call_ids: vec![],
+            skill_call_ids: vec![],
         }
     }
 }
@@ -92,13 +92,12 @@ mod tests {
                 base_url: None,
                 model: "claude".into(),
                 stream: true,
-                supports_tools: true,
                 supports_vision: false,
                 supports_thinking: false,
-                supports_server_side_tools: None,
+                max_output_tokens: None,
+                context_window_tokens: None,
             },
             max_turns: 12,
-            allowed_server_side_tools: vec![],
             seed_messages: vec![],
         };
         let j = serde_json::to_string(&r).unwrap();

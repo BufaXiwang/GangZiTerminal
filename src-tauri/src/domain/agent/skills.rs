@@ -1,8 +1,11 @@
-//! ToolSpec / ToolCall / ToolRegistry 协议层类型。
+//! SkillSpec / SkillCall — Skill 协议层类型。
 //!
-//! Spec: docs/design/agent-infra-module.md §2 `ToolSpec` `ToolCall`，§5 Tool Registry API
+//! Spec: docs/design/agent-infra-module.md §2 `SkillSpec` `SkillCall`，§5 Skill Registry API
 //!
-//! Infra 只定义注册协议；具体工具集合由 Runtime / adapter 注册。
+//! 设计：
+//! - Infra 只定义注册协议，不规定产品里必须有哪些 skill。
+//! - Skill 调用通过 `<use_skill name="...">{...}</use_skill>` XML 文本协议；不走 provider 原生 tool_use。
+//! - SkillCall 是审计真源；chat 历史中的 `<skill_result>` XML 是给 LLM / 用户看的副本。
 
 use crate::domain::shared::{ErrorCode, OccurredAt};
 use serde::{Deserialize, Serialize};
@@ -10,79 +13,71 @@ use specta::Type;
 
 use super::messages::JsonSummary;
 
-/// 工具副作用分类（spec §2）。
+/// Skill 副作用分类（spec §2 `SideEffect`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolSideEffect {
+pub enum SideEffect {
     None,
     NonTradingWrite,
     TradingWrite,
 }
 
-/// 工具来源 — local registry 或 provider server-side（spec §2）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCallSource {
-    LocalTool,
-    ServerSideTool,
-}
-
-/// 一个 local tool 的协议描述。
+/// 一个 Skill 的协议描述。
 ///
-/// Spec: agent-infra-module.md §2 `ToolSpec`
+/// Spec: agent-infra-module.md §2 `SkillSpec`
+///
+/// 规则（来自 spec §2）：
+/// - 同名 skill 只能注册一次；重复注册必须 fail closed。
+/// - `examples` 至少 1 个完整 `<use_skill ...>{...}</use_skill>` 示例字符串。
+/// - description 应当能被产品负责人手写为 markdown。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolSpec {
+pub struct SkillSpec {
     pub name: String,
     pub description: String,
-    /// JSON Schema（spec §2 inputSchema 必填）。
+    /// JSON Schema（dispatch 前校验）。
     pub input_schema: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<serde_json::Value>,
-    /// `source = "local_tool"`，常量；保留字段防止 wire 漂移。
-    pub source: ToolCallSource,
+    pub examples: Vec<String>,
+    pub side_effect: SideEffect,
     pub timeout_ms: u64,
-    pub side_effect: ToolSideEffect,
 }
 
-impl ToolSpec {
-    pub fn new_local(
+impl SkillSpec {
+    pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: serde_json::Value,
+        examples: Vec<String>,
         timeout_ms: u64,
-        side_effect: ToolSideEffect,
+        side_effect: SideEffect,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
-            output_schema: None,
-            source: ToolCallSource::LocalTool,
-            timeout_ms,
+            examples,
             side_effect,
+            timeout_ms,
         }
     }
 }
 
-/// ToolCall id — provider 用，本仓库以字符串持有。
-pub type ToolCallId = String;
+/// SkillCall id — Infra 在 parser 检测到 `<use_skill>` 闭合时生成（`sc_<uuid>`）。
+pub type SkillCallId = String;
 
-/// 一次工具调用审计。
+/// 一次 skill 调用审计。
 ///
-/// Spec: agent-infra-module.md §2 `ToolCall`
+/// Spec: agent-infra-module.md §2 `SkillCall`
 ///
-/// 规则：
-/// - `name`：`source = "local_tool"` 必须是本次 registry 已注册名；server side 用 provider 原始工具名。
-/// - 只读工具可只保存 summary；需要恢复副作用的工具（如 `operate_account`）必须保存结构化 payload，
-///   通过 `inputPayloadRef` / `outputPayloadRef` 关联。
+/// PayloadStore 双层存储规则：
+/// - input / output JSON 序列化后 ≤ 8KB 时 `inputSummary` = 完整 payload，`inputPayloadRef = None`。
+/// - > 8KB 时 `inputSummary` 是截断摘要（前 1KB + `"[truncated, see ref]"`），完整数据通过 ref。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolCall {
-    pub tool_call_id: ToolCallId,
+pub struct SkillCall {
+    pub skill_call_id: SkillCallId,
     pub run_id: String,
     pub name: String,
-    pub source: ToolCallSource,
     pub input_summary: JsonSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_payload_ref: Option<String>,
@@ -100,21 +95,20 @@ pub struct ToolCall {
     pub duration_ms: Option<u64>,
 }
 
-/// Tool dispatch 的最终结果（Infra 不解释业务语义）。
+/// Skill dispatch 的最终结果（Infra 不解释业务语义）。
 ///
-/// Spec: agent-infra-module.md §5 Tool Registry API
+/// Spec: agent-infra-module.md §5 Skill Registry API
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolCallResult {
-    pub tool_call_id: ToolCallId,
+pub struct SkillCallResult {
+    pub skill_call_id: SkillCallId,
     pub output_summary: JsonSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_payload_ref: Option<String>,
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
     pub duration_ms: u64,
-    /// 完整 payload 持久化引用；只读工具可省略，副作用工具必须有。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_payload_ref: Option<String>,
 }
 
 #[cfg(test)]
@@ -123,29 +117,29 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn tool_spec_serializes_camel_case() {
-        let s = ToolSpec::new_local(
+    fn skill_spec_serializes_camel_case() {
+        let s = SkillSpec::new(
             "fetch_quote",
             "Read latest quote",
             serde_json::json!({"type":"object"}),
+            vec![r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into()],
             5000,
-            ToolSideEffect::None,
+            SideEffect::None,
         );
         let j = serde_json::to_value(&s).unwrap();
         assert_eq!(j["name"], "fetch_quote");
         assert_eq!(j["inputSchema"]["type"], "object");
-        assert_eq!(j["source"], "local_tool");
         assert_eq!(j["sideEffect"], "none");
         assert_eq!(j["timeoutMs"], 5000);
+        assert!(j["examples"][0].as_str().unwrap().starts_with("<use_skill"));
     }
 
     #[test]
-    fn tool_call_serde_roundtrip() {
-        let c = ToolCall {
-            tool_call_id: "tc1".into(),
+    fn skill_call_serde_roundtrip() {
+        let c = SkillCall {
+            skill_call_id: "sc_abc".into(),
             run_id: "r1".into(),
             name: "fetch_quote".into(),
-            source: ToolCallSource::LocalTool,
             input_summary: serde_json::json!({"tsCode":"600519.SH"}),
             input_payload_ref: None,
             output_summary: Some(serde_json::json!({"price":"100.5"})),
@@ -157,17 +151,16 @@ mod tests {
             duration_ms: Some(120),
         };
         let j = serde_json::to_string(&c).unwrap();
-        let back: ToolCall = serde_json::from_str(&j).unwrap();
+        let back: SkillCall = serde_json::from_str(&j).unwrap();
         assert_eq!(back, c);
     }
 
     #[test]
-    fn tool_call_error_serializes_error_code() {
-        let c = ToolCall {
-            tool_call_id: "tc2".into(),
+    fn skill_call_error_serializes_error_code() {
+        let c = SkillCall {
+            skill_call_id: "sc_x".into(),
             run_id: "r1".into(),
             name: "do_x".into(),
-            source: ToolCallSource::LocalTool,
             input_summary: serde_json::json!({}),
             input_payload_ref: None,
             output_summary: Some(serde_json::json!({"reason":"insufficient_cash"})),

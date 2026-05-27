@@ -1,10 +1,10 @@
-//! Agent message / tool_call 持久化。
+//! Agent message / SkillCall 持久化。
 //!
 //! Spec: docs/design/agent-infra-module.md §2 不变量
-//! - 所有 local tool 调用必须先通过 `ToolRegistry` 校验。
-//! - 所有 local tool 和 server-side tool 都必须记录 `ToolCall`。
+//! - 所有 skill 调用必须先通过 `SkillRegistry` 校验。
+//! - 所有 skill 调用都必须记录 `SkillCall`。
 
-use crate::domain::agent::{AgentMessage, ToolCall};
+use crate::domain::agent::{AgentMessage, SkillCall};
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::db::AppDb;
 use chrono::{DateTime, Utc};
@@ -71,16 +71,12 @@ impl AgentMessagesRepo {
         })
     }
 
-    pub fn upsert_tool_call(&self, call: &ToolCall) -> Result<(), RepoError> {
+    pub fn upsert_skill_call(&self, call: &SkillCall) -> Result<(), RepoError> {
         let input_summary = serde_json::to_string(&call.input_summary)?;
         let output_summary = match &call.output_summary {
             Some(v) => Some(serde_json::to_string(v)?),
             None => None,
         };
-        let source = serde_json::to_value(call.source)?
-            .as_str()
-            .ok_or(RepoError::InvalidRow("source"))?
-            .to_string();
         let error_code = match call.error_code {
             Some(c) => Some(
                 serde_json::to_value(c)?
@@ -92,17 +88,16 @@ impl AgentMessagesRepo {
         };
         self.db.with(|c| {
             c.execute(
-                "INSERT OR REPLACE INTO agent_tool_calls (
-                    tool_call_id, run_id, name, source,
+                "INSERT OR REPLACE INTO agent_skill_calls (
+                    skill_call_id, run_id, name,
                     input_summary_json, input_payload_ref,
                     output_summary_json, output_payload_ref,
                     is_error, error_code, started_at, ended_at, duration_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
-                    call.tool_call_id,
+                    call.skill_call_id,
                     call.run_id,
                     call.name,
-                    source,
                     input_summary,
                     call.input_payload_ref,
                     output_summary,
@@ -118,17 +113,17 @@ impl AgentMessagesRepo {
         })
     }
 
-    pub fn load_tool_call(&self, tool_call_id: &str) -> Result<Option<ToolCall>, RepoError> {
+    pub fn load_skill_call(&self, skill_call_id: &str) -> Result<Option<SkillCall>, RepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT tool_call_id, run_id, name, source,
+                "SELECT skill_call_id, run_id, name,
                         input_summary_json, input_payload_ref,
                         output_summary_json, output_payload_ref,
                         is_error, error_code, started_at, ended_at, duration_ms
-                 FROM agent_tool_calls WHERE tool_call_id = ?1",
+                 FROM agent_skill_calls WHERE skill_call_id = ?1",
             )?;
             let row = stmt
-                .query_row(params![tool_call_id], row_to_tool_call)
+                .query_row(params![skill_call_id], row_to_skill_call)
                 .optional()?;
             Ok(row)
         })
@@ -141,12 +136,16 @@ fn row_to_message(row: &Row) -> rusqlite::Result<AgentMessage> {
     let role_s: String = row.get(2)?;
     let blocks_json: String = row.get(3)?;
     let created_at_s: String = row.get(4)?;
-    let role = serde_json::from_value(Json::String(role_s))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e)))?;
-    let blocks = serde_json::from_str(&blocks_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+    let role = serde_json::from_value(Json::String(role_s)).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let blocks = serde_json::from_str(&blocks_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&created_at_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(AgentMessage {
         message_id,
@@ -157,57 +156,58 @@ fn row_to_message(row: &Row) -> rusqlite::Result<AgentMessage> {
     })
 }
 
-fn row_to_tool_call(row: &Row) -> rusqlite::Result<ToolCall> {
-    let tool_call_id: String = row.get(0)?;
+fn row_to_skill_call(row: &Row) -> rusqlite::Result<SkillCall> {
+    let skill_call_id: String = row.get(0)?;
     let run_id: String = row.get(1)?;
     let name: String = row.get(2)?;
-    let source_s: String = row.get(3)?;
-    let input_summary_s: String = row.get(4)?;
-    let input_payload_ref: Option<String> = row.get(5)?;
-    let output_summary_s: Option<String> = row.get(6)?;
-    let output_payload_ref: Option<String> = row.get(7)?;
-    let is_error_i: i64 = row.get(8)?;
-    let error_code_s: Option<String> = row.get(9)?;
-    let started_at_s: String = row.get(10)?;
-    let ended_at_s: Option<String> = row.get(11)?;
-    let duration_ms_i: Option<i64> = row.get(12)?;
+    let input_summary_s: String = row.get(3)?;
+    let input_payload_ref: Option<String> = row.get(4)?;
+    let output_summary_s: Option<String> = row.get(5)?;
+    let output_payload_ref: Option<String> = row.get(6)?;
+    let is_error_i: i64 = row.get(7)?;
+    let error_code_s: Option<String> = row.get(8)?;
+    let started_at_s: String = row.get(9)?;
+    let ended_at_s: Option<String> = row.get(10)?;
+    let duration_ms_i: Option<i64> = row.get(11)?;
 
-    let source = serde_json::from_value(Json::String(source_s))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
-    let input_summary = serde_json::from_str(&input_summary_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+    let input_summary = serde_json::from_str(&input_summary_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let output_summary = match output_summary_s {
-        Some(s) => Some(
-            serde_json::from_str::<Json>(&s).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
-            })?,
-        ),
+        Some(s) => Some(serde_json::from_str::<Json>(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?),
         None => None,
     };
     let error_code: Option<ErrorCode> = match error_code_s {
         Some(s) => Some(serde_json::from_value(Json::String(s)).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
         })?),
         None => None,
     };
     let started_at = DateTime::parse_from_rfc3339(&started_at_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let ended_at = match ended_at_s {
         Some(s) => Some(
             DateTime::parse_from_rfc3339(&s)
                 .map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
                 })?
                 .with_timezone(&Utc),
         ),
         None => None,
     };
-    Ok(ToolCall {
-        tool_call_id,
+    Ok(SkillCall {
+        skill_call_id,
         run_id,
         name,
-        source,
         input_summary,
         input_payload_ref,
         output_summary,
@@ -223,9 +223,7 @@ fn row_to_tool_call(row: &Row) -> rusqlite::Result<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::agent::{
-        AgentMessageBlock, AgentMessageRole, ToolCallSource,
-    };
+    use crate::domain::agent::{AgentMessageBlock, AgentMessageRole};
     use crate::infrastructure::agent::migrations::migrations as agent_migrations;
     use crate::infrastructure::db::run_migrations;
 
@@ -254,14 +252,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_round_trip() {
+    fn skill_call_round_trip() {
         let db = fresh_db();
         let repo = AgentMessagesRepo::new(db);
-        let tc = ToolCall {
-            tool_call_id: "tc1".into(),
+        let tc = SkillCall {
+            skill_call_id: "sc_1".into(),
             run_id: "r1".into(),
             name: "fetch_quote".into(),
-            source: ToolCallSource::LocalTool,
             input_summary: serde_json::json!({"tsCode":"600519.SH"}),
             input_payload_ref: None,
             output_summary: Some(serde_json::json!({"price":"100.5"})),
@@ -272,24 +269,23 @@ mod tests {
             ended_at: Some(Utc::now()),
             duration_ms: Some(45),
         };
-        repo.upsert_tool_call(&tc).unwrap();
-        let loaded = repo.load_tool_call("tc1").unwrap().unwrap();
+        repo.upsert_skill_call(&tc).unwrap();
+        let loaded = repo.load_skill_call("sc_1").unwrap().unwrap();
         assert_eq!(loaded.name, "fetch_quote");
         assert_eq!(loaded.is_error, false);
         assert_eq!(loaded.duration_ms, Some(45));
     }
 
     #[test]
-    fn tool_call_with_error_code_round_trip() {
+    fn skill_call_with_error_code_round_trip() {
         let db = fresh_db();
         let repo = AgentMessagesRepo::new(db);
-        let tc = ToolCall {
-            tool_call_id: "tc2".into(),
+        let tc = SkillCall {
+            skill_call_id: "sc_2".into(),
             run_id: "r1".into(),
             name: "operate_account".into(),
-            source: ToolCallSource::LocalTool,
             input_summary: serde_json::json!({}),
-            input_payload_ref: Some("ref://payload/2".into()),
+            input_payload_ref: Some("pl_in".into()),
             output_summary: Some(serde_json::json!({"reason":"insufficient_cash"})),
             output_payload_ref: None,
             is_error: true,
@@ -298,9 +294,9 @@ mod tests {
             ended_at: Some(Utc::now()),
             duration_ms: Some(7),
         };
-        repo.upsert_tool_call(&tc).unwrap();
-        let loaded = repo.load_tool_call("tc2").unwrap().unwrap();
+        repo.upsert_skill_call(&tc).unwrap();
+        let loaded = repo.load_skill_call("sc_2").unwrap().unwrap();
         assert_eq!(loaded.error_code, Some(ErrorCode::InsufficientCash));
-        assert_eq!(loaded.input_payload_ref.as_deref(), Some("ref://payload/2"));
+        assert_eq!(loaded.input_payload_ref.as_deref(), Some("pl_in"));
     }
 }

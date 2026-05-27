@@ -1,13 +1,16 @@
-//! OpenAI Responses channel adapter。
+//! OpenAI Responses channel adapter — 纯 chat（无 tool_use）。
 //!
-//! Spec: docs/design/references/agent/openai-responses.md
+//! Spec: docs/design/agent-infra-module.md §2 ProviderChannel
+//!       docs/design/references/agent/openai-responses.md
 
-use super::{ProviderAdapter, WireMappingError};
+use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::context::ContextContent;
 use crate::domain::agent::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, ToolSpec, WireFormat,
+    ContextBundle, ProviderChannel, WireFormat,
 };
+use crate::infrastructure::agent::payload_store::PayloadStore;
+use base64::Engine;
 use serde_json::{json, Value};
 
 pub struct OpenAIResponsesAdapter {
@@ -31,81 +34,60 @@ impl OpenAIResponsesAdapter {
             .join("\n\n")
     }
 
-    fn block_to_input_content(b: &AgentMessageBlock) -> Result<Option<Value>, WireMappingError> {
+    fn block_to_input_content(
+        &self,
+        b: &AgentMessageBlock,
+        payload_store: Option<&PayloadStore>,
+    ) -> Result<Option<Value>, WireMappingError> {
         Ok(match b {
             AgentMessageBlock::Text { text } => {
                 Some(json!({"type":"input_text","text": text}))
             }
-            AgentMessageBlock::Image { mime_type, data_ref } => Some(json!({
-                "type":"input_image",
-                "image_url": format!("data:{};base64,{}", mime_type, data_ref)
-            })),
-            // Responses 第一阶段丢弃 thinking
-            AgentMessageBlock::Thinking { .. } => None,
-            // tool_use / tool_result 走 top-level item，不进 content array
-            AgentMessageBlock::ToolUse { .. } | AgentMessageBlock::ToolResult { .. } => None,
+            AgentMessageBlock::Image { mime_type, .. } => {
+                if !self.channel.supports_vision {
+                    return Err(WireMappingError::VisionNotSupported);
+                }
+                let (bytes, ct) = dereference_image(b, payload_store)?;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let media = if ct.is_empty() { mime_type.clone() } else { ct };
+                Some(json!({
+                    "type":"input_image",
+                    "image_url": format!("data:{};base64,{}", media, b64)
+                }))
+            }
+            AgentMessageBlock::Thinking { .. } => {
+                // Responses 渠道丢弃 thinking（spec §2: supports_thinking=false 时静默丢弃；
+                // OpenAI 渠道当前不支持 inline thinking 回写）。
+                None
+            }
         })
     }
 
-    fn message_to_input_items(msg: &AgentMessage) -> Result<Vec<Value>, WireMappingError> {
+    fn message_to_input_items(
+        &self,
+        msg: &AgentMessage,
+        payload_store: Option<&PayloadStore>,
+    ) -> Result<Vec<Value>, WireMappingError> {
         let role = match msg.role {
             AgentMessageRole::System => return Ok(vec![]),
             AgentMessageRole::User => "user",
             AgentMessageRole::Assistant => "assistant",
-            AgentMessageRole::Tool => "tool",
         };
-        let mut items = Vec::new();
         let mut content = Vec::new();
         for b in &msg.blocks {
-            match b {
-                AgentMessageBlock::ToolUse {
-                    tool_call_id,
-                    name,
-                    input_summary,
-                } => {
-                    items.push(json!({
-                        "type":"function_call",
-                        "call_id": tool_call_id,
-                        "name": name,
-                        "arguments": serde_json::to_string(input_summary)?
-                    }));
-                }
-                AgentMessageBlock::ToolResult {
-                    tool_call_id,
-                    output_summary,
-                    ..
-                } => {
-                    items.push(json!({
-                        "type":"function_call_output",
-                        "call_id": tool_call_id,
-                        "output": serde_json::to_string(output_summary)?
-                    }));
-                }
-                _ => {
-                    if let Some(c) = Self::block_to_input_content(b)? {
-                        content.push(c);
-                    }
-                }
+            if let Some(c) = self.block_to_input_content(b, payload_store)? {
+                content.push(c);
             }
         }
+        let mut out = Vec::new();
         if !content.is_empty() {
-            items.push(json!({
+            out.push(json!({
                 "type":"message",
                 "role": role,
                 "content": content
             }));
         }
-        Ok(items)
-    }
-
-    fn tool_spec_to_responses(t: &ToolSpec) -> Value {
-        json!({
-            "type":"function",
-            "name": t.name,
-            "description": t.description,
-            "parameters": t.input_schema,
-            "strict": false
-        })
+        Ok(out)
     }
 }
 
@@ -118,13 +100,13 @@ impl ProviderAdapter for OpenAIResponsesAdapter {
         &self,
         request: &AgentRunRequest,
         context: &ContextBundle,
-        tools: &[ToolSpec],
+        payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
         let mut input: Vec<Value> = Vec::new();
         for m in &request.seed_messages {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
-            input.extend(Self::message_to_input_items(m)?);
+            input.extend(self.message_to_input_items(m, payload_store)?);
         }
         let mut body = json!({
             "model": self.channel.model,
@@ -135,22 +117,10 @@ impl ProviderAdapter for OpenAIResponsesAdapter {
         if !system_text.is_empty() {
             body["instructions"] = Value::String(system_text);
         }
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.iter().map(Self::tool_spec_to_responses).collect());
+        if let Some(m) = self.channel.max_output_tokens {
+            body["max_output_tokens"] = Value::from(m);
         }
-        // server-side web_search（spec request mapping 表）
-        if request
-            .allowed_server_side_tools
-            .iter()
-            .any(|s| s == "web_search")
-        {
-            let entry = json!({"type":"web_search"});
-            if let Some(arr) = body["tools"].as_array_mut() {
-                arr.push(entry);
-            } else {
-                body["tools"] = json!([{"type":"web_search"}]);
-            }
-        }
+        // Spec §2: 不传 tools 字段、不传 server-side tool。
         Ok(body)
     }
 
@@ -167,10 +137,10 @@ impl ProviderAdapter for OpenAIResponsesAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::agent::{ContextBundle, ToolSideEffect, WireFormat};
+    use crate::domain::agent::WireFormat;
     use chrono::Utc;
 
-    fn ch() -> ProviderChannel {
+    fn ch(vision: bool) -> ProviderChannel {
         ProviderChannel {
             channel_id: "oai-responses".into(),
             provider: "openai".into(),
@@ -178,128 +148,96 @@ mod tests {
             base_url: None,
             model: "gpt-5".into(),
             stream: true,
-            supports_tools: true,
-            supports_vision: true,
+            supports_vision: vision,
             supports_thinking: false,
-            supports_server_side_tools: Some(vec!["web_search".into()]),
+            max_output_tokens: Some(2048),
+            context_window_tokens: Some(128_000),
+        }
+    }
+
+    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
+        AgentRunRequest {
+            run_id: "r1".into(),
+            trigger: "u".into(),
+            channel,
+            max_turns: 1,
+            seed_messages: msgs,
         }
     }
 
     #[test]
     fn maps_user_message_to_input_text() {
-        let ad = OpenAIResponsesAdapter::new(ch());
+        let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
                 role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: "hello".into(),
-                }],
+                blocks: vec![AgentMessageBlock::Text { text: "hello".into() }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
+        );
+        let body = ad.build_request_body(&r, &ctx, None).unwrap();
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["max_output_tokens"], 2048);
     }
 
     #[test]
-    fn maps_assistant_tool_use_to_function_call_item() {
-        let ad = OpenAIResponsesAdapter::new(ch());
+    fn skill_xml_in_assistant_text_passes_through() {
+        let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
                 role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::ToolUse {
-                    tool_call_id: "tc1".into(),
-                    name: "fetch_quote".into(),
-                    input_summary: json!({"tsCode":"600519.SH"}),
+                blocks: vec![AgentMessageBlock::Text {
+                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
                 }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
+        );
+        let body = ad.build_request_body(&r, &ctx, None).unwrap();
         let item = &body["input"][0];
-        assert_eq!(item["type"], "function_call");
-        assert_eq!(item["call_id"], "tc1");
-        assert_eq!(item["name"], "fetch_quote");
-        let parsed: Value = serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(parsed["tsCode"], "600519.SH");
+        assert_eq!(item["role"], "assistant");
+        let t = item["content"][0]["text"].as_str().unwrap();
+        assert!(t.contains("<use_skill"));
     }
 
     #[test]
-    fn tool_result_role_maps_to_function_call_output_item() {
-        let ad = OpenAIResponsesAdapter::new(ch());
+    fn vision_rejected_when_unsupported() {
+        let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
-                role: AgentMessageRole::Tool,
-                blocks: vec![AgentMessageBlock::ToolResult {
-                    tool_call_id: "tc1".into(),
-                    output_summary: json!({"price":"100.5"}),
-                    is_error: false,
+                role: AgentMessageRole::User,
+                blocks: vec![AgentMessageBlock::Image {
+                    mime_type: "image/png".into(),
+                    data_ref: "payload://pl_x".into(),
                 }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
-        let item = &body["input"][0];
-        assert_eq!(item["type"], "function_call_output");
-        assert_eq!(item["call_id"], "tc1");
+        );
+        let err = ad.build_request_body(&r, &ctx, None).unwrap_err();
+        assert!(matches!(err, WireMappingError::VisionNotSupported));
     }
 
     #[test]
-    fn tool_specs_emit_strict_false_function() {
-        let ad = OpenAIResponsesAdapter::new(ch());
-        let t = ToolSpec::new_local(
-            "x",
-            "x",
-            json!({"type":"object"}),
-            1000,
-            ToolSideEffect::None,
+    fn stop_reason_mapping() {
+        let ad = OpenAIResponsesAdapter::new(ch(false));
+        assert_eq!(ad.map_stop_reason("completed"), AgentStopReason::Completed);
+        assert_eq!(
+            ad.map_stop_reason("max_output_tokens"),
+            AgentStopReason::MaxTurns
         );
-        let body = ad
-            .build_request_body(
-                &AgentRunRequest {
-                    run_id: "r1".into(),
-                    trigger: "u".into(),
-                    channel: ch(),
-                    max_turns: 1,
-                    allowed_server_side_tools: vec!["web_search".into()],
-                    seed_messages: vec![],
-                },
-                &ContextBundle::new("r1"),
-                &[t],
-            )
-            .unwrap();
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["strict"], false);
-        assert!(body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["type"] == "web_search"));
     }
 }

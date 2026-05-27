@@ -1,16 +1,22 @@
-//! Anthropic Messages channel adapter。
+//! Anthropic Messages channel adapter — 纯 chat（无 tool_use）。
 //!
-//! Spec: docs/design/references/agent/anthropic-messages.md
+//! Spec: docs/design/agent-infra-module.md §2 ProviderChannel
+//!       docs/design/references/agent/anthropic-messages.md
 //!
-//! 实现 Phase 1：request body 映射 + stop_reason 归一化。
-//! HTTP / SSE 接线由后续迭代落地。
+//! 行为：
+//! - 把 canonical `AgentMessage` 翻译成 Anthropic `/v1/messages` 请求 body。
+//! - 图片 `dataRef` 在 build wire 时从 PayloadStore dereference → base64 编码。
+//! - Thinking block 把 `metadata` 中的 `signature` / `redacted` 还原回 wire。
+//! - **不**传 tools 字段、**不**解析 tool_use block（skill 走文本协议）。
 
-use super::{ProviderAdapter, WireMappingError};
+use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, ToolSpec, WireFormat,
+    ContextBundle, ProviderChannel, WireFormat,
 };
 use crate::domain::agent::context::ContextContent;
+use crate::infrastructure::agent::payload_store::PayloadStore;
+use base64::Engine;
 use serde_json::{json, Value};
 
 pub struct AnthropicAdapter {
@@ -34,68 +40,79 @@ impl AnthropicAdapter {
             .join("\n\n")
     }
 
-    fn block_to_anthropic(b: &AgentMessageBlock) -> Result<Value, WireMappingError> {
+    fn block_to_anthropic(
+        &self,
+        b: &AgentMessageBlock,
+        payload_store: Option<&PayloadStore>,
+    ) -> Result<Option<Value>, WireMappingError> {
         Ok(match b {
-            AgentMessageBlock::Text { text } => json!({ "type": "text", "text": text }),
-            AgentMessageBlock::Image { mime_type, data_ref } => json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": mime_type,
-                    "data": data_ref
-                }
-            }),
-            AgentMessageBlock::Thinking { text, provider: _ } => {
-                json!({ "type": "thinking", "thinking": text })
+            AgentMessageBlock::Text { text } => {
+                Some(json!({ "type": "text", "text": text }))
             }
-            AgentMessageBlock::ToolUse {
-                tool_call_id,
-                name,
-                input_summary,
-            } => json!({
-                "type": "tool_use",
-                "id": tool_call_id,
-                "name": name,
-                "input": input_summary
-            }),
-            AgentMessageBlock::ToolResult {
-                tool_call_id,
-                output_summary,
-                is_error,
-            } => json!({
-                "type": "tool_result",
-                "tool_use_id": tool_call_id,
-                "content": output_summary,
-                "is_error": is_error
-            }),
+            AgentMessageBlock::Image { mime_type, .. } => {
+                if !self.channel.supports_vision {
+                    return Err(WireMappingError::VisionNotSupported);
+                }
+                let (bytes, ct) = dereference_image(b, payload_store)?;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let media_type = if ct.is_empty() { mime_type.clone() } else { ct };
+                Some(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64
+                    }
+                }))
+            }
+            AgentMessageBlock::Thinking {
+                text,
+                provider: _,
+                metadata,
+            } => {
+                if !self.channel.supports_thinking {
+                    return Ok(None);
+                }
+                let mut obj = serde_json::Map::new();
+                obj.insert("type".into(), json!("thinking"));
+                obj.insert("thinking".into(), json!(text));
+                if let Some(m) = metadata {
+                    if let Some(sig) = m.get("signature") {
+                        obj.insert("signature".into(), sig.clone());
+                    }
+                    if let Some(red) = m.get("redacted") {
+                        obj.insert("redacted".into(), red.clone());
+                    }
+                }
+                Some(Value::Object(obj))
+            }
         })
     }
 
-    fn message_to_anthropic(msg: &AgentMessage) -> Result<Option<Value>, WireMappingError> {
+    fn message_to_anthropic(
+        &self,
+        msg: &AgentMessage,
+        payload_store: Option<&PayloadStore>,
+    ) -> Result<Option<Value>, WireMappingError> {
         let role = match msg.role {
             // system 走 top-level `system`
             AgentMessageRole::System => return Ok(None),
             AgentMessageRole::User => "user",
             AgentMessageRole::Assistant => "assistant",
-            AgentMessageRole::Tool => "user", // Anthropic 把 tool_result 包在 user message 内
         };
-        let content = msg
-            .blocks
-            .iter()
-            .map(Self::block_to_anthropic)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut content = Vec::new();
+        for b in &msg.blocks {
+            if let Some(v) = self.block_to_anthropic(b, payload_store)? {
+                content.push(v);
+            }
+        }
+        if content.is_empty() {
+            return Ok(None);
+        }
         Ok(Some(json!({
             "role": role,
             "content": content
         })))
-    }
-
-    fn tool_spec_to_anthropic(t: &ToolSpec) -> Value {
-        json!({
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.input_schema
-        })
     }
 }
 
@@ -108,38 +125,26 @@ impl ProviderAdapter for AnthropicAdapter {
         &self,
         request: &AgentRunRequest,
         context: &ContextBundle,
-        tools: &[ToolSpec],
+        payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
         let system_text = Self::extract_system(context);
         let mut messages = Vec::with_capacity(request.seed_messages.len());
         for m in &request.seed_messages {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
-            if let Some(v) = Self::message_to_anthropic(m)? {
+            if let Some(v) = self.message_to_anthropic(m, payload_store)? {
                 messages.push(v);
             }
         }
+        let max_tokens = self.channel.max_output_tokens.unwrap_or(8192);
         let mut body = json!({
             "model": self.channel.model,
             "stream": self.channel.stream,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "messages": messages,
         });
         if !system_text.is_empty() {
             body["system"] = Value::String(system_text);
-        }
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.iter().map(Self::tool_spec_to_anthropic).collect());
-        }
-        // server-side web_search（spec request mapping 表）
-        let server = &request.allowed_server_side_tools;
-        if server.iter().any(|s| s == "web_search") {
-            if let Some(arr) = body["tools"].as_array_mut() {
-                arr.push(json!({ "type": "web_search_20250305", "name": "web_search" }));
-            } else {
-                body["tools"] =
-                    json!([{ "type": "web_search_20250305", "name": "web_search" }]);
-            }
         }
         Ok(body)
     }
@@ -148,7 +153,6 @@ impl ProviderAdapter for AnthropicAdapter {
         match raw {
             "end_turn" => AgentStopReason::Completed,
             "max_tokens" => AgentStopReason::MaxTurns,
-            "tool_use" => AgentStopReason::ProviderStop,
             "stop_sequence" => AgentStopReason::ProviderStop,
             _ => AgentStopReason::Completed,
         }
@@ -158,12 +162,10 @@ impl ProviderAdapter for AnthropicAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::agent::{
-        ContextBundle, ToolSideEffect, ToolSpec, WireFormat,
-    };
+    use crate::domain::agent::{AgentMessage, AgentMessageBlock, AgentMessageRole, WireFormat};
     use chrono::Utc;
 
-    fn make_channel() -> ProviderChannel {
+    fn make_channel(vision: bool, thinking: bool) -> ProviderChannel {
         ProviderChannel {
             channel_id: "anthropic".into(),
             provider: "anthropic".into(),
@@ -171,16 +173,26 @@ mod tests {
             base_url: None,
             model: "claude-sonnet-4-5".into(),
             stream: true,
-            supports_tools: true,
-            supports_vision: true,
-            supports_thinking: false,
-            supports_server_side_tools: Some(vec!["web_search".into()]),
+            supports_vision: vision,
+            supports_thinking: thinking,
+            max_output_tokens: Some(4096),
+            context_window_tokens: Some(200_000),
+        }
+    }
+
+    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
+        AgentRunRequest {
+            run_id: "r1".into(),
+            trigger: "user".into(),
+            channel,
+            max_turns: 8,
+            seed_messages: msgs,
         }
     }
 
     #[test]
-    fn build_request_body_fixture_messages() {
-        let ad = AnthropicAdapter::new(make_channel());
+    fn build_request_body_basic_chat_no_tools_field() {
+        let ad = AnthropicAdapter::new(make_channel(false, false));
         let mut ctx = ContextBundle::new("r1");
         ctx.system_parts.push(crate::domain::agent::ContextPart {
             kind: crate::domain::agent::ContextPartKind::System,
@@ -189,94 +201,133 @@ mod tests {
             token_estimate: None,
             droppable: false,
         });
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "user".into(),
-            channel: make_channel(),
-            max_turns: 8,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let request = req(
+            make_channel(false, false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
                 role: AgentMessageRole::User,
                 blocks: vec![AgentMessageBlock::Text {
-                    text: "trade 600519.SH plan".into(),
+                    text: "plan trade".into(),
                 }],
                 created_at: Utc::now(),
             }],
-        };
-        let tool = ToolSpec::new_local(
-            "fetch_quote",
-            "read latest quote",
-            json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
-            5000,
-            ToolSideEffect::None,
         );
-        let body = ad.build_request_body(&req, &ctx, &[tool]).unwrap();
+        let body = ad.build_request_body(&request, &ctx, None).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["system"], "You are Gangzi.");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(body["tools"][0]["name"], "fetch_quote");
-        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["max_tokens"], 4096);
+        // Spec §2: provider request 不传 tools 字段。
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn build_request_body_appends_server_side_web_search_when_allowed() {
-        let ad = AnthropicAdapter::new(make_channel());
+    fn skill_call_xml_round_trips_as_text_block() {
+        // <use_skill> in assistant text — should be a normal text block to Anthropic.
+        let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: make_channel(),
-            max_turns: 2,
-            allowed_server_side_tools: vec!["web_search".into()],
-            seed_messages: vec![],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
-        let tools = body["tools"].as_array().unwrap();
-        assert!(tools
-            .iter()
-            .any(|t| t["type"] == "web_search_20250305" && t["name"] == "web_search"));
-    }
-
-    #[test]
-    fn tool_result_block_maps_to_anthropic_user_role() {
-        let ad = AnthropicAdapter::new(make_channel());
-        let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "x".into(),
-            channel: make_channel(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let request = req(
+            make_channel(false, false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
-                role: AgentMessageRole::Tool,
-                blocks: vec![AgentMessageBlock::ToolResult {
-                    tool_call_id: "tc1".into(),
-                    output_summary: json!({"ok":1}),
-                    is_error: false,
+                role: AgentMessageRole::Assistant,
+                blocks: vec![AgentMessageBlock::Text {
+                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#
+                        .into(),
                 }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
-        // tool result is wrapped inside a `user` role message with tool_result block
-        let msg = &body["messages"][0];
-        assert_eq!(msg["role"], "user");
-        assert_eq!(msg["content"][0]["type"], "tool_result");
-        assert_eq!(msg["content"][0]["tool_use_id"], "tc1");
+        );
+        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        assert_eq!(body["messages"][0]["role"], "assistant");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        let s = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(s.contains("<use_skill"));
+    }
+
+    #[test]
+    fn image_block_rejected_when_vision_unsupported() {
+        let ad = AnthropicAdapter::new(make_channel(false, false));
+        let ctx = ContextBundle::new("r1");
+        let request = req(
+            make_channel(false, false),
+            vec![AgentMessage {
+                message_id: "m1".into(),
+                run_id: Some("r1".into()),
+                role: AgentMessageRole::User,
+                blocks: vec![AgentMessageBlock::Image {
+                    mime_type: "image/png".into(),
+                    data_ref: "payload://pl_x".into(),
+                }],
+                created_at: Utc::now(),
+            }],
+        );
+        let err = ad.build_request_body(&request, &ctx, None).unwrap_err();
+        assert!(matches!(err, WireMappingError::VisionNotSupported));
+    }
+
+    #[test]
+    fn thinking_silently_dropped_when_unsupported() {
+        let ad = AnthropicAdapter::new(make_channel(false, false));
+        let ctx = ContextBundle::new("r1");
+        let request = req(
+            make_channel(false, false),
+            vec![AgentMessage {
+                message_id: "m1".into(),
+                run_id: Some("r1".into()),
+                role: AgentMessageRole::Assistant,
+                blocks: vec![
+                    AgentMessageBlock::Thinking {
+                        text: "reasoning".into(),
+                        provider: None,
+                        metadata: None,
+                    },
+                    AgentMessageBlock::Text { text: "ok".into() },
+                ],
+                created_at: Utc::now(),
+            }],
+        );
+        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn thinking_with_signature_preserved_when_supported() {
+        let ad = AnthropicAdapter::new(make_channel(false, true));
+        let ctx = ContextBundle::new("r1");
+        let request = req(
+            make_channel(false, true),
+            vec![AgentMessage {
+                message_id: "m1".into(),
+                run_id: Some("r1".into()),
+                role: AgentMessageRole::Assistant,
+                blocks: vec![AgentMessageBlock::Thinking {
+                    text: "reasoning".into(),
+                    provider: Some("anthropic".into()),
+                    metadata: Some(json!({"signature":"sig-xyz"})),
+                }],
+                created_at: Utc::now(),
+            }],
+        );
+        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], "reasoning");
+        assert_eq!(block["signature"], "sig-xyz");
     }
 
     #[test]
     fn map_stop_reason_known_codes() {
-        let ad = AnthropicAdapter::new(make_channel());
+        let ad = AnthropicAdapter::new(make_channel(false, false));
         assert_eq!(ad.map_stop_reason("end_turn"), AgentStopReason::Completed);
         assert_eq!(ad.map_stop_reason("max_tokens"), AgentStopReason::MaxTurns);
         assert_eq!(
-            ad.map_stop_reason("tool_use"),
+            ad.map_stop_reason("stop_sequence"),
             AgentStopReason::ProviderStop
         );
     }

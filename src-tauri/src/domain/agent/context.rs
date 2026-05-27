@@ -16,7 +16,9 @@ pub enum ContextPartKind {
     Realtime,
     Chat,
     Memory,
-    ToolStub,
+    /// Spec §2: 易腐 skill 结果被压缩成 stub 时，content 文本是
+    /// `<skill_result_stub name="..." call_id="..." ref="..." />`。
+    SkillResultStub,
 }
 
 /// Context content 多形态承载。
@@ -31,8 +33,7 @@ pub enum ContextContent {
 ///
 /// Spec: agent-infra-module.md §2 `ContextPart`
 //
-// 注：`freshness: Option<Freshness>` 中 `Freshness` 不 impl PartialEq（shared 不能改），
-// 因此本结构和 `ContextBundle` 不 derive PartialEq。
+// 注：`freshness: Option<Freshness>` 中 `Freshness` 不 impl PartialEq，因此本结构不 derive PartialEq。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextPart {
@@ -158,9 +159,9 @@ mod tests {
 
     #[test]
     fn context_part_kind_serde_snake() {
-        let p = part(ContextPartKind::ToolStub, "x", true);
+        let p = part(ContextPartKind::SkillResultStub, "x", true);
         let j = serde_json::to_value(&p).unwrap();
-        assert_eq!(j["kind"], "tool_stub");
+        assert_eq!(j["kind"], "skill_result_stub");
         assert_eq!(j["droppable"], true);
     }
 

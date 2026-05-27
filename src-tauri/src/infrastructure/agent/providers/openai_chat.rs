@@ -1,13 +1,18 @@
-//! OpenAI Chat Completions channel adapter（OpenAI-compatible 兼容厂商）。
+//! OpenAI Chat Completions channel adapter — 纯 chat（无 tool_use）。
 //!
-//! Spec: docs/design/references/agent/openai-chat-completions.md
+//! Spec: docs/design/agent-infra-module.md §2 ProviderChannel
+//!       docs/design/references/agent/openai-chat-completions.md
+//!
+//! 兼容 deepseek / 阿里 / 豆包等 OpenAI-compatible 端点。
 
-use super::{ProviderAdapter, WireMappingError};
+use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::context::ContextContent;
 use crate::domain::agent::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, ToolSpec, WireFormat,
+    ContextBundle, ProviderChannel, WireFormat,
 };
+use crate::infrastructure::agent::payload_store::PayloadStore;
+use base64::Engine;
 use serde_json::{json, Value};
 
 pub struct OpenAIChatAdapter {
@@ -31,7 +36,11 @@ impl OpenAIChatAdapter {
             .join("\n\n")
     }
 
-    fn message_to_chat(msg: &AgentMessage) -> Result<Option<Value>, WireMappingError> {
+    fn message_to_chat(
+        &self,
+        msg: &AgentMessage,
+        payload_store: Option<&PayloadStore>,
+    ) -> Result<Option<Value>, WireMappingError> {
         match msg.role {
             AgentMessageRole::System => {
                 let text = msg
@@ -57,27 +66,34 @@ impl OpenAIChatAdapter {
                             single_text = Some(text.clone());
                             parts.push(json!({"type":"text","text": text}));
                         }
-                        AgentMessageBlock::Image { mime_type, data_ref } => {
+                        AgentMessageBlock::Image { mime_type, .. } => {
+                            if !self.channel.supports_vision {
+                                return Err(WireMappingError::VisionNotSupported);
+                            }
+                            let (bytes, ct) = dereference_image(b, payload_store)?;
+                            let b64 =
+                                base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            let media = if ct.is_empty() { mime_type.clone() } else { ct };
                             single_text = None;
                             parts.push(json!({
                                 "type":"image_url",
-                                "image_url": {"url": format!("data:{};base64,{}", mime_type, data_ref)}
+                                "image_url": {"url": format!("data:{};base64,{}", media, b64)}
                             }));
                         }
-                        _ => {}
+                        AgentMessageBlock::Thinking { .. } => {
+                            // Spec §2: user role 不允许 thinking; shouldn't reach here
+                        }
                     }
                 }
-                let content: Value =
-                    if let (1, Some(t)) = (parts.len(), single_text) {
-                        Value::String(t)
-                    } else {
-                        Value::Array(parts)
-                    };
+                let content: Value = if let (1, Some(t)) = (parts.len(), single_text) {
+                    Value::String(t)
+                } else {
+                    Value::Array(parts)
+                };
                 Ok(Some(json!({"role":"user","content": content})))
             }
             AgentMessageRole::Assistant => {
                 let mut text: Option<String> = None;
-                let mut tool_calls: Vec<Value> = Vec::new();
                 for b in &msg.blocks {
                     match b {
                         AgentMessageBlock::Text { text: t } => {
@@ -87,77 +103,18 @@ impl OpenAIChatAdapter {
                             });
                         }
                         AgentMessageBlock::Thinking { .. } => {
-                            // Chat Completions 丢弃 thinking
+                            // Spec §2: supports_thinking=false 时 adapter 静默丢弃；
+                            // Chat Completions 普遍不支持 thinking 跨 turn 回写。
                         }
-                        AgentMessageBlock::ToolUse {
-                            tool_call_id,
-                            name,
-                            input_summary,
-                        } => {
-                            tool_calls.push(json!({
-                                "id": tool_call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input_summary)?
-                                }
-                            }));
+                        AgentMessageBlock::Image { .. } => {
+                            // assistant 不允许 image; shouldn't reach here
                         }
-                        _ => {}
                     }
                 }
-                let mut obj = serde_json::Map::new();
-                obj.insert("role".into(), json!("assistant"));
-                obj.insert(
-                    "content".into(),
-                    text.map(Value::String).unwrap_or(Value::Null),
-                );
-                if !tool_calls.is_empty() {
-                    obj.insert("tool_calls".into(), Value::Array(tool_calls));
-                }
-                Ok(Some(Value::Object(obj)))
-            }
-            AgentMessageRole::Tool => {
-                // tool result -> role=tool message keyed on tool_call_id
-                let mut out: Vec<Value> = Vec::new();
-                for b in &msg.blocks {
-                    if let AgentMessageBlock::ToolResult {
-                        tool_call_id,
-                        output_summary,
-                        ..
-                    } = b
-                    {
-                        out.push(json!({
-                            "role":"tool",
-                            "tool_call_id": tool_call_id,
-                            "content": serde_json::to_string(output_summary)?
-                        }));
-                    }
-                }
-                // 多 tool_result 会被外层展开；这里返回第一个，其余通过外部循环处理。
-                // 这里我们把多结果合并为单结果意义不对；改为外层调用一次返回多 message。
-                // 简化处理：将所有合并到一个 tool message 不符合 OpenAI 规范；
-                // 因此外层循环（build_request_body）按需要为每个 tool_result 调用 message_to_chat
-                // 已经按 message 粒度走，所以这里只允许 1 个 tool_result。
-                if out.len() > 1 {
-                    return Err(WireMappingError::InvalidMessage(
-                        "OpenAI chat completions requires one tool_result per tool message".into(),
-                    ));
-                }
-                Ok(out.into_iter().next())
+                let content_v = text.map(Value::String).unwrap_or(Value::Null);
+                Ok(Some(json!({"role":"assistant","content": content_v})))
             }
         }
-    }
-
-    fn tool_spec_to_chat(t: &ToolSpec) -> Value {
-        json!({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.input_schema
-            }
-        })
     }
 }
 
@@ -170,7 +127,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
         &self,
         request: &AgentRunRequest,
         context: &ContextBundle,
-        tools: &[ToolSpec],
+        payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
         let mut messages: Vec<Value> = Vec::new();
         let system_text = Self::extract_system(context);
@@ -180,7 +137,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
         for m in &request.seed_messages {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
-            if let Some(v) = Self::message_to_chat(m)? {
+            if let Some(v) = self.message_to_chat(m, payload_store)? {
                 messages.push(v);
             }
         }
@@ -189,10 +146,10 @@ impl ProviderAdapter for OpenAIChatAdapter {
             "stream": self.channel.stream,
             "messages": messages,
         });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.iter().map(Self::tool_spec_to_chat).collect());
+        if let Some(m) = self.channel.max_output_tokens {
+            body["max_tokens"] = Value::from(m);
         }
-        // Chat Completions 不下发 server-side web_search（spec rules：不支持）。
+        // Spec §2: 不传 tools 字段。
         Ok(body)
     }
 
@@ -200,7 +157,6 @@ impl ProviderAdapter for OpenAIChatAdapter {
         match raw {
             "stop" => AgentStopReason::Completed,
             "length" => AgentStopReason::MaxTurns,
-            "tool_calls" => AgentStopReason::ProviderStop,
             _ => AgentStopReason::Completed,
         }
     }
@@ -209,10 +165,10 @@ impl ProviderAdapter for OpenAIChatAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::agent::{ContextBundle, ToolSideEffect, WireFormat};
+    use crate::domain::agent::WireFormat;
     use chrono::Utc;
 
-    fn ch() -> ProviderChannel {
+    fn ch(vision: bool) -> ProviderChannel {
         ProviderChannel {
             channel_id: "oai-chat".into(),
             provider: "deepseek".into(),
@@ -220,129 +176,92 @@ mod tests {
             base_url: Some("https://api.deepseek.com".into()),
             model: "deepseek-chat".into(),
             stream: true,
-            supports_tools: true,
-            supports_vision: false,
+            supports_vision: vision,
             supports_thinking: false,
-            supports_server_side_tools: None,
+            max_output_tokens: Some(4096),
+            context_window_tokens: Some(64_000),
+        }
+    }
+
+    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
+        AgentRunRequest {
+            run_id: "r1".into(),
+            trigger: "u".into(),
+            channel,
+            max_turns: 1,
+            seed_messages: msgs,
         }
     }
 
     #[test]
     fn user_message_becomes_string_content() {
-        let ad = OpenAIChatAdapter::new(ch());
+        let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
                 role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: "hello".into(),
-                }],
+                blocks: vec![AgentMessageBlock::Text { text: "hello".into() }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
+        );
+        let body = ad.build_request_body(&r, &ctx, None).unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello");
+        assert_eq!(body["max_tokens"], 4096);
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
-    fn assistant_with_tool_use_emits_tool_calls() {
-        let ad = OpenAIChatAdapter::new(ch());
+    fn assistant_skill_xml_passes_through_as_text() {
+        let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req2 = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
                 role: AgentMessageRole::Assistant,
-                blocks: vec![
-                    AgentMessageBlock::Text {
-                        text: "let me check".into(),
-                    },
-                    AgentMessageBlock::ToolUse {
-                        tool_call_id: "tc1".into(),
-                        name: "fetch_quote".into(),
-                        input_summary: json!({"tsCode":"600519.SH"}),
-                    },
-                ],
-                created_at: Utc::now(),
-            }],
-        };
-        let body = ad.build_request_body(&req2, &ctx, &[]).unwrap();
-        let m = &body["messages"][0];
-        assert_eq!(m["role"], "assistant");
-        assert_eq!(m["content"], "let me check");
-        assert_eq!(m["tool_calls"][0]["id"], "tc1");
-        assert_eq!(m["tool_calls"][0]["function"]["name"], "fetch_quote");
-    }
-
-    #[test]
-    fn tool_result_becomes_role_tool_message() {
-        let ad = OpenAIChatAdapter::new(ch());
-        let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Tool,
-                blocks: vec![AgentMessageBlock::ToolResult {
-                    tool_call_id: "tc1".into(),
-                    output_summary: json!({"price":"100.5"}),
-                    is_error: false,
+                blocks: vec![AgentMessageBlock::Text {
+                    text: r#"thinking <use_skill name="x">{}</use_skill>"#.into(),
                 }],
                 created_at: Utc::now(),
             }],
-        };
-        let body = ad.build_request_body(&req, &ctx, &[]).unwrap();
+        );
+        let body = ad.build_request_body(&r, &ctx, None).unwrap();
         let m = &body["messages"][0];
-        assert_eq!(m["role"], "tool");
-        assert_eq!(m["tool_call_id"], "tc1");
+        assert_eq!(m["role"], "assistant");
+        let s = m["content"].as_str().unwrap();
+        assert!(s.contains("<use_skill"));
     }
 
     #[test]
-    fn does_not_emit_server_side_web_search() {
-        let ad = OpenAIChatAdapter::new(ch());
+    fn vision_rejected_when_unsupported() {
+        let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: ch(),
-            max_turns: 1,
-            allowed_server_side_tools: vec!["web_search".into()],
-            seed_messages: vec![],
-        };
-        let body = ad
-            .build_request_body(
-                &req,
-                &ctx,
-                &[ToolSpec::new_local(
-                    "x",
-                    "x",
-                    json!({}),
-                    1000,
-                    ToolSideEffect::None,
-                )],
-            )
-            .unwrap();
-        // tools must contain only the local function; no web_search injected
-        let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "x");
+        let r = req(
+            ch(false),
+            vec![AgentMessage {
+                message_id: "m1".into(),
+                run_id: Some("r1".into()),
+                role: AgentMessageRole::User,
+                blocks: vec![AgentMessageBlock::Image {
+                    mime_type: "image/png".into(),
+                    data_ref: "payload://pl_x".into(),
+                }],
+                created_at: Utc::now(),
+            }],
+        );
+        let err = ad.build_request_body(&r, &ctx, None).unwrap_err();
+        assert!(matches!(err, WireMappingError::VisionNotSupported));
+    }
+
+    #[test]
+    fn stop_reason_mapping() {
+        let ad = OpenAIChatAdapter::new(ch(false));
+        assert_eq!(ad.map_stop_reason("stop"), AgentStopReason::Completed);
+        assert_eq!(ad.map_stop_reason("length"), AgentStopReason::MaxTurns);
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Spec: docs/design/agent-infra-module.md §2
 //!
-//! 仅放 Agent **Infra** 概念（`AgentMessage` / `ToolSpec` / `ToolCall` / `AgentEvent` /
+//! 仅放 Agent **Infra** 概念（`AgentMessage` / `SkillSpec` / `SkillCall` / `AgentEvent` /
 //! `ProviderChannel` / `ContextBundle` / loop 请求 / `RunSummary`）。
 //!
 //! 不放 Runtime 概念（`AgentRun` / `AgentRunProfile` / `DecisionEpisode` /
@@ -14,17 +14,16 @@ pub mod context;
 pub mod events;
 pub mod loop_request;
 pub mod messages;
-pub mod tools;
+pub mod skills;
 
 pub use channel::{ProviderChannel, WireFormat};
 pub use context::{
-    CompactTier, ContextBundle, ContextPart, ContextPartKind, ContextWindowLimits,
+    CompactTier, ContextBundle, ContextContent, ContextPart, ContextPartKind,
+    ContextWindowLimits,
 };
-pub use events::{AgentEvent, AgentStopReason};
+pub use events::{AgentEvent, AgentStopReason, CompactedTier, UsageBreakdown};
 pub use loop_request::{AgentRunRequest, RunSummary, TokenEstimate};
 pub use messages::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, JsonSummary, MessageRoleBlockError,
 };
-pub use tools::{
-    ToolCall, ToolCallId, ToolCallResult, ToolCallSource, ToolSideEffect, ToolSpec,
-};
+pub use skills::{SideEffect, SkillCall, SkillCallId, SkillCallResult, SkillSpec};

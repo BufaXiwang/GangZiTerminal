@@ -8,19 +8,18 @@
 //! - `openai_responses`    — OpenAI `/v1/responses`
 //! - `openai_chat`         — OpenAI-compatible `/v1/chat/completions`
 //!
-//! 本目录只实现 **request mapping** + **stream → AgentEvent** 抽象 trait；
-//! 实际 HTTP / SSE 接线由 `loop_executor` 调用 trait。
-//!
-//! NOTE: Phase 1 把 wire format mapping 跑通到可测试程度；真实 provider 调用（reqwest + SSE
-//! 解码）由后续迭代落地，不在本 Phase 阻塞 loop 测试。
+//! 本目录只实现 **纯 chat request mapping**（text / image / thinking / usage / stop_reason）。
+//! Skill 调用走 §2 定义的 `<use_skill>` 文本协议，**不**通过 provider 原生 tool_use / function_calling。
+//! Provider request 中**不**传 `tools` 字段、**不**解析 `tool_use` / `function_call` block。
 
 pub mod anthropic;
 pub mod openai_chat;
 pub mod openai_responses;
 
 use crate::domain::agent::{
-    AgentRunRequest, AgentStopReason, ContextBundle, RunSummary, ToolSpec, WireFormat,
+    AgentMessageBlock, AgentRunRequest, AgentStopReason, ContextBundle, WireFormat,
 };
+use crate::infrastructure::agent::payload_store::PayloadStore;
 
 /// Provider request mapping 的 canonical 错误。
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +28,10 @@ pub enum WireMappingError {
     Unsupported(WireFormat, String),
     #[error("invalid canonical message: {0}")]
     InvalidMessage(String),
+    #[error("vision not supported by channel; image block disallowed")]
+    VisionNotSupported,
+    #[error("payload dereference failed: {0}")]
+    PayloadDeref(String),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -36,27 +39,66 @@ pub enum WireMappingError {
 /// 一个 provider channel adapter 必须实现的 mapping trait。
 ///
 /// Spec: agent-infra-module.md §5 Infra Loop API
-///
-/// Phase 1 阻塞实现的是 `build_request_body`；`run_stream` 暴露 trait 钩子但不在 Phase 1 接 HTTP。
 pub trait ProviderAdapter: Send + Sync {
-    /// Wire format 名。
     fn wire_format(&self) -> WireFormat;
 
-    /// 把 canonical request + context + tool specs 转成 provider 可接受的 JSON body。
+    /// 把 canonical request + context 转成 provider 可接受的 JSON body。
+    ///
+    /// Spec §2 ProviderChannel:
+    /// - `supports_vision = false` 时遇到 image block 返回 `VisionNotSupported`。
+    /// - `supports_thinking = false` 时静默丢弃 thinking block。
     fn build_request_body(
         &self,
         request: &AgentRunRequest,
         context: &ContextBundle,
-        tools: &[ToolSpec],
+        payload_store: Option<&PayloadStore>,
     ) -> Result<serde_json::Value, WireMappingError>;
 
-    /// 把 provider stop reason 文本归一化为 canonical `AgentStopReason`。
     fn map_stop_reason(&self, raw: &str) -> AgentStopReason;
 }
 
-/// 默认 RunSummary 构造（loop executor 完成后落盘）。
-pub fn empty_run_summary(run_id: &str) -> RunSummary {
-    RunSummary::empty(run_id)
+/// Dereference `payload://pl_xxx` URI into bytes via PayloadStore.
+/// Returns `(bytes, content_type)`. If `dataRef` is a non-payload URI (e.g. `file://`),
+/// caller treats it as already-resolved external; for now we only support `payload://`.
+pub fn dereference_image(
+    block: &AgentMessageBlock,
+    payload_store: Option<&PayloadStore>,
+) -> Result<(Vec<u8>, String), WireMappingError> {
+    let AgentMessageBlock::Image {
+        mime_type,
+        data_ref,
+    } = block
+    else {
+        return Err(WireMappingError::InvalidMessage(
+            "expected image block".into(),
+        ));
+    };
+    if let Some(payload_id) = PayloadStore::parse_uri(data_ref) {
+        let store = payload_store.ok_or_else(|| {
+            WireMappingError::PayloadDeref(format!(
+                "PayloadStore not provided; cannot resolve {}",
+                data_ref
+            ))
+        })?;
+        let entry = store
+            .get(payload_id)
+            .map_err(|e| WireMappingError::PayloadDeref(e.to_string()))?
+            .ok_or_else(|| {
+                WireMappingError::PayloadDeref(format!("payload {} not found", payload_id))
+            })?;
+        let bytes = entry
+            .content_bytes
+            .ok_or_else(|| WireMappingError::PayloadDeref(
+                "payload entry has no bytes".into(),
+            ))?;
+        let ct = entry.content_type.unwrap_or_else(|| mime_type.clone());
+        Ok((bytes, ct))
+    } else {
+        Err(WireMappingError::PayloadDeref(format!(
+            "unsupported dataRef scheme: {}",
+            data_ref
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -72,10 +114,10 @@ mod factory_smoke {
             base_url: None,
             model: "m".into(),
             stream: true,
-            supports_tools: true,
             supports_vision: false,
             supports_thinking: false,
-            supports_server_side_tools: None,
+            max_output_tokens: None,
+            context_window_tokens: None,
         }
     }
 

@@ -1,22 +1,30 @@
 //! Canonical Agent loop 编排（infra 内部 use case）。
 //!
-//! Spec: docs/design/agent-infra-module.md §3 / §5 Infra Loop API
+//! Spec: docs/design/agent-infra-module.md §3 Agent Loop，§4 Reactive retry，§5 Infra Loop API
 //!
 //! 行为：
 //! 1. emit `run_start`
 //! 2. 调 provider stream（trait `ProviderStream`，便于注入 fake provider 测试）
-//! 3. text / thinking delta -> emit
-//! 4. provider 给出 tool_use -> ToolRegistry dispatch -> append assistant tool_use + tool tool_result message -> 继续
-//! 5. 达到 max_turns 或 provider stop -> emit `done`
-//! 6. 任何错误 emit `error`，loop 关闭
-//!
-//! Phase 1：streaming 接线由 trait 注入；真实 HTTP / SSE 接线在后续迭代或测试 fixture 落地。
+//! 3. 把 provider 输出的 chat text 喂 `SkillCallParser`：
+//!    - `TextDelta` → emit `text_delta`
+//!    - `UseSkill` → emit `skill_start` → `SkillRegistry::dispatch_skill_call` →
+//!      emit `skill_end` → 缓存 `<skill_result>` 文本
+//!    - `ParseError` → 把 `<skill_error code="parse_error">` 加到本轮回写文本
+//! 4. turn 结束：
+//!    - 若本 turn 触发了 ≥ 1 次 dispatch：构造新一轮 user message（按出现顺序串联
+//!      `<skill_result>` / `<skill_error>`），继续 loop。
+//!    - 否则 finalize：emit usage / done。
+//! 5. Reactive retry：catch `ProviderContextTooLong` → `compact_context(ReactiveRetry)`
+//!    → 重发同一 turn（最多 1 次）→ 仍失败则 `stop_reason = context_limit`。
 
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest,
-    AgentStopReason, ContextBundle, JsonSummary, RunSummary,
+    AgentStopReason, ContextBundle, RunSummary,
 };
-use crate::infrastructure::agent::tool_registry::ToolRegistry;
+use crate::domain::shared::ErrorCode;
+use crate::infrastructure::agent::context_compaction::{compact_context, CompactPolicy};
+use crate::infrastructure::agent::skill_parser::{ParserEvent, SkillCallParser};
+use crate::infrastructure::agent::skill_registry::{DispatchError, SkillRegistry};
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -24,34 +32,24 @@ use uuid::Uuid;
 
 /// 一次 provider stream 的拉取结果。
 ///
-/// Provider 在一次 stream 内可以混合 text / thinking delta、tool_use 请求、usage、stop。
 /// 本 trait 抽象掉具体 SSE 解码细节，让 loop 测试可以注入 mock。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderTurnOutcome {
+    /// provider 输出的纯 chat text（可能含 `<use_skill>` XML 标签）。
     pub text: String,
-    pub thinking: Vec<String>,
-    pub tool_uses: Vec<ProviderToolUse>,
     pub usage_input: u32,
     pub usage_output: u32,
     /// provider 原始 stop reason（adapter 归一化后值）。
     pub stop_reason: AgentStopReason,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderToolUse {
-    pub tool_call_id: String,
-    pub name: String,
-    pub input: JsonSummary,
-}
-
 /// Provider stream 抽象。Loop executor 在每个 turn 调用一次 `next_turn`。
 #[async_trait::async_trait]
 pub trait ProviderStream: Send + Sync {
-    /// 拉取下一轮 provider 输出（包含一段文本 + 0..n 个 tool_use + stop reason）。
-    /// `messages`：截至当前 turn 的累积 canonical 消息，含 seed + 历次 assistant / tool turn。
     async fn next_turn(
         &mut self,
         messages: &[AgentMessage],
+        context: &ContextBundle,
         event_tx: &Sender<AgentEvent>,
         run_id: &str,
     ) -> Result<ProviderTurnOutcome, LoopError>;
@@ -61,33 +59,24 @@ pub trait ProviderStream: Send + Sync {
 pub enum LoopError {
     #[error("provider error: {0}")]
     Provider(String),
-    #[error("tool dispatch error: {0}")]
-    Dispatch(#[from] crate::infrastructure::agent::tool_registry::DispatchError),
+    /// Spec §4: provider 返回 context-too-long（HTTP 400 或等价 error code）。
+    #[error("provider context too long")]
+    ProviderContextTooLong,
     #[error("event channel closed")]
     EventChannelClosed,
-    #[error("context too long, all compaction exhausted")]
-    ContextTooLong,
 }
 
 /// 执行一次 Agent loop。
 ///
-/// Spec §3：`run_agent_loop(request, registry, context, event_tx) -> RunSummary`
-///
-/// 实参：
-/// - `provider`：调用 channel adapter 的 stream（trait `ProviderStream`）。
-/// - `registry`：本次 run 允许的 local tools。
-/// - `context`：runtime 提供（spec §2 ContextBundle）。本 Phase 暂不在 loop 内调 compact；
-///   `context` 由 caller 在 build provider request 之前压缩。
-/// - `event_tx`：AgentEvent stream。
+/// Spec §5：`run_agent_loop(request, registry, context, event_tx) -> RunSummary`
 pub async fn run_agent_loop(
     request: AgentRunRequest,
-    registry: Arc<ToolRegistry>,
-    _context: ContextBundle,
+    registry: Arc<SkillRegistry>,
+    mut context: ContextBundle,
     mut provider: Box<dyn ProviderStream>,
     event_tx: Sender<AgentEvent>,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
-    // 1. emit run_start
     send_event(
         &event_tx,
         AgentEvent::RunStart {
@@ -99,131 +88,222 @@ pub async fn run_agent_loop(
     .await?;
 
     let mut messages: Vec<AgentMessage> = request.seed_messages.clone();
-    let mut tool_call_ids: Vec<String> = Vec::new();
+    let mut skill_call_ids: Vec<String> = Vec::new();
     let mut usage_input: u32 = 0;
     let mut usage_output: u32 = 0;
 
     let mut turn: u32 = 0;
+    let mut reactive_retry_used = false;
     let stop_reason: AgentStopReason;
-    loop {
+    'outer: loop {
         if turn >= request.max_turns {
             stop_reason = AgentStopReason::MaxTurns;
             break;
         }
         turn += 1;
 
-        let outcome = provider
-            .next_turn(&messages, &event_tx, &run_id)
+        // ---- provider call with reactive retry ----
+        let outcome = match provider
+            .next_turn(&messages, &context, &event_tx, &run_id)
             .await
-            .map_err(|e| match e {
-                LoopError::EventChannelClosed => LoopError::EventChannelClosed,
-                other => other,
-            })?;
+        {
+            Ok(out) => out,
+            Err(LoopError::ProviderContextTooLong) => {
+                if reactive_retry_used {
+                    // Spec §4: 最多 1 次 reactive retry。第二次仍失败 → fail closed。
+                    send_event(
+                        &event_tx,
+                        AgentEvent::Error {
+                            run_id: run_id.clone(),
+                            code: ErrorCode::ProviderContextTooLong,
+                            message: "provider context too long after reactive retry".into(),
+                        },
+                    )
+                    .await?;
+                    stop_reason = AgentStopReason::ContextLimit;
+                    break;
+                }
+                // Compact + emit compacted event, then retry same turn.
+                reactive_retry_used = true;
+                let (new_ctx, dropped) = compact_context(
+                    context.clone(),
+                    CompactPolicy::ReactiveRetry,
+                    crate::domain::agent::ContextWindowLimits::default(),
+                );
+                context = new_ctx;
+                send_event(
+                    &event_tx,
+                    AgentEvent::Compacted {
+                        run_id: run_id.clone(),
+                        tier: crate::domain::agent::CompactedTier::ReactiveRetry,
+                        dropped_messages: dropped,
+                        estimated_tokens_saved: None,
+                    },
+                )
+                .await?;
+                // Rewind turn counter (this turn didn't actually progress) and retry.
+                turn -= 1;
+                continue 'outer;
+            }
+            Err(e) => return Err(e),
+        };
         usage_input = usage_input.saturating_add(outcome.usage_input);
         usage_output = usage_output.saturating_add(outcome.usage_output);
 
-        // 装配本轮 assistant message（text + 可选 tool_use）。
-        let mut blocks: Vec<AgentMessageBlock> = Vec::new();
-        if !outcome.text.is_empty() {
-            blocks.push(AgentMessageBlock::Text {
-                text: outcome.text.clone(),
-            });
+        // ---- feed provider text through SkillCallParser ----
+        let mut parser = SkillCallParser::new();
+        let mut events = parser.feed(&outcome.text);
+        events.extend(parser.finalize());
+
+        let mut assistant_text_parts: Vec<String> = Vec::new();
+        let mut skill_results_for_next_turn: Vec<String> = Vec::new();
+        let mut any_dispatch = false;
+
+        for ev in events {
+            match ev {
+                ParserEvent::TextDelta(s) => {
+                    send_event(
+                        &event_tx,
+                        AgentEvent::TextDelta {
+                            run_id: run_id.clone(),
+                            delta: s.clone(),
+                        },
+                    )
+                    .await?;
+                    assistant_text_parts.push(s);
+                }
+                ParserEvent::UseSkill { name, input } => {
+                    any_dispatch = true;
+                    let call_id = SkillRegistry::new_skill_call_id();
+                    // Persist <use_skill> raw XML in assistant text history for the LLM.
+                    let raw_use = format!(
+                        r#"<use_skill name="{}">{}</use_skill>"#,
+                        name,
+                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
+                    );
+                    assistant_text_parts.push(raw_use);
+
+                    send_event(
+                        &event_tx,
+                        AgentEvent::SkillStart {
+                            run_id: run_id.clone(),
+                            skill_call_id: call_id.clone(),
+                            name: name.clone(),
+                            input_summary: input.clone(),
+                        },
+                    )
+                    .await?;
+
+                    let dispatch_res = registry
+                        .dispatch_skill_call(&run_id, call_id.clone(), &name, input.clone())
+                        .await;
+
+                    let (out_summary, is_error, duration_ms, used_call_id, err_code) =
+                        match dispatch_res {
+                            Ok(r) => (
+                                r.output_summary,
+                                r.is_error,
+                                r.duration_ms,
+                                r.skill_call_id,
+                                r.error_code,
+                            ),
+                            Err(DispatchError::NotRegistered(_)) => {
+                                let summary = serde_json::json!({
+                                    "message": format!("skill '{}' not registered", name),
+                                });
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput))
+                            }
+                            Err(DispatchError::InvalidInput(msg)) => {
+                                let summary = serde_json::json!({"message": msg});
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput))
+                            }
+                            Err(e) => {
+                                let summary = serde_json::json!({"message": e.to_string()});
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::ParseError))
+                            }
+                        };
+
+                    skill_call_ids.push(used_call_id.clone());
+                    send_event(
+                        &event_tx,
+                        AgentEvent::SkillEnd {
+                            run_id: run_id.clone(),
+                            skill_call_id: used_call_id.clone(),
+                            name: name.clone(),
+                            output_summary: out_summary.clone(),
+                            is_error,
+                            duration_ms,
+                        },
+                    )
+                    .await?;
+
+                    // Format <skill_result> / <skill_error> for next turn user message.
+                    let payload_str = serde_json::to_string(&out_summary)
+                        .unwrap_or_else(|_| "{}".into());
+                    if is_error {
+                        let code_str =
+                            err_code.map(error_code_str).unwrap_or("parse_error");
+                        skill_results_for_next_turn.push(format!(
+                            r#"<skill_error name="{}" call_id="{}" code="{}">{}</skill_error>"#,
+                            name, used_call_id, code_str, payload_str
+                        ));
+                    } else {
+                        skill_results_for_next_turn.push(format!(
+                            r#"<skill_result name="{}" call_id="{}">{}</skill_result>"#,
+                            name, used_call_id, payload_str
+                        ));
+                    }
+                }
+                ParserEvent::ParseError { reason, partial } => {
+                    // Spec §2: 标签嵌套不合法 / JSON parse 错 → 返回 <skill_error code="parse_error">。
+                    let raw_partial = partial.clone();
+                    assistant_text_parts.push(raw_partial);
+                    any_dispatch = true;
+                    let call_id = SkillRegistry::new_skill_call_id();
+                    skill_call_ids.push(call_id.clone());
+                    let payload = serde_json::json!({"message": reason});
+                    let payload_str =
+                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+                    skill_results_for_next_turn.push(format!(
+                        r#"<skill_error name="_parser" call_id="{}" code="parse_error">{}</skill_error>"#,
+                        call_id, payload_str
+                    ));
+                }
+            }
         }
-        for tu in &outcome.tool_uses {
-            blocks.push(AgentMessageBlock::ToolUse {
-                tool_call_id: tu.tool_call_id.clone(),
-                name: tu.name.clone(),
-                input_summary: tu.input.clone(),
-            });
-        }
-        if !blocks.is_empty() {
+
+        // Persist assistant message (text-only).
+        if !assistant_text_parts.is_empty() {
+            let joined = assistant_text_parts.join("");
             messages.push(AgentMessage {
                 message_id: format!("am-{}", Uuid::new_v4()),
                 run_id: Some(run_id.clone()),
                 role: AgentMessageRole::Assistant,
-                blocks,
+                blocks: vec![AgentMessageBlock::Text { text: joined }],
                 created_at: Utc::now(),
             });
         }
 
-        // 没有 tool_use 且 provider 给的 stop 是 completed -> 结束。
-        if outcome.tool_uses.is_empty() {
-            if matches!(outcome.stop_reason, AgentStopReason::MaxTurns) {
-                stop_reason = AgentStopReason::MaxTurns;
-            } else if matches!(outcome.stop_reason, AgentStopReason::ProviderStop) {
-                stop_reason = AgentStopReason::ProviderStop;
-            } else {
-                stop_reason = AgentStopReason::Completed;
-            }
+        if !any_dispatch {
+            // No skill use → finalize.
+            stop_reason = match outcome.stop_reason {
+                AgentStopReason::MaxTurns => AgentStopReason::MaxTurns,
+                AgentStopReason::ProviderStop => AgentStopReason::ProviderStop,
+                _ => AgentStopReason::Completed,
+            };
             break;
         }
 
-        // 处理每个 tool_use：dispatch → emit tool_start/tool_end → append tool_result message。
-        for tu in outcome.tool_uses {
-            send_event(
-                &event_tx,
-                AgentEvent::ToolStart {
-                    run_id: run_id.clone(),
-                    tool_call_id: tu.tool_call_id.clone(),
-                    name: tu.name.clone(),
-                    input_summary: tu.input.clone(),
-                },
-            )
-            .await?;
-
-            let dispatch_res = registry
-                .dispatch_tool_call(
-                    &run_id,
-                    tu.tool_call_id.clone(),
-                    &tu.name,
-                    tu.input.clone(),
-                )
-                .await;
-            // dispatch error -> tool error result（spec §5）
-            let (out_summary, is_error, duration_ms, call_id) = match dispatch_res {
-                Ok(r) => (
-                    r.output_summary,
-                    r.is_error,
-                    r.duration_ms,
-                    r.tool_call_id,
-                ),
-                Err(e) => {
-                    // 仍记一次 tool_call_id（使用 provider 给的 id），把错误反馈给模型。
-                    let summary = serde_json::json!({"error": e.to_string()});
-                    (summary, true, 0u64, tu.tool_call_id.clone())
-                }
-            };
-
-            tool_call_ids.push(call_id.clone());
-
-            send_event(
-                &event_tx,
-                AgentEvent::ToolEnd {
-                    run_id: run_id.clone(),
-                    tool_call_id: call_id.clone(),
-                    name: tu.name.clone(),
-                    output_summary: out_summary.clone(),
-                    is_error,
-                    duration_ms,
-                },
-            )
-            .await?;
-
-            // 追加 tool result message，保持 tool_use / tool_result 配对
-            // —— spec §2 不变量：易腐工具结果替换 stub 时也必须保留 call id。
-            messages.push(AgentMessage {
-                message_id: format!("am-{}", Uuid::new_v4()),
-                run_id: Some(run_id.clone()),
-                role: AgentMessageRole::Tool,
-                blocks: vec![AgentMessageBlock::ToolResult {
-                    tool_call_id: tu.tool_call_id.clone(),
-                    output_summary: out_summary,
-                    is_error,
-                }],
-                created_at: Utc::now(),
-            });
-        }
-        // 继续下一个 turn（继续把 tool_result 喂回 provider）。
+        // Append next-turn user message carrying the <skill_result>s.
+        let user_text = skill_results_for_next_turn.join("\n");
+        messages.push(AgentMessage {
+            message_id: format!("am-{}", Uuid::new_v4()),
+            run_id: Some(run_id.clone()),
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Text { text: user_text }],
+            created_at: Utc::now(),
+        });
+        // Continue to next turn.
     }
 
     // emit usage + done
@@ -256,8 +336,38 @@ pub async fn run_agent_loop(
         output_tokens: usage_output,
         cache_read_tokens: None,
         cache_write_tokens: None,
-        tool_call_ids,
+        skill_call_ids,
     })
+}
+
+fn error_code_str(c: ErrorCode) -> &'static str {
+    match c {
+        ErrorCode::InvalidInput => "invalid_input",
+        ErrorCode::NotFound => "not_found",
+        ErrorCode::ProviderUnavailable => "provider_unavailable",
+        ErrorCode::RateLimited => "rate_limited",
+        ErrorCode::DbError => "db_error",
+        ErrorCode::ParseError => "parse_error",
+        ErrorCode::QuoteMissing => "quote_missing",
+        ErrorCode::QuoteStale => "quote_stale",
+        ErrorCode::QuotePriceMissing => "quote_price_missing",
+        ErrorCode::DepthMissing => "depth_missing",
+        ErrorCode::OutsideTradingSession => "outside_trading_session",
+        ErrorCode::InstrumentNotTradable => "instrument_not_tradable",
+        ErrorCode::InstrumentSuspended => "instrument_suspended",
+        ErrorCode::LimitUpDownBlocked => "limit_up_down_blocked",
+        ErrorCode::InsufficientCash => "insufficient_cash",
+        ErrorCode::InsufficientSellableQuantity => "insufficient_sellable_quantity",
+        ErrorCode::InvalidLotSize => "invalid_lot_size",
+        ErrorCode::OrderNotPending => "order_not_pending",
+        ErrorCode::RiskLimitExceeded => "risk_limit_exceeded",
+        ErrorCode::StrategyRequired => "strategy_required",
+        ErrorCode::DuplicateEvent => "duplicate_event",
+        ErrorCode::VersionConflict => "version_conflict",
+        ErrorCode::ArticleExtractFailed => "article_extract_failed",
+        ErrorCode::ToolTimeout => "tool_timeout",
+        ErrorCode::ProviderContextTooLong => "provider_context_too_long",
+    }
 }
 
 async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopError> {
@@ -268,10 +378,10 @@ async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopEr
 mod tests {
     use super::*;
     use crate::domain::agent::{
-        ProviderChannel, ToolSideEffect, ToolSpec, WireFormat,
+        ProviderChannel, SideEffect, SkillSpec, WireFormat,
     };
-    use crate::infrastructure::agent::tool_registry::{
-        FnToolHandler, ToolHandler, ToolHandlerFuture, ToolHandlerOutput, ToolInvocation,
+    use crate::infrastructure::agent::skill_registry::{
+        FnSkillHandler, SkillHandler, SkillHandlerFuture, SkillHandlerOutput, SkillInvocation,
     };
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -284,16 +394,16 @@ mod tests {
             base_url: None,
             model: "fake-model".into(),
             stream: true,
-            supports_tools: true,
             supports_vision: false,
             supports_thinking: false,
-            supports_server_side_tools: None,
+            max_output_tokens: None,
+            context_window_tokens: None,
         }
     }
 
-    /// Fake provider — 按预设脚本输出 turns。
+    /// Fake provider — 按预设脚本输出 turns.
     struct ScriptedProvider {
-        script: Vec<ProviderTurnOutcome>,
+        script: Vec<Result<ProviderTurnOutcome, LoopError>>,
         index: usize,
     }
     #[async_trait::async_trait]
@@ -301,61 +411,67 @@ mod tests {
         async fn next_turn(
             &mut self,
             _messages: &[AgentMessage],
-            event_tx: &Sender<AgentEvent>,
-            run_id: &str,
+            _context: &ContextBundle,
+            _event_tx: &Sender<AgentEvent>,
+            _run_id: &str,
         ) -> Result<ProviderTurnOutcome, LoopError> {
-            let out = self
-                .script
-                .get(self.index)
-                .cloned()
-                .ok_or_else(|| LoopError::Provider("scripted ran out".into()))?;
-            self.index += 1;
-            // emit text delta
-            if !out.text.is_empty() {
-                let _ = event_tx
-                    .send(AgentEvent::TextDelta {
-                        run_id: run_id.into(),
-                        delta: out.text.clone(),
-                    })
-                    .await;
+            // Move element out without cloning LoopError (LoopError: !Clone).
+            if self.index >= self.script.len() {
+                return Err(LoopError::Provider("scripted ran out".into()));
             }
-            Ok(out)
+            let item = std::mem::replace(
+                &mut self.script[self.index],
+                Err(LoopError::Provider("consumed".into())),
+            );
+            self.index += 1;
+            item
         }
     }
 
-    fn echo_handler() -> std::sync::Arc<dyn ToolHandler> {
-        std::sync::Arc::new(FnToolHandler(|inv: ToolInvocation| {
+    fn echo_handler() -> Arc<dyn SkillHandler> {
+        Arc::new(FnSkillHandler(|inv: SkillInvocation| {
             Box::pin(async move {
-                ToolHandlerOutput::ok(json!({ "echoed": inv.input }))
-            }) as ToolHandlerFuture
+                SkillHandlerOutput::ok(json!({"echoed": inv.input}))
+            }) as SkillHandlerFuture
         }))
     }
 
-    #[tokio::test]
-    async fn loop_completes_on_text_only_turn() {
-        let registry = Arc::new(ToolRegistry::new_without_persist());
-        let provider = Box::new(ScriptedProvider {
-            script: vec![ProviderTurnOutcome {
-                text: "hello".into(),
-                thinking: vec![],
-                tool_uses: vec![],
-                usage_input: 5,
-                usage_output: 7,
-                stop_reason: AgentStopReason::Completed,
-            }],
-            index: 0,
-        });
-        let req = AgentRunRequest {
+    fn spec(name: &str) -> SkillSpec {
+        SkillSpec::new(
+            name,
+            "test",
+            json!({"type":"object"}),
+            vec![format!(r#"<use_skill name="{}">{{}}</use_skill>"#, name)],
+            5000,
+            SideEffect::None,
+        )
+    }
+
+    fn req() -> AgentRunRequest {
+        AgentRunRequest {
             run_id: "r1".into(),
             trigger: "u".into(),
             channel: channel(),
             max_turns: 5,
-            allowed_server_side_tools: vec![],
             seed_messages: vec![],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_completes_on_text_only_turn() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![Ok(ProviderTurnOutcome {
+                text: "hello".into(),
+                usage_input: 5,
+                usage_output: 7,
+                stop_reason: AgentStopReason::Completed,
+            })],
+            index: 0,
+        });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req, registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
                 .await
                 .unwrap();
         assert_eq!(summary.turns, 1);
@@ -363,7 +479,6 @@ mod tests {
         assert_eq!(summary.input_tokens, 5);
         assert_eq!(summary.output_tokens, 7);
 
-        // run_start, text_delta, usage, done
         let mut events = Vec::new();
         while let Some(e) = rx.recv().await {
             events.push(e);
@@ -373,169 +488,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_stops_at_max_turns_when_provider_keeps_calling_tools() {
-        let registry = Arc::new(ToolRegistry::new_without_persist());
-        registry
-            .register_tool(
-                ToolSpec::new_local("echo", "echo", json!({}), 5000, ToolSideEffect::None),
-                echo_handler(),
-            )
-            .unwrap();
-        // Each turn requests one tool_use, never says completed.
-        let script = (0..10)
-            .map(|i| ProviderTurnOutcome {
-                text: String::new(),
-                thinking: vec![],
-                tool_uses: vec![ProviderToolUse {
-                    tool_call_id: format!("tc{}", i),
-                    name: "echo".into(),
-                    input: json!({"i": i}),
-                }],
-                usage_input: 1,
-                usage_output: 1,
-                stop_reason: AgentStopReason::ProviderStop,
-            })
-            .collect();
-        let provider = Box::new(ScriptedProvider { script, index: 0 });
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: channel(),
-            max_turns: 3,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![],
-        };
-        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let summary =
-            run_agent_loop(req, registry, ContextBundle::new("r1"), provider, tx)
-                .await
-                .unwrap();
-        assert_eq!(summary.stop_reason, AgentStopReason::MaxTurns);
-        assert_eq!(summary.turns, 3);
-        assert_eq!(summary.tool_call_ids.len(), 3);
-
-        // Verify tool_start / tool_end events emitted in order
-        let mut events = Vec::new();
-        while let Some(e) = rx.recv().await {
-            events.push(e);
-        }
-        let mut starts = 0;
-        let mut ends = 0;
-        for e in &events {
-            match e {
-                AgentEvent::ToolStart { .. } => starts += 1,
-                AgentEvent::ToolEnd { .. } => ends += 1,
-                _ => {}
-            }
-        }
-        assert_eq!(starts, 3);
-        assert_eq!(ends, 3);
-    }
-
-    #[tokio::test]
-    async fn loop_appends_tool_result_message_per_call() {
-        let registry = Arc::new(ToolRegistry::new_without_persist());
-        registry
-            .register_tool(
-                ToolSpec::new_local("echo", "echo", json!({}), 5000, ToolSideEffect::None),
-                echo_handler(),
-            )
-            .unwrap();
+    async fn loop_dispatches_single_skill_then_completes() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        registry.register_skill(spec("echo"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
-                ProviderTurnOutcome {
-                    text: "".into(),
-                    thinking: vec![],
-                    tool_uses: vec![ProviderToolUse {
-                        tool_call_id: "tc1".into(),
-                        name: "echo".into(),
-                        input: json!({"a":1}),
-                    }],
+                Ok(ProviderTurnOutcome {
+                    text: r#"check: <use_skill name="echo">{"a":1}</use_skill>"#.into(),
                     usage_input: 1,
                     usage_output: 1,
                     stop_reason: AgentStopReason::ProviderStop,
-                },
-                ProviderTurnOutcome {
+                }),
+                Ok(ProviderTurnOutcome {
                     text: "done".into(),
-                    thinking: vec![],
-                    tool_uses: vec![],
-                    usage_input: 2,
-                    usage_output: 2,
+                    usage_input: 1,
+                    usage_output: 1,
                     stop_reason: AgentStopReason::Completed,
-                },
+                }),
             ],
             index: 0,
         });
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: channel(),
-            max_turns: 5,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![],
-        };
-        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let summary =
-            run_agent_loop(req, registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
         assert_eq!(summary.turns, 2);
-        assert_eq!(summary.tool_call_ids, vec!["tc1".to_string()]);
+        assert_eq!(summary.skill_call_ids.len(), 1);
+
+        let mut starts = 0;
+        let mut ends = 0;
+        while let Some(e) = rx.recv().await {
+            match e {
+                AgentEvent::SkillStart { .. } => starts += 1,
+                AgentEvent::SkillEnd { .. } => ends += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(starts, 1);
+        assert_eq!(ends, 1);
     }
 
     #[tokio::test]
-    async fn loop_reports_tool_unregistered_as_error_to_model() {
-        // 模型尝试调用未注册工具 -> 不 panic，错误回填到 tool_result（is_error = true）。
-        let registry = Arc::new(ToolRegistry::new_without_persist());
+    async fn loop_handles_multiple_skills_in_one_turn_in_order() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        registry.register_skill(spec("a"), echo_handler()).unwrap();
+        registry.register_skill(spec("b"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
-                ProviderTurnOutcome {
-                    text: "".into(),
-                    thinking: vec![],
-                    tool_uses: vec![ProviderToolUse {
-                        tool_call_id: "tc1".into(),
-                        name: "unknown_tool".into(),
-                        input: json!({}),
-                    }],
+                Ok(ProviderTurnOutcome {
+                    text: r#"<use_skill name="a">{"i":1}</use_skill><use_skill name="b">{"i":2}</use_skill>"#
+                        .into(),
                     usage_input: 1,
                     usage_output: 1,
                     stop_reason: AgentStopReason::ProviderStop,
-                },
-                ProviderTurnOutcome {
-                    text: "bye".into(),
-                    thinking: vec![],
-                    tool_uses: vec![],
-                    usage_input: 1,
-                    usage_output: 1,
+                }),
+                Ok(ProviderTurnOutcome {
+                    text: "done".into(),
+                    usage_input: 0,
+                    usage_output: 0,
                     stop_reason: AgentStopReason::Completed,
-                },
+                }),
             ],
             index: 0,
         });
-        let req = AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel: channel(),
-            max_turns: 5,
-            allowed_server_side_tools: vec![],
-            seed_messages: vec![],
-        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let summary =
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+                .await
+                .unwrap();
+        assert_eq!(summary.skill_call_ids.len(), 2);
+        let mut ordered_names: Vec<String> = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::SkillStart { name, .. } = e {
+                ordered_names.push(name);
+            }
+        }
+        assert_eq!(ordered_names, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn loop_reactive_retry_recovers_on_first_failure() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![
+                Err(LoopError::ProviderContextTooLong),
+                Ok(ProviderTurnOutcome {
+                    text: "ok".into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                }),
+            ],
+            index: 0,
+        });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req, registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
-        // tool_end with is_error=true emitted
-        let mut saw_error_tool_end = false;
+        let mut saw_compacted = false;
         while let Some(e) = rx.recv().await {
-            if let AgentEvent::ToolEnd { is_error, .. } = e {
-                if is_error {
-                    saw_error_tool_end = true;
+            if let AgentEvent::Compacted { tier, .. } = e {
+                if matches!(tier, crate::domain::agent::CompactedTier::ReactiveRetry) {
+                    saw_compacted = true;
                 }
             }
         }
-        assert!(saw_error_tool_end);
+        assert!(saw_compacted);
+    }
+
+    #[tokio::test]
+    async fn loop_reactive_retry_fails_closed_on_second_context_too_long() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![
+                Err(LoopError::ProviderContextTooLong),
+                Err(LoopError::ProviderContextTooLong),
+            ],
+            index: 0,
+        });
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let summary =
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+                .await
+                .unwrap();
+        assert_eq!(summary.stop_reason, AgentStopReason::ContextLimit);
+        let mut saw_error_with_code = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::Error { code, .. } = e {
+                if matches!(code, ErrorCode::ProviderContextTooLong) {
+                    saw_error_with_code = true;
+                }
+            }
+        }
+        assert!(saw_error_with_code);
+    }
+
+    #[tokio::test]
+    async fn loop_reports_unknown_skill_as_error_to_model() {
+        // 模型尝试调用未注册 skill → loop 不 panic；下一轮回写 <skill_error code="invalid_input">.
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![
+                Ok(ProviderTurnOutcome {
+                    text: r#"<use_skill name="missing">{}</use_skill>"#.into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::ProviderStop,
+                }),
+                Ok(ProviderTurnOutcome {
+                    text: "bye".into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                }),
+            ],
+            index: 0,
+        });
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let summary =
+            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+                .await
+                .unwrap();
+        assert_eq!(summary.stop_reason, AgentStopReason::Completed);
+        let mut saw_error_end = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::SkillEnd { is_error, .. } = e {
+                if is_error {
+                    saw_error_end = true;
+                }
+            }
+        }
+        assert!(saw_error_end);
     }
 }

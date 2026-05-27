@@ -82,9 +82,7 @@ ego-tree = "0.6"
 
 # === agent-infra deps ===
 # Agent Infra 主要复用已有依赖（reqwest / tokio / serde / chrono / uuid / sha2 / thiserror）。
-# 追加项均为 Phase 1 provider stream 接线和 image block 编码所需；当前 Phase 主要由
-# loop executor / wire-format mapping 使用预留接入点，真正 HTTP / SSE 接线在后续迭代落地。
-eventsource-stream = "0.2"      # provider SSE 流解码（Anthropic / OpenAI Responses 都是 SSE）
-base64 = "0.22"                 # AgentMessageBlock::Image dataRef → data URL 编码
-tokio-stream = "0.1"            # tokio::sync::mpsc → futures Stream，便于前端 listen 推送
+# Skill 调用走 <use_skill> XML 文本协议，不需要 provider SSE / tool_use 解码；HTTP / SSE
+# 接线在后续迭代落地（届时再追加 eventsource-stream）。
+base64 = "0.22"                 # PayloadStore image dereference → base64 编码 wire format
 

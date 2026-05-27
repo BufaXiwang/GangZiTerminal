@@ -4,8 +4,9 @@
 //!
 //! 不变量：
 //! - role / block 组合必须按 spec §2 表格校验。
-//! - 图片使用 `dataRef` 指向本地附件 / 缓存，不把大二进制塞进消息表。
-//! - thinking 是否持久化取决于 provider；跨 provider 不保证恢复。
+//! - Skill 调用 / 结果以 XML 标签嵌在 `text` block 中，**不**作为独立 block type。
+//! - 图片 `dataRef` 是 PayloadStore URI（`payload://pl_xxx`）或 `file:///`；不是 base64 数据。
+//! - thinking 是否持久化取决于 provider；Anthropic 等需要保留 provider-specific metadata（signature）。
 
 use crate::domain::shared::OccurredAt;
 use serde::{Deserialize, Serialize};
@@ -17,18 +18,21 @@ pub type JsonSummary = serde_json::Value;
 /// AgentMessage 角色枚举。
 ///
 /// Spec: agent-infra-module.md §2
+///
+/// 注：`tool` role 不存在；skill_result 以 `user` role + text block（含 `<skill_result>` XML）形式回写。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMessageRole {
     System,
     User,
     Assistant,
-    Tool,
 }
 
 /// AgentMessage block 类型。
 ///
 /// Spec: agent-infra-module.md §2 `AgentMessageBlock`
+///
+/// Skill 调用 / 结果（`<use_skill>` / `<skill_result>` / `<skill_error>`）嵌在 text block 中。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessageBlock {
@@ -38,6 +42,8 @@ pub enum AgentMessageBlock {
     Image {
         #[serde(rename = "mimeType")]
         mime_type: String,
+        /// PayloadStore URI（`payload://pl_xxx`）或 `file:///path`。Provider adapter 在
+        /// build wire 时 dereference → base64 编码。
         #[serde(rename = "dataRef")]
         data_ref: String,
     },
@@ -45,21 +51,10 @@ pub enum AgentMessageBlock {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
-    },
-    ToolUse {
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
-        name: String,
-        #[serde(rename = "inputSummary")]
-        input_summary: JsonSummary,
-    },
-    ToolResult {
-        #[serde(rename = "toolCallId")]
-        tool_call_id: String,
-        #[serde(rename = "outputSummary")]
-        output_summary: JsonSummary,
-        #[serde(rename = "isError")]
-        is_error: bool,
+        /// Provider-specific metadata（如 Anthropic extended thinking 的 `signature` / `redacted`）。
+        /// Adapter 在 build wire 时把这里的内容还原到 provider wire format。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
 }
 
@@ -74,11 +69,8 @@ impl AgentMessageBlock {
             ) => true,
             (
                 AgentMessageRole::Assistant,
-                AgentMessageBlock::Text { .. }
-                | AgentMessageBlock::Thinking { .. }
-                | AgentMessageBlock::ToolUse { .. },
+                AgentMessageBlock::Text { .. } | AgentMessageBlock::Thinking { .. },
             ) => true,
-            (AgentMessageRole::Tool, AgentMessageBlock::ToolResult { .. }) => true,
             _ => false,
         }
     }
@@ -147,7 +139,7 @@ mod tests {
             AgentMessageRole::User,
             vec![AgentMessageBlock::Image {
                 mime_type: "image/png".into(),
-                data_ref: "ref://x".into(),
+                data_ref: "payload://pl_x".into(),
             }]
         )
         .validate_role_blocks()
@@ -155,22 +147,23 @@ mod tests {
         assert!(msg(
             AgentMessageRole::Assistant,
             vec![
-                AgentMessageBlock::Thinking { text: "t".into(), provider: None },
-                AgentMessageBlock::ToolUse {
-                    tool_call_id: "tc1".into(),
-                    name: "x".into(),
-                    input_summary: serde_json::json!({"k":1})
-                }
+                AgentMessageBlock::Thinking {
+                    text: "t".into(),
+                    provider: None,
+                    metadata: None,
+                },
+                AgentMessageBlock::Text {
+                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into()
+                },
             ]
         )
         .validate_role_blocks()
         .is_ok());
+        // skill_result lives in user-role text block
         assert!(msg(
-            AgentMessageRole::Tool,
-            vec![AgentMessageBlock::ToolResult {
-                tool_call_id: "tc1".into(),
-                output_summary: serde_json::json!("ok"),
-                is_error: false,
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text {
+                text: r#"<skill_result name="fetch_quote" call_id="sc_1">{"price":"1.0"}</skill_result>"#.into()
             }]
         )
         .validate_role_blocks()
@@ -192,25 +185,21 @@ mod tests {
         // user 不允许 thinking
         assert!(msg(
             AgentMessageRole::User,
-            vec![AgentMessageBlock::Thinking { text: "x".into(), provider: None }]
-        )
-        .validate_role_blocks()
-        .is_err());
-        // assistant 不允许 tool_result
-        assert!(msg(
-            AgentMessageRole::Assistant,
-            vec![AgentMessageBlock::ToolResult {
-                tool_call_id: "x".into(),
-                output_summary: serde_json::json!(null),
-                is_error: false,
+            vec![AgentMessageBlock::Thinking {
+                text: "x".into(),
+                provider: None,
+                metadata: None
             }]
         )
         .validate_role_blocks()
         .is_err());
-        // tool 不允许 text
+        // assistant 不允许 image
         assert!(msg(
-            AgentMessageRole::Tool,
-            vec![AgentMessageBlock::Text { text: "x".into() }]
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Image {
+                mime_type: "image/png".into(),
+                data_ref: "r".into()
+            }]
         )
         .validate_role_blocks()
         .is_err());
@@ -222,10 +211,10 @@ mod tests {
             AgentMessageRole::Assistant,
             vec![
                 AgentMessageBlock::Text { text: "hi".into() },
-                AgentMessageBlock::ToolUse {
-                    tool_call_id: "tc1".into(),
-                    name: "fetch_quote".into(),
-                    input_summary: serde_json::json!({"tsCode":"600519.SH"}),
+                AgentMessageBlock::Thinking {
+                    text: "reasoning".into(),
+                    provider: Some("anthropic".into()),
+                    metadata: Some(serde_json::json!({"signature": "abc"})),
                 },
             ],
         );
@@ -235,14 +224,26 @@ mod tests {
     }
 
     #[test]
-    fn message_block_tagged_serialization() {
+    fn thinking_metadata_preserves_signature() {
+        let b = AgentMessageBlock::Thinking {
+            text: "think".into(),
+            provider: Some("anthropic".into()),
+            metadata: Some(serde_json::json!({"signature": "sig-xyz", "redacted": false})),
+        };
+        let j = serde_json::to_value(&b).unwrap();
+        assert_eq!(j["type"], "thinking");
+        assert_eq!(j["metadata"]["signature"], "sig-xyz");
+    }
+
+    #[test]
+    fn message_block_image_serialization() {
         let b = AgentMessageBlock::Image {
             mime_type: "image/jpeg".into(),
-            data_ref: "ref://abc".into(),
+            data_ref: "payload://pl_abc".into(),
         };
         let j = serde_json::to_value(&b).unwrap();
         assert_eq!(j["type"], "image");
         assert_eq!(j["mimeType"], "image/jpeg");
-        assert_eq!(j["dataRef"], "ref://abc");
+        assert_eq!(j["dataRef"], "payload://pl_abc");
     }
 }

@@ -45,7 +45,7 @@ pub fn run() {
         adapters::quotes::cmd::list_market,
         adapters::quotes::cmd::fetch_data,
         adapters::quotes::cmd::scan_market,
-        adapters::agent::cmd::agent_list_tools,
+        adapters::agent::cmd::agent_list_skills,
     ]);
 
     #[cfg(debug_assertions)]

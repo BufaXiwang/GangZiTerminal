@@ -3,6 +3,9 @@
 //! Spec: docs/design/agent-infra-module.md §2 `ProviderChannel`
 //!
 //! 抽象轴是 wire format，不是厂商。新增兼容厂商通常只新增 channel config。
+//!
+//! 不再有 `supportsTools` / `supportsServerSideTools` 字段：所有 chat-completable provider 都通过
+//! Skill 文本协议（`<use_skill>`）提供工具能力，没有 provider 差异。
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -33,18 +36,21 @@ pub struct ProviderChannel {
     pub model: String,
     /// Streaming 是主渠道硬要求；保留布尔字段对外明示。
     pub stream: bool,
-    pub supports_tools: bool,
     pub supports_vision: bool,
     pub supports_thinking: bool,
+    /// 模型生成上限，写入 provider request。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supports_server_side_tools: Option<Vec<String>>,
+    pub max_output_tokens: Option<u32>,
+    /// 上下文窗口大小，驱动 soft / hard limit 计算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<u32>,
 }
 
 impl ProviderChannel {
-    /// 是否可以作为"主交易 Agent 渠道"——必须支持 streaming + local tools。
-    /// Spec §2 `ProviderChannel` rules + agent-infra-module.md §6 验收。
+    /// 是否可以作为"主交易 Agent 渠道"——必须支持 streaming。
+    /// Spec §2: 主渠道支持 streaming；不支持 streaming 的 provider 不能作为主渠道。
     pub fn is_primary_capable(&self) -> bool {
-        self.stream && self.supports_tools
+        self.stream
     }
 }
 
@@ -61,20 +67,21 @@ mod tests {
             base_url: None,
             model: "claude-sonnet-4-5".into(),
             stream: true,
-            supports_tools: true,
             supports_vision: true,
             supports_thinking: true,
-            supports_server_side_tools: Some(vec!["web_search".into()]),
+            max_output_tokens: Some(8192),
+            context_window_tokens: Some(200_000),
         };
         let j = serde_json::to_value(&c).unwrap();
         assert_eq!(j["channelId"], "anthropic-main");
         assert_eq!(j["wireFormat"], "messages");
-        assert_eq!(j["supportsTools"], true);
-        assert_eq!(j["supportsServerSideTools"][0], "web_search");
+        assert_eq!(j["supportsVision"], true);
+        assert_eq!(j["maxOutputTokens"], 8192);
+        assert_eq!(j["contextWindowTokens"], 200_000);
     }
 
     #[test]
-    fn primary_capable_requires_stream_and_tools() {
+    fn primary_capable_requires_stream() {
         let mut c = ProviderChannel {
             channel_id: "x".into(),
             provider: "p".into(),
@@ -82,13 +89,13 @@ mod tests {
             base_url: None,
             model: "m".into(),
             stream: true,
-            supports_tools: true,
             supports_vision: false,
             supports_thinking: false,
-            supports_server_side_tools: None,
+            max_output_tokens: None,
+            context_window_tokens: None,
         };
         assert!(c.is_primary_capable());
-        c.supports_tools = false;
+        c.stream = false;
         assert!(!c.is_primary_capable());
     }
 }
