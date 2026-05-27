@@ -552,15 +552,23 @@ fn commit_limit_fill(
             }
         }
 
-        // Adjust freeze (release as fill happens)
+        // Adjust freeze (release as fill happens).
+        //
+        // Spec: account-module.md §2 冻结和重建规则:
+        //   - 买单部分成交时，成交部分转为实际现金扣减；未成交部分继续冻结，
+        //     若实际成交价低于冻结价，差额必须释放。
+        //   - 买单撤单 / 过期时，释放剩余未成交数量对应的冻结现金。
+        //
+        // 新冻结 = limit_price * remaining_qty + estimated_fees_for_remaining (含 transfer_fee on SH stock/fund)。
         if let Some(f) = &freeze_before {
             match f.side {
                 OrderSide::Buy => {
-                    // 释放对应金额：实际成交金额 + 实际佣金；剩余冻结金额（按 limitPrice 原冻结 - 实际占用）。
-                    let actual_use = trade_amount + commission.0;
-                    let remaining_cash = (f.frozen_cash.0 - actual_use).max(Decimal::ZERO);
+                    // 实际占用 = 成交价 × 成交量 + 实际佣金 + 实际过户费。
+                    let actual_use = trade_amount + commission.0 + transfer_fee.0;
+                    let limit_price_dec = order.limit_price.map(|p| p.0).unwrap_or(Decimal::ZERO);
                     if full_fill {
-                        // 释放剩余冻结
+                        // 全成交 — 释放剩余冻结。
+                        let remaining_cash = (f.frozen_cash.0 - actual_use).max(Decimal::ZERO);
                         if remaining_cash > Decimal::ZERO {
                             let ev = AccountEvent {
                                 event_id: new_id("evt"),
@@ -569,7 +577,7 @@ fn commit_limit_fill(
                                 fill_id: Some(fill.fill_id.clone()),
                                 position_id: None,
                                 ts_code: Some(order.ts_code.clone()),
-                                reason: Some("partial freeze release on fill".into()),
+                                reason: Some("limit fill: release excess freeze".into()),
                                 actor: AccountActor::System.as_str().into(),
                                 payload: json!({ "amount": remaining_cash.to_string() }),
                                 occurred_at: now,
@@ -579,10 +587,43 @@ fn commit_limit_fill(
                         }
                         AccountRepository::delete_freeze(tx, &order_id)?;
                     } else {
-                        // 部分成交：扣减冻结至剩余 limit * remaining_qty + estimated_fee 比例
-                        let new_remaining_qty = updated_order.quantity.0 - updated_order.filled_quantity.0;
-                        let new_frozen = order.limit_price.map(|p| p.0).unwrap_or(Decimal::ZERO)
-                            * Decimal::from(new_remaining_qty);
+                        // 部分成交：新冻结 = limit_price × remaining_qty + 估算 fees for remainder。
+                        let new_remaining_qty =
+                            updated_order.quantity.0 - updated_order.filled_quantity.0;
+                        let est_commission_remain = compute_commission(
+                            Price(limit_price_dec),
+                            Shares(new_remaining_qty),
+                            &deps.fee_policy,
+                        );
+                        let est_transfer_remain = compute_transfer_fee(
+                            Price(limit_price_dec),
+                            Shares(new_remaining_qty),
+                            &deps.fee_policy,
+                            &order.ts_code,
+                            category,
+                        );
+                        let new_frozen = limit_price_dec * Decimal::from(new_remaining_qty)
+                            + est_commission_remain.0
+                            + est_transfer_remain.0;
+                        // 差额（旧冻结 - 实际占用 - 新冻结）= 必须释放的金额。
+                        let release_amount =
+                            (f.frozen_cash.0 - actual_use - new_frozen).max(Decimal::ZERO);
+                        if release_amount > Decimal::ZERO {
+                            let ev = AccountEvent {
+                                event_id: new_id("evt"),
+                                event_type: AccountEventType::CashReleased,
+                                order_id: Some(order_id.clone()),
+                                fill_id: Some(fill.fill_id.clone()),
+                                position_id: None,
+                                ts_code: Some(order.ts_code.clone()),
+                                reason: Some("limit partial fill: shrink freeze".into()),
+                                actor: AccountActor::System.as_str().into(),
+                                payload: json!({ "amount": release_amount.to_string() }),
+                                occurred_at: now,
+                            };
+                            AccountRepository::append_event(tx, &ev)?;
+                            event_ids.push(ev.event_id);
+                        }
                         AccountRepository::upsert_freeze(
                             tx,
                             &FreezeEntry {
