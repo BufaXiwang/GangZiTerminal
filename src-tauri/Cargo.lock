@@ -1328,11 +1328,13 @@ name = "gangzi-terminal"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "byteorder",
  "chrono",
  "chrono-tz",
  "ego-tree",
  "encoding_rs",
  "feed-rs",
+ "flate2",
  "futures-util",
  "regex",
  "reqwest 0.12.28",
@@ -1349,7 +1351,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-specta",
- "tdx",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4878,16 +4879,6 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.2+spec-1.1.0",
-]
-
-[[package]]
-name = "tdx"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "encoding_rs",
- "flate2",
- "thiserror 2.0.18",
 ]
 
 [[package]]

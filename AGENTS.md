@@ -76,7 +76,7 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 | Schema 迁移 | **`rusqlite_migration`**（推荐）或 `refinery` | 一个改动一个 `.sql`，启动自动 apply |
 | Rust↔TS 类型同步 | **`tauri-specta` + `specta`** | Rust 注解 → 自动生成 TS 函数 + 类型，编译期类型安全 |
 | 前端状态 | **zustand** | UI state（panel / scroll / hover）。不要 Redux |
-| 行情协议 | **`crates/tdx`** | 独立 crate，纯协议层，零项目依赖 |
+| 行情协议 | **`infrastructure/quotes/tdx`** | TDX 协议子模块（pytdx / mootdx wire compatible） |
 
 ---
 
@@ -97,7 +97,7 @@ domain/          纯类型 + 规则（无 I/O、无 Tauri、无 SQLite、无网�
 为什么 4 层不是 3 层：同一个 use case（例如 `refresh_news`）会被 Tauri command、Agent tool、scheduler 三种入口触发；把 adapters 单独拉出来，`pipeline/` 里的 use case 不用关心自己被谁调用，每种入口写一层薄 adapter 即可。
 
 **铁律**：
-- `domain/` **不允许** `use tauri | rusqlite | reqwest | tdx | infrastructure | pipeline | adapters`
+- `domain/` **不允许** `use tauri | rusqlite | reqwest | byteorder | flate2 | infrastructure | pipeline | adapters`
 - `infrastructure/` **不允许** `use pipeline | adapters`
 - `pipeline/` **不允许** `use adapters`
 - 跨 BC 反向依赖：以 `docs/design/architecture.md` 为准
@@ -106,13 +106,14 @@ domain/          纯类型 + 规则（无 I/O、无 Tauri、无 SQLite、无网�
 
 **以 `docs/design/architecture.md` 和各 `*-module.md` 为准。** 本文件不复述 BC 划分——避免和 spec 不同步。
 
-### TDX crate 边界
+### TDX 协议子模块
 
-- **`src-tauri/crates/tdx/`**：协议层，纯净，不依赖项目任何代码
-  - 暴露 `TdxHqClient` / 原始 `Bar` / `SecurityQuote` / `Market` 等
-  - 改动这个 crate 等同于改"外部依赖"——只在协议层有 bug / 缺能力时动
-- **项目内 provider adapter（位于 `infrastructure/quotes/`）**：把 crate 原始类型翻译成 domain 类型
-  - 处理：ts_code ↔ Market、北交所 fallback、ohlcv → `Yuan`/`Volume`、连接复用 / 失败重连、async wrapper（`spawn_blocking`）
+- **`src-tauri/src/infrastructure/quotes/tdx/`**：TDX HQ 二进制协议层
+  - 暴露 `TdxHqClient` / 原始 `Bar` / `SecurityQuote` / `TdxMarket` 等
+  - 内部只依赖 `byteorder` / `flate2` / `encoding_rs` / `thiserror`，不引用项目其他代码
+  - 改动等同于改"外部依赖"——只在协议层有 bug / 缺能力时动
+- **项目内 provider adapter（位于 `infrastructure/quotes/` 同目录下其他文件）**：把协议原始类型翻译成 domain 类型
+  - 处理：ts_code ↔ TdxMarket、北交所 fallback、ohlcv → `Money`/`Price`/`Volume`、连接复用 / 失败重连、async wrapper（`spawn_blocking`）
   - 这一层归 `infrastructure` 层管，遵守 spec
 
 ---
@@ -145,8 +146,6 @@ npm run tauri dev                                   # 开发联调
 npm run tauri build                                 # 打包
 cargo check --manifest-path src-tauri/Cargo.toml    # rust check
 cargo test  --manifest-path src-tauri/Cargo.toml    # rust tests
-cargo check -p tdx                                  # tdx crate 独立验证
-cargo test  -p tdx
 ```
 
 ---
@@ -160,7 +159,7 @@ cargo test  -p tdx
 grep -rE "use crate::adapters"        src-tauri/src/{domain,infrastructure,pipeline}
 grep -rE "use crate::pipeline"        src-tauri/src/{domain,infrastructure}
 grep -rE "use crate::infrastructure"  src-tauri/src/domain
-grep -rE "use (tauri|rusqlite|reqwest|tdx)" src-tauri/src/domain
+grep -rE "use (tauri|rusqlite|reqwest|byteorder|flate2)" src-tauri/src/domain
 
 # 2. spec 锚点自检：新增 / 改动的模块文件顶部有没有 `// Spec: ...` 注释
 

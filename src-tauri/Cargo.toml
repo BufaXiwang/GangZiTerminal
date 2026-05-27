@@ -1,6 +1,3 @@
-[workspace]
-members = [".", "crates/tdx"]
-
 [package]
 name = "gangzi-terminal"
 version = "0.1.0"
@@ -59,8 +56,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
-# TDX 协议（独立 crate，参考 mootdx / pytdx）
-tdx = { path = "crates/tdx" }
+# TDX 协议子模块（原独立 crate，已并入 infrastructure/quotes/tdx）
+# 需要这两个依赖支持协议层（byteorder 解二进制 / flate2 解 gzip 响应）。
+byteorder = "1.5"
+flate2 = "1.0"
 
 # === news deps ===
 # SHA-256 for stable ID hashing (news-module.md §2)
