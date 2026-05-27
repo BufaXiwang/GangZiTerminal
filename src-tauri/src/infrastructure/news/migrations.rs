@@ -6,7 +6,7 @@
 //!
 //! 真源表：
 //! - `news_items`            — `NewsItem` 主记录（spec §2）
-//! - `article_contents`      — `ArticleContent`，按 canonical URL 主键（spec §2）
+//! - `news_articles`         — `ArticleContent`，按 canonical URL 主键（spec §2）
 //! - `news_sources`          — `NewsSource` 配置 + 健康状态（spec §2）
 //!
 //! 读模型表：
@@ -44,8 +44,8 @@ CREATE INDEX idx_news_items_source_published_at
 CREATE INDEX idx_news_items_url
     ON news_items (url) WHERE url IS NOT NULL;
 
--- article_contents: ArticleContent，按 canonical URL 去重
-CREATE TABLE article_contents (
+-- news_articles: ArticleContent，按 canonical URL 去重
+CREATE TABLE news_articles (
     url             TEXT PRIMARY KEY,
     first_news_id   TEXT,
     title           TEXT,
@@ -105,5 +105,50 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// Spec / AGENTS.md 表前缀约定：News BC 所有表必须以 `news_` 前缀，FTS 虚表也算。
+    /// `article_contents` 是 B2 修复前的命名漂移，必须保持已重命名为 `news_articles`。
+    #[test]
+    fn all_news_tables_use_news_prefix() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn, migrations()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type IN ('table', 'view')
+                   AND name NOT LIKE 'sqlite_%'
+                   AND name NOT LIKE '%_segments'
+                   AND name NOT LIKE '%_segdir'
+                   AND name NOT LIKE '%_data'
+                   AND name NOT LIKE '%_idx'
+                   AND name NOT LIKE '%_docsize'
+                   AND name NOT LIKE '%_content'
+                   AND name NOT LIKE '%_config'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for name in &rows {
+            assert!(
+                name.starts_with("news_"),
+                "News BC table without news_ prefix: {}",
+                name
+            );
+        }
+        // 必须包含 news_articles（旧名 article_contents 不允许）
+        assert!(
+            rows.iter().any(|n| n == "news_articles"),
+            "news_articles table missing; got: {:?}",
+            rows
+        );
+        assert!(
+            !rows.iter().any(|n| n == "article_contents"),
+            "legacy table name article_contents should be removed"
+        );
     }
 }

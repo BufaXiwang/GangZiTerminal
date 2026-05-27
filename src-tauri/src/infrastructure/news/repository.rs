@@ -4,8 +4,8 @@
 //!
 //! 责任：
 //! - upsert `news_items`（同 ID 冲突时更新 `updated_at` + `payload`；判定是否字段变化）
-//! - upsert `article_contents`（按 canonical URL 主键；正文变化同步 FTS）
-//! - 维护 `news_search_fts` 与 `news_items` / `article_contents` 的一致性
+//! - upsert `news_articles`（按 canonical URL 主键；正文变化同步 FTS）
+//! - 维护 `news_search_fts` 与 `news_items` / `news_articles` 的一致性
 //! - 根据 `FetchNewsRequest` 拼装查询（按 spec §4 规则）
 //! - 不做 provider 调用，不做 normalize；只接受 domain 类型 / canonical URL
 
@@ -103,7 +103,7 @@ impl<'a> NewsRepository<'a> {
         self.db.with(|conn| {
             conn.query_row(
                 "SELECT url, first_news_id, title, content, payload_json, fetched_at, warning
-                 FROM article_contents WHERE url = ?1",
+                 FROM news_articles WHERE url = ?1",
                 [canonical_url],
                 row_to_article,
             )
@@ -385,7 +385,7 @@ fn upsert_article_in_tx(
 ) -> rusqlite::Result<RepoArticleUpsertOutcome> {
     let existing_content: Option<Option<String>> = tx
         .query_row(
-            "SELECT content FROM article_contents WHERE url = ?1",
+            "SELECT content FROM news_articles WHERE url = ?1",
             [&article.url],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -396,10 +396,10 @@ fn upsert_article_in_tx(
     let warning_s = article.warning.map(serde_plain_warning);
 
     tx.execute(
-        "INSERT INTO article_contents (url, first_news_id, title, content, payload_json, fetched_at, warning)
+        "INSERT INTO news_articles (url, first_news_id, title, content, payload_json, fetched_at, warning)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(url) DO UPDATE SET
-            first_news_id = COALESCE(article_contents.first_news_id, excluded.first_news_id),
+            first_news_id = COALESCE(news_articles.first_news_id, excluded.first_news_id),
             title = excluded.title,
             content = excluded.content,
             payload_json = excluded.payload_json,
@@ -465,11 +465,11 @@ fn sync_fts_item(
             params![news_id, title, summary.unwrap_or("")],
         )?;
     } else {
-        // article 列：如果该 url 已有 article_contents.content，预填；否则空。
+        // article 列：如果该 url 已有 news_articles.content，预填；否则空。
         let article_text: String = tx
             .query_row(
                 "SELECT COALESCE(ac.content, '')
-                 FROM news_items ni LEFT JOIN article_contents ac ON ac.url = ni.url
+                 FROM news_items ni LEFT JOIN news_articles ac ON ac.url = ni.url
                  WHERE ni.id = ?1",
                 [news_id],
                 |r| r.get::<_, String>(0),

@@ -799,7 +799,7 @@ mod tests {
     /// 走 service warm 的 failure-push 分支，断言 NewsFailure 的字段。
     ///
     /// 由于 service 内联使用 article_extractor，模拟方式：直接把一个失败缓存 ArticleContent
-    /// 写到 article_contents 表中，使非 force warm 跳过；然后用 force=true 触发抽取，
+    /// 写到 news_articles 表中，使非 force warm 跳过；然后用 force=true 触发抽取，
     /// 但 URL 是不可达的 example.invalid → extractor 返回 Network failure。
     #[tokio::test]
     async fn warm_articles_article_failure_uses_extract_failed_code() {
