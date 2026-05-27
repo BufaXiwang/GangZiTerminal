@@ -609,28 +609,36 @@ fn list_news_items_impl(
     Ok(ListResult { items, total })
 }
 
-fn normalize_query_text(q: &str) -> String {
-    // trim + 折叠连续空白（spec §4）
+/// Normalize 用户传入的 `query`，输出 FTS5 MATCH 表达式。
+///
+/// Spec: news-module.md §4 lines 265-266
+/// - trim、折叠连续空白
+/// - **英文大小写不敏感**：FTS5 unicode61 tokenizer 默认大小写折叠，这里再保险一次
+///   把 ASCII 字母转小写，避免任何上游 tokenizer 配置漂移导致大小写敏感泄漏。
+///   中文按 tokenizer 规则处理（unicode61 已折叠 NFC + casefold）。
+/// - **FTS5 特殊字符 strip**：避免调用方传入 `"`、`+`、`-`、`*`、`(`、`)`、`:` 等被当成
+///   FTS5 运算符执行（spec §4 line 266：多词 query 的 AND / OR / phrase 行为由 News FTS
+///   读模型统一定义，不能由调用方各自解释）。`-` 在 FTS5 中是 NOT/列限定符，`_` 是 token
+///   分隔符之一，统一作为 token 分隔符处理 —— 只保留 unicode 字母数字。
+/// - 多个非空 token 之间以空格分隔（FTS5 默认 AND 语义）。
+/// - 返回空串表示"无可执行 query"，调用方按"无 query"路径处理。
+pub(crate) fn normalize_query_text(q: &str) -> String {
     let mut out = String::with_capacity(q.len());
-    let mut last_ws = false;
+    let mut last_ws_or_empty = true;
     for ch in q.chars() {
-        if ch.is_whitespace() {
-            if !last_ws && !out.is_empty() {
-                out.push(' ');
-            }
-            last_ws = true;
-        } else {
-            // FTS5 special chars 转义为短语形式比较繁琐；这里用最简单的做法：
-            // 把单词拼成 `"w1" "w2"` 短语形式，FTS5 默认 AND；
-            // 但为了避免引号嵌入注入，只保留中英文数字
-            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
-                out.push(ch);
-            } else if ch == '"' {
-                // 跳过引号
+        if ch.is_alphanumeric() {
+            if ch.is_ascii_uppercase() {
+                out.push(ch.to_ascii_lowercase());
             } else {
                 out.push(ch);
             }
-            last_ws = false;
+            last_ws_or_empty = false;
+        } else {
+            // 空白、FTS5 特殊字符、其他标点统一作为 token 分隔
+            if !last_ws_or_empty {
+                out.push(' ');
+                last_ws_or_empty = true;
+            }
         }
     }
     if out.ends_with(' ') {
@@ -807,6 +815,100 @@ mod tests {
             .unwrap();
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].id, "id-a");
+    }
+
+    /// Spec §4 line 265：query 英文大小写不敏感。
+    /// B4 修复前 normalize_query_text 不做大小写折叠，依赖 FTS unicode61 tokenizer
+    /// 隐式 casefold —— 一旦上游 tokenizer 配置改动会立刻泄漏。
+    #[test]
+    fn query_is_case_insensitive_for_ascii() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+        let mut a = sample_item("id-case", "rss:x", None);
+        a.title = "gangzi quant terminal".to_string();
+        repo.upsert_news_item(&a).unwrap();
+        // 全大写 + 单引号 quote 应能命中（normalize 折叠为 lowercase）
+        let r = repo
+            .list_news_items(None, None, None, Some("GANGZI"), 50, 0)
+            .unwrap();
+        assert_eq!(r.items.len(), 1, "uppercase GANGZI should match lowercase title");
+        // 混合大小写
+        let r2 = repo
+            .list_news_items(None, None, None, Some("Quant"), 50, 0)
+            .unwrap();
+        assert_eq!(r2.items.len(), 1, "mixed-case Quant should match lowercase title");
+    }
+
+    /// Spec §4 line 266：多词 query 的 AND / OR / phrase 行为由 News FTS 读模型统一定义，
+    /// 不能由调用方各自解释。FTS5 特殊字符必须 strip 掉，避免 query 注入 FTS 运算符。
+    /// B5 修复前 normalize 把这些字符原样塞进 MATCH 表达式，会触发 FTS5 语法错误或被
+    /// 当成 phrase / NEAR / column-filter 运算符。
+    /// Spec §4 line 266：FTS5 特殊字符必须 strip 掉，避免 query 注入 FTS 运算符。
+    /// B5 修复前 normalize 把这些字符原样塞进 MATCH 表达式，会触发 FTS5 语法错误或被
+    /// 当成 phrase / NEAR / column-filter 运算符。
+    /// 本测试关注 **不抛 SQL 错误**；命中语义由 normalize 后剩余的 token 决定。
+    #[test]
+    fn query_strips_fts5_special_chars_and_does_not_error() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+        let mut a = sample_item("id-special", "rss:x", None);
+        a.title = "abc widgets".to_string();
+        a.summary = Some("brief".to_string());
+        repo.upsert_news_item(&a).unwrap();
+        // 这些 query 在 B5 修复前会被 FTS5 解读为运算符并抛 syntax error / unknown column。
+        for q in [
+            "abc + widgets",
+            "abc - widgets",
+            "abc * widgets",
+            "\"abc widgets\"",
+            "(abc widgets)",
+            "abc:widgets",
+            "title:abc",
+            "abc OR widgets",
+            "abc AND widgets",
+            "abc NOT widgets",
+        ] {
+            let r = repo
+                .list_news_items(None, None, None, Some(q), 50, 0)
+                .expect(&format!("query `{}` must not raise SQL error", q));
+            // 仅断言不报错；命中结果集对每个 q 不同
+            let _ = r;
+        }
+        // 显式断言：normalize 之后只剩 `abc widgets` 的 query 必须命中
+        let r = repo
+            .list_news_items(None, None, None, Some("\"abc widgets\""), 50, 0)
+            .unwrap();
+        assert_eq!(r.items.len(), 1, "stripped quotes still match by AND");
+    }
+
+    /// Spec §4：query 仅空白 / 仅特殊字符 → 视为无 query（不应触发 FTS MATCH 引发错误）。
+    #[test]
+    fn query_only_special_chars_treated_as_empty() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+        let mut a = sample_item("id-x", "rss:x", None);
+        a.title = "hello".to_string();
+        repo.upsert_news_item(&a).unwrap();
+        // 仅特殊字符 normalize 为空字符串 → 等价于无 query，应返回所有
+        let r = repo
+            .list_news_items(None, None, None, Some(" + - * "), 50, 0)
+            .unwrap();
+        assert_eq!(r.items.len(), 1);
+    }
+
+    #[test]
+    fn normalize_query_text_unit() {
+        assert_eq!(normalize_query_text("  Hello   World  "), "hello world");
+        assert_eq!(normalize_query_text("ABC+DEF"), "abc def");
+        assert_eq!(normalize_query_text("\"phrase\""), "phrase");
+        assert_eq!(normalize_query_text("a:b"), "a b");
+        assert_eq!(normalize_query_text(" +-* "), "");
+        // 中文透传（unicode61 internal casefold 仍然走）
+        assert_eq!(normalize_query_text("中文 测试"), "中文 测试");
+        // `-` 和 `_` 视为 token 分隔（FTS5 特殊字符 / token 分隔符）
+        assert_eq!(normalize_query_text("rss-news_now"), "rss news now");
+        // 多种空白折叠
+        assert_eq!(normalize_query_text("a\t\nb"), "a b");
     }
 
     #[test]
