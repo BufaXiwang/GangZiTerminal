@@ -3758,6 +3758,19 @@ mod tests {
         let lots = repo.list_lots_by_position(&pos_id).unwrap();
         assert_eq!(lots.len(), 1);
         assert_eq!(lots[0].quantity.0, 300);
+
+        // Spec §2 line 169-170: market partially_filled 是终态。
+        // 不应计入 pending_order_count / 不应被 list_active_orders 返回。
+        let snap = svc.snapshot_or_default();
+        assert_eq!(
+            snap.pending_order_count, 0,
+            "market partially_filled is terminal; must not be counted as pending"
+        );
+        let active = repo.list_active_orders().unwrap();
+        assert!(
+            active.iter().all(|o| o.order_id != order_id),
+            "market partially_filled order must not appear in list_active_orders"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -322,12 +322,31 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    /// 列出仍需调度评估的活跃订单。
+    ///
+    /// Spec: account-module.md §2 订单模型 line 168-170:
+    ///   - market `partially_filled` 是终态（剩余量已同事务自动取消）。
+    ///   - limit `partially_filled` 是中间态（剩余仍 pending）。
+    ///
+    /// 因此 evaluate_account_triggers 只需要扫描：
+    ///   - status = 'pending'（所有 limit pending，期望成交 / 过期）
+    ///   - status = 'partially_filled' AND order_type = 'limit'（剩余量继续撮合）
     pub fn list_active_orders(&self) -> rusqlite::Result<Vec<Order>> {
-        self.list_orders(
-            Some(&[OrderStatus::Pending, OrderStatus::PartiallyFilled]),
-            10_000,
-            0,
-        )
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
+                        filled_quantity, status, intent, position_id, reason,
+                        created_at, updated_at, expires_at
+                 FROM account_orders
+                 WHERE status = 'pending'
+                    OR (status = 'partially_filled' AND order_type = 'limit')
+                 ORDER BY updated_at ASC, order_id ASC",
+            )?;
+            let rows = stmt
+                .query_map([], Self::map_order_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
     }
 
     /// 查找指定 ts_code 的未终态 `open_position` 订单（pending / partially_filled）。
@@ -338,6 +357,9 @@ impl<'a> AccountRepository<'a> {
         &self,
         ts_code: &TsCode,
     ) -> rusqlite::Result<Option<Order>> {
+        // Spec §2 line 320: 只 limit pending / partially_filled 算未终态；
+        // market 订单的 partially_filled 已是终态（剩余量同事务自动取消），
+        // 不应该用来阻止第二次 open_position（也不会，因为 position 已生成会先撞墙）。
         self.db.with(|c| {
             c.query_row(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
@@ -345,6 +367,7 @@ impl<'a> AccountRepository<'a> {
                         created_at, updated_at, expires_at
                  FROM account_orders
                  WHERE ts_code = ? AND intent = 'open_position'
+                   AND order_type = 'limit'
                    AND status IN ('pending','partially_filled')
                  ORDER BY created_at ASC, order_id ASC
                  LIMIT 1",
@@ -355,10 +378,16 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    /// 计算未完成订单数。
+    ///
+    /// Spec: account-module.md §2 账户快照 pending_order_count = 未完成订单数。
+    /// market `partially_filled` 是终态（spec §2 订单模型 line 169-170），不能算"未完成"。
     pub fn count_pending_orders(&self) -> rusqlite::Result<u32> {
         self.db.with(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM account_orders WHERE status IN ('pending','partially_filled')",
+                "SELECT COUNT(*) FROM account_orders
+                 WHERE status = 'pending'
+                    OR (status = 'partially_filled' AND order_type = 'limit')",
                 [],
                 |r| r.get::<_, i64>(0).map(|n| n as u32),
             )
@@ -1050,7 +1079,8 @@ impl<'a> AccountRepository<'a> {
                         created_at, updated_at, expires_at
                  FROM account_orders
                  WHERE ts_code = ? AND side = 'buy'
-                   AND status IN ('pending','partially_filled')",
+                   AND (status = 'pending'
+                        OR (status = 'partially_filled' AND order_type = 'limit'))",
             )?;
             let rows = stmt
                 .query_map(params![ts_code.as_str()], Self::map_order_row)?
@@ -1059,6 +1089,13 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    /// 列出所有"活跃"买单 — 用于风控敞口计算。
+    ///
+    /// Spec: account-module.md §2 硬风控模型:
+    ///   "风控敞口必须包含 active buy orders 的剩余最大占用：pending / partially_filled
+    ///   买单按剩余数量和订单价格计入对应标的与总敞口"
+    /// 但 `partially_filled` market 单是终态（spec §2 line 169-170），剩余量已自动取消，
+    /// 不应该再计入风控敞口；只 limit partial 仍占用资金。
     pub fn list_all_active_buy_orders(&self) -> rusqlite::Result<Vec<Order>> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
@@ -1066,7 +1103,9 @@ impl<'a> AccountRepository<'a> {
                         filled_quantity, status, intent, position_id, reason,
                         created_at, updated_at, expires_at
                  FROM account_orders
-                 WHERE side = 'buy' AND status IN ('pending','partially_filled')",
+                 WHERE side = 'buy'
+                   AND (status = 'pending'
+                        OR (status = 'partially_filled' AND order_type = 'limit'))",
             )?;
             let rows = stmt
                 .query_map([], Self::map_order_row)?
