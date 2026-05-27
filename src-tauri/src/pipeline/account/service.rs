@@ -1877,6 +1877,16 @@ impl AccountService {
         if !order.status.is_active() {
             return self.reject_pre_event(ErrorCode::OrderNotPending, "order not pending");
         }
+        // Spec §2 line 168-170: market 订单的 partially_filled 是终态（剩余已自动取消），
+        // 不应再被显式撤销 — 用 OrderNotPending 反映该状态。
+        if matches!(order.order_type, OrderType::Market)
+            && matches!(order.status, OrderStatus::PartiallyFilled)
+        {
+            return self.reject_pre_event(
+                ErrorCode::OrderNotPending,
+                "market partially_filled is terminal; cannot cancel",
+            );
+        }
         let now = Utc::now();
         let prev_status = order.status;
         order.status = OrderStatus::Cancelled;
@@ -3781,6 +3791,18 @@ mod tests {
             active.iter().all(|o| o.order_id != order_id),
             "market partially_filled order must not appear in list_active_orders"
         );
+        // 显式 cancel market partially_filled → order_not_pending（终态不可撤）
+        let cancel_resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::CancelOrder {
+                    order_id: order_id.clone(),
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!cancel_resp.accepted);
+        assert_eq!(cancel_resp.reason, Some(ErrorCode::OrderNotPending));
     }
 
     // ------------------------------------------------------------------
