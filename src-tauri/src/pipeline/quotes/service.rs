@@ -892,7 +892,9 @@ impl QuotesService {
                         Ok(v) => v,
                         Err(e) => {
                             tracing::debug!(target: "quotes.refresh.kline", ts = ts.as_str(), error = %e, "tushare kline failed; try TDX");
-                            failed += 1;
+                            // spec §5 first-success-wins：TuShare 失败但 TDX fallback 成功 → 计入 success，
+                            // 不重复计入 failed；只有所有 provider 都失败才算 failed。
+                            let mut fallback_ok = false;
                             if let Some(bars) = self.tdx_daily_fallback(ts).await {
                                 if !bars.is_empty() {
                                     let _ = self.repo().upsert_daily_klines(
@@ -907,7 +909,11 @@ impl QuotesService {
                                         warnings.push(WarningCode::UsingUnadjustedKline);
                                     }
                                     success += 1;
+                                    fallback_ok = true;
                                 }
+                            }
+                            if !fallback_ok {
+                                failed += 1;
                             }
                             continue;
                         }
@@ -1916,6 +1922,29 @@ mod tests {
         assert_eq!(res.affected_ts_codes.len(), 1);
         // BJ + 无 token + 无 TDX → 全 failed
         assert_eq!(res.success + res.failed, res.total);
+    }
+
+    /// Q1 regression: 任何 path 都必须保持 total == success + failed.
+    /// 之前 bug：TuShare 失败 + TDX fallback 成功时同时计入 success 和 failed。
+    /// 这里走 no-token + BJ（TDX 不支持）path：每条记录恰好 failed，
+    /// 即使有多个 period 也只能是 N failed，不能出现重复计数。
+    #[tokio::test]
+    async fn refresh_klines_count_invariant_no_token_bj() {
+        let svc = make_service();
+        seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
+        let res = svc
+            .refresh_klines(
+                RefreshDataScope::Manual {
+                    ts_codes: vec![TsCode::parse("430047.BJ").unwrap()],
+                },
+                vec![KlinePeriod::Day, KlinePeriod::Week],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 2);
+        assert_eq!(res.success + res.failed, res.total,
+            "count invariant: success({}) + failed({}) must equal total({})",
+            res.success, res.failed, res.total);
     }
 
     #[tokio::test]

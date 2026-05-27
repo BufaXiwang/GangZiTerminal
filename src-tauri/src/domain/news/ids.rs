@@ -65,12 +65,12 @@ pub fn compute_stable_id(input: &IdInput<'_>) -> Option<String> {
         .summary
         .map(|s| normalize_text(s))
         .unwrap_or_default();
-    // Spec §2：参与 fingerprint 时按 UTC 秒级精度；但多数 provider 时间精度不稳定
-    // （秒级波动会让同一条新闻每次 refresh 生成新 ID），第一阶段保守地降到分钟级。
-    // adapter 可以在传入前自行 truncate，这里再 truncate 一次保证 idempotency。
+    // Spec §2 line 108：参与 fingerprint 时按 UTC 秒级精度。
+    // adapter 必须自行降到该 source 稳定精度或跳过该时间字段——本函数不做降级；
+    // 若 provider 二次返回精度变化，由 adapter 决定要不要塞 published_at。
     let published_norm = input
         .published_at
-        .map(|t| (t.timestamp() / 60 * 60).to_string())
+        .map(|t| t.timestamp().to_string())
         .unwrap_or_default();
 
     let buf = format!("{}\u{1f}{}\u{1f}{}", title_norm, published_norm, summary_norm);
@@ -142,6 +142,49 @@ mod tests {
             published_at: None,
         })
         .is_none());
+    }
+
+    #[test]
+    fn fingerprint_uses_utc_second_precision() {
+        use chrono::TimeZone;
+        // 同一秒 → 同 ID；秒级差异 → 不同 ID（spec §2 line 108：UTC 秒级精度）
+        let t1 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let t2 = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 30)
+            .unwrap()
+            .with_timezone(&Utc);
+        let t3 = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 31).unwrap();
+
+        let id1 = compute_stable_id(&IdInput {
+            source: "rss:x",
+            canonical_url: None,
+            provider_item_id: None,
+            title: Some("hello"),
+            summary: None,
+            published_at: Some(t1),
+        })
+        .unwrap();
+        let id2 = compute_stable_id(&IdInput {
+            source: "rss:x",
+            canonical_url: None,
+            provider_item_id: None,
+            title: Some("hello"),
+            summary: None,
+            published_at: Some(t2),
+        })
+        .unwrap();
+        let id3 = compute_stable_id(&IdInput {
+            source: "rss:x",
+            canonical_url: None,
+            provider_item_id: None,
+            title: Some("hello"),
+            summary: None,
+            published_at: Some(t3),
+        })
+        .unwrap();
+
+        assert_eq!(id1, id2, "same UTC second → same id");
+        assert_ne!(id1, id3, "different UTC second → different id");
     }
 
     #[test]
