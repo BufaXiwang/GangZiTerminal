@@ -499,16 +499,48 @@ fn list_news_items_impl(
     limit: u32,
     offset: u32,
 ) -> rusqlite::Result<ListResult> {
-    let mut where_clauses: Vec<String> = Vec::new();
-    let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+    // 每个 (clause, binds) 一起 push，保证 SQL placeholder 顺序与 binds 顺序严格对齐。
+    // Spec: news-module.md §4 fetch_news（query / sources / 时间范围按 AND 组合）。
+    //
+    // 历史 bug 修复（B1）：原实现把 query bind push 在 binds 末尾，但 SQL 把 `fts MATCH ?`
+    // 放在 WHERE 第一个，导致 sources / from / to 与 query 同时使用时绑定顺序错位。
+    type ClauseBinds = (String, Vec<rusqlite::types::Value>);
+    let mut where_parts: Vec<ClauseBinds> = Vec::new();
 
+    // -- FTS MATCH 必须在 SQL 中第一位（FROM ... INNER JOIN fts WHERE fts MATCH ?）
+    let has_query = query
+        .map(|q| !normalize_query_text(q).is_empty())
+        .unwrap_or(false);
+
+    let (from_table_sql, order_sql) = if has_query {
+        let q_norm = normalize_query_text(query.unwrap());
+        where_parts.push((
+            "fts.news_search_fts MATCH ?".to_string(),
+            vec![rusqlite::types::Value::Text(q_norm)],
+        ));
+        (
+            "FROM news_items ni
+             INNER JOIN news_search_fts fts ON fts.news_id = ni.id"
+                .to_string(),
+            "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string(),
+        )
+    } else {
+        (
+            "FROM news_items ni".to_string(),
+            "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
+                .to_string(),
+        )
+    };
+
+    // -- sources / from / to —— 顺序无关，按 AND 组合
     if let Some(srcs) = sources {
         if !srcs.is_empty() {
             let marks: Vec<String> = (0..srcs.len()).map(|_| "?".to_string()).collect();
-            where_clauses.push(format!("ni.source IN ({})", marks.join(",")));
-            for s in srcs {
-                binds.push(rusqlite::types::Value::Text(s.clone()));
-            }
+            let binds: Vec<rusqlite::types::Value> = srcs
+                .iter()
+                .map(|s| rusqlite::types::Value::Text(s.clone()))
+                .collect();
+            where_parts.push((format!("ni.source IN ({})", marks.join(",")), binds));
         } else {
             // empty sources list 过滤等价于不命中
             return Ok(ListResult {
@@ -519,47 +551,37 @@ fn list_news_items_impl(
     }
 
     if let Some(from) = published_from {
-        where_clauses.push("(ni.published_at IS NOT NULL AND ni.published_at >= ?)".to_string());
-        binds.push(rusqlite::types::Value::Text(format_dt(from)));
+        where_parts.push((
+            "(ni.published_at IS NOT NULL AND ni.published_at >= ?)".to_string(),
+            vec![rusqlite::types::Value::Text(format_dt(from))],
+        ));
     }
     if let Some(to) = published_to {
-        where_clauses.push("(ni.published_at IS NOT NULL AND ni.published_at <= ?)".to_string());
-        binds.push(rusqlite::types::Value::Text(format_dt(to)));
+        where_parts.push((
+            "(ni.published_at IS NOT NULL AND ni.published_at <= ?)".to_string(),
+            vec![rusqlite::types::Value::Text(format_dt(to))],
+        ));
     }
 
-    let has_query = query
-        .map(|q| !normalize_query_text(q).is_empty())
-        .unwrap_or(false);
-
-    let (mut from_sql, order_sql) = if has_query {
-        // FTS join
-        let q_norm = normalize_query_text(query.unwrap());
-        binds.push(rusqlite::types::Value::Text(q_norm));
-        (
-            "FROM news_items ni
-             INNER JOIN news_search_fts fts ON fts.news_id = ni.id
-             WHERE fts.news_search_fts MATCH ?".to_string(),
-            "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string(),
-        )
-    } else {
-        (
-            "FROM news_items ni WHERE 1=1".to_string(),
-            "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
-                .to_string(),
-        )
-    };
-
-    for w in &where_clauses {
-        from_sql.push_str(" AND ");
-        from_sql.push_str(w);
+    // -- 组装 WHERE 子句 + binds，严格 lockstep
+    let mut where_sql = String::new();
+    let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+    for (i, (clause, part_binds)) in where_parts.iter().enumerate() {
+        where_sql.push_str(if i == 0 { " WHERE " } else { " AND " });
+        where_sql.push_str(clause);
+        binds.extend(part_binds.iter().cloned());
+    }
+    if where_sql.is_empty() {
+        where_sql = " WHERE 1=1".to_string();
     }
 
-    let count_sql = format!("SELECT COUNT(*) {}", from_sql);
+    let from_with_where = format!("{}{}", from_table_sql, where_sql);
+    let count_sql = format!("SELECT COUNT(*) {}", from_with_where);
     let select_sql = format!(
         "SELECT ni.id, ni.source, ni.title, ni.summary, ni.url, ni.published_at,
                 ni.payload_json, ni.created_at, ni.updated_at
          {} {} LIMIT ? OFFSET ?",
-        from_sql, order_sql
+        from_with_where, order_sql
     );
 
     let total: u32 = {
