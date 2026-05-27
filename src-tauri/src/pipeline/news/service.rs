@@ -506,11 +506,14 @@ impl NewsService {
             // 即使失败也写缓存（spec §抑制短期重试）
             match repo.upsert_article_content(&out.article) {
                 Ok(RepoArticleUpsertOutcome::Updated { affected_news_ids }) => {
+                    // Spec §5: 仅在"成功写入或更新 ArticleContent"时计入 articleUpdatedCount
+                    // 与 articleUpdatedNewsIds——失败缓存（content=None）首次写入不算成功。
+                    // 两个字段必须 lockstep 同进同退。
                     if out.article.content.is_some() {
                         article_updated_count += 1;
-                    }
-                    for id in affected_news_ids {
-                        updated_ids.insert(id);
+                        for id in affected_news_ids {
+                            updated_ids.insert(id);
+                        }
                     }
                 }
                 Ok(RepoArticleUpsertOutcome::Unchanged) => {}
@@ -833,5 +836,55 @@ mod tests {
             }
             WarmArticlesResponse::Err(e) => panic!("unexpected err: {:?}", e.error.code),
         }
+    }
+
+    /// Spec §5: 失败缓存（content=None）首次写入 `news_articles` 时,
+    /// `articleUpdatedCount` 与 `articleUpdatedNewsIds` 必须严格 lockstep —
+    /// 两者都为空/零，绝不能出现 "ids 非空但 count = 0" 的字段间漂移。
+    ///
+    /// 构造方法：用一个 URL 但抓取必然失败（example.invalid），warm 路径会写入失败缓存
+    /// （content=None），repository 返回 `Updated{affected_news_ids}` 但 service 必须不把
+    /// 这些 id 计入 `updated_ids`，也不递增 `article_updated_count`。
+    #[tokio::test]
+    async fn warm_articles_failure_cache_does_not_leak_into_article_updated_ids() {
+        let svc = setup_service();
+        let url = "http://news-bc-test-lockstep.invalid/article";
+        insert_item(&svc, "id-lockstep", "rss:sample", "lockstep title", Some(url));
+
+        let emitted: Arc<Mutex<Vec<NewsRefreshedPayload>>> = Arc::new(Mutex::new(vec![]));
+        let captured = Arc::clone(&emitted);
+        svc.set_event_sink(Arc::new(move |p| {
+            captured.lock().unwrap().push(p);
+        }));
+
+        let resp = svc
+            .warm_articles(WarmArticlesRequest {
+                news_ids: Some(vec!["id-lockstep".to_string()]),
+                force: Some(true),
+                ..Default::default()
+            })
+            .await;
+        match resp {
+            WarmArticlesResponse::Ok(ok) => {
+                // 失败缓存写入成功，但不算 article-update：两字段严格 lockstep。
+                assert_eq!(
+                    ok.result.article_updated_count, 0,
+                    "failure cache must not increment article_updated_count"
+                );
+                assert!(
+                    ok.result.article_updated_news_ids.is_empty(),
+                    "failure cache must not populate article_updated_news_ids, got {:?}",
+                    ok.result.article_updated_news_ids
+                );
+                // 同时确认 attempted 已计数且 failure 已产生（确实走到写缓存分支）。
+                assert!(!ok.result.failures.is_empty(), "expected article failure");
+            }
+            WarmArticlesResponse::Err(e) => panic!("unexpected err: {:?}", e.error.code),
+        }
+        // articleUpdatedCount = 0 → 不 emit news-refreshed（spec §5）。
+        assert!(
+            emitted.lock().unwrap().is_empty(),
+            "no emit when article_updated_count=0"
+        );
     }
 }
