@@ -1407,16 +1407,15 @@ impl AccountService {
                     trigger_ids.push(trig.trigger_id.clone());
                 }
             }
+            // 8) 同事务内更新 meta.cash — 保证派生缓存与事件源原子一致。
+            // Spec §3 line 70: "所有账户状态变化必须先写 account_events，再更新派生".
+            AccountRepository::update_cash_in_tx(tx, new_cash, now)?;
             Ok(())
         });
         if result.is_err() {
             return self.reject_pre_event(ErrorCode::DbError, "tx failure");
         }
-
         order.updated_at = now;
-        if repo.update_cash(new_cash, now).is_err() {
-            // 事件是真源；下次 rebuild_snapshot 可重算。
-        }
 
         let snapshot = self.snapshot_or_default();
 

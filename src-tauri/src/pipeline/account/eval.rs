@@ -711,13 +711,14 @@ fn commit_limit_fill(
                 trigger = Some(trig);
             }
         }
+        // 同事务内更新 meta.cash — 保证派生缓存与事件源原子一致。
+        // Spec §3 line 70: "所有账户状态变化必须先写 account_events，再更新派生".
+        AccountRepository::update_cash_in_tx(tx, Money(meta.cash.0 + cash_delta), now)?;
         Ok(())
     });
     if result.is_err() {
         return None;
     }
-    // Update cash
-    let _ = repo.update_cash(Money(meta.cash.0 + cash_delta), now);
     Some((trigger, event_ids))
 }
 

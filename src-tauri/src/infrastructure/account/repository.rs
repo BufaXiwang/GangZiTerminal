@@ -125,6 +125,19 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    /// 同事务内更新 cash。
+    ///
+    /// Spec: account-module.md §3 数据流: "所有状态变化必须先写 account_events,
+    /// 再更新 / 派生订单, 仓位, snapshot"。`meta.cash` 是派生缓存，与 fill 事件
+    /// 必须原子更新；否则 tx 提交后 update_cash 失败会让缓存与事件源不一致。
+    pub fn update_cash_in_tx(tx: &Transaction<'_>, cash: Money, now: OccurredAt) -> rusqlite::Result<()> {
+        tx.execute(
+            "UPDATE account_meta SET cash = ?, updated_at = ? WHERE id = 1",
+            params![cash.0.to_string(), now.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Event append + sequence
     // ------------------------------------------------------------------
