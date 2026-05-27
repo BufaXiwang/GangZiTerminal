@@ -160,9 +160,9 @@ pub fn run() {
             }
 
             // -- Agent Infra bootstrap（Phase 1）
-            // Spec: docs/design/agent-infra-module.md §5（ToolRegistry / 持久化）。
-            // Runtime（Phase 3）会通过 `AgentInfra.registry.register_tool(...)` 注入
-            // Quotes / News / Account facade 工具，并新增 run_agent / send_user_message command。
+            // Spec: docs/design/agent-infra-module.md §5（SkillRegistry / 持久化）。
+            // Runtime（Phase 3）会通过 `AgentInfra.registry.register_skill(...)` 注入
+            // Quotes / News / Account facade skill，并新增 run_agent / send_user_message command。
             let agent_infra = bootstrap_agent_infra(db.clone());
             app.manage(agent_infra);
 

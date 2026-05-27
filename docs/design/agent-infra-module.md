@@ -427,6 +427,8 @@ Runtime builds AgentRunRequest
 - Stream 解析必须**实时**（不等整个 turn 结束）：用户能从 UI 看到 LLM 思考 + skill 调用进度。
 - 同一 turn 内多个 `<use_skill>` 按出现顺序**串行** dispatch；不并行（保证 LLM 看到的 skill_result 顺序与发出顺序一致）。
 
+**ProviderStream 实现归属**：Agent Infra 定义 `ProviderStream` trait（接 canonical request、产 stream of chunks）。HTTP + SSE 实现（reqwest 调 Anthropic / OpenAI、解 SSE event、转 stop_reason、聚合 usage）归 Agent Runtime 在 Phase 3 实现，因为它涉及 Runtime 的 `ProviderChannel` 选择 / 鉴权 / retry 策略。Infra 自带一个用于测试的 `ScriptedProvider`，能让 loop_executor 测试无网络运行。
+
 ---
 
 ## 4. 上下文管理
