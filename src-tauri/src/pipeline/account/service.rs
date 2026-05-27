@@ -737,6 +737,9 @@ impl AccountService {
     // ====================================================================
 
     pub fn rebuild_account_snapshot(&self) -> Result<AccountSnapshot, ErrorCode> {
+        // Spec §3 line 714: 所有写操作串行化。snapshot_rebuilt 是写事件，
+        // 必须握 write_lock 以避免与其他写操作竞争。
+        let _g = self.write_lock.lock().unwrap();
         let repo = AccountRepository::new(&self.db);
         let now = Utc::now();
         let r = rebuild_snapshot(SnapshotBuildInput {
