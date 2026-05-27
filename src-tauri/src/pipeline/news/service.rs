@@ -318,11 +318,12 @@ impl NewsService {
                     }),
                 ),
             };
-            fetched_count += items.len() as u32;
-            skipped_count += warns
-                .iter()
-                .filter_map(|w| w.skipped_count)
-                .sum::<u32>();
+            // Spec §5 line 372：fetchedCount 表示 provider 返回的原始 item 数量；
+            // skippedCount 表示 normalize / validate 阶段跳过的 item 数量。
+            // adapter 返回的 `items` 已经是 normalize 通过的子集，被跳过的写在 warns.skipped_count。
+            let stage_skipped: u32 = warns.iter().filter_map(|w| w.skipped_count).sum();
+            fetched_count += items.len() as u32 + stage_skipped;
+            skipped_count += stage_skipped;
             warnings.append(&mut warns);
             if let Some(f) = failure {
                 let when = f.occurred_at;
