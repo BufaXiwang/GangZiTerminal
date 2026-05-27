@@ -2365,8 +2365,16 @@ impl AccountService {
             }
         }
         if let Some(sigs) = invalidation_signals {
-            if next.invalidation_signals != sigs {
-                next.invalidation_signals = sigs;
+            // Spec §2 line 358: "Account 做精确匹配"。signal 字符串 trim 后保存，
+            // 与 record_invalidation_signal 入口 trim 行为对齐，避免 "  foo " 与 "foo"
+            // 错配。空字符串过滤掉（无效 signal）。
+            let normalized: Vec<String> = sigs
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if next.invalidation_signals != normalized {
+                next.invalidation_signals = normalized;
                 changed = true;
             }
         }
@@ -4610,5 +4618,71 @@ mod tests {
             resp.reason,
             Some(ErrorCode::QuoteMissing) | Some(ErrorCode::QuotePriceMissing)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // Spec §2 line 358: invalidation signal 精确匹配（双侧 trim 对齐）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn adjust_protection_invalidation_signals_trimmed_and_dedup_empty() {
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let pos_id = open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        // Apply protection with raw + padded + empty signals
+        let r = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: None,
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: Some(vec![
+                        "  earnings_recovery_failed  ".into(),
+                        "".into(),
+                        "   ".into(),
+                        "raw_signal".into(),
+                    ]),
+                    enabled: None,
+                    reason: "init".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(r.accepted);
+        let repo = AccountRepository::new(&db);
+        let prot = repo.get_protection(&pos_id).unwrap().unwrap();
+        // 空字符串 / 纯空格被过滤，其余 trim
+        assert_eq!(prot.invalidation_signals.len(), 2);
+        assert!(prot.invalidation_signals.contains(&"earnings_recovery_failed".to_string()));
+        assert!(prot.invalidation_signals.contains(&"raw_signal".to_string()));
+
+        // record_invalidation_signal with " earnings_recovery_failed " → should trigger invalidated
+        let rr = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id,
+                    signal: "  earnings_recovery_failed  ".into(),
+                    evidence_ref: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(rr.accepted);
+        assert!(
+            rr.trigger_id.is_some(),
+            "matching signal (trim-equal) should produce invalidated trigger"
+        );
     }
 }
