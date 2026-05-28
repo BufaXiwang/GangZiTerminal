@@ -190,3 +190,16 @@ pub struct XdxrRecord {
     pub houzongguben: Option<f64>,
 }
 
+/// 当日分时点（`get_minute_time_data`）。
+///
+/// pytdx 返回 240 个点（A 股标准交易时段 9:30–11:30 / 13:00–15:00 = 240 分钟），
+/// 价格是 delta-encoded：每点 `price = prev_price + delta`，再除以 100 得元。
+/// 协议本身**不带时间戳**——调用方按 `index → trading minute` 派生时间。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MinuteTimePoint {
+    /// 价格（元）。
+    pub price: f64,
+    /// 该分钟的成交量（手或股，按 volunit 转换由上层处理）。
+    pub volume: i64,
+}
+

@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 use super::error::{Error, Result};
 use super::hosts::HQ_HOSTS;
-use super::types::{Bar, BarCategory, Market, SecurityListEntry, SecurityQuote, XdxrRecord};
+use super::types::{
+    Bar, BarCategory, Market, MinuteTimePoint, SecurityListEntry, SecurityQuote, XdxrRecord,
+};
 
 /// Blocking Tdx HQ client. Open with [`connect`](Self::connect) (or
 /// [`connect_default`](Self::connect_default)) and call methods directly.
@@ -169,6 +171,18 @@ impl TdxHqClient {
         let pkg = cmd::security_xdxr::build(market.as_u8(), code)?;
         let body = frame::request(&mut self.sock, &pkg)?;
         cmd::security_xdxr::parse(&body)
+    }
+
+    /// 当日分时（240 个交易分钟价格 + 成交量序列）。
+    /// 返回的 `MinuteTimePoint` 不含时间戳——index 对应交易时段第 N 分钟。
+    pub fn security_minute_time(
+        &mut self,
+        market: Market,
+        code: &str,
+    ) -> Result<Vec<MinuteTimePoint>> {
+        let pkg = cmd::security_minute::build(market.as_u8(), code)?;
+        let body = frame::request(&mut self.sock, &pkg)?;
+        cmd::security_minute::parse(&body)
     }
 }
 

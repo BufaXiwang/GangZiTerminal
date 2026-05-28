@@ -10,7 +10,8 @@
 //! - per-IP 速率限制：调用之间最小间隔 `MIN_CALL_INTERVAL`。
 
 use super::{
-    Bar, BarCategory, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket, XdxrRecord,
+    Bar, BarCategory, MinuteTimePoint, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket,
+    XdxrRecord,
 };
 use crate::domain::quotes::{MinuteKlinePoint, QuoteSource, StockQuote, TradeStatus};
 use crate::domain::shared::{
@@ -369,6 +370,60 @@ impl TdxConnectionManager {
                 }
                 let cli = guard.client.as_mut().expect("client");
                 let res = cli.security_xdxr(market, &code);
+                guard.last_call = Some(Instant::now());
+                match res {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        guard.client = None;
+                        if attempt == 1 {
+                            return Err(TdxManagerError::Protocol(e.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(TdxManagerError::Reconnect("retries exhausted".into()))
+        })
+        .await
+        .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
+    }
+
+    /// 当日分时（240 个交易分钟）。BJ 不支持。
+    ///
+    /// 协议层返回的 `MinuteTimePoint` 不含时间戳——index 对应交易时段第 N 分钟。
+    /// pipeline / domain 层负责派生具体时间。
+    pub async fn fetch_minute_time(
+        &self,
+        ts_code: &TsCode,
+    ) -> Result<Vec<MinuteTimePoint>, TdxManagerError> {
+        let market = match ts_code.market() {
+            crate::domain::shared::Market::SH => TdxMarket::SH,
+            crate::domain::shared::Market::SZ => TdxMarket::SZ,
+            crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
+        };
+        let code = ts_code.as_str()[..6].to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let mut guard = inner.lock().expect("tdx state poisoned");
+            if let Some(last) = guard.last_call {
+                let e = last.elapsed();
+                if e < MIN_CALL_INTERVAL {
+                    std::thread::sleep(MIN_CALL_INTERVAL - e);
+                }
+            }
+            for attempt in 0..2 {
+                if guard.client.is_none() {
+                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
+                        Ok((c, _)) => guard.client = Some(c),
+                        Err(e) => {
+                            if attempt == 1 {
+                                return Err(TdxManagerError::Reconnect(e.to_string()));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let cli = guard.client.as_mut().expect("client");
+                let res = cli.security_minute_time(market, &code);
                 guard.last_call = Some(Instant::now());
                 match res {
                     Ok(v) => return Ok(v),
