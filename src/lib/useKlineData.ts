@@ -33,10 +33,13 @@ export interface UseKlineDataState {
   lastUpdatedMs: number | null;
 }
 
+/** 拓展周期：标准 K 线周期 + "intraday" 分时。 */
+export type ChartPeriod = AnyKlinePeriod | "intraday";
+
 export interface UseKlineDataOptions {
   tsCode: TsCode | null;
-  /** 默认 'day'。支持 day/week/month + 1m/5m/15m/30m/60m。 */
-  period?: AnyKlinePeriod;
+  /** 默认 'day'。支持 intraday + day/week/month + 1m/5m/15m/30m/60m。 */
+  period?: ChartPeriod;
   /** 是否启用（false 时不发请求，常用于条件渲染） */
   enabled?: boolean;
 }
@@ -59,6 +62,72 @@ function isMinutePeriod(p: AnyKlinePeriod): p is MinuteKlinePeriod {
  * 后端 DTO 形状以 quotes-module.md §4 为准；这里做防御式解析，
  * 字段缺失 / 类型不符直接 fallback 为空数组（不抛错），让 UI 显示空态。
  */
+function extractIntraday(raw: unknown, tsCode: TsCode): KlineDataPoint[] {
+  if (!raw || typeof raw !== "object") return [];
+  const root = raw as Record<string, unknown>;
+  const itemsArr = (root.items ?? []) as unknown;
+  if (!Array.isArray(itemsArr)) return [];
+  const target = itemsArr.find(
+    (it) =>
+      it &&
+      typeof it === "object" &&
+      (it as Record<string, unknown>).tsCode === tsCode,
+  ) as Record<string, unknown> | undefined;
+  if (!target) return [];
+  const intraday = target.intraday as Record<string, unknown> | undefined;
+  if (!intraday) return [];
+  const points = intraday.points;
+  if (!Array.isArray(points)) return [];
+  const tradeDate =
+    typeof intraday.tradeDate === "string" ? intraday.tradeDate : undefined;
+  return points
+    .map((row) => normalizeMinutePoint(row, tradeDate))
+    .filter((r): r is KlineDataPoint => r !== null);
+}
+
+function normalizeMinutePoint(
+  row: unknown,
+  tradeDate: string | undefined,
+): KlineDataPoint | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  // MinutePoint = { tradeDate, time: "HHMM" or "HH:MM", price, ... }
+  const timeStr = typeof r.time === "string" ? r.time : null;
+  const price = toNumber(r.price);
+  if (price == null) return null;
+  let unix: number | null = null;
+  if (timeStr && tradeDate && /^\d{8}$/.test(tradeDate)) {
+    // 时间格式可能是 "HHMM" / "HH:MM" / "HHMMSS"
+    const digits = timeStr.replace(/\D/g, "");
+    const hh = Number(digits.slice(0, 2));
+    const mm = Number(digits.slice(2, 4));
+    const y = Number(tradeDate.slice(0, 4));
+    const mo = Number(tradeDate.slice(4, 6)) - 1;
+    const d = Number(tradeDate.slice(6, 8));
+    if (
+      Number.isFinite(hh) &&
+      Number.isFinite(mm) &&
+      Number.isFinite(y) &&
+      Number.isFinite(mo) &&
+      Number.isFinite(d)
+    ) {
+      unix = Math.floor(Date.UTC(y, mo, d, hh, mm) / 1000);
+    }
+  }
+  if (unix == null) {
+    unix = toUnixSeconds(timeStr ?? r.tradeDate);
+  }
+  if (unix == null) return null;
+  return {
+    time: unix,
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    volume: toNumber(r.volume) ?? undefined,
+  };
+}
+
 function extractKlines(
   raw: unknown,
   tsCode: TsCode,
@@ -175,9 +244,15 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
     }
     const id = ++reqIdRef.current;
     setState((s) => ({ ...s, loading: true, error: null }));
-    const include: FetchInclude = isMinutePeriod(period)
-      ? { minuteKlines: [period] }
-      : { klines: [period as KlinePeriod] };
+    const isIntraday = period === "intraday";
+    let include: FetchInclude;
+    if (isIntraday) {
+      include = { intraday: true };
+    } else if (isMinutePeriod(period)) {
+      include = { minuteKlines: [period] };
+    } else {
+      include = { klines: [period as KlinePeriod] };
+    }
     void commands
       .fetchData({ tsCodes: [tsCode], include })
       .then((res) => {
@@ -191,7 +266,9 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
           });
           return;
         }
-        const points = extractKlines(res.data, tsCode, period);
+        const points = isIntraday
+          ? extractIntraday(res.data, tsCode)
+          : extractKlines(res.data, tsCode, period as AnyKlinePeriod);
         setState({
           data: points,
           loading: false,
