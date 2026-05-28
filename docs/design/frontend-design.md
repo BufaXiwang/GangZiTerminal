@@ -252,15 +252,16 @@ Agent tabbar
 
 ### K 线图
 
-K 线图统一使用现有 `KLineChart` 组件。
+K 线图统一使用 **lightweight-charts** 库（TradingView 出品，已锁定在 `package.json`）。**不包 wrapper 组件，页面直接调 lightweight-charts API**。
 
 规则：
 
-- 不新增第二套 K 线组件，不直接在页面里手写 chart 实现。
-- 页面只通过 `KLineChart` props 传入 `code`、`tsCode`、`name`、`category`、`meta`。
-- `KLineChart` 内部负责周期、指标、画线、截图、全屏、缓存和错误态。
-- 页面层负责为 K 线提供稳定容器尺寸，不能让图表因列表切换或按钮 hover 发生高度跳动。
-- 分时、分钟 K、日 / 周 / 月 K 的交互入口保持在 `KLineChart` 内部。
+- 使用 lightweight-charts 的 `createChart` + `addCandlestickSeries` / `addLineSeries` / `addHistogramSeries` 等原生 API。
+- K 线和成交量分两个 series（candle + histogram），通过 priceScale / pane 分离展示（参考 lightweight-charts docs/panes）。
+- 周期切换器（分时 / 1m / 5m / 15m / 30m / 60m / 日 / 周 / 月，默认日 K）作为页面 control strip 的一部分，切换时调对应后端 command 重拉数据并 `setData()`。
+- 页面层负责为图表提供稳定容器尺寸（一般 fixed height，例如 480 / 600px），不能让图表因列表切换或按钮 hover 发生高度跳动。
+- 涨跌颜色按 CSS variables `--chart-up` / `--chart-down` 配置（A 股语义红涨绿跌）。
+- 不同页面需要 K 线时各自调 lightweight-charts；如果出现明显重复逻辑（例如周期切换 + 数据拉取 + 错误态），允许在 `src/lib/` 抽 hook（如 `useKlineData`），但不抽完整 UI 组件 wrapper。
 
 ---
 
