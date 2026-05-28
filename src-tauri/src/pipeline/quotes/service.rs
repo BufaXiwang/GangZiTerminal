@@ -19,6 +19,7 @@ use crate::infrastructure::db::AppDb;
 use crate::infrastructure::quotes::{
     CachedSnapshot, EastmoneyProvider, QuotesConfig, QuotesRepository, SinaProvider, SnapshotCache,
     TdxConnectionManager, TencentProvider, TradeCalendar, TradeCalendarRepo, TushareClient,
+    TushareHealthCheck,
 };
 use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
 use chrono::Utc;
@@ -45,6 +46,9 @@ pub struct QuotesService {
     pub(crate) sina: SinaProvider,
     pub(crate) tencent: TencentProvider,
     pub(crate) tushare: TushareClient,
+    /// TuShare 健康 gate（spec quotes-module.md §2 "TuShare 健康状态"）。
+    /// 所有 TuShare provider 调用前必须 `health.is_available()`；为 false 则跳过。
+    pub(crate) health: Arc<TushareHealthCheck>,
     pub(crate) calendar: Arc<TradeCalendarRepo>,
     #[allow(dead_code)]
     pub(crate) config: QuotesConfig,
@@ -61,6 +65,11 @@ impl QuotesService {
         let sina = SinaProvider::new()?;
         let tencent = TencentProvider::new()?;
         let tushare = TushareClient::new(config.tushare_token.clone())?;
+        // 共享 client 给 health probe；TushareClient 是 Clone（reqwest::Client + Option<String>）。
+        let health = Arc::new(TushareHealthCheck::new(
+            Arc::new(tushare.clone()),
+            crate::domain::quotes::TushareHealthConfig::default(),
+        ));
         let calendar = Arc::new(TradeCalendarRepo::new(db.clone()));
         Ok(Self {
             db,
@@ -70,10 +79,16 @@ impl QuotesService {
             sina,
             tencent,
             tushare,
+            health,
             calendar,
             config,
             event_sink: std::sync::RwLock::new(None),
         })
+    }
+
+    /// 暴露 health check 给 lib / scheduler 调用。
+    pub fn health(&self) -> &Arc<TushareHealthCheck> {
+        &self.health
     }
 
     pub fn db(&self) -> &AppDb {
@@ -699,8 +714,9 @@ impl QuotesService {
                 .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
         }
 
-        // 3. TuShare enrich（仅 token 可用时执行，非阻塞）
-        if self.tushare.has_token() {
+        // 3. TuShare enrich（仅 health.is_available() 时执行，非阻塞）
+        // Spec: quotes-module.md §2 "TuShare 健康状态"
+        if self.health.is_available() {
             let mut enrich: Vec<MarketInstrument> = Vec::new();
             match self.tushare.fetch_stock_basic().await {
                 Ok(mut v) => enrich.append(&mut v),
@@ -723,7 +739,11 @@ impl QuotesService {
                     .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
             }
         } else {
-            tracing::info!(target: "quotes.refresh", "tushare token missing; skip universe enrich (main universe still written from tdx/em)");
+            tracing::info!(
+                target: "quotes.refresh",
+                state = ?self.health.state(),
+                "tushare unavailable; skip universe enrich (main universe still written from tdx/em)"
+            );
         }
 
         // 类别变更：让 snapshot cache 中的过期类别条目失效（spec §2 不变量）。
@@ -990,7 +1010,8 @@ impl QuotesService {
         for ts in &ts_codes {
             for period in &periods {
                 total += 1;
-                if self.tushare.has_token() {
+                // Spec: quotes-module.md §2 "TuShare 健康状态"：调用前 gate
+                if self.health.is_available() {
                     let raw_bars = self
                         .tushare
                         .fetch_kline(ts, *period, &start_str, &end_str)
@@ -1253,11 +1274,13 @@ impl QuotesService {
         scope: RefreshDataScope,
         trade_date: Option<TradeDate>,
     ) -> Result<RefreshDataResult, ResponseError> {
-        if !self.tushare.has_token() {
-            // Spec §5 line 764: "TuShare token 缺失时，这些读模型保持旧数据并返回 freshness / warning"。
+        if !self.health.is_available() {
+            // Spec: quotes-module.md §2 "TuShare 健康状态" + §5：health gate fail-open
+            // → 保留旧数据 + data_partial warning。token_missing 与熔断走同一分支。
             tracing::info!(
                 target: "quotes.refresh",
-                "tushare token missing; daily_basic refresh skipped, keeping local data"
+                state = ?self.health.state(),
+                "tushare unavailable; daily_basic refresh skipped, keeping local data"
             );
             return Ok(RefreshDataResult {
                 total: 0,
@@ -1326,11 +1349,12 @@ impl QuotesService {
         scope: RefreshDataScope,
         window_days: Option<i64>,
     ) -> Result<RefreshDataResult, ResponseError> {
-        if !self.tushare.has_token() {
-            // Spec §5 line 764: "TuShare token 缺失时，这些读模型保持旧数据并返回 freshness / warning"。
+        if !self.health.is_available() {
+            // Spec: quotes-module.md §2 "TuShare 健康状态" + §5：health gate fail-open
             tracing::info!(
                 target: "quotes.refresh",
-                "tushare token missing; company events refresh skipped, keeping local data"
+                state = ?self.health.state(),
+                "tushare unavailable; company events refresh skipped, keeping local data"
             );
             return Ok(RefreshDataResult {
                 total: 0,
@@ -1434,7 +1458,13 @@ impl QuotesService {
         start_date: &str,
         end_date: &str,
     ) -> Result<u32, ResponseError> {
-        if !self.tushare.has_token() {
+        // Spec: quotes-module.md §2 "TuShare 健康状态" + §5：日历校准 gate；不可用时本地推算继续工作
+        if !self.health.is_available() {
+            tracing::info!(
+                target: "quotes.refresh",
+                state = ?self.health.state(),
+                "tushare unavailable; trade_calendar refresh skipped (local computation still works)"
+            );
             return Ok(0);
         }
         let entries = self

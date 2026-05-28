@@ -5,8 +5,10 @@
 pub mod calendar;
 pub mod client;
 pub mod events;
+pub mod health;
 pub mod kline;
 pub mod universe;
 
 pub use calendar::CalendarEntry;
 pub use client::{TushareClient, TushareError};
+pub use health::TushareHealthCheck;

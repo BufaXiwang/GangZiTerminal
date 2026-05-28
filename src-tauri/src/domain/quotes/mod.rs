@@ -14,6 +14,7 @@ pub mod limit;
 pub mod quote;
 pub mod scan;
 pub mod sources;
+pub mod tushare_health;
 pub mod xdxr;
 
 pub use errors::{QuoteFacadeError, QuoteFacadeErrorKind};
@@ -41,6 +42,7 @@ pub use scan::{
     ScanOp, ScanResult, ScanSortBy, ScanUniverse,
 };
 pub use sources::core_indexes;
+pub use tushare_health::{TushareHealthConfig, TushareHealthState};
 pub use xdxr::{XdxrCategory, XdxrEvent};
 
 // Spec: quotes-module.md §1 / §4

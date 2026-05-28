@@ -166,6 +166,10 @@ pub fn spawn_full_scheduler(
                 tokio::select! {
                     _ = stop_rx.recv() => break,
                     _ = ticker.tick() => {
+                        // Spec: quotes-module.md §2 "TuShare 健康状态"：每 60s 检查是否到 recheck 时刻。
+                        // service 内部按 `next_recheck_at` (默认 1h 间隔) 判定 due/not-due，本 tick 是廉价的。
+                        svc.health().recheck_if_due().await;
+
                         let ctx = svc.market_time_now();
                         let shanghai_now = ctx.now.with_timezone(&Shanghai);
                         let cal: &dyn TradeCalendar = svc.calendar().as_ref();

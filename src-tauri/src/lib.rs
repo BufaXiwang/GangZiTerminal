@@ -169,13 +169,30 @@ pub fn run() {
                 }
             }
 
+            // -- TuShare 健康探针（spec §2 "TuShare 健康状态"）：启动 ping。
+            // 在 universe enrich 之前完成，让 refresh_market_instruments 看到正确的 is_available。
+            // 用 block_on + 内置 timeout（health 自己的 fetch_trade_cal timeout = 10s；
+            // 这里再裹一层 5s 上限避免启动阻塞）。
+            {
+                let hc = Arc::clone(quotes_service.health());
+                let _ = tauri::async_runtime::block_on(async move {
+                    let timeout = std::time::Duration::from_secs(5);
+                    let _ = tokio::time::timeout(timeout, hc.initial_ping()).await;
+                });
+                tracing::info!(
+                    target: "quotes.tushare.health",
+                    state = ?quotes_service.health().state(),
+                    "tushare initial health probe completed"
+                );
+            }
+
             // -- Quotes startup catch-up（spec §5）：异步后台 task；不阻塞 setup。
             // 用 tauri::async_runtime::spawn 而非 tokio::spawn — setup 闭包没有
             // current tokio runtime context；tauri::async_runtime 提供同等接口。
             {
                 let svc = Arc::clone(&quotes_service);
                 tauri::async_runtime::spawn(async move {
-                    // 1) universe enrich（TuShare 可用时；token 缺失会自动 skip）
+                    // 1) universe enrich（TuShare 可用时；health gate 自动 skip）
                     if let Err(e) = svc.refresh_market_instruments().await {
                         tracing::warn!(target: "quotes.startup", error = ?e, "refresh_market_instruments failed");
                     }

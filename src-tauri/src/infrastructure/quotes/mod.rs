@@ -27,4 +27,4 @@ pub use snapshot_cache::{CachedSnapshot, SnapshotCache};
 pub use tdx::{TdxConnectionManager, TdxManagerError};
 pub use tencent::TencentProvider;
 pub use trade_calendar::{TradeCalendar, TradeCalendarRepo, WeekdayCalendar};
-pub use tushare::{CalendarEntry, TushareClient};
+pub use tushare::{CalendarEntry, TushareClient, TushareHealthCheck};
