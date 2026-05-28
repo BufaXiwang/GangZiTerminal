@@ -268,8 +268,11 @@ leaderNames: string[] }
 export type InstrumentCategory = "stock" | "index" | "fund"
 /**
  * Spec: quotes-module.md §2 — universe 来源。
+ * 
+ * `Builtin` 表示 cold-start seed 行：在 process startup 时由 `seed_builtin_instruments`
+ * 写入，仅作 diagnostic 用途。真实 provider refresh 完成后 source 会被覆盖（spec §5 step 0）。
  */
-export type InstrumentSource = "tdx" | "eastmoney" | "tushare" | "mixed"
+export type InstrumentSource = "builtin" | "tdx" | "eastmoney" | "tushare" | "mixed"
 export type InstrumentStatus = "listed" | "suspended" | "delisted" | "unknown"
 export type IntradaySeries = { tradeDate: string; points: MinutePoint[]; freshness: Freshness; warnings?: WarningCode[] }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>

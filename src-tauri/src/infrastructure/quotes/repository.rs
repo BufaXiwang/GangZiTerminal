@@ -1104,6 +1104,7 @@ fn status_from_str(s: &str) -> InstrumentStatus {
 
 fn instrument_source_to_str(s: InstrumentSource) -> &'static str {
     match s {
+        InstrumentSource::Builtin => "builtin",
         InstrumentSource::Tdx => "tdx",
         InstrumentSource::Eastmoney => "eastmoney",
         InstrumentSource::Tushare => "tushare",
@@ -1113,6 +1114,7 @@ fn instrument_source_to_str(s: InstrumentSource) -> &'static str {
 
 fn instrument_source_from_str(s: &str) -> InstrumentSource {
     match s {
+        "builtin" => InstrumentSource::Builtin,
         "eastmoney" => InstrumentSource::Eastmoney,
         "tushare" => InstrumentSource::Tushare,
         "mixed" => InstrumentSource::Mixed,

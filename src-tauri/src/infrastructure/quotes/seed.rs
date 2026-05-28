@@ -8,7 +8,8 @@
 //! - 仅 hardcode (code6, market, name)；(category, board) 由 `universe::classify` 推。
 //! - 不写 `list_date` / `industry` / `is_st` 等，留给后续 TDX/TuShare refresh enrich。
 //! - 不确定的 code 不要瞎填——错的 code 会污染 universe 持久层。
-//! - `InstrumentSource::Tdx`（语义为本地 universe 来源；后续 TuShare enrich 时升为 Mixed）。
+//! - `InstrumentSource::Builtin`（spec §5 step 0：仅作 cold-start diagnostic；后续 TDX/EM/TuShare
+//!   refresh upsert 时 `source` 会被覆盖为对应 provider）。
 //!
 //! 依赖方向：本文件只 use `domain` + 同层 `universe`，不引 pipeline / adapters。
 
@@ -151,7 +152,7 @@ fn build_instruments() -> Vec<MarketInstrument> {
             fund_type: None,
             management: None,
             list_date: None,
-            source: InstrumentSource::Tdx,
+            source: InstrumentSource::Builtin,
             updated_at: now,
         });
     }
@@ -271,6 +272,22 @@ mod tests {
         // 第二次 upsert 不应导致重复行：count 仍等于 seed size
         let (_, total) = repo.list_instruments(None, None, 1000, 0).unwrap();
         assert_eq!(total as usize, BUILTIN_INSTRUMENTS.len());
+    }
+
+    #[test]
+    fn seed_rows_have_builtin_source() {
+        // Spec §5 step 0：seed 行写入时 source = "builtin"，diagnostic only。
+        // 真实 provider refresh 后会被覆盖；测试这里只验证 seed 阶段。
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        seed_builtin_instruments(&repo).unwrap();
+        let maotai = TsCode::parse("600519.SH").unwrap();
+        let got = repo.get_instrument(&maotai).unwrap().unwrap();
+        assert_eq!(
+            got.source,
+            InstrumentSource::Builtin,
+            "seed row must carry InstrumentSource::Builtin"
+        );
     }
 
     #[test]

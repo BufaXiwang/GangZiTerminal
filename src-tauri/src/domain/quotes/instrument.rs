@@ -37,9 +37,13 @@ pub struct MarketInstrument {
 }
 
 /// Spec: quotes-module.md §2 — universe 来源。
+///
+/// `Builtin` 表示 cold-start seed 行：在 process startup 时由 `seed_builtin_instruments`
+/// 写入，仅作 diagnostic 用途。真实 provider refresh 完成后 source 会被覆盖（spec §5 step 0）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum InstrumentSource {
+    Builtin,
     Tdx,
     Eastmoney,
     Tushare,
