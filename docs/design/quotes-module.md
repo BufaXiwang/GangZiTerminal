@@ -798,12 +798,12 @@ ensure_chart_data(ts_code: TsCode, period: ChartPeriod): Promise<void>
 ```
 
 行为：
-- `period ∈ {day, week}` → 走 `refresh_klines_extended(scope=Subscribed[ts_code], periods=[period], target_days=1500)`，一次性补足 ~4 年历史。
-- `period == month` → 同上，但 `target_days=4500`（~12 年月 K）。
+- `period ∈ {day, week, month}` → 走 `refresh_klines_full(scope=Subscribed[ts_code], periods=[period])`，**TDX 分页全量历史**：循环 `security_bars(start=0, 800, 1600, ...)` 直到 TDX 返回空 / 不足 800 / 命中硬上限（50 000 根）。覆盖该 ts_code + period 的全部可获取历史。
 - `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`。
 - `period == intraday` → `refresh_intraday(...)`。
-- 已有数据时也会重新拉（upsert 幂等）；UI 调用方决定何时触发。
-- 设计目的：用户进入标的详情时一次性把长历史拉好，不依赖 K 线左拉 callback 触发；后续从 DB 命中即可。
+- 已有数据时也会重新拉（upsert 幂等，PK = `(ts_code, period, adjust, trade_date)`）；UI 调用方决定何时触发。
+- 设计目的：用户进入标的详情时一次性把全量历史拉好，不依赖 K 线左拉 callback 触发；后续访问从 DB 命中即可，不再重复 TDX 调用。
+- 耗时提示：老股可能触发 10+ 次 TDX 调用（每次 80ms 间隔 + 100-500ms 协议延迟），总耗时 3-10s。前端应在 UI 显示 loading；中间 batch 失败由底层整体 abort（partial 落库无意义）。
 
 #### `extend_chart_history`
 
@@ -915,11 +915,14 @@ TDX > Eastmoney > 腾讯 > 新浪
 日 / 周 / 月 K：
 
 - **TDX 是主源**：日 / 周 / 月 K 全部从 TDX 拉取 unadjusted bar；单次拉取根数受 TDX 协议限制（默认 ~800 根），SH / SZ 全覆盖，BJ 不支持。
-- **增量回溯**：每只 (ts_code, period) 先查 `max(trade_date) FROM quote_klines_daily WHERE adjust='none'`：
+- **全量历史（`refresh_klines_full`）**：`ensure_chart_data` 触发时走分页 loop —— TDX `security_bars(start=0, 800, 1600, ...)` 直到返回空 / 不足 800 根 / 命中硬上限 50 000 根。`start` 是从最新往回跳过的根数，更早的 batch prepend 到累计 Vec 前，最终升序。这是首次访问标的的默认路径，一次性把全量历史落 DB，后续从 DB 命中。
+- **增量回溯（`refresh_klines` / `refresh_klines_extended`）**：每只 (ts_code, period) 先查 `max(trade_date) FROM quote_klines_daily WHERE adjust='none'`：
   - DB 空 → 初始拉过去 ~365 天（受 TDX 单次根数限制约束，超出部分留给 TuShare 长历史扩展）。
   - 有数据 → 从 `max+1` 拉到 today，幂等 upsert。
+  - 用途：盘后调度补当日新 bar，不为 `ensure_chart_data` 的全量场景。
 - **本地复权**：`qfq` / `hfq` 由 Quotes 基于本地 unadjusted K 线 + TDX xdxr 事件现算（见 §2 "本地复权计算"）；不依赖 TuShare adj_factor。
 - **长历史扩展**：当调用方请求的回溯窗口超出 TDX 单次拉取根数限制（~800 根 ≈ 一年），且 `TushareHealthState.isAvailable = true` 时，可使用 TuShare 补拉更早的 unadjusted 历史段，落本地后统一走本地复权算法。当前 TuShare 长历史段补拉为 D2.5 后续实现；尚未上线时，调用方若回看超出 TDX 单次根数限制，超出部分返回空 + `KlineSeries.warnings` 含 `data_partial`。
+  - 注：`refresh_klines_full` 通过 TDX 分页（`start=0, 800, 1600, ...`）已覆盖 TDX 可获取的全部历史段，不再依赖 TuShare 长历史扩展。TuShare 长历史扩展仅在 `refresh_klines_extended(history_days > 800)` 路径下触发（盘后调度 / 显式补段场景）。
 - **Eastmoney fallback**：TDX 失败时可用 Eastmoney 补 SH / SZ 当日 / 近期段；BJ 没有日 / 周 / 月 K 备源，按 per-item warning / error 返回。
 - 股票趋势 / 技术指标优先使用 `qfq`；只能用 `none` 时返回 `using_unadjusted_kline` warning。
 

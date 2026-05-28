@@ -1213,6 +1213,101 @@ impl QuotesService {
 
     // ====================================================================== refresh_klines
 
+    /// 全量历史拉取 K 线（spec §5 K 线 + §4 ensure_chart_data）。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 "全量历史" + §4 ensure_chart_data。
+    ///
+    /// 与 `refresh_klines_extended` 的区别：
+    /// - 后者按 `history_days` 取一段（受 TDX 单次 800 根限制 + TuShare 长历史扩展）；
+    /// - 本方法走 `tdx.fetch_kline_paginated` 分页 loop（`start = 0, 800, ...`）直到 TDX
+    ///   返回空 / 不足 800 / 命中硬上限 50_000。结果是该 ts_code + period 的**全量**历史。
+    ///
+    /// 用途：`ensure_chart_data` 首次访问触发 — 一次性把全部历史拉好落 DB；后续访问从 DB 命中。
+    /// DB 已覆盖时 upsert 幂等（PK = ts_code + period + adjust + trade_date）。
+    ///
+    /// 不调 TuShare 长历史扩展：TDX 全量分页本身已覆盖所有可获取的历史段；TuShare 仅作为
+    /// "TDX 单次 800 根限制 + 调用方按 days 窗口请求" 的补救路径，全量分页场景无意义。
+    ///
+    /// 失败处理：单一 (ts, period) 失败 → 计入 failed，其他继续；BJ 直接 failed + warning。
+    /// 中间 batch 失败由底层 `fetch_kline_paginated` 整体 abort（partial 落库无意义）。
+    pub async fn refresh_klines_full(
+        &self,
+        scope: RefreshDataScope,
+        periods: Vec<KlinePeriod>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let periods = if periods.is_empty() {
+            vec![KlinePeriod::Day]
+        } else {
+            periods
+        };
+        let now = Utc::now();
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut warnings: Vec<WarningCode> = Vec::new();
+
+        for ts in &ts_codes {
+            for period in &periods {
+                total += 1;
+                // BJ 不支持 K 线（spec §5 "BJ 不支持"）。
+                if matches!(ts.market(), crate::domain::shared::Market::BJ) {
+                    failed += 1;
+                    if !warnings.contains(&WarningCode::DataPartial) {
+                        warnings.push(WarningCode::DataPartial);
+                    }
+                    continue;
+                }
+                match self.tdx.fetch_kline_paginated(ts, *period).await {
+                    Ok(bars) => {
+                        let pts: Vec<KlinePoint> = bars
+                            .iter()
+                            .filter_map(
+                                crate::infrastructure::quotes::tdx::manager::map_daily_bar,
+                            )
+                            .collect();
+                        if pts.is_empty() {
+                            failed += 1;
+                            continue;
+                        }
+                        let _ = self.repo().upsert_daily_klines(
+                            ts,
+                            *period,
+                            AdjEnum::None,
+                            &pts,
+                            "tdx",
+                            now,
+                        );
+                        self.adjust_cache.invalidate(ts);
+                        success += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "quotes.refresh.kline",
+                            ts = ts.as_str(),
+                            period = ?period,
+                            error = %e,
+                            "tdx full-history pagination failed"
+                        );
+                        failed += 1;
+                    }
+                }
+            }
+        }
+
+        let eligible_td = eligible_trade_date(&self.market_time_now()).trade_date;
+        let _ = self
+            .repo()
+            .record_refresh_state("kline", eligible_td, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings,
+            affected_ts_codes: ts_codes,
+        })
+    }
+
     /// 拉取 K 线 — TDX-primary + 增量（spec §1 line 15-16 + §5 line 800-810）。
     /// 等价于 `refresh_klines_extended(scope, periods, None)`。
     pub async fn refresh_klines(
@@ -3076,6 +3171,62 @@ mod tests {
             .unwrap();
         assert_eq!(res.total, 1);
         assert!(!res.warnings.contains(&WarningCode::DataPartial));
+    }
+
+    /// J · 全量历史分页（spec §5 K 线 + §4 ensure_chart_data）。
+    ///
+    /// 触发 `refresh_klines_full`，TDX 网络在测试环境不可达 → 单只 SH 标的会失败但**不应 panic**；
+    /// 主要验证 (1) 接口可调通、(2) total/success/failed 不变量、(3) affected_ts_codes 完整。
+    #[tokio::test]
+    async fn refresh_klines_full_handles_unreachable_tdx() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let res = svc
+            .refresh_klines_full(
+                RefreshDataScope::Manual { ts_codes: vec![ts.clone()] },
+                vec![KlinePeriod::Day],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.success + res.failed, res.total);
+        assert_eq!(res.affected_ts_codes, vec![ts]);
+    }
+
+    /// J · BJ 标的不走 K 线（spec §5 line "BJ 不支持"）—— 直接 failed + data_partial warning。
+    #[tokio::test]
+    async fn refresh_klines_full_bj_returns_data_partial() {
+        let svc = make_service();
+        seed_instrument(&svc, "430047.BJ", "诺思兰德", InstrumentCategory::Stock);
+        let ts = TsCode::parse("430047.BJ").unwrap();
+        let res = svc
+            .refresh_klines_full(
+                RefreshDataScope::Manual { ts_codes: vec![ts] },
+                vec![KlinePeriod::Day],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.failed, 1);
+        assert!(res.warnings.contains(&WarningCode::DataPartial));
+    }
+
+    /// J · 空 periods 默认 KlinePeriod::Day（与 refresh_klines/extended 行为一致）。
+    #[tokio::test]
+    async fn refresh_klines_full_empty_periods_defaults_to_day() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let res = svc
+            .refresh_klines_full(
+                RefreshDataScope::Manual { ts_codes: vec![ts] },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        // 默认 day → total = 1 * 1 = 1（1 标的 × 1 period）
+        assert_eq!(res.total, 1);
     }
 
     /// refresh_klines 旧接口等价于 refresh_klines_extended(.., .., None)，
