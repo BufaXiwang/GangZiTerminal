@@ -813,7 +813,35 @@ impl QuotesService {
         (ts_codes, map)
     }
 
-    /// Refresh 单只标的：TDX > EM > Tencent > Sina（SH/SZ）；BJ 走 EM。
+    /// 按 spec §5 line 742 从多个 provider 候选中选取一条 quote。
+    ///
+    /// `candidates` 必须按 spec tie-breaker 顺序（TDX > EM > Tencent > Sina）传入；
+    /// 函数选首个 `is_quote_complete = true`，否则首个 `is_display_complete = true`，否则 None。
+    /// 暴露为关联函数便于纯函数单测；和 `refresh_one_quote` 的命中-即-return 等价。
+    #[doc(hidden)]
+    pub fn pick_fallback_quote(candidates: Vec<StockQuote>) -> Option<StockQuote> {
+        let mut display_fallback: Option<StockQuote> = None;
+        for q in candidates {
+            if q.is_quote_complete() {
+                return Some(q);
+            }
+            if q.is_display_complete() && display_fallback.is_none() {
+                display_fallback = Some(q);
+            }
+        }
+        display_fallback
+    }
+
+    /// Refresh 单只标的：尝试 TDX → EM → Tencent → Sina；按 spec §5 line 742 选取。
+    ///
+    /// 选取规则：
+    /// 1. 顺序尝试 provider，遇到首个 `is_quote_complete = true` 立即采纳（带盘口）。
+    /// 2. 都不完整时，保留首个 `is_display_complete = true` 的 quote 作为 fallback。
+    /// 3. 全部失败返回 None。
+    ///
+    /// 顺序本身就是 spec 要求的 tie-breaker `TDX > Eastmoney > Tencent > Sina`，因此先 hit 即满足
+    /// "字段完整度优先 + tie-break 顺序"。eligible trade date 由调用方 (`refresh_market_quotes`)
+    /// 统一指定，本函数内一致。BJ 跳过 TDX。
     ///
     /// Spec: quotes-module.md §5 实时行情 fallback。
     async fn refresh_one_quote(
@@ -825,32 +853,38 @@ impl QuotesService {
         now: chrono::DateTime<Utc>,
     ) -> Option<StockQuote> {
         let is_bj = matches!(ts.market(), crate::domain::shared::Market::BJ);
+        let mut fallback_display: Option<StockQuote> = None;
+
+        // helper: 处理一个 provider 的返回值；命中完整则立即 return Some。
+        macro_rules! consider {
+            ($result:expr, $provider:literal) => {{
+                match $result {
+                    Ok(q) => {
+                        if q.is_quote_complete() {
+                            return Some(q);
+                        }
+                        if q.is_display_complete() && fallback_display.is_none() {
+                            fallback_display = Some(q);
+                        }
+                    }
+                    Err(e) => tracing::debug!(target: concat!("quotes.provider.", $provider), ts = ts.as_str(), error = %e, "provider failed"),
+                }
+            }};
+        }
+
         if !is_bj {
-            // TDX 主路径
-            match self
-                .tdx
-                .fetch_quote(ts, category, trade_date, now, name.clone())
-                .await
-            {
-                Ok(q) => return Some(q),
-                Err(e) => tracing::debug!(target: "quotes.provider.tdx", ts = ts.as_str(), error = %e, "tdx failed; fallback EM"),
-            }
+            consider!(
+                self.tdx
+                    .fetch_quote(ts, category, trade_date, now, name.clone())
+                    .await,
+                "tdx"
+            );
         }
-        match self.eastmoney.fetch_quote(ts, category, trade_date, now).await {
-            Ok(q) => return Some(q),
-            Err(e) => tracing::debug!(target: "quotes.provider.em", ts = ts.as_str(), error = %e, "em failed; fallback tencent"),
-        }
-        match self.tencent.fetch_quote(ts, category, trade_date, now).await {
-            Ok(q) => return Some(q),
-            Err(e) => tracing::debug!(target: "quotes.provider.tencent", ts = ts.as_str(), error = %e, "tencent failed; fallback sina"),
-        }
-        match self.sina.fetch_quote(ts, category, trade_date, now).await {
-            Ok(q) => Some(q),
-            Err(e) => {
-                tracing::debug!(target: "quotes.provider.sina", ts = ts.as_str(), error = %e, "sina failed; no more fallbacks");
-                None
-            }
-        }
+        consider!(self.eastmoney.fetch_quote(ts, category, trade_date, now).await, "em");
+        consider!(self.tencent.fetch_quote(ts, category, trade_date, now).await, "tencent");
+        consider!(self.sina.fetch_quote(ts, category, trade_date, now).await, "sina");
+
+        fallback_display
     }
 
     // ====================================================================== refresh_klines
@@ -1657,6 +1691,7 @@ pub struct RefreshDataResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::quotes::QuoteSource;
     use crate::infrastructure::db::run_migrations;
     use crate::infrastructure::quotes::migrations as quotes_migrations;
 
@@ -1986,5 +2021,92 @@ mod tests {
         };
         let res = svc.list_market(req);
         assert_eq!(res.items.first().unwrap().instrument.ts_code.as_str(), "600519.SH");
+    }
+
+    // ----------------------------------------------------------------- Q2 fallback selection
+    fn fake_quote(src: QuoteSource, with_price: bool, with_depth: bool) -> StockQuote {
+        use crate::domain::quotes::QuoteDepthLevel;
+        use crate::domain::shared::{Freshness, FreshnessStatus, Price, Volume};
+        let bid = if with_depth {
+            vec![QuoteDepthLevel { price: Some(Price(Decimal::new(999, 2))), volume: Some(Volume(100)) }]
+        } else {
+            Vec::new()
+        };
+        let ask = if with_depth {
+            vec![QuoteDepthLevel { price: Some(Price(Decimal::new(1001, 2))), volume: Some(Volume(100)) }]
+        } else {
+            Vec::new()
+        };
+        StockQuote {
+            ts_code: TsCode::parse("600519.SH").unwrap(),
+            name: None,
+            category: InstrumentCategory::Stock,
+            trade_date: TradeDate::from_naive(chrono::NaiveDate::from_ymd_opt(2025, 5, 26).unwrap()),
+            price: if with_price { Some(Price(Decimal::new(1000, 2))) } else { None },
+            previous_close: None,
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: None,
+            volume: None,
+            amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid,
+            ask,
+            trade_status: TradeStatus::Trading,
+            source: src,
+            captured_at: Utc::now(),
+            exchange_time: None,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: None,
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pick_fallback_picks_first_complete_skipping_incomplete_higher_priority() {
+        // TDX 缺盘口（incomplete），EM 完整 → 采纳 EM.
+        let tdx = fake_quote(QuoteSource::Tdx, true, false);
+        let em = fake_quote(QuoteSource::Eastmoney, true, true);
+        let picked = QuotesService::pick_fallback_quote(vec![tdx, em]).unwrap();
+        assert!(matches!(picked.source, QuoteSource::Eastmoney));
+        assert!(picked.is_quote_complete());
+    }
+
+    #[test]
+    fn pick_fallback_prefers_higher_priority_if_both_complete() {
+        let tdx = fake_quote(QuoteSource::Tdx, true, true);
+        let em = fake_quote(QuoteSource::Eastmoney, true, true);
+        let picked = QuotesService::pick_fallback_quote(vec![tdx, em]).unwrap();
+        assert!(matches!(picked.source, QuoteSource::Tdx));
+    }
+
+    #[test]
+    fn pick_fallback_falls_back_to_display_only_when_none_complete() {
+        let tdx = fake_quote(QuoteSource::Tdx, true, false);
+        let em = fake_quote(QuoteSource::Eastmoney, true, false);
+        let sina = fake_quote(QuoteSource::Sina, true, false);
+        let picked = QuotesService::pick_fallback_quote(vec![tdx, em, sina]).unwrap();
+        // 第一个 display_complete 取 TDX。
+        assert!(matches!(picked.source, QuoteSource::Tdx));
+        assert!(picked.is_display_complete());
+        assert!(!picked.is_quote_complete());
+    }
+
+    #[test]
+    fn pick_fallback_returns_none_if_no_display_complete() {
+        let tdx = fake_quote(QuoteSource::Tdx, false, false);
+        let em = fake_quote(QuoteSource::Eastmoney, false, false);
+        assert!(QuotesService::pick_fallback_quote(vec![tdx, em]).is_none());
     }
 }

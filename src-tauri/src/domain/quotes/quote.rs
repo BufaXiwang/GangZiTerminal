@@ -111,6 +111,26 @@ pub struct StockQuote {
     pub warnings: Vec<WarningCode>,
 }
 
+impl StockQuote {
+    /// Spec: quotes-module.md §5 line 742 — 展示最小集：`price / tradeDate / capturedAt`。
+    ///
+    /// `tradeDate` 和 `captured_at` 在 `StockQuote` 类型上不可为空（非 Option），
+    /// 所以展示完整性只取决于 `price` 是否存在。
+    pub fn is_display_complete(&self) -> bool {
+        self.price.is_some()
+    }
+
+    /// Spec: quotes-module.md §5 line 742 — 成交模拟完整集：展示集 + 买一/卖一价格。
+    pub fn is_quote_complete(&self) -> bool {
+        if !self.is_display_complete() {
+            return false;
+        }
+        let bid_ok = self.bid.first().and_then(|l| l.price).is_some();
+        let ask_ok = self.ask.first().and_then(|l| l.price).is_some();
+        bid_ok && ask_ok
+    }
+}
+
 /// Spec: quotes-module.md §2 行情快照
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -177,4 +197,75 @@ pub enum CompanyEventType {
     EarningsForecast,
     Unlock,
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::shared::{Freshness, FreshnessStatus, InstrumentCategory, Price, TradeDate};
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+
+    fn make_base(price: Option<Price>) -> StockQuote {
+        StockQuote {
+            ts_code: crate::domain::shared::TsCode::parse("600519.SH").unwrap(),
+            name: None,
+            category: InstrumentCategory::Stock,
+            trade_date: TradeDate::from_naive(chrono::NaiveDate::from_ymd_opt(2025, 5, 26).unwrap()),
+            price,
+            previous_close: None,
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: None,
+            volume: None,
+            amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid: Vec::new(),
+            ask: Vec::new(),
+            trade_status: TradeStatus::Trading,
+            source: QuoteSource::Tdx,
+            captured_at: Utc::now(),
+            exchange_time: None,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: None,
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_display_complete_requires_price() {
+        let q_no_price = make_base(None);
+        assert!(!q_no_price.is_display_complete());
+        let q_with_price = make_base(Some(Price(Decimal::new(1000, 2))));
+        assert!(q_with_price.is_display_complete());
+    }
+
+    #[test]
+    fn is_quote_complete_requires_depth() {
+        let mut q = make_base(Some(Price(Decimal::new(1000, 2))));
+        assert!(!q.is_quote_complete(), "missing bid+ask");
+        q.bid = vec![QuoteDepthLevel { price: Some(Price(Decimal::new(999, 2))), volume: None }];
+        assert!(!q.is_quote_complete(), "still missing ask");
+        q.ask = vec![QuoteDepthLevel { price: Some(Price(Decimal::new(1001, 2))), volume: None }];
+        assert!(q.is_quote_complete());
+    }
+
+    #[test]
+    fn is_quote_complete_requires_bid0_price_not_just_volume() {
+        let mut q = make_base(Some(Price(Decimal::new(1000, 2))));
+        q.bid = vec![QuoteDepthLevel { price: None, volume: Some(crate::domain::shared::Volume(100)) }];
+        q.ask = vec![QuoteDepthLevel { price: Some(Price(Decimal::new(1001, 2))), volume: None }];
+        assert!(!q.is_quote_complete(), "bid[0].price missing must fail completeness");
+    }
 }
