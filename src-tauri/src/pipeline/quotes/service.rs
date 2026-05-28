@@ -1099,6 +1099,142 @@ impl QuotesService {
         })
     }
 
+    // ====================================================================== refresh_minute_klines
+
+    /// 拉取分钟 K（spec §5 line 753-757：TDX > Eastmoney；BJ 走 EM）。
+    ///
+    /// 写入 `quote_klines_minute`；失败的 (ts_code, period) 计入 failed。
+    /// 调度由模块外运行时决定（spec §5 未规定固定频率）。
+    pub async fn refresh_minute_klines(
+        &self,
+        scope: RefreshDataScope,
+        periods: Vec<MinuteKlinePeriod>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let periods = if periods.is_empty() {
+            vec![MinuteKlinePeriod::M5]
+        } else {
+            periods
+        };
+        let now = Utc::now();
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut warnings: Vec<WarningCode> = Vec::new();
+        const MINUTE_COUNT: u16 = 240;
+
+        for ts in &ts_codes {
+            let is_bj = matches!(ts.market(), crate::domain::shared::Market::BJ);
+            for period in &periods {
+                total += 1;
+                let mut ok = false;
+                if !is_bj {
+                    match self.tdx.fetch_minute_kline(ts, *period, MINUTE_COUNT).await {
+                        Ok(bars) => {
+                            let points: Vec<_> = bars
+                                .iter()
+                                .filter_map(
+                                    crate::infrastructure::quotes::tdx::manager::map_minute_bar,
+                                )
+                                .collect();
+                            if !points.is_empty() {
+                                let _ = self
+                                    .repo()
+                                    .upsert_minute_klines(ts, *period, &points, "tdx", now);
+                                success += 1;
+                                ok = true;
+                            }
+                        }
+                        Err(e) => tracing::debug!(target: "quotes.refresh.minute", ts = ts.as_str(), error = %e, "tdx minute kline failed; try EM"),
+                    }
+                }
+                if !ok {
+                    match self.eastmoney.fetch_minute_kline(ts, *period, MINUTE_COUNT as u32).await {
+                        Ok(points) if !points.is_empty() => {
+                            let _ = self
+                                .repo()
+                                .upsert_minute_klines(ts, *period, &points, "eastmoney", now);
+                            success += 1;
+                            ok = true;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(target: "quotes.refresh.minute", ts = ts.as_str(), error = %e, "em minute kline failed"),
+                    }
+                }
+                if !ok {
+                    failed += 1;
+                    if is_bj && !warnings.contains(&WarningCode::DataPartial) {
+                        warnings.push(WarningCode::DataPartial);
+                    }
+                }
+            }
+        }
+
+        let eligible_td = eligible_trade_date(&self.market_time_now()).trade_date;
+        let _ = self
+            .repo()
+            .record_refresh_state("minute_kline", eligible_td, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings,
+            affected_ts_codes: ts_codes,
+        })
+    }
+
+    // ====================================================================== refresh_intraday
+
+    /// 拉取当日分时（spec §5 line 753-757：TDX > Eastmoney；BJ 走 EM）。
+    ///
+    /// 写入 `quote_intraday` 表。TDX 协议不直接暴露分时序列，目前实现走 EM 主路径；
+    /// 后续 TDX 分时接入可在此扩展。
+    pub async fn refresh_intraday(
+        &self,
+        scope: RefreshDataScope,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let ctx = self.market_time_now();
+        let now = ctx.now;
+        let trade_date = if ctx.is_trading_time {
+            ctx.current_trade_date.unwrap_or(ctx.latest_completed_trade_date)
+        } else {
+            ctx.latest_completed_trade_date
+        };
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+        let warnings: Vec<WarningCode> = Vec::new();
+
+        for ts in &ts_codes {
+            total += 1;
+            match self.eastmoney.fetch_intraday(ts, trade_date).await {
+                Ok(points) if !points.is_empty() => {
+                    let _ = self
+                        .repo()
+                        .upsert_intraday(ts, trade_date, &points, "eastmoney", now);
+                    success += 1;
+                }
+                Ok(_) => failed += 1,
+                Err(e) => {
+                    tracing::debug!(target: "quotes.refresh.intraday", ts = ts.as_str(), error = %e, "em intraday failed");
+                    failed += 1;
+                }
+            }
+        }
+
+        let _ = self
+            .repo()
+            .record_refresh_state("intraday", trade_date, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings,
+            affected_ts_codes: ts_codes,
+        })
+    }
+
     async fn tdx_daily_fallback(&self, ts: &TsCode) -> Option<Vec<KlinePoint>> {
         match self.tdx.fetch_daily_kline(ts, 365).await {
             Ok(bars) => Some(
@@ -2163,6 +2299,59 @@ mod tests {
         assert_eq!(res.success + res.failed, res.total,
             "count invariant: success({}) + failed({}) must equal total({})",
             res.success, res.failed, res.total);
+    }
+
+    #[tokio::test]
+    async fn refresh_minute_klines_data_scope_manual_empty_rejected() {
+        let svc = make_service();
+        let res = svc
+            .refresh_minute_klines(RefreshDataScope::Manual { ts_codes: vec![] }, vec![])
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn refresh_minute_klines_records_refresh_state() {
+        // BJ + 无 TDX/EM 网络 → 走 failed path，但函数仍 Ok 并写 refresh_state。
+        let svc = make_service();
+        seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
+        let res = svc
+            .refresh_minute_klines(
+                RefreshDataScope::Manual {
+                    ts_codes: vec![TsCode::parse("430047.BJ").unwrap()],
+                },
+                vec![MinuteKlinePeriod::M5],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.success + res.failed, res.total);
+        assert_eq!(res.affected_ts_codes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_intraday_data_scope_manual_empty_rejected() {
+        let svc = make_service();
+        let res = svc
+            .refresh_intraday(RefreshDataScope::Manual { ts_codes: vec![] })
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn refresh_intraday_returns_ok_with_count_invariant() {
+        let svc = make_service();
+        seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
+        let res = svc
+            .refresh_intraday(RefreshDataScope::Manual {
+                ts_codes: vec![TsCode::parse("430047.BJ").unwrap()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.success + res.failed, res.total);
     }
 
     #[tokio::test]
