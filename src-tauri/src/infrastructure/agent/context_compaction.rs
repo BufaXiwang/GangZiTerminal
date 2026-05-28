@@ -43,26 +43,44 @@ pub struct MicroClearReport {
 
 /// 给易腐 skill 结果替换 stub。
 ///
-/// Spec §4：易腐 skill 结果替换 stub 时，**必须保留 `name` + `call_id` + `ref`**，让 replay
-/// 能通过 PayloadStore 拉回。本函数扫描 droppable realtime parts，若内容形如
-/// `<skill_result name="X" call_id="Y" ref="Z">...</skill_result>` 则提取属性渲染成
-/// `<skill_result_stub name="X" call_id="Y" ref="Z" />`；无法识别时（无 skill_result 包裹的纯文本）
-/// 退化为不含属性的 `<skill_result_stub />`，但不影响 audit 真源（`agent_skill_calls` + `agent_payloads`
-/// 持久化不动）。
+/// Spec §2 line 261：stub 文本格式必须为 `<skill_result_stub name="..." call_id="..." ref="..." />`，
+/// **必须**含 attrs，让 replay 能通过 PayloadStore 拉回。因此只对内容形如
+/// `<skill_result name="X" call_id="Y" ref="Z">...</skill_result>` 的 wrapper 做 stub；
+/// 非 wrapper 的 droppable parts 无 attrs 可填，不该走 stub 路径。
+///
+/// **Realtime lane**（spec §4 line 322）：trigger / 账户 / 行情 / 新闻 / 策略——这些不一定是
+/// skill_result wrapper。处理策略：
+///   - 是 `<skill_result>` wrapper → stub 化（保留 name + call_id + ref）
+///   - 不是 wrapper 但 droppable → 直接移除（drop，不 stub）。realtime lane 是 fresh data，过期就该 drop。
+///   - `droppable = false` 的 part 保留不动（spec §2 line 332 invariant）。
+///
+/// **Chat lane**（spec §4 line 442）：历史 skill_result。只对 wrapper 做 stub，纯用户 / 助理对话留给
+/// Drop / Summarize 处理。
 pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
     let mut report = MicroClearReport {
         stubbed_parts: 0,
         estimated_tokens_saved: 0,
     };
-    // Realtime parts: stub-replace any droppable non-stub part (typical home of fresh
-    // skill_result blocks placed there by Runtime for the current turn).
-    for p in bundle.realtime_parts.iter_mut() {
-        if p.droppable && !is_stub(p) {
+    // Realtime parts:
+    //   - droppable + skill_result wrapper → stub 化（attrs 完整）
+    //   - droppable + 非 wrapper → 直接移除（无 attrs 可填，不能走 stub）
+    //   - 非 droppable → 保留
+    bundle.realtime_parts.retain_mut(|p| {
+        if !p.droppable || is_stub(p) {
+            return true;
+        }
+        if content_is_skill_result(&p.content) {
             report.estimated_tokens_saved += p.estimated_tokens();
             stub_in_place(p);
             report.stubbed_parts += 1;
+            true
+        } else {
+            // Non-wrapper realtime part: drop entirely (counted in stubbed_parts as "compacted").
+            report.estimated_tokens_saved += p.estimated_tokens();
+            report.stubbed_parts += 1;
+            false
         }
-    }
+    });
     // Chat parts: only stub-replace droppable parts whose content is itself a
     // <skill_result ...> wrapper (historical skill_results migrated into chat history).
     // Pure user / assistant chat is left untouched — Drop / Summarize handle that lane.
@@ -93,31 +111,35 @@ fn stub_in_place(p: &mut ContextPart) {
     p.kind = ContextPartKind::SkillResultStub;
 }
 
-/// 把一段 part 内容（可能含 `<skill_result name=".." call_id=".." ref="..">...</skill_result>`）
+/// 把一段 part 内容（必须含 `<skill_result name=".." call_id=".." ref="..">...</skill_result>` wrapper）
 /// 渲染成对应的 `<skill_result_stub name=".." call_id=".." ref=".." />`。
 ///
-/// Spec §4 line 511: 易腐 skill 结果替换 stub 时，必须保留 `name` + `call_id` + `ref`。
+/// Spec §2 line 261: stub 文本格式必须为 `<skill_result_stub name="..." call_id="..." ref="..." />`，
+/// **必须**含 attrs。caller 必须先用 `content_is_skill_result` 校验 wrapper 存在；非 wrapper part
+/// 应在 caller 层被 drop 而不是 stub。
+///
+/// Spec invariant: stub 只对 skill_result wrapper 调用 —— 否则 panic。
 fn render_stub(content: &ContextContent) -> String {
     let body = match content {
         ContextContent::Text(s) => s.clone(),
         ContextContent::Json(v) => v.to_string(),
     };
-    if let Some(attrs) = parse_skill_result_attrs(&body) {
-        let mut s = String::from("<skill_result_stub");
-        if let Some(name) = attrs.name {
-            s.push_str(&format!(r#" name="{}""#, escape_attr(&name)));
-        }
-        if let Some(call_id) = attrs.call_id {
-            s.push_str(&format!(r#" call_id="{}""#, escape_attr(&call_id)));
-        }
-        if let Some(payload_ref) = attrs.payload_ref {
-            s.push_str(&format!(r#" ref="{}""#, escape_attr(&payload_ref)));
-        }
-        s.push_str(" />");
-        s
-    } else {
-        "<skill_result_stub />".to_string()
+    let attrs = parse_skill_result_attrs(&body).expect(
+        "render_stub spec invariant violated: caller must guarantee skill_result wrapper present \
+         (spec §2 line 261 — stub must have name/call_id/ref attrs)",
+    );
+    let mut s = String::from("<skill_result_stub");
+    if let Some(name) = attrs.name {
+        s.push_str(&format!(r#" name="{}""#, escape_attr(&name)));
     }
+    if let Some(call_id) = attrs.call_id {
+        s.push_str(&format!(r#" call_id="{}""#, escape_attr(&call_id)));
+    }
+    if let Some(payload_ref) = attrs.payload_ref {
+        s.push_str(&format!(r#" ref="{}""#, escape_attr(&payload_ref)));
+    }
+    s.push_str(" />");
+    s
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -300,15 +322,6 @@ pub fn compact_context(
 mod tests {
     use super::*;
 
-    fn realtime(text: &str) -> ContextPart {
-        ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(text.into()),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        }
-    }
     fn chat(text: &str, droppable: bool) -> ContextPart {
         ContextPart {
             kind: ContextPartKind::Chat,
@@ -320,10 +333,29 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_replaces_realtime_parts_with_stubs() {
+    fn micro_clear_replaces_realtime_skill_result_wrappers_with_stubs() {
+        // Spec §2 line 261: realtime droppable skill_result wrappers → stub with attrs.
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(realtime(&"q".repeat(400)));
-        b.realtime_parts.push(realtime(&"r".repeat(400)));
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(format!(
+                r#"<skill_result name="q1" call_id="sc_a" ref="pl_a">{}</skill_result>"#,
+                "q".repeat(400)
+            )),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(format!(
+                r#"<skill_result name="q2" call_id="sc_b" ref="pl_b">{}</skill_result>"#,
+                "r".repeat(400)
+            )),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
         let before = b.estimated_tokens();
         let rep = micro_clear(&mut b);
         let after = b.estimated_tokens();
@@ -379,12 +411,22 @@ mod tests {
     #[test]
     fn compact_context_reactive_retry_drops_chats_and_stubs_realtime() {
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(realtime(&"q".repeat(400)));
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(format!(
+                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                "q".repeat(400)
+            )),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
         b.chat_parts.push(chat(&"a".repeat(1000), true));
         b.chat_parts.push(chat(&"b".repeat(1000), true));
         let (out, n) = compact_context(b, CompactPolicy::ReactiveRetry, ContextWindowLimits::default());
         assert!(n >= 2);
-        // realtime stubbed
+        // realtime wrapper stubbed (survives as stub)
+        assert_eq!(out.realtime_parts.len(), 1);
         for p in &out.realtime_parts {
             assert!(matches!(p.kind, ContextPartKind::SkillResultStub));
         }
@@ -461,7 +503,10 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_falls_back_to_bare_stub_when_no_attrs() {
+    fn micro_clear_drops_non_skill_result_realtime_parts() {
+        // Spec §2 line 261: stub must have name/call_id/ref attrs — non-wrapper realtime parts
+        // have no attrs to fill, so they're dropped entirely instead of stubbed.
+        // (Spec §4 line 322: realtime lane is fresh data; expired non-wrapper data should drop.)
         let mut b = ContextBundle::new("r1");
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
@@ -470,12 +515,66 @@ mod tests {
             token_estimate: None,
             droppable: true,
         });
-        micro_clear(&mut b);
-        let rendered = match &b.realtime_parts[0].content {
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(
+                r#"<skill_result name="quote" call_id="sc_q" ref="pl_q">{"px":"1"}</skill_result>"#
+                    .into(),
+            ),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        let rep = micro_clear(&mut b);
+        assert_eq!(rep.stubbed_parts, 2, "both droppable parts compacted (1 dropped + 1 stubbed)");
+        // Only the wrapper part survives, as a stub with attrs:
+        assert_eq!(b.realtime_parts.len(), 1);
+        let surviving = &b.realtime_parts[0];
+        assert!(matches!(surviving.kind, ContextPartKind::SkillResultStub));
+        let rendered = match &surviving.content {
             ContextContent::Text(s) => s.clone(),
             _ => panic!("expected text"),
         };
-        assert_eq!(rendered, "<skill_result_stub />");
+        assert!(rendered.starts_with("<skill_result_stub"), "{}", rendered);
+        assert!(rendered.contains(r#"name="quote""#), "{}", rendered);
+        assert!(rendered.contains(r#"call_id="sc_q""#), "{}", rendered);
+        assert!(rendered.contains(r#"ref="pl_q""#), "{}", rendered);
+        assert!(rendered.ends_with("/>"), "{}", rendered);
+    }
+
+    #[test]
+    fn micro_clear_keeps_droppable_false_realtime_parts() {
+        // Spec §2 line 332 invariant: parts with droppable = false must never be removed
+        // or mutated by compaction — even by realtime-lane micro_clear.
+        let mut b = ContextBundle::new("r1");
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text("system trigger payload — must survive".into()),
+            freshness: None,
+            token_estimate: None,
+            droppable: false,
+        });
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(
+                r#"<skill_result name="quote" call_id="sc_q" ref="pl_q">{"px":"1"}</skill_result>"#
+                    .into(),
+            ),
+            freshness: None,
+            token_estimate: None,
+            droppable: false,
+        });
+        let rep = micro_clear(&mut b);
+        assert_eq!(rep.stubbed_parts, 0);
+        assert_eq!(b.realtime_parts.len(), 2);
+        // Both untouched (not stubbed, not dropped):
+        assert!(matches!(b.realtime_parts[0].kind, ContextPartKind::Realtime));
+        assert!(matches!(b.realtime_parts[1].kind, ContextPartKind::Realtime));
+        let head = match &b.realtime_parts[0].content {
+            ContextContent::Text(s) => s.clone(),
+            _ => panic!("text"),
+        };
+        assert_eq!(head, "system trigger payload — must survive");
     }
 
     #[test]
@@ -560,7 +659,16 @@ mod tests {
     #[test]
     fn compact_context_micro_clear_only_stubs_realtime() {
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(realtime(&"q".repeat(400)));
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(format!(
+                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                "q".repeat(400)
+            )),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
         b.chat_parts.push(chat(&"x".repeat(400), true));
         let (out, n) = compact_context(b, CompactPolicy::MicroClear, ContextWindowLimits::default());
         assert_eq!(n, 1);
