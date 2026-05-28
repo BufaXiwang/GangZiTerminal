@@ -1027,18 +1027,43 @@ impl QuotesService {
                 self.resolve_categories(ts_codes.clone())
             }
             RefreshMarketQuotesScope::Universe => {
-                // 分页：避免一次 load 100k（spec drift #20）。
                 let (instruments, _total) = self
                     .repo()
                     .list_instruments(None, None, 100_000, 0)
                     .unwrap_or_default();
-                let ts_codes: Vec<TsCode> =
-                    instruments.iter().map(|i| i.ts_code.clone()).collect();
-                let cats: std::collections::HashMap<TsCode, (InstrumentCategory, Option<String>)> =
-                    instruments
+                // **Resume-from-missing** (purpose=Close 时)：跳过已经有今日 close_snapshot
+                // 的标的，只刷新缺数据的。这样 cargo rebuild 打断后下次重启不会从头再来。
+                // 其他 purpose（Intraday / Wakeup）保持全量刷新（实时性需要）。
+                let skip_existing = matches!(req.purpose, RefreshPurpose::Close);
+                let existing: std::collections::HashSet<TsCode> = if skip_existing {
+                    self.repo()
+                        .list_close_snapshot_ts_codes(trade_date)
+                        .unwrap_or_default()
                         .into_iter()
-                        .map(|i| (i.ts_code.clone(), (i.category, Some(i.name))))
-                        .collect();
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let mut ts_codes: Vec<TsCode> = Vec::with_capacity(instruments.len());
+                let mut cats: std::collections::HashMap<
+                    TsCode,
+                    (InstrumentCategory, Option<String>),
+                > = std::collections::HashMap::new();
+                for i in instruments {
+                    if existing.contains(&i.ts_code) {
+                        continue;
+                    }
+                    cats.insert(i.ts_code.clone(), (i.category, Some(i.name)));
+                    ts_codes.push(i.ts_code);
+                }
+                tracing::info!(
+                    target: "quotes.refresh",
+                    purpose = ?req.purpose,
+                    skip_existing,
+                    skipped = existing.len(),
+                    pending = ts_codes.len(),
+                    "universe refresh scope resolved"
+                );
                 (ts_codes, cats)
             }
         };

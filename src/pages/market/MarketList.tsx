@@ -54,6 +54,13 @@ function fmtPct(v: number | undefined | null): string {
   return `${sign}${v.toFixed(2)}%`;
 }
 
+function fmtAmountShort(v: number | undefined | null): string {
+  if (v == null || !Number.isFinite(v)) return "";
+  if (Math.abs(v) >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
+  if (Math.abs(v) >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
+  return v.toFixed(0);
+}
+
 function sortValue(item: ListMarketItem, key: SortKey): number | null {
   switch (key) {
     case "changePercent":
@@ -131,7 +138,12 @@ function Row({
           <span className="instrument-name">{item.name}</span>
           {item.isSt && <span className="chip st-chip">ST</span>}
         </div>
-        <div className="row-code tabular">{item.tsCode}</div>
+        <div className="row-meta tabular">
+          <span className="row-code">{item.tsCode}</span>
+          {item.quote?.amount != null && (
+            <span className="row-amount">{fmtAmountShort(item.quote.amount)}</span>
+          )}
+        </div>
       </div>
       <div className="row-right">
         <div className={`row-price tabular ${tone}`}>

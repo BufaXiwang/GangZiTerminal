@@ -978,6 +978,20 @@ body {
   color: var(--fg-muted);
 }
 
+.market-list-row.compact .row-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.market-list-row.compact .row-amount {
+  color: var(--chart-up);
+}
+
 .market-list-row.compact .row-right {
   display: flex;
   flex-direction: column;

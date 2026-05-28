@@ -835,6 +835,32 @@ impl<'a> QuotesRepository<'a> {
         })
     }
 
+    /// 列出指定 trade_date 已有 close_snapshot 的所有 ts_code。
+    ///
+    /// 用于 `refresh_market_quotes(purpose=Close, scope=Universe)` 的 resume-from-missing
+    /// 优化：跳过已 snapshot 的标的，只刷新缺数据的。cargo rebuild 反复打断 catch-up
+    /// 时避免每次从头开始。
+    pub fn list_close_snapshot_ts_codes(
+        &self,
+        trade_date: TradeDate,
+    ) -> rusqlite::Result<Vec<TsCode>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts_code FROM quote_close_snapshot WHERE trade_date = ?1",
+            )?;
+            let rows = stmt.query_map(params![trade_date.format()], |r| r.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for row in rows {
+                if let Ok(code) = row {
+                    if let Ok(ts) = TsCode::parse(&code) {
+                        out.push(ts);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     pub fn load_close_snapshot(
         &self,
         ts_code: &TsCode,
