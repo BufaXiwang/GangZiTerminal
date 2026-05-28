@@ -130,16 +130,36 @@ pub async fn ensure_chart_data(
     let scope = RefreshDataScope::Subscribed {
         ts_codes: vec![code],
     };
+    // day/week/month：一次性补足较深历史（~4 年）；DB 已覆盖时 upsert 幂等不会重复拉。
+    // 这样用户进详情就拿到长历史，不再依赖 K 线左拉 callback 触发。
+    // 1500 天目标：TDX 单次 800 根能覆盖大部分；超出部分需 TuShare token 健康时才补。
+    const DAY_HISTORY_TARGET_DAYS: u32 = 1500;
     match period.as_str() {
         "day" => {
-            service.refresh_klines(scope, vec![KlinePeriod::Day]).await?;
+            service
+                .refresh_klines_extended(
+                    scope,
+                    vec![KlinePeriod::Day],
+                    Some(DAY_HISTORY_TARGET_DAYS),
+                )
+                .await?;
         }
         "week" => {
-            service.refresh_klines(scope, vec![KlinePeriod::Week]).await?;
+            service
+                .refresh_klines_extended(
+                    scope,
+                    vec![KlinePeriod::Week],
+                    Some(DAY_HISTORY_TARGET_DAYS),
+                )
+                .await?;
         }
         "month" => {
             service
-                .refresh_klines(scope, vec![KlinePeriod::Month])
+                .refresh_klines_extended(
+                    scope,
+                    vec![KlinePeriod::Month],
+                    Some(DAY_HISTORY_TARGET_DAYS * 3), // 月 K 给 ~12 年
+                )
                 .await?;
         }
         "1m" => {

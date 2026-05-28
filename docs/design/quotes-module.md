@@ -798,10 +798,12 @@ ensure_chart_data(ts_code: TsCode, period: ChartPeriod): Promise<void>
 ```
 
 行为：
-- `period ∈ {day, week, month}` → 内部走 `refresh_klines(scope=Subscribed[ts_code], periods=[period])`。
+- `period ∈ {day, week}` → 走 `refresh_klines_extended(scope=Subscribed[ts_code], periods=[period], target_days=1500)`，一次性补足 ~4 年历史。
+- `period == month` → 同上，但 `target_days=4500`（~12 年月 K）。
 - `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`。
 - `period == intraday` → `refresh_intraday(...)`。
 - 已有数据时也会重新拉（upsert 幂等）；UI 调用方决定何时触发。
+- 设计目的：用户进入标的详情时一次性把长历史拉好，不依赖 K 线左拉 callback 触发；后续从 DB 命中即可。
 
 #### `extend_chart_history`
 

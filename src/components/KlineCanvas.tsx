@@ -39,9 +39,9 @@ interface KlineCanvasProps {
   pricePrecision?: number;
 }
 
-const INITIAL_LIMIT = 500;
-const FORWARD_STEP = 300;
-const MAX_LIMIT = 2000;
+// 一次性拉够（后端 ensure_chart_data 已对 day/week/month 走 refresh_klines_extended
+// 把 ~4 年历史补到 DB；前端只读一次即可）。
+const INITIAL_LIMIT = 2000;
 const MINUTE_PERIODS: readonly MinuteKlinePeriod[] = [
   "1m",
   "5m",
@@ -293,83 +293,31 @@ export function KlineCanvas({
     chart.createIndicator("VOL", false, { id: "vol_pane" });
 
     let cancelled = false;
-    let currentLimit = INITIAL_LIMIT;
-    const loadedTs = new Set<number>();
-
-    // 仅日/周/月 K 走后端 extend_chart_history（拉更长 TDX/TuShare 历史）；
-    // 分钟 K 和分时不支持扩展（数据单位太细，靠初始 limit 已足够）。
-    const supportsBackendExtend =
-      period === "day" || period === "week" || period === "month";
-
-    const setupLoadMore = () => {
-      chart.setLoadDataCallback(({ type, callback }) => {
-        if (cancelled) return;
-        if (type !== "forward") {
-          callback([], false);
-          return;
-        }
-        if (currentLimit >= MAX_LIMIT) {
-          callback([], false);
-          return;
-        }
-        currentLimit = Math.min(currentLimit + FORWARD_STEP, MAX_LIMIT);
-
-        const doFetch = () =>
-          fetchKlineData(tsCode, period, currentLimit).then(
-            (all) => {
-              if (cancelled) return;
-              const newBars = all.filter((b) => !loadedTs.has(b.timestamp));
-              newBars.forEach((b) => loadedTs.add(b.timestamp));
-              const stillForward =
-                all.length >= currentLimit && currentLimit < MAX_LIMIT;
-              callback(newBars, stillForward);
-            },
-            () => {
-              if (!cancelled) callback([], false);
-            },
-          );
-
-        if (supportsBackendExtend) {
-          // 先后端 extend（触发 TDX / TuShare 拉更多历史 K 线写 DB），再读
-          void commands
-            .extendChartHistory(tsCode, period, currentLimit)
-            .then(() => doFetch())
-            .catch(() => doFetch()); // extend 失败也至少把现有 DB 重读
-        } else {
-          void doFetch();
-        }
-      });
-    };
 
     void (async () => {
       try {
         setStatus("loading");
         setErrorMsg(null);
-        let data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
-        if (data.length === 0) {
-          // DB 空 → 触发 backend refresh
-          const refreshRes = await commands.ensureChartData(tsCode, period);
-          if (cancelled) return;
-          if (refreshRes.status === "error") {
-            setStatus("error");
-            setErrorMsg(
-              `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
-            );
-            return;
-          }
-          data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
+        // 1. 先调 ensure_chart_data —— 后端会把长历史补到 DB（day/week/month 走
+        //    refresh_klines_extended target_days=1500；minute/intraday 走对应 refresh）。
+        //    DB 已覆盖时是 upsert 幂等，不会重复拉。
+        const ensureRes = await commands.ensureChartData(tsCode, period);
+        if (cancelled) return;
+        if (ensureRes.status === "error") {
+          setStatus("error");
+          setErrorMsg(
+            `${ensureRes.error.code}${ensureRes.error.message ? `: ${ensureRes.error.message}` : ""}`,
+          );
+          return;
         }
+        // 2. 读 DB 一次性把数据喂给 chart。无 load-more callback，简单可控。
+        const data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
         if (cancelled) return;
         if (data.length === 0) {
           setStatus("empty");
           return;
         }
-        data.forEach((b) => loadedTs.add(b.timestamp));
-        // 总是允许 forward callback —— 即使 DB 只有 ~150 bars (< INITIAL_LIMIT)，
-        // extend_chart_history 仍能让后端去 TDX 拉更早历史。callback 自己会按
-        // currentLimit >= MAX_LIMIT 或返回无新 bar 时给 callback([], false) 终止。
-        setupLoadMore();
-        chart.applyNewData(data, true);
+        chart.applyNewData(data, false);
         setStatus("ok");
       } catch (e) {
         if (cancelled) return;
