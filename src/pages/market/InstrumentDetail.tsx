@@ -1,38 +1,22 @@
-// InstrumentDetail — 选中标的右侧详情面板。
+// InstrumentDetail — 选中标的右侧详情面板（精简版）。
 //
 // Spec: docs/design/frontend-design.md §4 + §5 K 线图 + quotes-module.md §2/§4
 //
 // 结构：
-//   header: tsCode + name + category badge + 大字价格 + 涨跌幅
-//   summary 网格：previousClose / open / high / low / limitUp / limitDown / volume / amount
-//   period strip：分时 / 1m / 5m / 15m / 30m / 60m / 日 / 周 / 月
-//   K 线区：KlineCanvas（candle 或 line）
+//   header（单行）：name + tsCode + category tag + 最新价 + 涨跌% + 成交 + 日内 high/low
+//   KlinePeriodTabs：9 周期分 3 组
+//   K 线区：KlineCanvas（autoHeight 占满剩余空间）
+//   footer：freshness 时间 + source（小灰字）
 
 import { useState } from "react";
 import { KlineCanvas } from "../../components/KlineCanvas";
 import { useKlineData, type ChartPeriod } from "../../lib/useKlineData";
+import { KlinePeriodTabs } from "./KlinePeriodTabs";
 import type { ListMarketItem } from "../../bindings";
 
 interface InstrumentDetailProps {
   item: ListMarketItem | null;
 }
-
-interface PeriodOption {
-  value: ChartPeriod;
-  label: string;
-}
-
-const PERIODS: PeriodOption[] = [
-  { value: "intraday", label: "分时" },
-  { value: "1m", label: "1m" },
-  { value: "5m", label: "5m" },
-  { value: "15m", label: "15m" },
-  { value: "30m", label: "30m" },
-  { value: "60m", label: "60m" },
-  { value: "day", label: "日" },
-  { value: "week", label: "周" },
-  { value: "month", label: "月" },
-];
 
 const CATEGORY_LABEL: Record<string, string> = {
   stock: "股票",
@@ -46,13 +30,6 @@ function fmtNum(v: number | undefined | null, digits = 2): string {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
-}
-
-function fmtVolume(v: number | undefined | null): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  if (Math.abs(v) >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
-  if (Math.abs(v) >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
-  return v.toLocaleString("en-US");
 }
 
 function fmtAmount(v: number | undefined | null): string {
@@ -75,10 +52,10 @@ function fmtPct(v: number | undefined | null): string {
   return `${sign}${v.toFixed(2)}%`;
 }
 
-function fmtChange(v: number | undefined | null): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  const sign = v > 0 ? "+" : "";
-  return `${sign}${v.toFixed(2)}`;
+function fmtFreshness(ts: number | null): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  return d.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
 export function InstrumentDetail({ item }: InstrumentDetailProps) {
@@ -99,18 +76,14 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
 
   const q = item.quote;
   const pct = q?.changePercent;
-  const change = q?.change;
-  // Note: spec'd full StockQuote.limitUp/limitDown 只在 fetch_data 里返回，
-  // list_market 不带；这里 summary 显示 - 表示未取到。
-  const limitUp = undefined as number | undefined;
-  const limitDown = undefined as number | undefined;
-
+  const tone = changeClass(pct);
   const isLineMode = period === "intraday";
 
   return (
     <div className="instrument-detail">
-      <div className="detail-header">
-        <div className="detail-header-line">
+      {/* 精简一行 Header */}
+      <div className="detail-header detail-header-compact">
+        <div className="detail-header-left">
           <span className="detail-header-name">{item.name}</span>
           <span className="detail-header-code tabular">{item.tsCode}</span>
           <span className="chip detail-header-category">
@@ -118,68 +91,33 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
           </span>
           {item.isSt && <span className="chip st-chip">ST</span>}
         </div>
-        <div className="detail-price-line">
-          <span className={`detail-price tabular ${changeClass(pct)}`}>
-            {fmtNum(q?.price)}
+        <div className="detail-header-right">
+          <span className="detail-stat">
+            <span className="label">最新</span>
+            <span className={`value tabular ${tone}`}>{fmtNum(q?.price)}</span>
           </span>
-          <span className={`detail-change tabular ${changeClass(pct)}`}>
-            {fmtChange(change)} {fmtPct(pct)}
+          <span className="detail-stat">
+            <span className={`value tabular ${tone}`}>{fmtPct(pct)}</span>
+          </span>
+          <span className="detail-stat">
+            <span className="label">成交</span>
+            <span className="value tabular">{fmtAmount(q?.amount)}</span>
+          </span>
+          <span className="detail-stat">
+            <span className="label">日内</span>
+            <span className="value tabular up">{fmtNum(q?.high)}</span>
+            <span className="muted">/</span>
+            <span className="value tabular down">{fmtNum(q?.low)}</span>
           </span>
         </div>
       </div>
 
-      <div className="detail-summary">
-        <div className="summary-row">
-          <span className="label">昨收</span>
-          <span className="value">{fmtNum(q?.previousClose)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">今开</span>
-          <span className="value">{fmtNum(q?.open)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">最高</span>
-          <span className="value up">{fmtNum(q?.high)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">最低</span>
-          <span className="value down">{fmtNum(q?.low)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">涨停</span>
-          <span className="value up">{fmtNum(limitUp)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">跌停</span>
-          <span className="value down">{fmtNum(limitDown)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">成交量</span>
-          <span className="value">{fmtVolume(q?.volume)}</span>
-        </div>
-        <div className="summary-row">
-          <span className="label">成交额</span>
-          <span className="value">{fmtAmount(q?.amount)}</span>
-        </div>
-      </div>
-
+      {/* K 线周期切换器 */}
       <div className="detail-period-strip">
-        <div className="segmented" role="tablist">
-          {PERIODS.map((p) => (
-            <button
-              key={p.value}
-              type="button"
-              role="tab"
-              aria-selected={period === p.value}
-              className={`segmented-item ${period === p.value ? "active" : ""}`}
-              onClick={() => setPeriod(p.value)}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
+        <KlinePeriodTabs value={period} onChange={setPeriod} />
       </div>
 
+      {/* K 线区域（占满剩余高度） */}
       <div className="detail-chart">
         {kline.loading && kline.data.length === 0 ? (
           <div className="detail-chart-status">加载中</div>
@@ -191,8 +129,18 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
           <KlineCanvas
             data={kline.data}
             mode={isLineMode ? "line" : "candle"}
-            height={360}
+            autoHeight
           />
+        )}
+      </div>
+
+      {/* 极简 footer：刷新时间 */}
+      <div className="detail-footer">
+        <span className="muted">
+          {kline.lastUpdatedMs ? `更新 ${fmtFreshness(kline.lastUpdatedMs)}` : ""}
+        </span>
+        {q?.tradeDate && (
+          <span className="muted">交易日 {q.tradeDate}</span>
         )}
       </div>
     </div>

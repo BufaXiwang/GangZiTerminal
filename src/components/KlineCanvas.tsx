@@ -30,6 +30,11 @@ interface KlineCanvasProps {
   mode?: "candle" | "line";
   /** 容器高度（px）。默认 480。spec §5 要求稳定容器尺寸，不允许内部跳动。 */
   height?: number;
+  /**
+   * 自适应高度：忽略 height，按父容器实际高度渲染。
+   * 注意：父容器必须有 min-height: 0 + flex 约束，否则会塌成 0。
+   */
+  autoHeight?: boolean;
   /** A 股语义上涨色（默认从 CSS var --chart-up 读取） */
   upColor?: string;
   /** A 股语义下跌色（默认从 CSS var --chart-down 读取） */
@@ -48,6 +53,7 @@ export function KlineCanvas({
   data,
   mode = "candle",
   height = 480,
+  autoHeight = false,
   upColor,
   downColor,
 }: KlineCanvasProps) {
@@ -68,9 +74,12 @@ export function KlineCanvas({
     const borderSoft = readCssVar("--border-soft", "#efe7d7");
     const bgCard = readCssVar("--bg-card", "#ffffff");
 
+    const initialHeight = autoHeight
+      ? containerRef.current.clientHeight || height
+      : height;
     const chart = createChart(containerRef.current, {
       width: containerRef.current.clientWidth,
-      height,
+      height: initialHeight,
       layout: {
         background: { type: ColorType.Solid, color: bgCard },
         textColor: fgDefault,
@@ -126,12 +135,16 @@ export function KlineCanvas({
       volumeSeriesRef.current = volumeSeries;
     }
 
-    // ResizeObserver：容器宽度变化自适应
+    // ResizeObserver：容器宽度变化自适应；autoHeight 时同时跟踪高度。
     const ro = new ResizeObserver(() => {
       if (!containerRef.current || !chartRef.current) return;
-      chartRef.current.applyOptions({
+      const opts: { width: number; height?: number } = {
         width: containerRef.current.clientWidth,
-      });
+      };
+      if (autoHeight) {
+        opts.height = containerRef.current.clientHeight;
+      }
+      chartRef.current.applyOptions(opts);
     });
     ro.observe(containerRef.current);
     roRef.current = ro;
@@ -145,7 +158,7 @@ export function KlineCanvas({
       volumeSeriesRef.current = null;
       lineSeriesRef.current = null;
     };
-  }, [height, upColor, downColor, mode]);
+  }, [height, autoHeight, upColor, downColor, mode]);
 
   // 数据更新
   useEffect(() => {
@@ -190,7 +203,9 @@ export function KlineCanvas({
       ref={containerRef}
       style={{
         width: "100%",
-        height,
+        height: autoHeight ? "100%" : height,
+        flex: autoHeight ? "1 1 auto" : undefined,
+        minHeight: 0,
         background: "var(--bg-card)",
         border: "1px solid var(--border-default)",
         borderRadius: "var(--radius-sm)",

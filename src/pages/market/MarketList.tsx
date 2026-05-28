@@ -1,24 +1,20 @@
-// MarketList — 市场列表组件（table-like rows）。
+// MarketList — 紧凑列表（每行 2 行：名称 + 代码 / 价格 + 涨跌幅）。
 //
 // Spec: docs/design/frontend-design.md §4 市场页 + quotes-module.md §4 list_market
 //
-// 职责：
-// - 渲染 ListMarketItem 数组成表格
-// - 列：tsCode / name / price / change% / volume / amount / star
-// - 排序：默认 amount 降序，可点列头切换
-// - 选中行 → 调用 onSelect
+// 结构：
+//   row：
+//     左：name (大字加粗) + tsCode (小灰)
+//     右：price (tabular) + change% (红绿，下方)
+//   hover 时右侧浮出 star 按钮
+//
+// Sort 简化：默认 / 涨跌幅 / 成交额（3 个 tab 由 MarketPage 控制；本组件只接收 sortKey/sortDir 排序）
 
-import { ChevronDown, ChevronUp, Star } from "lucide-react";
+import { Star } from "lucide-react";
 import { useMemo } from "react";
 import type { ListMarketItem, TsCode } from "../../bindings";
 
-export type SortKey =
-  | "tsCode"
-  | "name"
-  | "price"
-  | "changePercent"
-  | "volume"
-  | "amount";
+export type SortKey = "default" | "changePercent" | "amount";
 export type SortDir = "asc" | "desc";
 
 interface MarketListProps {
@@ -27,27 +23,10 @@ interface MarketListProps {
   onSelect: (tsCode: TsCode) => void;
   sortKey: SortKey;
   sortDir: SortDir;
-  onSort: (key: SortKey) => void;
   starred: Set<TsCode>;
   onToggleStar: (tsCode: TsCode) => void;
   loading?: boolean;
 }
-
-interface ColumnDef {
-  key: SortKey;
-  label: string;
-  align: "left" | "right";
-  className?: string;
-}
-
-const COLUMNS: ColumnDef[] = [
-  { key: "tsCode", label: "代码", align: "left" },
-  { key: "name", label: "名称", align: "left" },
-  { key: "price", label: "现价", align: "right" },
-  { key: "changePercent", label: "涨跌幅", align: "right" },
-  { key: "volume", label: "成交量", align: "right" },
-  { key: "amount", label: "成交额", align: "right" },
-];
 
 function fmtNum(v: number | undefined | null, digits = 2): string {
   if (v == null || !Number.isFinite(v)) return "-";
@@ -55,20 +34,6 @@ function fmtNum(v: number | undefined | null, digits = 2): string {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
-}
-
-function fmtVolume(v: number | undefined | null): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  if (Math.abs(v) >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
-  if (Math.abs(v) >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
-  return v.toLocaleString("en-US");
-}
-
-function fmtAmount(v: number | undefined | null): string {
-  if (v == null || !Number.isFinite(v)) return "-";
-  if (Math.abs(v) >= 1e8) return `${(v / 1e8).toFixed(2)}亿`;
-  if (Math.abs(v) >= 1e4) return `${(v / 1e4).toFixed(2)}万`;
-  return v.toFixed(0);
 }
 
 function changeClass(v: number | undefined | null): string {
@@ -84,18 +49,10 @@ function fmtPct(v: number | undefined | null): string {
   return `${sign}${v.toFixed(2)}%`;
 }
 
-function sortValue(item: ListMarketItem, key: SortKey): string | number | null {
+function sortValue(item: ListMarketItem, key: SortKey): number | null {
   switch (key) {
-    case "tsCode":
-      return item.tsCode;
-    case "name":
-      return item.name ?? "";
-    case "price":
-      return item.quote?.price ?? null;
     case "changePercent":
       return item.quote?.changePercent ?? null;
-    case "volume":
-      return item.quote?.volume ?? null;
     case "amount":
       return item.quote?.amount ?? null;
     default:
@@ -109,20 +66,15 @@ function compareSort(
   key: SortKey,
   dir: SortDir,
 ): number {
+  if (key === "default") return 0;
   const av = sortValue(a, key);
   const bv = sortValue(b, key);
-  // null 永远排到末尾
-  const aNull = av == null || (typeof av === "number" && !Number.isFinite(av));
-  const bNull = bv == null || (typeof bv === "number" && !Number.isFinite(bv));
+  const aNull = av == null || !Number.isFinite(av);
+  const bNull = bv == null || !Number.isFinite(bv);
   if (aNull && bNull) return 0;
   if (aNull) return 1;
   if (bNull) return -1;
-  let cmp = 0;
-  if (typeof av === "number" && typeof bv === "number") {
-    cmp = av - bv;
-  } else {
-    cmp = String(av).localeCompare(String(bv));
-  }
+  const cmp = (av as number) - (bv as number);
   return dir === "asc" ? cmp : -cmp;
 }
 
@@ -132,12 +84,12 @@ export function MarketList({
   onSelect,
   sortKey,
   sortDir,
-  onSort,
   starred,
   onToggleStar,
   loading,
 }: MarketListProps) {
   const sorted = useMemo(() => {
+    if (sortKey === "default") return items;
     const copy = [...items];
     copy.sort((a, b) => compareSort(a, b, sortKey, sortDir));
     return copy;
@@ -145,27 +97,6 @@ export function MarketList({
 
   return (
     <div className="market-list">
-      <div className="market-list-header" role="row">
-        {COLUMNS.map((c) => (
-          <button
-            key={c.key}
-            type="button"
-            className={`market-list-th ${c.align} ${
-              sortKey === c.key ? "active" : ""
-            }`}
-            onClick={() => onSort(c.key)}
-          >
-            <span>{c.label}</span>
-            {sortKey === c.key &&
-              (sortDir === "desc" ? (
-                <ChevronDown size={12} />
-              ) : (
-                <ChevronUp size={12} />
-              ))}
-          </button>
-        ))}
-        <div className="market-list-th right star-col">自选</div>
-      </div>
       <div className="market-list-body">
         {sorted.length === 0 && !loading && (
           <div className="market-list-empty">无标的</div>
@@ -174,52 +105,43 @@ export function MarketList({
           const isSel = item.tsCode === selected;
           const isStarred = starred.has(item.tsCode);
           const pct = item.quote?.changePercent;
+          const tone = changeClass(pct);
           return (
             <div
               key={item.tsCode}
               role="row"
-              className={`market-list-row ${isSel ? "selected" : ""}`}
+              className={`market-list-row compact ${isSel ? "selected" : ""}`}
               onClick={() => onSelect(item.tsCode)}
             >
-              <div className="market-list-cell left tabular">
-                {item.tsCode}
+              <div className="row-left">
+                <div className="row-name">
+                  <span className="instrument-name">{item.name}</span>
+                  {item.isSt && <span className="chip st-chip">ST</span>}
+                </div>
+                <div className="row-code tabular">{item.tsCode}</div>
               </div>
-              <div className="market-list-cell left">
-                <span className="instrument-name">{item.name}</span>
-                {item.isSt && <span className="chip st-chip">ST</span>}
+              <div className="row-right">
+                <div className={`row-price tabular ${tone}`}>
+                  {fmtNum(item.quote?.price)}
+                </div>
+                <div className={`row-pct tabular ${tone}`}>{fmtPct(pct)}</div>
               </div>
-              <div className="market-list-cell right tabular">
-                {fmtNum(item.quote?.price)}
-              </div>
-              <div
-                className={`market-list-cell right tabular ${changeClass(pct)}`}
+              <button
+                type="button"
+                className={`star-btn row-star ${isStarred ? "starred" : ""}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleStar(item.tsCode);
+                }}
+                aria-label={isStarred ? "已加入自选" : "加入自选"}
+                title={isStarred ? "已加入自选" : "加入自选"}
               >
-                {fmtPct(pct)}
-              </div>
-              <div className="market-list-cell right tabular">
-                {fmtVolume(item.quote?.volume)}
-              </div>
-              <div className="market-list-cell right tabular">
-                {fmtAmount(item.quote?.amount)}
-              </div>
-              <div className="market-list-cell right star-col">
-                <button
-                  type="button"
-                  className={`star-btn ${isStarred ? "starred" : ""}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onToggleStar(item.tsCode);
-                  }}
-                  aria-label={isStarred ? "已加入自选" : "加入自选"}
-                  title={isStarred ? "已加入自选" : "加入自选"}
-                >
-                  <Star
-                    size={14}
-                    fill={isStarred ? "currentColor" : "none"}
-                    strokeWidth={1.5}
-                  />
-                </button>
-              </div>
+                <Star
+                  size={14}
+                  fill={isStarred ? "currentColor" : "none"}
+                  strokeWidth={1.5}
+                />
+              </button>
             </div>
           );
         })}

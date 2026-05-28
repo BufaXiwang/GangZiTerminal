@@ -8,12 +8,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
-  type AnyKlinePeriod,
   type FetchInclude,
   type KlinePeriod,
   type MinuteKlinePeriod,
   type TsCode,
 } from "../bindings";
+
+// 后端 bindings 没单独导出联合，本地合成。
+type AnyKlinePeriod = KlinePeriod | MinuteKlinePeriod;
 
 export interface KlineDataPoint {
   /** UNIX timestamp（秒）。日 K / 分钟 K 都用秒级。 */
