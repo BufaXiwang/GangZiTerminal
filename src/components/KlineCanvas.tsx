@@ -14,13 +14,7 @@
 // loading/empty/error 自维护 + overlay 显示。
 
 import { useEffect, useRef, useState } from "react";
-import {
-  init,
-  dispose,
-  LoadDataType,
-  type Chart,
-  type KLineData,
-} from "klinecharts";
+import { init, dispose, type Chart, type KLineData } from "klinecharts";
 import {
   commands,
   type FetchInclude,
@@ -305,7 +299,8 @@ export function KlineCanvas({
     const setupLoadMore = () => {
       chart.setLoadDataCallback(({ type, callback }) => {
         if (cancelled) return;
-        if (type !== LoadDataType.Forward) {
+        // 仅处理 'forward'（用户左拉加载更早 bars）；'init'/'backward' 忽略
+        if (type !== "forward") {
           callback([], false);
           return;
         }
