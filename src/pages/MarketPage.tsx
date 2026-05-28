@@ -17,7 +17,7 @@
 // 默认选中 `000001.SH`（上证指数）—— 这只有 K 线数据（K-line warmup 已覆盖核心指数）。
 // 选中非核心标的会显示"暂无 K 线数据"（后续加 on-demand refresh）。
 
-import { Plus, RefreshCcw, Search } from "lucide-react";
+import { Plus, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { PageShell } from "../components/PageShell";
 import { useWatchlistStore } from "../lib/watchlistStore";
@@ -72,7 +72,8 @@ export default function MarketPage() {
   const starred = useWatchlistStore((s) => s.codes);
   const addWatch = useWatchlistStore((s) => s.add);
   const removeWatch = useWatchlistStore((s) => s.remove);
-  const [sortKey, setSortKey] = useState<SortKey>("default");
+  // 默认按成交量降序排（amount desc）
+  const [sortKey, setSortKey] = useState<SortKey>("amount");
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
 
@@ -203,25 +204,12 @@ export default function MarketPage() {
         ? "ok"
         : "stale";
 
-  // PageShell 顶部 controls 仅保留全局刷新按钮（其他都下移到列表头）
-  const controls = (
-    <button
-      type="button"
-      className="btn"
-      onClick={handleRefresh}
-      disabled={loading}
-      title="刷新"
-    >
-      <RefreshCcw size={14} />
-    </button>
-  );
-
+  // PageShell 顶部 controls 留空（自动刷新由各 hook 周期 polling 处理，不再需要按钮）
   return (
     <PageShell
       title="市场"
       status={status}
       statusTone={statusTone}
-      controls={controls}
     >
       <div className="market-page">
         <MarketMetricsRow selected={selected} onSelectIndex={handleSelectIndex} />

@@ -259,6 +259,9 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
       .fetchData({ tsCodes: [tsCode], include })
       .then((res) => {
         if (id !== reqIdRef.current) return; // stale request
+        // DEBUG
+        // eslint-disable-next-line no-console
+        console.log("[useKlineData] fetchData result:", { tsCode, period, status: res.status, data: res.status === "ok" ? res.data : null });
         if (res.status === "error") {
           setState({
             data: [],
@@ -271,6 +274,8 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         const points = isIntraday
           ? extractIntraday(res.data, tsCode)
           : extractKlines(res.data, tsCode, period as AnyKlinePeriod);
+        // eslint-disable-next-line no-console
+        console.log("[useKlineData] parsed points:", points.length, points.slice(0, 2));
         setState({
           data: points,
           loading: false,
