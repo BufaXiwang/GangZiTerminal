@@ -18,7 +18,8 @@
 // 选中非核心标的会显示"暂无 K 线数据"（后续加 on-demand refresh）。
 
 import { Search } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useWatchlistStore } from "../lib/watchlistStore";
 import { InstrumentDetail } from "./market/InstrumentDetail";
 import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
@@ -81,11 +82,42 @@ export default function MarketPage() {
   const [sortKey, setSortKey] = useState<SortKey>("amount");
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
+  // universe scope refresh 进度事件触发的去抖 refetch（spec §5 全市场刷新执行契约）
+  const progressDebounceRef = useRef<number | null>(null);
 
   useEffect(() => {
     perf(`MarketPage mount at ${performance.now().toFixed(1)}`);
     return () => {
       perf(`MarketPage unmount at ${performance.now().toFixed(1)}`);
+    };
+  }, []);
+
+  // 订阅 universe refresh progress event — 后台 batch refresh 时每 200 只 emit 一次，
+  // 这里做 1.5s debounce 静默 refetch listMarket，让冷启动期间用户看到列表逐步填充。
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void listen<unknown>("market-quotes-refresh-progress", (event) => {
+      const p = (event.payload as { payload?: { completed?: number; success?: number; total?: number } } | undefined)?.payload;
+      perf(
+        `progress event completed=${p?.completed ?? "?"} success=${p?.success ?? "?"} total=${p?.total ?? "?"}`,
+      );
+      if (progressDebounceRef.current != null) {
+        window.clearTimeout(progressDebounceRef.current);
+      }
+      progressDebounceRef.current = window.setTimeout(() => {
+        progressDebounceRef.current = null;
+        // 数据库刚被 batch 写入新行，cache 必须失效让 listMarket 走 IPC 读 fresh state。
+        invalidateAllListCache();
+        setRefreshTick((t) => t + 1);
+      }, 1500);
+    }).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      if (progressDebounceRef.current != null) {
+        window.clearTimeout(progressDebounceRef.current);
+      }
+      unlisten?.();
     };
   }, []);
 

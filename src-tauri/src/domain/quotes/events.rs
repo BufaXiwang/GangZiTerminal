@@ -86,8 +86,34 @@ pub enum RefreshDataScope {
     },
 }
 
+/// universe scope 进度事件 payload。
+///
+/// Spec: shared-types.md §6 `MarketQuotesRefreshProgressPayload`；
+/// quotes-module.md §5 "全市场 quote 刷新执行契约" — 每 200 只 emit 一次。
+///
+/// 消费者只用于增量列表刷新；终态仍以 [`MarketQuotesRefreshedPayload`] 为准。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketQuotesRefreshProgressPayload {
+    /// 总是 [`RefreshScopeKind::Universe`]；spec 用 `scope: "universe"` 字面量约束。
+    pub scope: RefreshScopeKind,
+    pub purpose: RefreshPurpose,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_date: Option<TradeDate>,
+    /// 累计已完成数量（含失败）。
+    pub completed: u32,
+    /// 累计成功数量。
+    pub success: u32,
+    /// 本轮目标总数。
+    pub total: u32,
+    /// 本次 progress 增量写入成功的标的（自上一个 progress 起）。
+    pub affected_ts_codes: Vec<TsCode>,
+    pub captured_at: OccurredAt,
+}
+
 /// Tauri event channel name.
 pub const MARKET_QUOTES_REFRESHED_EVENT: &str = "market-quotes-refreshed";
+pub const MARKET_QUOTES_REFRESH_PROGRESS_EVENT: &str = "market-quotes-refresh-progress";
 
 #[cfg(test)]
 mod tests {

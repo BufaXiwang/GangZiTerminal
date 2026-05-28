@@ -24,8 +24,9 @@ pub use adjust::{apply_adjust, AdjustMode};
 pub use breadth::{IndustryHeatmap, IndustryHeatmapItem, MarketBreadth};
 pub use errors::{QuoteFacadeError, QuoteFacadeErrorKind};
 pub use events::{
-    MarketQuotesRefreshedPayload, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose,
-    RefreshScope, RefreshScopeKind,
+    MarketQuotesRefreshProgressPayload, MarketQuotesRefreshedPayload, RefreshDataScope,
+    RefreshMarketQuotesScope, RefreshPurpose, RefreshScope, RefreshScopeKind,
+    MARKET_QUOTES_REFRESHED_EVENT, MARKET_QUOTES_REFRESH_PROGRESS_EVENT,
 };
 pub use freshness_rules::{
     derive_freshness, eligible_trade_date, EligibleTradeDate, FreshnessIntent,
@@ -54,5 +55,3 @@ pub use trade_calendar::{
 pub use tushare_health::{TushareHealthConfig, TushareHealthState};
 pub use xdxr::{XdxrCategory, XdxrEvent};
 
-// Spec: quotes-module.md §1 / §4
-pub use events::MARKET_QUOTES_REFRESHED_EVENT;

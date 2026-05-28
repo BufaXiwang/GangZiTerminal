@@ -19,7 +19,10 @@ use crate::adapters::account::events::{
     wrap_account_triggered, wrap_account_updated, ACCOUNT_TRIGGERED_EVENT, ACCOUNT_UPDATED_EVENT,
 };
 use crate::adapters::news::events::{wrap_news_refreshed, NEWS_REFRESHED_EVENT};
-use crate::adapters::quotes::events::{wrap_market_quotes_refreshed, MARKET_QUOTES_REFRESHED_EVENT};
+use crate::adapters::quotes::events::{
+    wrap_market_quotes_refresh_progress, wrap_market_quotes_refreshed,
+    MARKET_QUOTES_REFRESHED_EVENT, MARKET_QUOTES_REFRESH_PROGRESS_EVENT,
+};
 use crate::domain::shared::Money;
 use crate::infrastructure::account::migrations as account_migrations;
 use crate::infrastructure::agent::{
@@ -170,6 +173,19 @@ pub fn run() {
                     }
                 });
             quotes_service.set_event_sink(quotes_sink);
+
+            // -- Quotes Refresh Progress sink（spec §5 全市场刷新执行契约）
+            let app_handle = app.handle().clone();
+            let quotes_progress_sink: crate::pipeline::quotes::service::RefreshProgressSink =
+                Arc::new(move |payload| {
+                    let envelope = wrap_market_quotes_refresh_progress(payload, None);
+                    if let Err(e) =
+                        app_handle.emit(MARKET_QUOTES_REFRESH_PROGRESS_EVENT, envelope)
+                    {
+                        tracing::warn!(target: "quotes.refresh.emit", error = %e, "failed to emit market-quotes-refresh-progress");
+                    }
+                });
+            quotes_service.set_progress_sink(quotes_progress_sink);
 
             // -- Quotes cold-start seed（spec §5 universe — seed drift, see seed.rs）：
             // 在异步 TDX universe 刷新启动之前，先把 ~80 条内置热门标的 upsert 进 DB，

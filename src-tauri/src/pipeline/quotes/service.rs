@@ -7,7 +7,8 @@ use crate::domain::quotes::{
     eligible_trade_date, is_in_trading_session, Adjust as AdjEnum, CompanyEvent, DailyBasic,
     FreshnessIntent, IndicatorBasis, IndicatorName, IndicatorSnapshot, IndustryHeatmap,
     IndustryHeatmapItem, IntradaySeries, KlinePeriod, KlinePoint, KlineSeries, MarketBreadth,
-    MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod, MinuteKlineSeries,
+    MarketInstrument, MarketQuotesRefreshProgressPayload, MarketQuotesRefreshedPayload,
+    MinuteKlinePeriod, MinuteKlineSeries,
     RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose, RefreshScopeKind, ScanCondition,
     ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem, ScanOp, ScanResult,
     ScanSortBy, ScanUniverse, StockProfile, StockQuote, TradeStatus,
@@ -57,9 +58,12 @@ pub struct QuotesService {
     #[allow(dead_code)]
     pub(crate) config: QuotesConfig,
     pub(crate) event_sink: std::sync::RwLock<Option<RefreshEventSink>>,
+    pub(crate) progress_sink: std::sync::RwLock<Option<RefreshProgressSink>>,
 }
 
 pub type RefreshEventSink = Arc<dyn Fn(MarketQuotesRefreshedPayload) + Send + Sync + 'static>;
+pub type RefreshProgressSink =
+    Arc<dyn Fn(MarketQuotesRefreshProgressPayload) + Send + Sync + 'static>;
 
 impl QuotesService {
     pub fn new(db: AppDb, config: QuotesConfig) -> reqwest::Result<Self> {
@@ -89,6 +93,7 @@ impl QuotesService {
             adjust_cache,
             config,
             event_sink: std::sync::RwLock::new(None),
+            progress_sink: std::sync::RwLock::new(None),
         })
     }
 
@@ -125,6 +130,20 @@ impl QuotesService {
 
     pub(crate) fn emit_refreshed(&self, payload: MarketQuotesRefreshedPayload) {
         if let Ok(g) = self.event_sink.read() {
+            if let Some(sink) = g.as_ref() {
+                sink(payload);
+            }
+        }
+    }
+
+    pub fn set_progress_sink(&self, sink: RefreshProgressSink) {
+        if let Ok(mut g) = self.progress_sink.write() {
+            *g = Some(sink);
+        }
+    }
+
+    pub(crate) fn emit_progress(&self, payload: MarketQuotesRefreshProgressPayload) {
+        if let Ok(g) = self.progress_sink.read() {
             if let Some(sink) = g.as_ref() {
                 sink(payload);
             }
@@ -1056,6 +1075,17 @@ impl QuotesService {
                     cats.insert(i.ts_code.clone(), (i.category, Some(i.name)));
                     ts_codes.push(i.ts_code);
                 }
+                // Spec §5 全市场刷新执行契约：按 Stock → Index → Fund 排序。
+                // 用户首屏感知优先级是股票，让"看得见的部分"先就绪。
+                ts_codes.sort_by_key(|c| match cats
+                    .get(c)
+                    .map(|(cat, _)| *cat)
+                    .unwrap_or(InstrumentCategory::Stock)
+                {
+                    InstrumentCategory::Stock => 0,
+                    InstrumentCategory::Index => 1,
+                    InstrumentCategory::Fund => 2,
+                });
                 tracing::info!(
                     target: "quotes.refresh",
                     purpose = ?req.purpose,
@@ -1072,35 +1102,234 @@ impl QuotesService {
         let mut success: u32 = 0;
         let mut failed_batches: u32 = 0;
         let mut affected: Vec<TsCode> = Vec::new();
+        // Spec §5 全市场刷新执行契约 — 每 N 只 emit progress event。
+        const PROGRESS_BATCH: usize = 200;
 
-        // 分批 refresh — 每批最多 200。避免一个超大 universe 把进程阻塞太久。
-        const BATCH: usize = 200;
-        for chunk in targets.chunks(BATCH) {
-            for ts in chunk {
-                let (category, name) = target_categories
+        if matches!(scope_kind, RefreshScopeKind::Universe) {
+            // ============================================================
+            // Universe scope: TDX 批量快路径 + per-stock fallback。
+            // Spec §5 "全市场 quote 刷新执行契约":
+            //   1. 批量 RPC 强制 — 用 tdx.fetch_quotes (manager 内部按 80/批 节流)。
+            //   2. BJ 不走 TDX (UnsupportedMarket) — 进入 per-stock fallback。
+            //   3. 每 PROGRESS_BATCH (200) 只 emit market-quotes-refresh-progress。
+            //   4. TDX 失败 / 不完整的标的延后进 fallback chain (EM → Tencent → Sina)。
+            // ============================================================
+            let mut tdx_input: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+            let mut bj_codes: Vec<TsCode> = Vec::new();
+            for ts in &targets {
+                let (cat, name) = target_categories
                     .get(ts)
                     .cloned()
                     .unwrap_or((InstrumentCategory::Stock, None));
-                let outcome = self.refresh_one_quote(ts, category, name, trade_date, now).await;
-                match outcome {
-                    Some(q) => {
+                if matches!(ts.market(), crate::domain::shared::Market::BJ) {
+                    bj_codes.push(ts.clone());
+                } else {
+                    tdx_input.push((ts.clone(), cat, name));
+                }
+            }
+
+            let t_tdx_start = std::time::Instant::now();
+            tracing::info!(
+                target: "quotes.refresh.universe",
+                tdx_targets = tdx_input.len(),
+                bj_targets = bj_codes.len(),
+                total,
+                "universe TDX batch pass starting"
+            );
+
+            let tdx_results = self
+                .tdx
+                .fetch_quotes(tdx_input.clone(), trade_date, now)
+                .await;
+
+            tracing::info!(
+                target: "quotes.refresh.universe",
+                tdx_targets = tdx_input.len(),
+                elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
+                "universe TDX batch pass returned"
+            );
+
+            let mut completed: u32 = 0;
+            let mut affected_in_batch: Vec<TsCode> = Vec::new();
+            let mut fallback_queue: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+
+            for ((ts, cat, name), res) in
+                tdx_input.into_iter().zip(tdx_results.into_iter())
+            {
+                completed += 1;
+                match res {
+                    Ok(q) if q.is_quote_complete() => {
                         let captured_at = q.captured_at;
                         let source_str = q.source.as_str().to_string();
-                        let snap = CachedSnapshot {
+                        self.cache.put(CachedSnapshot {
                             quote: q.clone(),
                             captured_at,
                             trade_date,
                             source: source_str,
-                        };
-                        self.cache.put(snap);
+                        });
                         if matches!(req.purpose, RefreshPurpose::Close) {
-                            let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
+                            let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
                         }
                         success += 1;
                         affected.push(ts.clone());
+                        affected_in_batch.push(ts.clone());
+                    }
+                    _ => {
+                        // TDX 失败或字段不全 — 推入 fallback chain (EM → Tencent → Sina)。
+                        fallback_queue.push((ts, cat, name));
+                    }
+                }
+                if affected_in_batch.len() >= PROGRESS_BATCH {
+                    tracing::info!(
+                        target: "quotes.refresh.universe",
+                        completed,
+                        success,
+                        total,
+                        batch_size = affected_in_batch.len(),
+                        "emit progress (tdx batch path)"
+                    );
+                    self.emit_progress(MarketQuotesRefreshProgressPayload {
+                        scope: RefreshScopeKind::Universe,
+                        purpose: req.purpose,
+                        trade_date: Some(trade_date),
+                        completed,
+                        success,
+                        total,
+                        affected_ts_codes: std::mem::take(&mut affected_in_batch),
+                        captured_at: now,
+                    });
+                }
+            }
+
+            tracing::info!(
+                target: "quotes.refresh.universe",
+                success_after_tdx = success,
+                fallback_pending = fallback_queue.len() + bj_codes.len(),
+                "universe TDX batch pass complete; entering fallback chain"
+            );
+
+            // BJ + TDX 失败 → per-stock fallback chain。
+            let bj_inputs: Vec<(TsCode, InstrumentCategory, Option<String>)> = bj_codes
+                .into_iter()
+                .map(|ts| {
+                    let (cat, name) = target_categories
+                        .get(&ts)
+                        .cloned()
+                        .unwrap_or((InstrumentCategory::Stock, None));
+                    (ts, cat, name)
+                })
+                .collect();
+            fallback_queue.extend(bj_inputs);
+
+            let t_fb_start = std::time::Instant::now();
+            for (ts, cat, name) in fallback_queue {
+                completed += 1;
+                let outcome = self
+                    .refresh_one_quote(&ts, cat, name, trade_date, now)
+                    .await;
+                match outcome {
+                    Some(q) => {
+                        let captured_at = q.captured_at;
+                        let source_str = q.source.as_str().to_string();
+                        self.cache.put(CachedSnapshot {
+                            quote: q.clone(),
+                            captured_at,
+                            trade_date,
+                            source: source_str,
+                        });
+                        if matches!(req.purpose, RefreshPurpose::Close) {
+                            let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
+                        }
+                        success += 1;
+                        affected.push(ts.clone());
+                        affected_in_batch.push(ts.clone());
                     }
                     None => {
                         failed_batches += 1;
+                    }
+                }
+                if affected_in_batch.len() >= PROGRESS_BATCH {
+                    tracing::info!(
+                        target: "quotes.refresh.universe",
+                        completed,
+                        success,
+                        total,
+                        batch_size = affected_in_batch.len(),
+                        "emit progress (fallback path)"
+                    );
+                    self.emit_progress(MarketQuotesRefreshProgressPayload {
+                        scope: RefreshScopeKind::Universe,
+                        purpose: req.purpose,
+                        trade_date: Some(trade_date),
+                        completed,
+                        success,
+                        total,
+                        affected_ts_codes: std::mem::take(&mut affected_in_batch),
+                        captured_at: now,
+                    });
+                }
+            }
+            if !affected_in_batch.is_empty() {
+                tracing::info!(
+                    target: "quotes.refresh.universe",
+                    completed,
+                    success,
+                    total,
+                    batch_size = affected_in_batch.len(),
+                    "emit progress (final flush)"
+                );
+                self.emit_progress(MarketQuotesRefreshProgressPayload {
+                    scope: RefreshScopeKind::Universe,
+                    purpose: req.purpose,
+                    trade_date: Some(trade_date),
+                    completed,
+                    success,
+                    total,
+                    affected_ts_codes: std::mem::take(&mut affected_in_batch),
+                    captured_at: now,
+                });
+            }
+
+            tracing::info!(
+                target: "quotes.refresh.universe",
+                total,
+                success,
+                failed = failed_batches,
+                fallback_elapsed_ms = t_fb_start.elapsed().as_millis() as u64,
+                total_elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
+                "universe refresh complete"
+            );
+        } else {
+            // Subscribed / Manual scope: per-stock loop (small N, fallback chain has best quality).
+            const BATCH: usize = 200;
+            for chunk in targets.chunks(BATCH) {
+                for ts in chunk {
+                    let (category, name) = target_categories
+                        .get(ts)
+                        .cloned()
+                        .unwrap_or((InstrumentCategory::Stock, None));
+                    let outcome = self
+                        .refresh_one_quote(ts, category, name, trade_date, now)
+                        .await;
+                    match outcome {
+                        Some(q) => {
+                            let captured_at = q.captured_at;
+                            let source_str = q.source.as_str().to_string();
+                            self.cache.put(CachedSnapshot {
+                                quote: q.clone(),
+                                captured_at,
+                                trade_date,
+                                source: source_str,
+                            });
+                            if matches!(req.purpose, RefreshPurpose::Close) {
+                                let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
+                            }
+                            success += 1;
+                            affected.push(ts.clone());
+                        }
+                        None => {
+                            failed_batches += 1;
+                        }
                     }
                 }
             }
