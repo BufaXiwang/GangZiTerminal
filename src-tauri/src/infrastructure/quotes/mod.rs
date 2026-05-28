@@ -4,6 +4,7 @@
 //!
 //! 铁律：infrastructure/quotes 不允许 use pipeline | adapters。
 
+pub mod adjust_cache;
 pub mod config;
 pub mod eastmoney;
 pub mod migrations;
@@ -17,6 +18,7 @@ pub mod trade_calendar;
 pub mod tushare;
 pub mod universe;
 
+pub use adjust_cache::{AdjustCache, AdjustCacheKey};
 pub use config::QuotesConfig;
 pub use eastmoney::EastmoneyProvider;
 pub use migrations::migrations;

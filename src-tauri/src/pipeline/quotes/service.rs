@@ -17,9 +17,9 @@ use crate::domain::shared::{
 };
 use crate::infrastructure::db::AppDb;
 use crate::infrastructure::quotes::{
-    CachedSnapshot, EastmoneyProvider, QuotesConfig, QuotesRepository, SinaProvider, SnapshotCache,
-    TdxConnectionManager, TencentProvider, TradeCalendar, TradeCalendarRepo, TushareClient,
-    TushareHealthCheck,
+    AdjustCache, AdjustCacheKey, CachedSnapshot, EastmoneyProvider, QuotesConfig, QuotesRepository,
+    SinaProvider, SnapshotCache, TdxConnectionManager, TencentProvider, TradeCalendar,
+    TradeCalendarRepo, TushareClient, TushareHealthCheck,
 };
 use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
 use chrono::Utc;
@@ -50,6 +50,8 @@ pub struct QuotesService {
     /// 所有 TuShare provider 调用前必须 `health.is_available()`；为 false 则跳过。
     pub(crate) health: Arc<TushareHealthCheck>,
     pub(crate) calendar: Arc<TradeCalendarRepo>,
+    /// qfq / hfq on-read cache（spec §2 "本地复权计算"）。
+    pub(crate) adjust_cache: Arc<AdjustCache>,
     #[allow(dead_code)]
     pub(crate) config: QuotesConfig,
     pub(crate) event_sink: std::sync::RwLock<Option<RefreshEventSink>>,
@@ -71,6 +73,7 @@ impl QuotesService {
             crate::domain::quotes::TushareHealthConfig::default(),
         ));
         let calendar = Arc::new(TradeCalendarRepo::new(db.clone()));
+        let adjust_cache = Arc::new(AdjustCache::new());
         Ok(Self {
             db,
             cache,
@@ -81,6 +84,7 @@ impl QuotesService {
             tushare,
             health,
             calendar,
+            adjust_cache,
             config,
             event_sink: std::sync::RwLock::new(None),
         })
@@ -364,9 +368,15 @@ impl QuotesService {
             if let Some(periods) = include.klines.as_ref() {
                 let mut klines = std::collections::BTreeMap::new();
                 for p in periods {
+                    // Spec §2: 本地存 unadjusted；qfq 由 read 时基于 xdxr 事件现算（带 cache）。
                     let (series, used_none) =
-                        match repo.load_kline_series(ts_code, *p, AdjEnum::Qfq, kline_limit) {
-                            Ok(Some(s)) => (Some(s), false),
+                        match self.read_kline_series_with_adjust(ts_code, *p, AdjEnum::Qfq, kline_limit) {
+                            Ok(Some(s)) => {
+                                // 如果 series 带 QfqMissing warning（xdxr 缺失 → 实际是 unadjusted）
+                                // 则按 spec §2 line 233 标 using_unadjusted_kline。
+                                let lacks_xdxr = s.warnings.contains(&WarningCode::QfqMissing);
+                                (Some(s), lacks_xdxr)
+                            }
                             _ => match repo.load_kline_series(ts_code, *p, AdjEnum::None, kline_limit) {
                                 Ok(Some(s)) => (Some(s), true),
                                 _ => (None, false),
@@ -397,7 +407,7 @@ impl QuotesService {
             }
             if let Some(names) = indicator_set.as_ref() {
                 if let Ok(Some(series)) =
-                    repo.load_kline_series(ts_code, KlinePeriod::Day, AdjEnum::Qfq, 200)
+                    self.read_kline_series_with_adjust(ts_code, KlinePeriod::Day, AdjEnum::Qfq, 200)
                 {
                     let snap = compute_indicators(
                         ts_code.clone(),
@@ -982,8 +992,18 @@ impl QuotesService {
 
     // ====================================================================== refresh_klines
 
-    /// 拉取 K 线（spec §4 + §5）：调用 TuShare 拉 daily + adj_factor，apply qfq/hfq；
-    /// 缺 TuShare token 时降级到 TDX (none) 并返回 warning。
+    /// 拉取 K 线 — TDX-primary + 增量（spec §1 line 15-16 + §5 line 800-810）。
+    ///
+    /// 路径：
+    /// 1. 查 `max(trade_date)` from `quote_klines_daily` WHERE `adjust='none'`；
+    ///    无数据 → 拉 365 天；有数据 → 从 `max+1` 开始（增量）。
+    /// 2. TDX `fetch_kline(period, count)` 拉 unadjusted Bar。
+    /// 3. 失败 → EM `fetch_daily_kline` fallback（仅 Day period；EM 不提供 W/M）。
+    /// 4. 都失败 → 该 (ts_code, period) 计入 failed，continue。
+    /// 5. Adapter Bar → KlinePoint → repo `upsert_daily_klines(adjust=none)`。
+    /// 6. TuShare 长历史扩展（spec §5 line 805）：TODO(D2.5)。
+    /// 7. 写入 unadjusted 后，invalidate 该 ts_code 的 qfq/hfq cache（spec §2 "xdxr 事件刷新时整体失效"
+    ///    包含 base unadjusted 更新；下次读取重算）。
     pub async fn refresh_klines(
         &self,
         scope: RefreshDataScope,
@@ -1000,113 +1020,94 @@ impl QuotesService {
         let mut success: u32 = 0;
         let mut failed: u32 = 0;
         let mut warnings: Vec<WarningCode> = Vec::new();
-
-        // 默认拉 365 天数据
-        let start_naive = now.date_naive() - chrono::Duration::days(365);
-        let end_naive = now.date_naive();
-        let start_str = start_naive.format("%Y%m%d").to_string();
-        let end_str = end_naive.format("%Y%m%d").to_string();
+        let today = now.date_naive();
 
         for ts in &ts_codes {
             for period in &periods {
                 total += 1;
-                // Spec: quotes-module.md §2 "TuShare 健康状态"：调用前 gate
-                if self.health.is_available() {
-                    let raw_bars = self
-                        .tushare
-                        .fetch_kline(ts, *period, &start_str, &end_str)
-                        .await;
-                    let raw_bars = match raw_bars {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::debug!(target: "quotes.refresh.kline", ts = ts.as_str(), error = %e, "tushare kline failed; try TDX");
-                            // spec §5 first-success-wins：TuShare 失败但 TDX fallback 成功 → 计入 success，
-                            // 不重复计入 failed；只有所有 provider 都失败才算 failed。
-                            let mut fallback_ok = false;
-                            if let Some(bars) = self.tdx_daily_fallback(ts).await {
-                                if !bars.is_empty() {
-                                    let _ = self.repo().upsert_daily_klines(
-                                        ts,
-                                        *period,
-                                        AdjEnum::None,
-                                        &bars,
-                                        "tdx",
-                                        now,
-                                    );
-                                    if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
-                                        warnings.push(WarningCode::UsingUnadjustedKline);
-                                    }
-                                    success += 1;
-                                    fallback_ok = true;
-                                }
-                            }
-                            if !fallback_ok {
-                                failed += 1;
-                            }
-                            continue;
+                let repo = self.repo();
+                // ① 增量：查 max(trade_date)；定 count（TDX 协议单次限制 ~800）。
+                //    无数据 → 全量 365 根；有数据 → max+1 到今日。
+                let max_td = repo.max_kline_trade_date(ts, *period).ok().flatten();
+                let count = match max_td {
+                    None => 365u16,
+                    Some(td) => {
+                        let days_gap = (today - td.as_naive()).num_days();
+                        if days_gap <= 0 {
+                            // 已有今日数据，但仍允许刷新最后一根（盘中实时变化）。
+                            2
+                        } else {
+                            // 加 buffer，TDX 协议返回包含 max+1..today 的根数取决于交易日。
+                            (days_gap as u16 + 5).min(800)
                         }
-                    };
-                    if raw_bars.is_empty() {
-                        failed += 1;
-                        continue;
                     }
-                    // 写 unadjusted。
-                    let _ = self.repo().upsert_daily_klines(
+                };
+
+                // ② TDX 主路径（SH/SZ）。
+                let mut ok = false;
+                let mut got_bars: Option<Vec<KlinePoint>> = None;
+                let mut source_used = "tdx";
+                match self.tdx.fetch_kline(ts, *period, count).await {
+                    Ok(bars) => {
+                        let pts: Vec<KlinePoint> = bars
+                            .iter()
+                            .filter_map(
+                                crate::infrastructure::quotes::tdx::manager::map_daily_bar,
+                            )
+                            .collect();
+                        if !pts.is_empty() {
+                            got_bars = Some(pts);
+                        }
+                    }
+                    Err(e) => tracing::debug!(target: "quotes.refresh.kline", ts = ts.as_str(), error = %e, "tdx kline failed; try EM"),
+                }
+
+                // ③ EM fallback（仅 Day period；W/M 无 EM 备源 → 直接 failed）。
+                if got_bars.is_none() && matches!(period, KlinePeriod::Day) {
+                    match self.eastmoney.fetch_daily_kline(ts, count as u32).await {
+                        Ok(pts) if !pts.is_empty() => {
+                            got_bars = Some(pts);
+                            source_used = "eastmoney";
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(target: "quotes.refresh.kline", ts = ts.as_str(), error = %e, "em kline fallback failed"),
+                    }
+                }
+
+                if let Some(pts) = got_bars {
+                    // ④ 写 unadjusted（spec §2：本地落库的永远 adjust=none）。
+                    let _ = repo.upsert_daily_klines(
                         ts,
                         *period,
                         AdjEnum::None,
-                        &raw_bars,
-                        "tushare",
+                        &pts,
+                        source_used,
                         now,
                     );
-                    // 复权因子 → qfq + hfq（只对 day period）。
-                    if matches!(period, KlinePeriod::Day) {
-                        match self.tushare.fetch_adj_factor(ts, &start_str, &end_str).await {
-                            Ok(factors) if !factors.is_empty() => {
-                                let qfq = TushareClient::apply_adjust(&raw_bars, &factors, AdjEnum::Qfq);
-                                let hfq = TushareClient::apply_adjust(&raw_bars, &factors, AdjEnum::Hfq);
-                                let _ = self.repo().upsert_daily_klines(
-                                    ts, *period, AdjEnum::Qfq, &qfq, "tushare", now,
-                                );
-                                let _ = self.repo().upsert_daily_klines(
-                                    ts, *period, AdjEnum::Hfq, &hfq, "tushare", now,
-                                );
-                            }
-                            _ => {
-                                if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
-                                    warnings.push(WarningCode::UsingUnadjustedKline);
-                                }
-                            }
-                        }
-                    }
+                    // ⑤ Invalidate qfq/hfq cache（unadjusted 变了，复权 series 需重算）。
+                    self.adjust_cache.invalidate(ts);
                     success += 1;
-                } else {
-                    // 无 token → 走 TDX (none)。
-                    if let Some(bars) = self.tdx_daily_fallback(ts).await {
-                        if !bars.is_empty() {
-                            let _ = self.repo().upsert_daily_klines(
-                                ts,
-                                *period,
-                                AdjEnum::None,
-                                &bars,
-                                "tdx",
-                                now,
-                            );
-                            if !warnings.contains(&WarningCode::UsingUnadjustedKline) {
-                                warnings.push(WarningCode::UsingUnadjustedKline);
-                            }
-                            success += 1;
-                        } else {
-                            failed += 1;
-                        }
-                    } else {
-                        failed += 1;
+                    ok = true;
+                }
+
+                if !ok {
+                    failed += 1;
+                    // BJ 不支持 K 线 → warning（spec §5 line 806 "BJ 不支持"）。
+                    if matches!(ts.market(), crate::domain::shared::Market::BJ)
+                        && !warnings.contains(&WarningCode::DataPartial)
+                    {
+                        warnings.push(WarningCode::DataPartial);
                     }
                 }
+
+                // ⑥ TuShare 长历史扩展（spec §5 line 805）。
+                // TODO(D2.5): 当请求回溯窗口超出 TDX 单次根数限制且 TushareHealthState.is_available
+                //             时，调 tushare.fetch_kline 补更早的 unadjusted 历史段。
+                //             D2 范围只做近 365 天 TDX 主路径。
             }
         }
 
-        // 记录 refresh_state（kind = "kline"）。
+        // 记录 refresh_state（按 period 分 kind）— 当前简化为 "kline"。
         let eligible_td = eligible_trade_date(&self.market_time_now()).trade_date;
         let _ = self
             .repo()
@@ -1118,6 +1119,136 @@ impl QuotesService {
             warnings,
             affected_ts_codes: ts_codes,
         })
+    }
+
+    // ====================================================================== refresh_xdxr_events
+
+    /// 拉取 xdxr 除权事件 — TDX 主源（spec §2 + §5 line 854）。
+    ///
+    /// 路径：对每个 ts_code：
+    /// 1. `tdx.fetch_xdxr(ts_code)` → `Vec<XdxrRecord>`；
+    /// 2. adapter → `Vec<XdxrEvent>`（跳过未知 category）；
+    /// 3. `delete_xdxr_events(ts_code)` + `upsert_xdxr_events(...)` (清空 + 重写 = 幂等)；
+    /// 4. invalidate 该 ts_code 的 adjust_cache 条目（xdxr 变了 → qfq/hfq 需重算）；
+    /// 5. 记录 refresh_state `kind=xdxr`。
+    ///
+    /// xdxr 数据量小（单只标的几十~几百条），不做增量。
+    /// BJ 标的不发到 TDX（`UnsupportedMarket`），整 ts_code 直接 failed。
+    pub async fn refresh_xdxr_events(
+        &self,
+        scope: RefreshDataScope,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        let ts_codes = self.resolve_data_scope(&scope)?;
+        let now = Utc::now();
+        let fetched_at_ms = now.timestamp_millis();
+        let mut total: u32 = 0;
+        let mut success: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut warnings: Vec<WarningCode> = Vec::new();
+
+        for ts in &ts_codes {
+            total += 1;
+            match self.tdx.fetch_xdxr(ts).await {
+                Ok(records) => {
+                    let events: Vec<crate::domain::quotes::XdxrEvent> = records
+                        .iter()
+                        .filter_map(|r| {
+                            crate::infrastructure::quotes::tdx::adapter::tdx_xdxr_to_domain(
+                                ts,
+                                r,
+                                fetched_at_ms,
+                            )
+                        })
+                        .collect();
+                    let repo = self.repo();
+                    let _ = repo.delete_xdxr_events(ts);
+                    let _ = repo.upsert_xdxr_events(ts, &events);
+                    self.adjust_cache.invalidate(ts);
+                    success += 1;
+                }
+                Err(e) => {
+                    tracing::debug!(target: "quotes.refresh.xdxr", ts = ts.as_str(), error = %e, "tdx xdxr failed");
+                    failed += 1;
+                    if matches!(ts.market(), crate::domain::shared::Market::BJ)
+                        && !warnings.contains(&WarningCode::DataPartial)
+                    {
+                        warnings.push(WarningCode::DataPartial);
+                    }
+                }
+            }
+        }
+
+        let eligible_td = eligible_trade_date(&self.market_time_now()).trade_date;
+        let _ = self
+            .repo()
+            .record_refresh_state("xdxr", eligible_td, total, success, failed, now);
+        Ok(RefreshDataResult {
+            total,
+            success,
+            failed,
+            warnings,
+            affected_ts_codes: ts_codes,
+        })
+    }
+
+    // ====================================================================== read with adjust
+
+    /// 读取 `KlineSeries`，按 `adjust` 现算 qfq / hfq，带 cache。
+    ///
+    /// Spec: docs/design/quotes-module.md §2 "本地复权计算（基于 TDX xdxr）"。
+    ///
+    /// 路径：
+    /// 1. `adjust == None` → 直接读 `adjust='none'` 行。
+    /// 2. `adjust == Qfq / Hfq`：
+    ///    a. 算 cache key `(ts_code, period, adjust, xdxr_version)`；hit → 返回。
+    ///    b. miss → 读 unadjusted + 读 xdxr events → `apply_adjust`；
+    ///       结果写 cache。
+    /// 3. xdxr 完全缺失 → warning `qfq_missing`，返回 unadjusted 当 fallback。
+    pub fn read_kline_series_with_adjust(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+        adjust: AdjEnum,
+        limit: u32,
+    ) -> rusqlite::Result<Option<KlineSeries>> {
+        let repo = self.repo();
+        if matches!(adjust, AdjEnum::None) {
+            return repo.load_kline_series(ts_code, period, AdjEnum::None, limit);
+        }
+        // 计算 xdxr_version：用事件总数 + 最大 fetched_at 简化表达（够区分刷新前后）。
+        let events = repo.list_xdxr_events(ts_code).unwrap_or_default();
+        let xdxr_version: i64 =
+            events.iter().map(|e| e.fetched_at).max().unwrap_or(0) + events.len() as i64;
+        let key = AdjustCacheKey {
+            ts_code: ts_code.as_str().to_string(),
+            period,
+            adjust,
+            xdxr_version,
+        };
+        if let Some(cached) = self.adjust_cache.get(&key) {
+            return Ok(Some(cached));
+        }
+        let Some(unadj) = repo.load_kline_series(ts_code, period, AdjEnum::None, limit)? else {
+            return Ok(None);
+        };
+        let mode = match adjust {
+            AdjEnum::Qfq => crate::domain::quotes::AdjustMode::Qfq,
+            AdjEnum::Hfq => crate::domain::quotes::AdjustMode::Hfq,
+            AdjEnum::None => crate::domain::quotes::AdjustMode::None,
+        };
+        let adjusted_points = crate::domain::quotes::apply_adjust(&unadj.points, &events, mode);
+        let mut series = KlineSeries {
+            period,
+            adjust,
+            points: adjusted_points,
+            freshness: unadj.freshness,
+            warnings: unadj.warnings,
+        };
+        if events.is_empty() {
+            series.warnings.push(WarningCode::QfqMissing);
+        }
+        self.adjust_cache.put(key, series.clone());
+        Ok(Some(series))
     }
 
     // ====================================================================== refresh_minute_klines
@@ -1256,6 +1387,9 @@ impl QuotesService {
         })
     }
 
+    /// 旧 TDX-fallback (TuShare-primary 时代)；新 TDX-primary `refresh_klines` 已直接调
+    /// `tdx.fetch_kline`。保留 dead_code 占位以兼容潜在外部引用；后续可删。
+    #[allow(dead_code)]
     async fn tdx_daily_fallback(&self, ts: &TsCode) -> Option<Vec<KlinePoint>> {
         match self.tdx.fetch_daily_kline(ts, 365).await {
             Ok(bars) => Some(
@@ -2415,6 +2549,253 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(res.code, ErrorCode::InvalidInput);
+    }
+
+    // ============================================================================ D2 tests
+
+    /// 增量 refresh：第一次 (无数据) 应该用 365；后续 (有数据) 用 max+gap+buffer。
+    /// 这里只验证 max_kline_trade_date repo 查询和 refresh 不 panic。
+    #[tokio::test]
+    async fn refresh_klines_incremental_uses_max_trade_date() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        // 预先 seed 一条 unadjusted bar — 模拟"已有数据"。
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20250520").unwrap(),
+            open: Price(Decimal::new(180000, 2)),
+            close: Price(Decimal::new(181000, 2)),
+            high: Price(Decimal::new(182000, 2)),
+            low: Price(Decimal::new(179000, 2)),
+            volume: Some(Volume(100_000)),
+            amount: Some(Amount(Decimal::new(180_000_000, 2))),
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        let max = svc
+            .repo()
+            .max_kline_trade_date(&ts, KlinePeriod::Day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.format(), "20250520");
+        // 调 refresh — TDX 网络可能不可达，主要验证不 panic。
+        let res = svc
+            .refresh_klines(
+                RefreshDataScope::Manual { ts_codes: vec![ts.clone()] },
+                vec![KlinePeriod::Day],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.success + res.failed, res.total);
+    }
+
+    #[tokio::test]
+    async fn refresh_xdxr_events_manual_empty_rejected() {
+        let svc = make_service();
+        let res = svc
+            .refresh_xdxr_events(RefreshDataScope::Manual { ts_codes: vec![] })
+            .await
+            .unwrap_err();
+        assert_eq!(res.code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn refresh_xdxr_events_bj_market_counted_as_failed() {
+        // BJ 不支持 TDX xdxr → 调用直接 unsupported_market error → failed 计数。
+        let svc = make_service();
+        seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
+        let res = svc
+            .refresh_xdxr_events(RefreshDataScope::Manual {
+                ts_codes: vec![TsCode::parse("430047.BJ").unwrap()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert_eq!(res.success + res.failed, res.total);
+        assert_eq!(res.failed, 1);
+    }
+
+    #[test]
+    fn read_kline_no_adjust_returns_unadjusted_directly() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20240620").unwrap(),
+            open: Price(Decimal::new(20000, 2)),
+            close: Price(Decimal::new(20000, 2)),
+            high: Price(Decimal::new(20000, 2)),
+            low: Price(Decimal::new(20000, 2)),
+            volume: Some(Volume(1_000_000)),
+            amount: Some(Amount(Decimal::new(200_000_000, 2))),
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::None, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(series.adjust, AdjEnum::None);
+        assert_eq!(series.points.len(), 1);
+    }
+
+    #[test]
+    fn read_kline_qfq_without_xdxr_returns_unadjusted_with_warning() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20240620").unwrap(),
+            open: Price(Decimal::new(20000, 2)),
+            close: Price(Decimal::new(20000, 2)),
+            high: Price(Decimal::new(20000, 2)),
+            low: Price(Decimal::new(20000, 2)),
+            volume: Some(Volume(1_000_000)),
+            amount: Some(Amount(Decimal::new(200_000_000, 2))),
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        // 无 xdxr 事件 → qfq 应该返回 unadjusted + QfqMissing warning。
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(series.adjust, AdjEnum::Qfq);
+        assert_eq!(series.points.len(), 1);
+        assert!(series.warnings.contains(&WarningCode::QfqMissing));
+        // 值应等于 unadjusted（无事件 ⇒ apply_adjust 直接 clone）
+        assert_eq!(series.points[0].close.0, Decimal::new(20000, 2));
+    }
+
+    #[test]
+    fn read_kline_qfq_with_xdxr_applies_factor_and_caches() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 2 bars: 200 (pre) → 198.8 (event day)
+        let pre = KlinePoint {
+            date: TradeDate::parse("20140629").unwrap(),
+            open: Price(Decimal::new(20000, 2)),
+            close: Price(Decimal::new(20000, 2)),
+            high: Price(Decimal::new(20000, 2)),
+            low: Price(Decimal::new(20000, 2)),
+            volume: Some(Volume(1_000_000)),
+            amount: None,
+        };
+        let post = KlinePoint {
+            date: TradeDate::parse("20140630").unwrap(),
+            open: Price(Decimal::new(19880, 2)),
+            close: Price(Decimal::new(19880, 2)),
+            high: Price(Decimal::new(19880, 2)),
+            low: Price(Decimal::new(19880, 2)),
+            volume: Some(Volume(1_000_000)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(
+                &ts,
+                KlinePeriod::Day,
+                AdjEnum::None,
+                &[pre, post],
+                "test",
+                Utc::now(),
+            )
+            .unwrap();
+        // xdxr: 10送1派12
+        let ev = crate::domain::quotes::XdxrEvent::dividend_and_split(
+            ts.clone(),
+            TradeDate::parse("20140630").unwrap(),
+            Some(12.0),
+            Some(0.0),
+            Some(1.0),
+            Some(0.0),
+            1_700_000_000_000,
+        );
+        svc.repo().upsert_xdxr_events(&ts, &[ev]).unwrap();
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(series.points.len(), 2);
+        // qfq: 历史价 < unadjusted 200，最新价不变 198.8。
+        use rust_decimal::prelude::ToPrimitive;
+        let pre_close = series.points[0].close.0.to_f64().unwrap();
+        let post_close = series.points[1].close.0.to_f64().unwrap();
+        assert!(pre_close < 200.0, "qfq pre = {} should < 200", pre_close);
+        assert!(pre_close > 175.0, "qfq pre = {} should ≈ 180.7", pre_close);
+        assert!((post_close - 198.8).abs() < 0.5);
+        // 第二次读：走 cache（同一 xdxr_version）；不会 panic，结果相同。
+        let series2 = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        let pre2 = series2.points[0].close.0.to_f64().unwrap();
+        assert!((pre2 - pre_close).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_kline_qfq_cache_invalidated_after_xdxr_update() {
+        use crate::domain::shared::{Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20140630").unwrap(),
+            open: Price(Decimal::new(19880, 2)),
+            close: Price(Decimal::new(19880, 2)),
+            high: Price(Decimal::new(19880, 2)),
+            low: Price(Decimal::new(19880, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        // 读一次（无 xdxr）→ warning
+        let s1 = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(s1.warnings.contains(&WarningCode::QfqMissing));
+        // upsert xdxr → version change → key 不命中
+        let ev = crate::domain::quotes::XdxrEvent::dividend_and_split(
+            ts.clone(),
+            TradeDate::parse("20140630").unwrap(),
+            Some(12.0),
+            Some(0.0),
+            Some(1.0),
+            Some(0.0),
+            1_700_000_000_000,
+        );
+        svc.repo().upsert_xdxr_events(&ts, &[ev]).unwrap();
+        // 显式 invalidate（refresh_xdxr_events 内部会调；这里测函数式）
+        svc.adjust_cache.invalidate(&ts);
+        let s2 = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(!s2.warnings.contains(&WarningCode::QfqMissing));
+    }
+
+    #[test]
+    fn max_kline_trade_date_empty_returns_none() {
+        let svc = make_service();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let max = svc.repo().max_kline_trade_date(&ts, KlinePeriod::Day).unwrap();
+        assert!(max.is_none());
     }
 
     #[test]

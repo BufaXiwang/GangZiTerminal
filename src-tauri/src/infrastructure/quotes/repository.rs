@@ -362,6 +362,29 @@ impl<'a> QuotesRepository<'a> {
         }))
     }
 
+    /// 查 `quote_klines_daily` 中 `(ts_code, period, adjust = none)` 的最新 trade_date。
+    /// 用于 incremental refresh：只从 `max+1` 开始往后补。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 "增量 K 线"。
+    pub fn max_kline_trade_date(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+    ) -> rusqlite::Result<Option<TradeDate>> {
+        self.db.with(|conn| {
+            let res: Option<String> = conn
+                .query_row(
+                    "SELECT MAX(trade_date) FROM quote_klines_daily
+                     WHERE ts_code = ?1 AND period = ?2 AND adjust = 'none'",
+                    params![ts_code.as_str(), period.as_str()],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|o| o.flatten())?;
+            Ok(res.and_then(|s| TradeDate::parse(&s).ok()))
+        })
+    }
+
     // ====================================================================== klines (minute)
 
     pub fn upsert_minute_klines(
