@@ -249,6 +249,69 @@ mod tests {
         assert!(hc.is_available());
     }
 
+    #[test]
+    fn two_failures_without_reset_keep_state_available() {
+        // Spec §2 line 506-509：失败计数器累计；2 次失败不应翻 false (max=3)。
+        let cfg = TushareHealthConfig {
+            max_consecutive_failures: 3,
+            ..TushareHealthConfig::default()
+        };
+        let hc = TushareHealthCheck::new(client_with_token(Some("fake")), cfg);
+        hc.record_success();
+        hc.record_failure("e1");
+        hc.record_failure("e2");
+        assert!(hc.is_available(), "2 failures (< max=3) must keep available");
+        let s = hc.state();
+        // last_error 不在 < max 时写入（仅熔断时记录 circuit_open）
+        assert!(s.last_error.is_none(), "no circuit_open before threshold");
+    }
+
+    #[test]
+    fn record_success_during_failures_resets_counter_window() {
+        // 关键 spec 行为（§2 line 506）："任意一次业务调用成功立即重置为 0"。
+        // 2 failures + 1 success + 2 failures 不应熔断（counter 在中间被 reset）。
+        let cfg = TushareHealthConfig {
+            max_consecutive_failures: 3,
+            ..TushareHealthConfig::default()
+        };
+        let hc = TushareHealthCheck::new(client_with_token(Some("fake")), cfg);
+        hc.record_success();
+        hc.record_failure("a1");
+        hc.record_failure("a2");
+        hc.record_success(); // 重置
+        hc.record_failure("b1");
+        hc.record_failure("b2");
+        assert!(
+            hc.is_available(),
+            "fail-fail-success-fail-fail must not open circuit"
+        );
+    }
+
+    #[test]
+    fn circuit_opens_then_success_closes_and_resets_counter() {
+        // 熔断 → record_success → 立即 available + counter = 0；下一次熔断需要 fresh 3 次失败。
+        let cfg = TushareHealthConfig {
+            max_consecutive_failures: 3,
+            ..TushareHealthConfig::default()
+        };
+        let hc = TushareHealthCheck::new(client_with_token(Some("fake")), cfg);
+        hc.record_success();
+        hc.record_failure("e1");
+        hc.record_failure("e2");
+        hc.record_failure("e3");
+        assert!(!hc.is_available(), "3rd failure must open circuit");
+        hc.record_success();
+        assert!(hc.is_available(), "success after circuit_open must re-enable");
+        let s = hc.state();
+        assert!(s.last_error.is_none());
+        // 再 2 次失败不应又熔断（counter 已 reset，需要 3 次）。
+        hc.record_failure("f1");
+        hc.record_failure("f2");
+        assert!(hc.is_available(), "2 fresh failures after reset must keep available");
+        hc.record_failure("f3");
+        assert!(!hc.is_available(), "3rd fresh failure must reopen circuit");
+    }
+
     #[tokio::test]
     async fn initial_ping_short_circuits_when_token_missing() {
         let hc = TushareHealthCheck::new(client_with_token(None), TushareHealthConfig::default());
