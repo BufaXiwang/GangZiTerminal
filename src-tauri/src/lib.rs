@@ -72,7 +72,11 @@ pub fn run() {
     #[cfg(debug_assertions)]
     specta_builder
         .export(
-            specta_typescript::Typescript::default(),
+            specta_typescript::Typescript::default()
+                // i64 在我们这里只用于 ageMs / Shares / Volume / TimestampMs 等，
+                // 实际值远小于 Number.MAX_SAFE_INTEGER (2^53-1)。允许 TS Number 输出。
+                // Money / Price / Amount 走 rust_decimal serialize-as-string，不受此影响。
+                .bigint(specta_typescript::BigIntExportBehavior::Number),
             "../src/bindings.ts",
         )
         .expect("failed to export specta typescript bindings");
@@ -122,11 +126,17 @@ pub fn run() {
                 });
             news_service.set_event_sink(Arc::clone(&sink));
 
-            let news_handle: NewsSchedulerHandle = spawn_news_refresh_scheduler(
-                Arc::clone(&news_service),
-                Duration::from_secs(NEWS_REFRESH_INTERVAL_SECS),
-                sink,
-            );
+            // Tauri setup 闭包跑在 main thread，没有 current tokio runtime context；
+            // scheduler 内部 `tokio::spawn` 需要 runtime handle。用 tauri::async_runtime::block_on
+            // 进入 runtime context 让内部 spawn 工作。
+            let news_handle: NewsSchedulerHandle =
+                tauri::async_runtime::block_on(async {
+                    spawn_news_refresh_scheduler(
+                        Arc::clone(&news_service),
+                        Duration::from_secs(NEWS_REFRESH_INTERVAL_SECS),
+                        sink,
+                    )
+                });
             app.manage(news_handle);
 
             // -- Quotes BC bootstrap
@@ -147,10 +157,24 @@ pub fn run() {
                 });
             quotes_service.set_event_sink(quotes_sink);
 
+            // -- Quotes cold-start seed（spec §5 universe — seed drift, see seed.rs）：
+            // 在异步 TDX universe 刷新启动之前，先把 ~80 条内置热门标的 upsert 进 DB，
+            // 让 UI 第一帧（启动到首次 refresh 完成的 ~10s 窗口）就能看到非空市场列表。
+            // 同步 + 幂等；预期 <100ms。失败不阻断启动，仅日志。
+            {
+                let repo = crate::infrastructure::quotes::QuotesRepository::new(&db);
+                match crate::infrastructure::quotes::seed_builtin_instruments(&repo) {
+                    Ok(n) => tracing::info!(target: "quotes.seed", count = n, "builtin universe seed upserted"),
+                    Err(e) => tracing::warn!(target: "quotes.seed", error = %e, "builtin universe seed failed"),
+                }
+            }
+
             // -- Quotes startup catch-up（spec §5）：异步后台 task；不阻塞 setup。
+            // 用 tauri::async_runtime::spawn 而非 tokio::spawn — setup 闭包没有
+            // current tokio runtime context；tauri::async_runtime 提供同等接口。
             {
                 let svc = Arc::clone(&quotes_service);
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     // 1) universe enrich（TuShare 可用时；token 缺失会自动 skip）
                     if let Err(e) = svc.refresh_market_instruments().await {
                         tracing::warn!(target: "quotes.startup", error = ?e, "refresh_market_instruments failed");
@@ -237,23 +261,31 @@ pub fn run() {
             account_service.set_triggered_sink(triggered_sink);
             app.manage(Arc::clone(&account_service));
 
-            // Account eval scheduler
-            let account_handle: AccountSchedulerHandle = spawn_account_eval_scheduler(
-                Arc::clone(&account_service),
-                std::time::Duration::from_secs(ACCOUNT_EVAL_INTERVAL_SECS),
-                ACCOUNT_EVAL_BATCH_SIZE,
-            );
+            // Account eval scheduler — 同样需要 runtime context 包装
+            let account_handle: AccountSchedulerHandle =
+                tauri::async_runtime::block_on(async {
+                    spawn_account_eval_scheduler(
+                        Arc::clone(&account_service),
+                        std::time::Duration::from_secs(ACCOUNT_EVAL_INTERVAL_SECS),
+                        ACCOUNT_EVAL_BATCH_SIZE,
+                    )
+                });
             app.manage(account_handle);
 
-            // -- Quotes Scheduler（multi-tick）
-            let quotes_handle: QuotesSchedulerHandle = spawn_full_scheduler(
-                Arc::clone(&quotes_service),
-                QuotesSchedulerIntervals {
-                    universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
-                    subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
-                    daily_tick_interval: Duration::from_secs(60),
-                },
-            );
+            // -- Quotes Scheduler（multi-tick）— 同样需要 runtime context 包装
+            let quotes_handle: QuotesSchedulerHandle =
+                tauri::async_runtime::block_on(async {
+                    spawn_full_scheduler(
+                        Arc::clone(&quotes_service),
+                        QuotesSchedulerIntervals {
+                            universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
+                            subscribed_interval: Duration::from_secs(
+                                QUOTES_SUBSCRIBED_INTERVAL_SECS,
+                            ),
+                            daily_tick_interval: Duration::from_secs(60),
+                        },
+                    )
+                });
             app.manage(quotes_handle);
 
             Ok(())
