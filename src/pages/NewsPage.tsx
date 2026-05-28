@@ -14,7 +14,7 @@
 //   - 滚动到底 → fetchNews({ offset: prev + limit }) 拼接
 //   - 点条目 → 打开 ArticleDrawer，drawer 内决定是否 warm + 重读 includeArticle
 
-import { RefreshCcw, Search } from "lucide-react";
+import { RefreshCcw, Search, X } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -221,8 +221,21 @@ export default function NewsPage() {
           {enabledCount}/{totalCount} 来源启用
         </span>
       )}
-      {items.length > 0 && (
-        <span className="muted">· 当前 {items.length} 条</span>
+      {query.length > 0 ? (
+        <span className="muted">
+          · 匹配 {items.length} 条
+          {page?.hasMore ? "+" : ""} (query: "{query}")
+        </span>
+      ) : (
+        items.length > 0 && (
+          <span className="muted">
+            · 当前 {items.length} 条
+            {page?.hasMore ? "+（可加载更多）" : ""}
+          </span>
+        )
+      )}
+      {selectedSources.size > 0 && (
+        <span className="muted">· {selectedSources.size} 来源过滤中</span>
       )}
       {warnings.length > 0 && (
         <span className="news-warning-pill" title={warnings.join("\n")}>
@@ -247,6 +260,17 @@ export default function NewsPage() {
           value={queryInput}
           onChange={(e) => setQueryInput(e.target.value)}
         />
+        {queryInput.length > 0 && (
+          <button
+            type="button"
+            className="btn ghost"
+            style={{ height: 22, padding: "0 4px" }}
+            onClick={() => setQueryInput("")}
+            aria-label="清除搜索"
+          >
+            <X size={12} />
+          </button>
+        )}
       </div>
 
       <div className="news-source-chips">
