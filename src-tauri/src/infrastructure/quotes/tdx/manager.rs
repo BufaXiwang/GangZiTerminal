@@ -811,6 +811,7 @@ fn map_security_quote(
 /// 4. `start >= hard_cap` → break。
 ///
 /// **顺序契约**：每次 batch 升序，新（更早）batch prepend 到累计前；最终 Vec 升序。
+#[allow(dead_code)] // 当前仅 unit test 直接调用；fetch_kline_paginated 内联同等逻辑（含 socket 编织）。
 pub(crate) fn aggregate_paginated_bars<F>(
     page_size: u16,
     hard_cap: u32,
@@ -991,8 +992,8 @@ mod tests {
     fn mk_bar(year: u16, month: u8, day: u8) -> Bar {
         Bar {
             year,
-            month: month as u16,
-            day: day as u16,
+            month,
+            day,
             hour: 0,
             minute: 0,
             open: 1.0,
