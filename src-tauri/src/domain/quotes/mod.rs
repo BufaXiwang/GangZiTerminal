@@ -14,6 +14,7 @@ pub mod limit;
 pub mod quote;
 pub mod scan;
 pub mod sources;
+pub mod xdxr;
 
 pub use errors::{QuoteFacadeError, QuoteFacadeErrorKind};
 pub use events::{
@@ -40,6 +41,7 @@ pub use scan::{
     ScanOp, ScanResult, ScanSortBy, ScanUniverse,
 };
 pub use sources::core_indexes;
+pub use xdxr::{XdxrCategory, XdxrEvent};
 
 // Spec: quotes-module.md §1 / §4
 pub use events::MARKET_QUOTES_REFRESHED_EVENT;

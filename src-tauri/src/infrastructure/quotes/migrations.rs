@@ -14,11 +14,15 @@
 //! - `quote_close_snapshot`  — 收盘快照（按 trade_date + ts_code 持久化最后行情事实）
 //! - `quote_trade_calendar`  — 交易日历缓存（TuShare `trade_cal`）
 //! - `quote_refresh_state`   — 收盘 refresh 完成 / 状态记录（spec §5 收盘快照完成状态）
+//! - `quote_xdxr_events`     — TDX xdxr 除权除息事件（spec §2 本地复权计算）
 
 use rusqlite_migration::M;
 
 pub fn migrations() -> Vec<M<'static>> {
-    vec![M::up(MIGRATION_001_INITIAL)]
+    vec![
+        M::up(MIGRATION_001_INITIAL),
+        M::up(MIGRATION_002_XDXR_EVENTS),
+    ]
 }
 
 const MIGRATION_001_INITIAL: &str = r#"
@@ -168,6 +172,44 @@ CREATE TABLE quote_refresh_state (
     completed_at  TEXT NOT NULL,
     PRIMARY KEY (refresh_kind, trade_date)
 );
+"#;
+
+// Spec: quotes-module.md §2 "本地复权计算（基于 TDX xdxr）"
+//
+// 字段含义见 domain::quotes::xdxr::XdxrCategory（mirrors TDX 协议层 XdxrRecord）。
+// 14 种 category 不同字段子集都展平成可空列；多余的 NULL 比缺列好维护。
+const MIGRATION_002_XDXR_EVENTS: &str = r#"
+CREATE TABLE quote_xdxr_events (
+    ts_code         TEXT NOT NULL,
+    occur_date      TEXT NOT NULL,          -- YYYYMMDD
+    category        INTEGER NOT NULL,       -- 1..14（XdxrCategory）
+
+    -- category = 1（除权除息 / 复权核心输入）
+    fenhong         REAL,                   -- 每 10 股派息（元）
+    peigujia        REAL,                   -- 配股价
+    songzhuangu     REAL,                   -- 每 10 股送转股本
+    peigu           REAL,                   -- 每 10 股配股股数
+
+    -- category in (11, 12)：缩股比例
+    suogu           REAL,
+
+    -- category in (13, 14)：权证
+    xingquanjia     REAL,
+    fenshu          REAL,
+
+    -- 其他 category：股本结构变动
+    panqianliutong  REAL,
+    qianzongguben   REAL,
+    panhouliutong   REAL,
+    houzongguben    REAL,
+
+    fetched_at      INTEGER NOT NULL,       -- TimestampMs (ms since epoch)
+    source          TEXT NOT NULL,          -- "tdx"
+
+    PRIMARY KEY (ts_code, occur_date, category)
+);
+
+CREATE INDEX idx_quote_xdxr_ts_code ON quote_xdxr_events (ts_code, occur_date);
 "#;
 
 #[cfg(test)]

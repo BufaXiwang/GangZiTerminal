@@ -7,7 +7,7 @@ use crate::domain::quotes::quote::{CompanyEvent, CompanyEventType};
 use crate::domain::quotes::{
     Adjust, DailyBasic, InstrumentSource, IntradaySeries, KlinePeriod, KlinePoint, KlineSeries,
     MarketInstrument, MinuteKlinePeriod, MinuteKlinePoint, MinuteKlineSeries, MinutePoint,
-    StockQuote,
+    StockQuote, XdxrCategory, XdxrEvent,
 };
 use crate::domain::shared::{
     Amount, Freshness, FreshnessStatus, InstrumentCategory, InstrumentStatus, Market, Money,
@@ -871,6 +871,136 @@ impl<'a> QuotesRepository<'a> {
             Ok(())
         })
     }
+
+    // ====================================================================== xdxr_events
+    //
+    // Spec: quotes-module.md §2 "本地复权计算（基于 TDX xdxr）"
+
+    /// Upsert xdxr events for a ts_code. Idempotent by (ts_code, occur_date, category).
+    pub fn upsert_xdxr_events(
+        &self,
+        ts_code: &TsCode,
+        events: &[XdxrEvent],
+    ) -> rusqlite::Result<usize> {
+        self.db.with(|conn| {
+            let tx = conn.transaction()?;
+            let mut written = 0usize;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT INTO quote_xdxr_events (
+                        ts_code, occur_date, category,
+                        fenhong, peigujia, songzhuangu, peigu,
+                        suogu, xingquanjia, fenshu,
+                        panqianliutong, qianzongguben, panhouliutong, houzongguben,
+                        fetched_at, source
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                     ON CONFLICT(ts_code, occur_date, category) DO UPDATE SET
+                        fenhong = excluded.fenhong,
+                        peigujia = excluded.peigujia,
+                        songzhuangu = excluded.songzhuangu,
+                        peigu = excluded.peigu,
+                        suogu = excluded.suogu,
+                        xingquanjia = excluded.xingquanjia,
+                        fenshu = excluded.fenshu,
+                        panqianliutong = excluded.panqianliutong,
+                        qianzongguben = excluded.qianzongguben,
+                        panhouliutong = excluded.panhouliutong,
+                        houzongguben = excluded.houzongguben,
+                        fetched_at = excluded.fetched_at,
+                        source = excluded.source",
+                )?;
+                for e in events {
+                    if e.ts_code.as_str() != ts_code.as_str() {
+                        // skip mismatched ts_code (defensive — caller should pre-filter)
+                        continue;
+                    }
+                    stmt.execute(params![
+                        e.ts_code.as_str(),
+                        e.occur_date.format(),
+                        e.category.as_u8() as i64,
+                        e.fenhong,
+                        e.peigujia,
+                        e.songzhuangu,
+                        e.peigu,
+                        e.suogu,
+                        e.xingquanjia,
+                        e.fenshu,
+                        e.panqianliutong,
+                        e.qianzongguben,
+                        e.panhouliutong,
+                        e.houzongguben,
+                        e.fetched_at,
+                        "tdx",
+                    ])?;
+                    written += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(written)
+        })
+    }
+
+    /// List all xdxr events for a ts_code, ordered by `occur_date ASC, category ASC`。
+    pub fn list_xdxr_events(&self, ts_code: &TsCode) -> rusqlite::Result<Vec<XdxrEvent>> {
+        self.db.with(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ts_code, occur_date, category,
+                        fenhong, peigujia, songzhuangu, peigu,
+                        suogu, xingquanjia, fenshu,
+                        panqianliutong, qianzongguben, panhouliutong, houzongguben,
+                        fetched_at
+                 FROM quote_xdxr_events
+                 WHERE ts_code = ?1
+                 ORDER BY occur_date ASC, category ASC",
+            )?;
+            let mut rows = stmt.query(params![ts_code.as_str()])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                if let Ok(ev) = row_to_xdxr(row) {
+                    out.push(ev);
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Delete all xdxr events for a ts_code（用于刷新前清空，保证幂等重建）。
+    pub fn delete_xdxr_events(&self, ts_code: &TsCode) -> rusqlite::Result<usize> {
+        self.db.with(|conn| {
+            let n = conn.execute(
+                "DELETE FROM quote_xdxr_events WHERE ts_code = ?1",
+                params![ts_code.as_str()],
+            )?;
+            Ok(n)
+        })
+    }
+}
+
+fn row_to_xdxr(row: &rusqlite::Row<'_>) -> rusqlite::Result<XdxrEvent> {
+    let ts_code_s: String = row.get(0)?;
+    let ts_code = TsCode::parse(&ts_code_s).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let occur_date_s: String = row.get(1)?;
+    let occur_date = TradeDate::parse(&occur_date_s).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let category_raw: i64 = row.get(2)?;
+    let category =
+        XdxrCategory::from_u8(category_raw as u8).ok_or(rusqlite::Error::InvalidQuery)?;
+    Ok(XdxrEvent {
+        ts_code,
+        occur_date,
+        category,
+        fenhong: row.get(3)?,
+        peigujia: row.get(4)?,
+        songzhuangu: row.get(5)?,
+        peigu: row.get(6)?,
+        suogu: row.get(7)?,
+        xingquanjia: row.get(8)?,
+        fenshu: row.get(9)?,
+        panqianliutong: row.get(10)?,
+        qianzongguben: row.get(11)?,
+        panhouliutong: row.get(12)?,
+        houzongguben: row.get(13)?,
+        fetched_at: row.get(14)?,
+    })
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1196,6 +1326,121 @@ mod tests {
             map.get(&TsCode::parse("000001.SH").unwrap()).copied(),
             Some(InstrumentCategory::Index)
         );
+    }
+
+    // ====================================================================== xdxr_events tests
+
+    fn xdxr_div(ts: &str, date: &str, fenhong: f64, songzhuangu: f64) -> XdxrEvent {
+        XdxrEvent::dividend_and_split(
+            TsCode::parse(ts).unwrap(),
+            TradeDate::parse(date).unwrap(),
+            Some(fenhong),
+            None,
+            Some(songzhuangu),
+            None,
+            1_700_000_000_000,
+        )
+    }
+
+    #[test]
+    fn xdxr_upsert_then_list_roundtrips_fields() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let e1 = xdxr_div("600519.SH", "20240620", 30.872, 0.0);
+        let e2 = xdxr_div("600519.SH", "20230630", 25.911, 0.0);
+        let n = repo.upsert_xdxr_events(&ts, &[e1.clone(), e2.clone()]).unwrap();
+        assert_eq!(n, 2);
+        let got = repo.list_xdxr_events(&ts).unwrap();
+        assert_eq!(got.len(), 2);
+        // ordered by occur_date ASC
+        assert_eq!(got[0].occur_date, e2.occur_date);
+        assert_eq!(got[0].fenhong, Some(25.911));
+        assert_eq!(got[1].occur_date, e1.occur_date);
+        assert_eq!(got[1].category, XdxrCategory::DividendAndSplit);
+    }
+
+    #[test]
+    fn xdxr_upsert_is_idempotent_on_pk() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let e = xdxr_div("600519.SH", "20240620", 30.872, 0.0);
+        repo.upsert_xdxr_events(&ts, &[e.clone()]).unwrap();
+        // 重复写同一 PK，行数仍为 1
+        repo.upsert_xdxr_events(&ts, &[e.clone()]).unwrap();
+        let got = repo.list_xdxr_events(&ts).unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn xdxr_upsert_updates_existing_row() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let e1 = xdxr_div("600519.SH", "20240620", 30.872, 0.0);
+        let e2 = xdxr_div("600519.SH", "20240620", 31.0, 0.0); // 同 PK，数值变化
+        repo.upsert_xdxr_events(&ts, &[e1]).unwrap();
+        repo.upsert_xdxr_events(&ts, &[e2]).unwrap();
+        let got = repo.list_xdxr_events(&ts).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].fenhong, Some(31.0));
+    }
+
+    #[test]
+    fn xdxr_delete_clears_only_target_ts_code() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let ts1 = TsCode::parse("600519.SH").unwrap();
+        let ts2 = TsCode::parse("000001.SH").unwrap();
+        repo.upsert_xdxr_events(&ts1, &[xdxr_div("600519.SH", "20240620", 30.0, 0.0)])
+            .unwrap();
+        repo.upsert_xdxr_events(&ts2, &[xdxr_div("000001.SH", "20240120", 5.0, 0.0)])
+            .unwrap();
+        let n = repo.delete_xdxr_events(&ts1).unwrap();
+        assert_eq!(n, 1);
+        assert!(repo.list_xdxr_events(&ts1).unwrap().is_empty());
+        assert_eq!(repo.list_xdxr_events(&ts2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn xdxr_supports_different_categories_same_date() {
+        let db = make_db();
+        let repo = QuotesRepository::new(&db);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let date = TradeDate::parse("20240620").unwrap();
+        let div = XdxrEvent::dividend_and_split(
+            ts.clone(),
+            date,
+            Some(30.0),
+            None,
+            None,
+            None,
+            1_700_000_000_000,
+        );
+        let equity = XdxrEvent {
+            ts_code: ts.clone(),
+            occur_date: date,
+            category: XdxrCategory::EquityChange,
+            fenhong: None,
+            peigujia: None,
+            songzhuangu: None,
+            peigu: None,
+            suogu: None,
+            xingquanjia: None,
+            fenshu: None,
+            panqianliutong: Some(1.0e8),
+            qianzongguben: Some(1.5e8),
+            panhouliutong: Some(1.1e8),
+            houzongguben: Some(1.6e8),
+            fetched_at: 1_700_000_000_000,
+        };
+        repo.upsert_xdxr_events(&ts, &[div, equity]).unwrap();
+        let got = repo.list_xdxr_events(&ts).unwrap();
+        assert_eq!(got.len(), 2);
+        let cats: Vec<XdxrCategory> = got.iter().map(|e| e.category).collect();
+        assert!(cats.contains(&XdxrCategory::DividendAndSplit));
+        assert!(cats.contains(&XdxrCategory::EquityChange));
     }
 }
 
