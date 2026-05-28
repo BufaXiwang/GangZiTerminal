@@ -4060,6 +4060,159 @@ mod tests {
             .all(|i| i.sector != "未分类"));
     }
 
+    // ============================================================================ F2 — scan_market mixed coverage
+    //
+    // Spec: docs/design/quotes-module.md §4 scan_market 规则 line 465-466：
+    // - 有 quote 的 item 参与扫描；
+    // - 无 quote / 过期 quote 被 skip 并计入 coverage warning（response 级 data_partial）；
+    // - stale quote 仍参与扫描，但 item 带 quote_stale warning。
+
+    #[test]
+    fn scan_market_mixed_coverage_partial_quotes() {
+        let svc = make_service();
+        // 3 个 stock：A 有 quote, B 无 quote, C 有 quote。
+        seed_instrument_with(&svc, "600001.SH", "A", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 3.0);
+        seed_instrument_with(&svc, "600002.SH", "B", None, Some("主板"), false);
+        // 故意不写 snapshot for B
+        seed_instrument_with(&svc, "600003.SH", "C", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600003.SH", -1.0);
+
+        let res = svc.scan_market(ScanMarketRequest::default());
+        // universe total = 3，valid quote = 2，excluded missing = 1
+        assert_eq!(res.result.universe.total, 3);
+        assert_eq!(res.result.universe.valid_quote_count, Some(2));
+        assert_eq!(res.result.universe.excluded_missing_quote_count, Some(1));
+        // 覆盖不完整 → response 级 data_partial（spec line 466）
+        assert!(
+            res.result.warnings.contains(&WarningCode::DataPartial),
+            "mixed coverage must emit response-level data_partial"
+        );
+        // matched item: A + C 都进入；ts_code 应在 items 中。
+        let codes: Vec<_> = res.result.items.iter().map(|i| i.ts_code.as_str().to_string()).collect();
+        assert!(codes.contains(&"600001.SH".to_string()));
+        assert!(codes.contains(&"600003.SH".to_string()));
+        assert!(!codes.contains(&"600002.SH".to_string()));
+    }
+
+    #[test]
+    fn scan_market_filter_top_gain_excludes_no_quote_items() {
+        // top_gain filter：只看 changePercent 存在的；无 quote 标的应被排除并计入 excluded_missing。
+        let svc = make_service();
+        seed_instrument_with(&svc, "600001.SH", "G1", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 4.0);
+        seed_instrument_with(&svc, "600002.SH", "G2", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600002.SH", 7.0);
+        seed_instrument_with(&svc, "600003.SH", "NoQuote", None, Some("主板"), false);
+
+        let req = ScanMarketRequest {
+            filter: Some(ScanFilter::TopGain),
+            ..Default::default()
+        };
+        let res = svc.scan_market(req);
+        // 涨幅 top 排序：600002 (+7) > 600001 (+4)
+        assert_eq!(res.result.items.len(), 2);
+        assert_eq!(res.result.items[0].ts_code.as_str(), "600002.SH");
+        assert_eq!(res.result.items[1].ts_code.as_str(), "600001.SH");
+        assert_eq!(res.result.universe.excluded_missing_quote_count, Some(1));
+        assert!(res.result.warnings.contains(&WarningCode::DataPartial));
+    }
+
+    // ============================================================================ F2 — Startup catch-up integration
+    //
+    // Spec: docs/design/quotes-module.md §5 后台刷新 "refresh_state 读写契约" + 收盘快照 retry。
+    // 测 service 层逻辑：close_snapshot_complete 在不同 refresh_state 下返回正确 bool；
+    // read_refresh_state 写入后能读出。
+
+    #[tokio::test]
+    async fn startup_catchup_close_snapshot_complete_false_without_record() {
+        let svc = make_service();
+        let td = eligible_trade_date(&svc.market_time_now()).trade_date;
+        // 没有任何 refresh_state 记录 → 视为未完成。
+        assert!(!svc.close_snapshot_complete(td).await);
+    }
+
+    #[tokio::test]
+    async fn startup_catchup_close_snapshot_complete_true_above_95_pct() {
+        let svc = make_service();
+        let td = eligible_trade_date(&svc.market_time_now()).trade_date;
+        // seed 100 个 universe instrument，写一条 close refresh_state (96 / 100) → 应视为完成。
+        for i in 0..100 {
+            seed_instrument(
+                &svc,
+                &format!("60{:04}.SH", i),
+                &format!("S{}", i),
+                InstrumentCategory::Stock,
+            );
+        }
+        svc.repo()
+            .record_refresh_state("close", td, 100, 96, 4, Utc::now())
+            .unwrap();
+        assert!(svc.close_snapshot_complete(td).await);
+    }
+
+    #[tokio::test]
+    async fn startup_catchup_close_snapshot_incomplete_below_95_pct() {
+        let svc = make_service();
+        let td = eligible_trade_date(&svc.market_time_now()).trade_date;
+        // 90 / 100 = 90% < 95% → 仍视为未完成（spec line 951 "完成状态阈值"）。
+        for i in 0..100 {
+            seed_instrument(
+                &svc,
+                &format!("60{:04}.SH", i),
+                &format!("S{}", i),
+                InstrumentCategory::Stock,
+            );
+        }
+        svc.repo()
+            .record_refresh_state("close", td, 100, 90, 10, Utc::now())
+            .unwrap();
+        assert!(!svc.close_snapshot_complete(td).await);
+    }
+
+    #[test]
+    fn refresh_state_roundtrips_for_all_known_kinds() {
+        // Spec §5 line 974：refresh_kind 枚举 = close / intraday / kline / minute_kline /
+        // daily_basic / events / xdxr。本测试验证每个 kind 都能 record + read 回。
+        let svc = make_service();
+        let td = TradeDate::parse("20260520").unwrap();
+        let now = Utc::now();
+        for kind in [
+            "close",
+            "intraday",
+            "kline",
+            "minute_kline",
+            "daily_basic",
+            "events",
+            "xdxr",
+        ] {
+            svc.repo()
+                .record_refresh_state(kind, td, 100, 95, 5, now)
+                .unwrap();
+            let got = svc.repo().read_refresh_state(kind, td).unwrap().unwrap();
+            assert_eq!(got.0, 100, "kind={}", kind);
+            assert_eq!(got.1, 95, "kind={}", kind);
+            assert_eq!(got.2, 5, "kind={}", kind);
+            // has_refresh_state 应该全 true（任意 trade_date 存在即可）。
+            assert!(svc.repo().has_refresh_state(kind).unwrap(), "kind={}", kind);
+        }
+    }
+
+    #[test]
+    fn has_refresh_state_only_true_after_record() {
+        // Spec §2 三态判定靠 has_refresh_state；本测试验证它在写入前为 false，写入后为 true。
+        let svc = make_service();
+        assert!(!svc.repo().has_refresh_state("xdxr").unwrap());
+        assert!(!svc.repo().has_refresh_state("kline").unwrap());
+        let td = TradeDate::parse("20260520").unwrap();
+        svc.repo()
+            .record_refresh_state("xdxr", td, 1, 1, 0, Utc::now())
+            .unwrap();
+        assert!(svc.repo().has_refresh_state("xdxr").unwrap());
+        // 别的 kind 不受影响。
+        assert!(!svc.repo().has_refresh_state("kline").unwrap());
+    }
+
     #[test]
     fn industry_heatmap_respects_top_n() {
         let svc = make_service();
