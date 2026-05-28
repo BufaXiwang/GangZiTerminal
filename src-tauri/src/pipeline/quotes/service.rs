@@ -1308,6 +1308,56 @@ impl QuotesService {
         })
     }
 
+    /// 拉一页 K 线（spec §5 K 线分页支持，渐进式加载）。
+    ///
+    /// `start_offset = 0` 拉最新一批；`= 800` 再往前一批，依此类推。
+    /// 返回 `(new_bars_added, has_more)`：
+    /// - `new_bars_added`：本页 upsert 的新 bar 数（>= 0）
+    /// - `has_more`：是否还有更早历史可拉（本页满 800 根 = true；< 800 或 0 = false）
+    ///
+    /// 配合前端渐进式 K 线：先调 start=0 显示首屏，再 background loop 调
+    /// start=800/1600/... applyMoreData 直到 has_more=false。
+    ///
+    /// BJ 不支持；返回 (0, false)。
+    pub async fn fetch_kline_page(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+        start_offset: u16,
+    ) -> Result<(u32, bool), ResponseError> {
+        const PAGE_SIZE: u16 = 800;
+        if matches!(ts_code.market(), crate::domain::shared::Market::BJ) {
+            return Ok((0, false));
+        }
+        let bars = self
+            .tdx
+            .fetch_kline_at(ts_code, period, start_offset, PAGE_SIZE)
+            .await
+            .map_err(|e| {
+                ResponseError::with_message(ErrorCode::ProviderUnavailable, e.to_string())
+            })?;
+        let pts: Vec<KlinePoint> = bars
+            .iter()
+            .filter_map(crate::infrastructure::quotes::tdx::manager::map_daily_bar)
+            .collect();
+        let added = pts.len() as u32;
+        if !pts.is_empty() {
+            let now = Utc::now();
+            let _ = self.repo().upsert_daily_klines(
+                ts_code,
+                period,
+                AdjEnum::None,
+                &pts,
+                "tdx",
+                now,
+            );
+            self.adjust_cache.invalidate(ts_code);
+        }
+        // < PAGE_SIZE 说明已到最早记录；= PAGE_SIZE 还能继续往前拉。
+        let has_more = bars.len() >= PAGE_SIZE as usize;
+        Ok((added, has_more))
+    }
+
     /// 拉取 K 线 — TDX-primary + 增量（spec §1 line 15-16 + §5 line 800-810）。
     /// 等价于 `refresh_klines_extended(scope, periods, None)`。
     pub async fn refresh_klines(

@@ -108,6 +108,47 @@ pub async fn extend_chart_history(
     Ok(())
 }
 
+/// 拉一页 K 线（渐进式加载用）。`start_offset` 为从最新往回跳过的根数：
+/// - 0 = 最新一批
+/// - 800 = 再往前一批
+/// - ...
+///
+/// 后端 upsert 写 DB 后返回 `(addedCount, hasMore)`。前端先拉 start=0 显示首屏，
+/// 再 background loop 800/1600/... applyMoreData，直到 hasMore=false 停。
+///
+/// 仅支持 day/week/month；分钟 K 不需要分页（一次 800 根足够）。
+#[tauri::command]
+#[specta::specta]
+pub async fn fetch_kline_page(
+    ts_code: String,
+    period: String,
+    start_offset: u16,
+    service: State<'_, Arc<QuotesService>>,
+) -> Result<KlinePageResult, CommandError> {
+    let code = TsCode::parse(&ts_code)
+        .map_err(|e| CommandError::with_message(ErrorCode::InvalidInput, e.to_string()))?;
+    let kp = match period.as_str() {
+        "day" => KlinePeriod::Day,
+        "week" => KlinePeriod::Week,
+        "month" => KlinePeriod::Month,
+        _ => {
+            return Err(CommandError::with_message(
+                ErrorCode::InvalidInput,
+                format!("fetch_kline_page only supports day/week/month, got {}", period),
+            ))
+        }
+    };
+    let (added, has_more) = service.fetch_kline_page(&code, kp, start_offset).await?;
+    Ok(KlinePageResult { added, has_more })
+}
+
+#[derive(serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct KlinePageResult {
+    pub added: u32,
+    pub has_more: bool,
+}
+
 /// 前端 on-demand 拉数据：用户选中标的 + 切到某 chart period 时，如果 DB 空就触发后端拉一份。
 ///
 /// 按 period 字符串分派：
@@ -128,25 +169,25 @@ pub async fn ensure_chart_data(
     let code = TsCode::parse(&ts_code)
         .map_err(|e| CommandError::with_message(ErrorCode::InvalidInput, e.to_string()))?;
     let scope = RefreshDataScope::Subscribed {
-        ts_codes: vec![code],
+        ts_codes: vec![code.clone()],
     };
-    // day/week/month：走 refresh_klines_full（TDX 分页全量历史），一次性把该 ts_code
-    // 该 period 的所有可获取历史拉到 DB；后续访问从 DB 命中即可，不重复拉。
-    // upsert 幂等，DB 已覆盖时新批次和老批次自然合并。
+    // day/week/month：只拉首屏（start=0 的 ~800 根）就立即返回，让 UI 第一时间能展示。
+    // 后续更早历史由前端 background loop 调 fetch_kline_page(start=800/1600/...)
+    // 渐进式补到 DB。upsert 幂等。
     match period.as_str() {
         "day" => {
-            service
-                .refresh_klines_full(scope, vec![KlinePeriod::Day])
+            let _ = service
+                .fetch_kline_page(&code, KlinePeriod::Day, 0)
                 .await?;
         }
         "week" => {
-            service
-                .refresh_klines_full(scope, vec![KlinePeriod::Week])
+            let _ = service
+                .fetch_kline_page(&code, KlinePeriod::Week, 0)
                 .await?;
         }
         "month" => {
-            service
-                .refresh_klines_full(scope, vec![KlinePeriod::Month])
+            let _ = service
+                .fetch_kline_page(&code, KlinePeriod::Month, 0)
                 .await?;
         }
         "1m" => {

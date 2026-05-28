@@ -39,14 +39,18 @@ interface KlineCanvasProps {
   pricePrecision?: number;
 }
 
-// 一次性拉够（后端 ensure_chart_data 已对 day/week/month 走 refresh_klines_extended
-// 把 ~4 年历史补到 DB；前端只读一次即可）。
+// 渐进式加载：先用 INITIAL_LIMIT 喂首屏（覆盖后端 ensure_chart_data 拉的首 800 根），
+// 然后后台 loop fetchKlinePage(800, 1600, ...) 不断 applyMoreData 把更早历史补上。
 const INITIAL_LIMIT = 2000;
+/** 单页大小 — 与后端 fetch_kline_page 一致，TDX 协议固定 800 根 */
+const PAGE_SIZE = 800;
+/** 安全上限：A 股最老股 ~8500 日 = 11 页；20 页绰绰有余 */
+const MAX_PAGES = 20;
 
 // 进程内 cache：记录已经 ensureChartData 过的 (tsCode, period)，避免重复触发后端。
-// 后端 upsert 幂等本身没问题，但避免多余 IPC + 减小用户感知延迟。
-// 注意：重启 app 时 cache 清空 → 第一次重新 ensure；属于安全行为。
 const ensuredKeys = new Set<string>();
+// 已完成全量分页加载的 (tsCode, period) — 不再触发 background pagination loop
+const fullyLoadedKeys = new Set<string>();
 const MINUTE_PERIODS: readonly MinuteKlinePeriod[] = [
   "1m",
   "5m",
@@ -304,8 +308,7 @@ export function KlineCanvas({
         setStatus("loading");
         setErrorMsg(null);
         const cacheKey = `${tsCode}|${period}`;
-        // 1. 已 ensure 过的 key 直接跳过 backend refresh —— 走 DB 命中路径
-        //    （首访 ~800ms 等 TDX；后续切回 < 50ms）
+        // 1. 已 ensure 过 → 跳过 backend；否则触发后端拉首页（仅 ~800ms）
         if (!ensuredKeys.has(cacheKey)) {
           const ensureRes = await commands.ensureChartData(tsCode, period);
           if (cancelled) return;
@@ -318,15 +321,57 @@ export function KlineCanvas({
           }
           ensuredKeys.add(cacheKey);
         }
-        // 2. 读 DB 一次性把数据喂给 chart。无 load-more callback，简单可控。
-        const data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
+        // 2. 读 DB → 首屏渲染（~800 根 day/week/month；分钟 K 一次拉到）
+        const initialData = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
         if (cancelled) return;
-        if (data.length === 0) {
+        if (initialData.length === 0) {
           setStatus("empty");
           return;
         }
-        chart.applyNewData(data, false);
+        const shownTs = new Set<number>();
+        initialData.forEach((b) => shownTs.add(b.timestamp));
+        chart.applyNewData(initialData, true); // more=true: 表示可能还有更早数据
         setStatus("ok");
+
+        // 3. 渐进式 background loop：仅 day/week/month 走分页；
+        //    每页 fetch_kline_page → DB upsert → 前端 re-read diff → applyMoreData。
+        //    fullyLoadedKeys 防重复 loop 同一标的同周期。
+        const isPaginatableK =
+          period === "day" || period === "week" || period === "month";
+        if (isPaginatableK && !fullyLoadedKeys.has(cacheKey)) {
+          let pageIndex = 1; // 0 已被 ensure 拉过
+          while (!cancelled && pageIndex < MAX_PAGES) {
+            const offset = pageIndex * PAGE_SIZE;
+            const pageRes = await commands.fetchKlinePage(
+              tsCode,
+              period,
+              offset,
+            );
+            if (cancelled) return;
+            if (pageRes.status === "error") break;
+            const { added, hasMore } = pageRes.data;
+            if (added === 0) break;
+            // 重新读 DB 拿全量，挑出新 bars（之前没显示过）
+            const allData = await fetchKlineData(
+              tsCode,
+              period,
+              (pageIndex + 1) * PAGE_SIZE + INITIAL_LIMIT,
+            );
+            if (cancelled) return;
+            const newBars = allData.filter((b) => !shownTs.has(b.timestamp));
+            if (newBars.length > 0) {
+              newBars.forEach((b) => shownTs.add(b.timestamp));
+              // applyMoreData(olderBars) 把更早 bars prepend，保留用户滚动位置
+              chart.applyMoreData(newBars, hasMore);
+            } else {
+              // 后端有新行但前端没拿到 → 异常，停
+              break;
+            }
+            if (!hasMore) break;
+            pageIndex++;
+          }
+          if (!cancelled) fullyLoadedKeys.add(cacheKey);
+        }
       } catch (e) {
         if (cancelled) return;
         setStatus("error");

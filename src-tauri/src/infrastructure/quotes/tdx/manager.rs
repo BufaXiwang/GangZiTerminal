@@ -289,6 +289,20 @@ impl TdxConnectionManager {
         period: crate::domain::quotes::KlinePeriod,
         count: u16,
     ) -> Result<Vec<Bar>, TdxManagerError> {
+        self.fetch_kline_at(ts_code, period, 0, count).await
+    }
+
+    /// 任意 `start` offset 拉一页 K 线（spec §5 K 线分页支持）。
+    ///
+    /// `start = 0` 拉最新一批；`start = 800` 拉再往前一批；以此类推。
+    /// 用于前端"渐进式加载"——先显示最新 800 根，再背景一次次往前拉。
+    pub async fn fetch_kline_at(
+        &self,
+        ts_code: &TsCode,
+        period: crate::domain::quotes::KlinePeriod,
+        start: u16,
+        count: u16,
+    ) -> Result<Vec<Bar>, TdxManagerError> {
         use crate::infrastructure::quotes::tdx::adapter::kline_period_to_tdx;
         let market = match ts_code.market() {
             crate::domain::shared::Market::SH => TdxMarket::SH,
@@ -320,7 +334,7 @@ impl TdxConnectionManager {
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
-                let res = cli.security_bars(cat, market, &code, 0, count);
+                let res = cli.security_bars(cat, market, &code, start, count);
                 guard.last_call = Some(Instant::now());
                 match res {
                     Ok(v) => return Ok(v),

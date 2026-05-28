@@ -142,6 +142,25 @@ async extendChartHistory(tsCode: string, period: string, targetDays: number) : P
 }
 },
 /**
+ * 拉一页 K 线（渐进式加载用）。`start_offset` 为从最新往回跳过的根数：
+ * - 0 = 最新一批
+ * - 800 = 再往前一批
+ * - ...
+ * 
+ * 后端 upsert 写 DB 后返回 `(addedCount, hasMore)`。前端先拉 start=0 显示首屏，
+ * 再 background loop 800/1600/... applyMoreData，直到 hasMore=false 停。
+ * 
+ * 仅支持 day/week/month；分钟 K 不需要分页（一次 800 根足够）。
+ */
+async fetchKlinePage(tsCode: string, period: string, startOffset: number) : Promise<Result<KlinePageResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_kline_page", { tsCode, period, startOffset }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出当前 SkillRegistry 已注册的 skill。
  * 
  * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）
@@ -315,6 +334,7 @@ export type InstrumentSource = "builtin" | "tdx" | "eastmoney" | "tushare" | "mi
 export type InstrumentStatus = "listed" | "suspended" | "delisted" | "unknown"
 export type IntradaySeries = { tradeDate: string; points: MinutePoint[]; freshness: Freshness; warnings?: WarningCode[] }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+export type KlinePageResult = { added: number; hasMore: boolean }
 /**
  * Spec: quotes-module.md §2
  */
