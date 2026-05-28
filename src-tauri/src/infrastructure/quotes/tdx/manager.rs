@@ -729,24 +729,39 @@ pub fn map_minute_bar(b: &Bar) -> Option<MinuteKlinePoint> {
 }
 
 /// 把 TDX 日 Bar 翻译为 KlinePoint。
+///
+/// 防御性校验（spec §2 + TDX provider ref："非法值按 missing 处理"）：
+/// - year 必须在 [1990, 2100]
+/// - open/close/high/low 必须是 finite 正数（拒绝负价 / NaN / Infinity）
+/// - volume / amount 必须 finite（NaN/Inf → None）
+///
+/// 任一字段失败 → 返回 None。调用方根据 None 决定丢弃 / 整批弃用。
 pub fn map_daily_bar(b: &Bar) -> Option<crate::domain::quotes::KlinePoint> {
     use chrono::NaiveDate;
     use rust_decimal::{prelude::FromPrimitive, Decimal};
+    if b.year < 1990 || b.year > 2100 {
+        return None;
+    }
     let date = NaiveDate::from_ymd_opt(b.year as i32, b.month as u32, b.day as u32)?;
     let date = TradeDate::from_naive(date);
+    let valid_price = |p: f64| p.is_finite() && p > 0.0;
+    if !valid_price(b.open) || !valid_price(b.close) || !valid_price(b.high) || !valid_price(b.low)
+    {
+        return None;
+    }
     Some(crate::domain::quotes::KlinePoint {
         date,
         open: Price(Decimal::from_f64(b.open)?.round_dp(4)),
         close: Price(Decimal::from_f64(b.close)?.round_dp(4)),
         high: Price(Decimal::from_f64(b.high)?.round_dp(4)),
         low: Price(Decimal::from_f64(b.low)?.round_dp(4)),
-        volume: if b.volume > 0.0 {
+        volume: if b.volume.is_finite() && b.volume > 0.0 {
             Some(Volume(b.volume as i64))
         } else {
             None
         },
-        amount: if b.amount > 0.0 {
-            Some(Amount(Decimal::from_f64(b.amount)?.round_dp(4)))
+        amount: if b.amount.is_finite() && b.amount > 0.0 {
+            Decimal::from_f64(b.amount).map(|d| Amount(d.round_dp(4)))
         } else {
             None
         },

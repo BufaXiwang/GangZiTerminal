@@ -153,7 +153,13 @@ fn f64_to_amount(v: f64) -> Option<Amount> {
 }
 
 /// 把 TDX `Bar`（日 K）映射成 `KlinePoint`，`adjust = none`。
+///
+/// 防御校验：year ∈ [1990, 2100]；ohlcv 必须 finite & positive。
+/// 任一字段失败 → None；调用方丢弃该 bar（spec §2 "非法值按 missing 处理"）。
 pub fn map_daily_bar(b: &Bar) -> Option<KlinePoint> {
+    if b.year < 1990 || b.year > 2100 {
+        return None;
+    }
     let date = NaiveDate::from_ymd_opt(b.year as i32, b.month as u32, b.day as u32)?;
     let date = TradeDate::from_naive(date);
     Some(KlinePoint {
@@ -162,7 +168,7 @@ pub fn map_daily_bar(b: &Bar) -> Option<KlinePoint> {
         close: f64_to_price(b.close)?,
         high: f64_to_price(b.high)?,
         low: f64_to_price(b.low)?,
-        volume: if b.volume > 0.0 {
+        volume: if b.volume.is_finite() && b.volume > 0.0 {
             Some(Volume(b.volume as i64))
         } else {
             None

@@ -233,12 +233,22 @@ pub fn run() {
                     // 4) K 线日线预热（核心指数）— 小而快（~4 codes），先跑，UI 切到指数 K 线立即可见。
                     //    Universe 级 K 线刷新交给 scheduler 16:00 / 下次启动后台。
                     let core = svc.core_indexes();
-                    let kline_scope = crate::domain::quotes::RefreshDataScope::Subscribed { ts_codes: core };
+                    let kline_scope = crate::domain::quotes::RefreshDataScope::Subscribed {
+                        ts_codes: core.clone(),
+                    };
                     if let Err(e) = svc.refresh_klines(kline_scope, vec![crate::domain::quotes::KlinePeriod::Day]).await {
                         tracing::warn!(target: "quotes.startup", error = ?e, "kline warmup failed");
                     }
 
-                    // 5) Close snapshot catch-up（universe，慢 — 单独 spawn 不阻塞后续）
+                    // 5) xdxr 预热（核心指数 + 后续 watchlist）— 即使指数没事件也要写 refresh_state
+                    //    让 read 路径从状态 A（qfq_missing）→ 状态 B（无 warning，干净）。
+                    //    Spec: quotes-module.md §2 "本地复权计算" + §5 后台刷新 xdxr 行。
+                    let xdxr_scope = crate::domain::quotes::RefreshDataScope::Subscribed { ts_codes: core };
+                    if let Err(e) = svc.refresh_xdxr_events(xdxr_scope).await {
+                        tracing::warn!(target: "quotes.startup", error = ?e, "xdxr warmup failed");
+                    }
+
+                    // 6) Close snapshot catch-up（universe，慢 — 单独 spawn 不阻塞后续）
                     //
                     // scheduler 在 h==15 && m>=30 触发一次 close snapshot；如果用户在 15:30
                     // 之后冷启动 app，会永久错过当天窗口。这里启动时检查 latest_completed
