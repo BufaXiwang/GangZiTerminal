@@ -54,6 +54,8 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
         stubbed_parts: 0,
         estimated_tokens_saved: 0,
     };
+    // Realtime parts: stub-replace any droppable non-stub part (typical home of fresh
+    // skill_result blocks placed there by Runtime for the current turn).
     for p in bundle.realtime_parts.iter_mut() {
         if p.droppable && !is_stub(p) {
             report.estimated_tokens_saved += p.estimated_tokens();
@@ -61,7 +63,27 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
             report.stubbed_parts += 1;
         }
     }
+    // Chat parts: only stub-replace droppable parts whose content is itself a
+    // <skill_result ...> wrapper (historical skill_results migrated into chat history).
+    // Pure user / assistant chat is left untouched — Drop / Summarize handle that lane.
+    for p in bundle.chat_parts.iter_mut() {
+        if p.droppable && !is_stub(p) && content_is_skill_result(&p.content) {
+            report.estimated_tokens_saved += p.estimated_tokens();
+            stub_in_place(p);
+            report.stubbed_parts += 1;
+        }
+    }
     report
+}
+
+/// True iff the part's content body contains a `<skill_result ...>` opening tag with
+/// at least one of the canonical attributes (name / call_id / ref).
+fn content_is_skill_result(content: &ContextContent) -> bool {
+    let body = match content {
+        ContextContent::Text(s) => s.clone(),
+        ContextContent::Json(v) => v.to_string(),
+    };
+    parse_skill_result_attrs(&body).is_some()
 }
 
 fn stub_in_place(p: &mut ContextPart) {
@@ -395,6 +417,47 @@ mod tests {
         assert!(rendered.contains(r#"ref="pl_xyz""#), "{}", rendered);
         assert!(rendered.starts_with("<skill_result_stub"));
         assert!(rendered.ends_with("/>"));
+    }
+
+    #[test]
+    fn micro_clear_stubs_chat_skill_results_but_leaves_plain_chat_alone() {
+        // Spec §4: chat history that contains historical skill_result must be stub-replaced
+        // by MicroClear (preserves replay link); plain user / assistant chat is left untouched.
+        let mut b = ContextBundle::new("r1");
+        b.chat_parts.push(ContextPart {
+            kind: ContextPartKind::Chat,
+            content: ContextContent::Text(
+                r#"<skill_result name="news_search" call_id="sc_news" ref="pl_news">{"items":[]}</skill_result>"#
+                    .into(),
+            ),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        b.chat_parts.push(ContextPart {
+            kind: ContextPartKind::Chat,
+            content: ContextContent::Text("user said something".into()),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        let rep = micro_clear(&mut b);
+        assert_eq!(rep.stubbed_parts, 1);
+        // First chat part stubbed:
+        let head = match &b.chat_parts[0].content {
+            ContextContent::Text(s) => s.clone(),
+            _ => panic!("text"),
+        };
+        assert!(head.starts_with("<skill_result_stub"));
+        assert!(head.contains(r#"name="news_search""#));
+        assert!(head.contains(r#"ref="pl_news""#));
+        // Second chat part left as-is:
+        let tail = match &b.chat_parts[1].content {
+            ContextContent::Text(s) => s.clone(),
+            _ => panic!("text"),
+        };
+        assert_eq!(tail, "user said something");
+        assert!(matches!(b.chat_parts[1].kind, ContextPartKind::Chat));
     }
 
     #[test]
