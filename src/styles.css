@@ -2313,6 +2313,43 @@ body {
   min-height: 0;
 }
 
+/* 自选行右上角浮出删除按钮（hover 显示，参考市场行 ⭐ pattern） */
+.watchlist-compact-row {
+  position: relative;
+}
+
+.watchlist-row-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--fg-faint);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 100ms ease, color 100ms ease, background 100ms ease;
+}
+
+.watchlist-compact-row:hover .watchlist-row-remove {
+  opacity: 1;
+}
+
+.watchlist-row-remove:hover {
+  color: var(--chart-up);
+  background: var(--bg-soft);
+}
+
+.watchlist-compact-row.stale .row-price,
+.watchlist-compact-row.stale .row-pct {
+  color: var(--fg-faint);
+}
+
 .watchlist-add-btn {
   height: 26px;
   padding: 0 10px;

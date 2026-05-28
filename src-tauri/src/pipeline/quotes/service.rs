@@ -1263,8 +1263,15 @@ impl QuotesService {
                 // ① 增量：查 max(trade_date)；定 count（TDX 协议单次限制 ~800）。
                 //    无数据 → 全量 365 根；有数据 → max+1 到今日。
                 let max_td = repo.max_kline_trade_date(ts, *period).ok().flatten();
+                // 初始 count：caller 传 history_days 时优先使用（cap 到 TDX 单次上限 800），
+                // 否则默认 365。增量场景仍按 gap 取量。
+                // 之前 history_days 只用在 TuShare 段，导致 TuShare 无 token 时 caller 设的
+                // target_days 完全不生效 —— 用户感知就是 "ensure_chart_data target=1500 没拉够"。
+                let initial_count = history_days
+                    .map(|d| d.min(800) as u16)
+                    .unwrap_or(365u16);
                 let count = match max_td {
-                    None => 365u16,
+                    None => initial_count,
                     Some(td) => {
                         let days_gap = (today - td.as_naive()).num_days();
                         if days_gap <= 0 {
@@ -1272,7 +1279,10 @@ impl QuotesService {
                             2
                         } else {
                             // 加 buffer，TDX 协议返回包含 max+1..today 的根数取决于交易日。
-                            (days_gap as u16 + 5).min(800)
+                            // 若 caller 要求更深（如换周期切换后想要更长历史），
+                            // initial_count 大于 gap+5 时也以它为准。
+                            let gap_count = (days_gap as u16 + 5).min(800);
+                            gap_count.max(initial_count.min(800))
                         }
                     }
                 };
