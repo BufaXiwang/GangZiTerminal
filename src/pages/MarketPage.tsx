@@ -25,6 +25,11 @@ import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
 import { MarketMetricsRow } from "./market/MarketMetricsRow";
 import { CORE_INDEXES } from "../lib/useCoreIndexes";
 import {
+  getCachedList,
+  setCachedList,
+  invalidateAllListCache,
+} from "../lib/marketListCache";
+import {
   commands,
   type InstrumentCategory,
   type ListMarketItem,
@@ -75,9 +80,22 @@ export default function MarketPage() {
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
 
-  // Pull list（不分页，一次性拉）
+  // Pull list（不分页，一次性拉）。带 module-level cache，TTL 60s。
+  // 切 tab 回到市场页时立即从 cache 渲染，背景静默 refetch（如已过期）。
   useEffect(() => {
     let cancelled = false;
+
+    // 1. 立即用 cache（如有）
+    const cached = getCachedList(category, query);
+    if (cached) {
+      setItems(cached.items);
+      setLastUpdated(new Date(Date.now() - cached.ageMs));
+      setLoading(false);
+      setError(null);
+      return; // 命中 cache → 不发起 IPC
+    }
+
+    // 2. cache miss / 过期 → 发起 IPC
     setLoading(true);
     setError(null);
     void commands
@@ -98,6 +116,7 @@ export default function MarketPage() {
           return;
         }
         setItems(res.data.items);
+        setCachedList(category, query, res.data.items);
         setLastUpdated(new Date());
         setLoading(false);
       });
@@ -149,6 +168,7 @@ export default function MarketPage() {
   }, []);
 
   const handleRefresh = useCallback(() => {
+    invalidateAllListCache();
     setRefreshTick((t) => t + 1);
   }, []);
 

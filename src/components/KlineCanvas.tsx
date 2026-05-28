@@ -42,6 +42,11 @@ interface KlineCanvasProps {
 // 一次性拉够（后端 ensure_chart_data 已对 day/week/month 走 refresh_klines_extended
 // 把 ~4 年历史补到 DB；前端只读一次即可）。
 const INITIAL_LIMIT = 2000;
+
+// 进程内 cache：记录已经 ensureChartData 过的 (tsCode, period)，避免重复触发后端。
+// 后端 upsert 幂等本身没问题，但避免多余 IPC + 减小用户感知延迟。
+// 注意：重启 app 时 cache 清空 → 第一次重新 ensure；属于安全行为。
+const ensuredKeys = new Set<string>();
 const MINUTE_PERIODS: readonly MinuteKlinePeriod[] = [
   "1m",
   "5m",
@@ -298,17 +303,20 @@ export function KlineCanvas({
       try {
         setStatus("loading");
         setErrorMsg(null);
-        // 1. 先调 ensure_chart_data —— 后端会把长历史补到 DB（day/week/month 走
-        //    refresh_klines_extended target_days=1500；minute/intraday 走对应 refresh）。
-        //    DB 已覆盖时是 upsert 幂等，不会重复拉。
-        const ensureRes = await commands.ensureChartData(tsCode, period);
-        if (cancelled) return;
-        if (ensureRes.status === "error") {
-          setStatus("error");
-          setErrorMsg(
-            `${ensureRes.error.code}${ensureRes.error.message ? `: ${ensureRes.error.message}` : ""}`,
-          );
-          return;
+        const cacheKey = `${tsCode}|${period}`;
+        // 1. 已 ensure 过的 key 直接跳过 backend refresh —— 走 DB 命中路径
+        //    （首访 ~800ms 等 TDX；后续切回 < 50ms）
+        if (!ensuredKeys.has(cacheKey)) {
+          const ensureRes = await commands.ensureChartData(tsCode, period);
+          if (cancelled) return;
+          if (ensureRes.status === "error") {
+            setStatus("error");
+            setErrorMsg(
+              `${ensureRes.error.code}${ensureRes.error.message ? `: ${ensureRes.error.message}` : ""}`,
+            );
+            return;
+          }
+          ensuredKeys.add(cacheKey);
         }
         // 2. 读 DB 一次性把数据喂给 chart。无 load-more callback，简单可控。
         const data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
