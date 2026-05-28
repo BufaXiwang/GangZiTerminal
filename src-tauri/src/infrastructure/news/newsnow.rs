@@ -22,6 +22,12 @@ use std::time::Duration;
 pub const NEWSNOW_TIMEOUT_SECS: u64 = 8;
 pub const NEWSNOW_MAX_ITEMS: usize = 100;
 
+// 浏览器 UA：NewsNow 公开实例 (newsnow.busiyi.world) 对未带 Origin / 非浏览器 UA
+// 直接 403。其他自部署实例不需要这种伪装，但发个标准 UA 也没副作用。
+const BROWSER_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
 pub struct NewsNowProvider {
     client: Client,
 }
@@ -29,7 +35,7 @@ pub struct NewsNowProvider {
 impl NewsNowProvider {
     pub fn new() -> reqwest::Result<Self> {
         let client = Client::builder()
-            .user_agent("GangZi-Terminal/0.1 (+news/newsnow)")
+            .user_agent(BROWSER_USER_AGENT)
             .timeout(Duration::from_secs(NEWSNOW_TIMEOUT_SECS))
             .build()?;
         Ok(Self { client })
@@ -60,7 +66,14 @@ impl NewsNowProvider {
             }
         };
 
-        let resp = match self.client.get(endpoint).send().await {
+        // NewsNow 服务端要求 Origin 同源；从 endpoint URL 派生 scheme://host[:port]。
+        // 派生失败时跳过 header，让服务端用默认行为（自部署实例可能不需要）。
+        let origin = derive_origin(endpoint);
+        let mut req = self.client.get(endpoint);
+        if let Some(o) = origin.as_deref() {
+            req = req.header("Origin", o).header("Referer", o);
+        }
+        let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
                 return (
@@ -245,6 +258,43 @@ fn normalize_payload(
         });
     }
     (out, warnings)
+}
+
+/// 从 `https://host[:port]/path?query` 派生 `https://host[:port]`。
+/// 不依赖 url crate；newsnow endpoint 形态稳定够用。
+fn derive_origin(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let host_port = rest.split(['/', '?', '#']).next()?;
+    if host_port.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, host_port))
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::derive_origin;
+
+    #[test]
+    fn derives_origin_from_full_url() {
+        assert_eq!(
+            derive_origin("https://newsnow.busiyi.world/api/s?id=cls-telegraph&latest"),
+            Some("https://newsnow.busiyi.world".to_string())
+        );
+    }
+
+    #[test]
+    fn derives_origin_with_port() {
+        assert_eq!(
+            derive_origin("http://localhost:3000/api/s?id=x"),
+            Some("http://localhost:3000".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_invalid() {
+        assert_eq!(derive_origin("not-a-url"), None);
+    }
 }
 
 fn pick_string<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
