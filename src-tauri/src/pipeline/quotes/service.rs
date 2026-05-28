@@ -5,11 +5,12 @@
 use crate::domain::quotes::{
     apply_band_helper, compute_indicators, compute_limit_band, core_indexes, derive_freshness,
     eligible_trade_date, is_in_trading_session, Adjust as AdjEnum, CompanyEvent, DailyBasic,
-    FreshnessIntent, IndicatorBasis, IndicatorName, IndicatorSnapshot, IntradaySeries, KlinePeriod,
-    KlinePoint, KlineSeries, MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod,
-    MinuteKlineSeries, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose, RefreshScopeKind,
-    ScanCondition, ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem,
-    ScanOp, ScanResult, ScanSortBy, ScanUniverse, StockProfile, StockQuote, TradeStatus,
+    FreshnessIntent, IndicatorBasis, IndicatorName, IndicatorSnapshot, IndustryHeatmap,
+    IndustryHeatmapItem, IntradaySeries, KlinePeriod, KlinePoint, KlineSeries, MarketBreadth,
+    MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod, MinuteKlineSeries,
+    RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose, RefreshScopeKind, ScanCondition,
+    ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem, ScanOp, ScanResult,
+    ScanSortBy, ScanUniverse, StockProfile, StockQuote, TradeStatus,
 };
 use crate::domain::shared::{
     ErrorCode, Freshness, FreshnessStatus, InstrumentCategory, InstrumentStatus, MarketTimeContext,
@@ -648,6 +649,216 @@ impl QuotesService {
             },
             errors: Vec::new(),
         }
+    }
+
+    // ====================================================================== market_breadth / industry_heatmap
+
+    /// 市场宽度 —— 仅统计 `category == stock` 的标的；
+    /// 数据源优先级：`MARKET_SNAPSHOT` in-memory → 非交易时段 fallback 至 `quote_close_snapshot`。
+    ///
+    /// Spec: docs/design/quotes-module.md §4 `market_breadth`
+    pub fn market_breadth(&self) -> MarketBreadth {
+        let ctx = self.market_time_now();
+        let now = ctx.now;
+        let eligible = eligible_trade_date(&ctx);
+        let repo = self.repo();
+        let (instruments, _total) = repo
+            .list_instruments(Some(InstrumentCategory::Stock), None, 100_000, 0)
+            .unwrap_or_default();
+
+        let mut total: u32 = 0;
+        let mut up: u32 = 0;
+        let mut down: u32 = 0;
+        let mut flat: u32 = 0;
+        let mut limit_up: u32 = 0;
+        let mut limit_down: u32 = 0;
+        let mut no_data: u32 = 0;
+
+        for inst in &instruments {
+            let Some(quote) = self.load_eligible_quote(inst, &ctx) else {
+                no_data += 1;
+                continue;
+            };
+            total += 1;
+            let cp = quote.change_percent.unwrap_or(0.0);
+            // 三态分桶（spec §4：up / down / flat 三选一；flat 包含 change_percent 缺失）。
+            if cp > 0.0 {
+                up += 1;
+            } else if cp < 0.0 {
+                down += 1;
+            } else {
+                flat += 1;
+            }
+            // 涨停 / 跌停：复用 compute_limit_band 拿到适用 percent；
+            // 比较 `change_percent.abs() >= up_percent - epsilon`。
+            if let Some(band) = compute_limit_band(
+                &inst.ts_code,
+                inst.category,
+                inst.board.as_deref(),
+                inst.is_st.unwrap_or(false),
+            ) {
+                if band.bounded {
+                    const EPSILON: f64 = 0.05; // 百分点
+                    let up_threshold = band.up_percent as f64 - EPSILON;
+                    let down_threshold = -(band.down_percent as f64 - EPSILON);
+                    if cp >= up_threshold {
+                        limit_up += 1;
+                    } else if cp <= down_threshold {
+                        limit_down += 1;
+                    }
+                }
+            }
+        }
+
+        MarketBreadth {
+            total,
+            up,
+            down,
+            flat,
+            limit_up,
+            limit_down,
+            no_data,
+            trade_date: eligible.trade_date,
+            computed_at: now,
+        }
+    }
+
+    /// 行业热度 —— 按 `MarketInstrument.sector` 聚合 `category == stock` 标的的 `change_percent`。
+    ///
+    /// 规则（spec §4 `industry_heatmap`）：
+    /// - 仅统计 `category == stock`。
+    /// - sector 为 `None` 或空串 → 归入 `"未分类"` 桶，但**不**参与 top_gainers / top_losers。
+    /// - 无有效 quote 的标的不参与统计（与 `market_breadth.no_data` 一致）。
+    /// - top_gainers / top_losers 各取 `top_n` 个行业（少于 `top_n` 时全返）。
+    /// - 每个行业内 `leader_codes` 按 `change_percent desc` 取前 3，`change_percent` 缺失 → 0.0。
+    ///
+    /// Spec: docs/design/quotes-module.md §4 `industry_heatmap`
+    pub fn industry_heatmap(&self, top_n: usize) -> IndustryHeatmap {
+        let ctx = self.market_time_now();
+        let now = ctx.now;
+        let eligible = eligible_trade_date(&ctx);
+        let repo = self.repo();
+        let (instruments, _total) = repo
+            .list_instruments(Some(InstrumentCategory::Stock), None, 100_000, 0)
+            .unwrap_or_default();
+
+        // 行业 bucket：sector 字符串 → 该行业全部 (ts_code, name, change_percent) tuple。
+        let mut buckets: std::collections::HashMap<
+            String,
+            Vec<(TsCode, String, f64)>,
+        > = std::collections::HashMap::new();
+
+        const UNCLASSIFIED: &str = "未分类";
+
+        for inst in &instruments {
+            let Some(quote) = self.load_eligible_quote(inst, &ctx) else {
+                continue;
+            };
+            let cp = quote.change_percent.unwrap_or(0.0);
+            let sector = inst
+                .sector
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(UNCLASSIFIED)
+                .to_string();
+            buckets
+                .entry(sector)
+                .or_default()
+                .push((inst.ts_code.clone(), inst.name.clone(), cp));
+        }
+
+        // 聚合每个 sector → IndustryHeatmapItem。
+        let mut items: Vec<IndustryHeatmapItem> = buckets
+            .into_iter()
+            .filter(|(s, _)| s != UNCLASSIFIED) // spec：未分类不参与 top
+            .map(|(sector, entries)| {
+                let count = entries.len() as u32;
+                let sum: f64 = entries.iter().map(|(_, _, cp)| *cp).sum();
+                let avg = if count == 0 { 0.0 } else { sum / count as f64 };
+                // leaders: 按 change_percent desc 取前 3。
+                let mut sorted = entries.clone();
+                sorted.sort_by(|a, b| {
+                    b.2.partial_cmp(&a.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.as_str().cmp(b.0.as_str()))
+                });
+                let leaders: Vec<_> = sorted.into_iter().take(3).collect();
+                IndustryHeatmapItem {
+                    sector,
+                    avg_change_percent: avg,
+                    count,
+                    leader_codes: leaders.iter().map(|(c, _, _)| c.clone()).collect(),
+                    leader_names: leaders.into_iter().map(|(_, n, _)| n).collect(),
+                }
+            })
+            .collect();
+
+        // top_gainers：avg desc；top_losers：avg asc。
+        let mut by_gain = items.clone();
+        by_gain.sort_by(|a, b| {
+            b.avg_change_percent
+                .partial_cmp(&a.avg_change_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.sector.cmp(&b.sector))
+        });
+        let top_gainers: Vec<_> = by_gain.into_iter().take(top_n).collect();
+
+        // top_losers：保持 items 引用即可（复用一次 sort）。
+        items.sort_by(|a, b| {
+            a.avg_change_percent
+                .partial_cmp(&b.avg_change_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.sector.cmp(&b.sector))
+        });
+        let top_losers: Vec<_> = items.into_iter().take(top_n).collect();
+
+        IndustryHeatmap {
+            top_gainers,
+            top_losers,
+            trade_date: eligible.trade_date,
+            computed_at: now,
+        }
+    }
+
+    /// 取一个 instrument 当前 eligible 的 quote。
+    ///
+    /// 数据源优先级（spec §2 / §4）：
+    /// 1. `MARKET_SNAPSHOT` 内存 cache（trade_date 必须等于 eligible.trade_date 才接受）。
+    /// 2. 非交易时段：fallback 至 `quote_close_snapshot` 表的 `eligible.trade_date` 行。
+    ///
+    /// 同时在硬过期场景（交易时段 + capturedAt > HARD_EXPIRE_SECS）下过滤掉，
+    /// 复用 `derive_freshness` 的 eligibility 检查保持与 `list_market` / `scan_market` 一致。
+    fn load_eligible_quote(
+        &self,
+        inst: &MarketInstrument,
+        ctx: &MarketTimeContext,
+    ) -> Option<StockQuote> {
+        let eligible = eligible_trade_date(ctx);
+        let snap = self.cache.get(&inst.ts_code).map(|c| c.quote).or_else(|| {
+            if !eligible.is_intraday {
+                self.repo()
+                    .load_close_snapshot(&inst.ts_code, eligible.trade_date)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        });
+        let quote = snap?;
+        let source = quote.source.as_str().to_string();
+        let (_freshness, eligibility) = derive_freshness(
+            ctx,
+            FreshnessIntent::Universe,
+            quote.trade_date,
+            quote.captured_at,
+            &source,
+        );
+        // eligibility 非空 → 此 quote 不可用（snapshot expired / trade_date mismatch）。
+        if eligibility.is_some() {
+            return None;
+        }
+        Some(quote)
     }
 
     // ====================================================================== refresh hooks
@@ -3182,5 +3393,293 @@ mod tests {
         let tdx = fake_quote(QuoteSource::Tdx, false, false);
         let em = fake_quote(QuoteSource::Eastmoney, false, false);
         assert!(QuotesService::pick_fallback_quote(vec![tdx, em]).is_none());
+    }
+
+    // ============================================================================ E1 — market_breadth / industry_heatmap
+    //
+    // Spec: docs/design/quotes-module.md §4 (`market_breadth` / `industry_heatmap`)
+    //
+    // 测试策略：用 service 的 `market_time_now` 派生 eligible trade date，把这个
+    // trade_date 写到 fake quote 上确保 `derive_freshness` 接受；用
+    // `cache.put(CachedSnapshot)` 直接写入 snapshot 而非走 refresh 网络路径。
+
+    fn seed_instrument_with(
+        svc: &QuotesService,
+        ts: &str,
+        name: &str,
+        sector: Option<&str>,
+        board: Option<&str>,
+        is_st: bool,
+    ) {
+        let code = TsCode::parse(ts).unwrap();
+        let inst = MarketInstrument {
+            ts_code: code.clone(),
+            name: name.to_string(),
+            category: InstrumentCategory::Stock,
+            market: code.market(),
+            board: board.map(str::to_string),
+            sector: sector.map(str::to_string),
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(is_st),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: crate::domain::quotes::InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        svc.repo().upsert_instruments(&[inst]).unwrap();
+    }
+
+    /// 把一只标的的当日 quote 写入 in-memory `MARKET_SNAPSHOT`。
+    fn put_snapshot_for(
+        svc: &QuotesService,
+        ts: &str,
+        change_percent: f64,
+    ) {
+        use crate::domain::shared::{Freshness, FreshnessStatus, Price};
+        let ts_code = TsCode::parse(ts).unwrap();
+        let eligible = eligible_trade_date(&svc.market_time_now());
+        let now = Utc::now();
+        let q = StockQuote {
+            ts_code: ts_code.clone(),
+            name: None,
+            category: InstrumentCategory::Stock,
+            trade_date: eligible.trade_date,
+            price: Some(Price(Decimal::new(1000, 2))),
+            previous_close: Some(Price(Decimal::new(1000, 2))),
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: Some(change_percent),
+            volume: None,
+            amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid: Vec::new(),
+            ask: Vec::new(),
+            trade_status: TradeStatus::Trading,
+            source: QuoteSource::Tdx,
+            captured_at: now,
+            exchange_time: None,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: Some(0),
+                source: Some("tdx".into()),
+                warning: None,
+            },
+            warnings: Vec::new(),
+        };
+        svc.cache.put(crate::infrastructure::quotes::CachedSnapshot {
+            quote: q,
+            captured_at: now,
+            trade_date: eligible.trade_date,
+            source: "tdx".into(),
+        });
+    }
+
+    #[test]
+    fn market_breadth_empty_universe_returns_zero() {
+        let svc = make_service();
+        let b = svc.market_breadth();
+        assert_eq!(b.total, 0);
+        assert_eq!(b.up + b.down + b.flat, 0);
+        assert_eq!(b.no_data, 0);
+        assert_eq!(b.limit_up, 0);
+        assert_eq!(b.limit_down, 0);
+    }
+
+    #[test]
+    fn market_breadth_counts_up_down_flat() {
+        let svc = make_service();
+        // 5 涨 / 3 跌 / 1 平 — 全部主板 10% bounded（未达涨停）。
+        seed_instrument_with(&svc, "600001.SH", "U1", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 2.0);
+        seed_instrument_with(&svc, "600002.SH", "U2", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600002.SH", 3.5);
+        seed_instrument_with(&svc, "600003.SH", "U3", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600003.SH", 1.0);
+        seed_instrument_with(&svc, "600004.SH", "U4", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600004.SH", 0.1);
+        seed_instrument_with(&svc, "600005.SH", "U5", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600005.SH", 5.0);
+        seed_instrument_with(&svc, "600010.SH", "D1", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600010.SH", -1.5);
+        seed_instrument_with(&svc, "600011.SH", "D2", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600011.SH", -3.0);
+        seed_instrument_with(&svc, "600012.SH", "D3", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600012.SH", -2.0);
+        seed_instrument_with(&svc, "600020.SH", "F1", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600020.SH", 0.0);
+
+        let b = svc.market_breadth();
+        assert_eq!(b.total, 9);
+        assert_eq!(b.up, 5);
+        assert_eq!(b.down, 3);
+        assert_eq!(b.flat, 1);
+        assert_eq!(b.no_data, 0);
+        assert_eq!(b.limit_up, 0);
+        assert_eq!(b.limit_down, 0);
+    }
+
+    #[test]
+    fn market_breadth_detects_limit_up_main_board_10pct() {
+        let svc = make_service();
+        // 主板：10% 阈值；9.96 已视为涨停（epsilon = 0.05）。
+        seed_instrument_with(&svc, "600001.SH", "LU", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 9.96);
+        let b = svc.market_breadth();
+        assert_eq!(b.up, 1);
+        assert_eq!(b.limit_up, 1);
+        assert_eq!(b.limit_down, 0);
+    }
+
+    #[test]
+    fn market_breadth_detects_limit_down_main_board_10pct() {
+        let svc = make_service();
+        seed_instrument_with(&svc, "600001.SH", "LD", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", -9.97);
+        let b = svc.market_breadth();
+        assert_eq!(b.down, 1);
+        assert_eq!(b.limit_down, 1);
+        assert_eq!(b.limit_up, 0);
+    }
+
+    #[test]
+    fn market_breadth_chinext_limit_up_threshold_is_20pct() {
+        let svc = make_service();
+        // 创业板：20% 阈值。10% 在创业板上不是涨停。
+        seed_instrument_with(&svc, "300750.SZ", "CN1", None, Some("创业板"), false);
+        put_snapshot_for(&svc, "300750.SZ", 10.0);
+        let b = svc.market_breadth();
+        assert_eq!(b.up, 1);
+        assert_eq!(b.limit_up, 0, "10% on ChiNext is not limit_up");
+        // 19.96% 应该达到涨停。
+        let svc2 = make_service();
+        seed_instrument_with(&svc2, "300750.SZ", "CN1", None, Some("创业板"), false);
+        put_snapshot_for(&svc2, "300750.SZ", 19.96);
+        let b2 = svc2.market_breadth();
+        assert_eq!(b2.limit_up, 1);
+    }
+
+    #[test]
+    fn market_breadth_st_limit_at_5pct() {
+        let svc = make_service();
+        // SH 主板 ST 标的 5% 涨停。
+        seed_instrument_with(&svc, "600100.SH", "ST X", None, Some("主板"), true);
+        put_snapshot_for(&svc, "600100.SH", 4.97);
+        let b = svc.market_breadth();
+        assert_eq!(b.limit_up, 1);
+    }
+
+    #[test]
+    fn market_breadth_no_data_counts_instruments_without_snapshot() {
+        let svc = make_service();
+        seed_instrument_with(&svc, "600001.SH", "X", None, Some("主板"), false);
+        // 没有写 snapshot —— 应进 no_data。
+        let b = svc.market_breadth();
+        assert_eq!(b.total, 0);
+        assert_eq!(b.no_data, 1);
+    }
+
+    #[test]
+    fn market_breadth_ignores_non_stock_category() {
+        let svc = make_service();
+        // 指数：market_breadth 只统计 category == stock。
+        let code = TsCode::parse("000001.SH").unwrap();
+        let inst = MarketInstrument {
+            ts_code: code.clone(),
+            name: "上证指数".to_string(),
+            category: InstrumentCategory::Index,
+            market: code.market(),
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: crate::domain::quotes::InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        svc.repo().upsert_instruments(&[inst]).unwrap();
+        let b = svc.market_breadth();
+        assert_eq!(b.total, 0);
+        assert_eq!(b.no_data, 0, "non-stock not counted into universe");
+    }
+
+    #[test]
+    fn industry_heatmap_groups_by_sector_and_picks_leaders() {
+        let svc = make_service();
+        // sector A：3 只，平均 (+5 + +3 + +1) / 3 ≈ +3
+        seed_instrument_with(&svc, "600001.SH", "A1", Some("电子"), Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 5.0);
+        seed_instrument_with(&svc, "600002.SH", "A2", Some("电子"), Some("主板"), false);
+        put_snapshot_for(&svc, "600002.SH", 3.0);
+        seed_instrument_with(&svc, "600003.SH", "A3", Some("电子"), Some("主板"), false);
+        put_snapshot_for(&svc, "600003.SH", 1.0);
+        // sector B：2 只，平均 -2
+        seed_instrument_with(&svc, "600010.SH", "B1", Some("银行"), Some("主板"), false);
+        put_snapshot_for(&svc, "600010.SH", -1.0);
+        seed_instrument_with(&svc, "600011.SH", "B2", Some("银行"), Some("主板"), false);
+        put_snapshot_for(&svc, "600011.SH", -3.0);
+
+        let h = svc.industry_heatmap(5);
+        assert_eq!(h.top_gainers.len(), 2);
+        // top_gainers[0] 应是 "电子"（avg ≈ +3）。
+        assert_eq!(h.top_gainers[0].sector, "电子");
+        assert!((h.top_gainers[0].avg_change_percent - 3.0).abs() < 1e-6);
+        assert_eq!(h.top_gainers[0].count, 3);
+        // leader_codes 取 change_percent desc 前 3：600001(+5), 600002(+3), 600003(+1)。
+        assert_eq!(h.top_gainers[0].leader_codes.len(), 3);
+        assert_eq!(h.top_gainers[0].leader_codes[0].as_str(), "600001.SH");
+        assert_eq!(h.top_gainers[0].leader_codes[1].as_str(), "600002.SH");
+        assert_eq!(h.top_gainers[0].leader_codes[2].as_str(), "600003.SH");
+        assert_eq!(h.top_gainers[0].leader_names[0], "A1");
+        // top_losers[0] 应是 "银行"（avg = -2）。
+        assert_eq!(h.top_losers[0].sector, "银行");
+        assert!((h.top_losers[0].avg_change_percent + 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn industry_heatmap_excludes_unclassified_sector() {
+        let svc = make_service();
+        // 一个有 sector，一个 sector=None。
+        seed_instrument_with(&svc, "600001.SH", "A1", Some("电子"), Some("主板"), false);
+        put_snapshot_for(&svc, "600001.SH", 3.0);
+        seed_instrument_with(&svc, "600010.SH", "U1", None, Some("主板"), false);
+        put_snapshot_for(&svc, "600010.SH", 10.0);
+
+        let h = svc.industry_heatmap(5);
+        // 仅 "电子" 进入；"未分类" 不参与 top（spec §4）。
+        assert_eq!(h.top_gainers.len(), 1);
+        assert_eq!(h.top_gainers[0].sector, "电子");
+        assert!(h
+            .top_gainers
+            .iter()
+            .all(|i| i.sector != "未分类"));
+    }
+
+    #[test]
+    fn industry_heatmap_respects_top_n() {
+        let svc = make_service();
+        // 4 个 sector → top_n=2 应仅返回 2。
+        for (idx, sector) in ["电子", "银行", "白酒", "新能源"].iter().enumerate() {
+            let ts = format!("60000{}.SH", idx);
+            seed_instrument_with(&svc, &ts, sector, Some(sector), Some("主板"), false);
+            put_snapshot_for(&svc, &ts, idx as f64);
+        }
+        let h = svc.industry_heatmap(2);
+        assert_eq!(h.top_gainers.len(), 2);
+        assert_eq!(h.top_losers.len(), 2);
+        // 全 4 都正/0 → top_losers 仍按 asc 排序，取最小 2 个。
     }
 }
