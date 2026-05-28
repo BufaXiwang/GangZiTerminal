@@ -17,7 +17,7 @@
 // 默认选中 `000001.SH`（上证指数）—— 这只有 K 线数据（K-line warmup 已覆盖核心指数）。
 // 选中非核心标的会显示"暂无 K 线数据"（后续加 on-demand refresh）。
 
-import { Plus, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWatchlistStore } from "../lib/watchlistStore";
 import { InstrumentDetail } from "./market/InstrumentDetail";
@@ -61,8 +61,8 @@ export default function MarketPage() {
   const [category, setCategory] = useState<InstrumentCategory>("stock");
   const [query, setQuery] = useState("");
   const [queryInput, setQueryInput] = useState("");
-  const [addCodeInput, setAddCodeInput] = useState("");
   const [items, setItems] = useState<ListMarketItem[]>([]);
+  const [menuState, setMenuState] = useState<{ tsCode: TsCode; x: number; y: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -138,22 +138,12 @@ export default function MarketPage() {
     setQuery(queryInput.trim());
   }, [queryInput]);
 
-  const handleAddCode = useCallback(async () => {
-    const code = addCodeInput.trim();
-    if (!code) return;
-    if (!/^\d{6}$/.test(code) && !/^\d{6}\.(SH|SZ|BJ)$/i.test(code)) return;
-    const res = await commands.listMarket({
-      query: code,
-      includeQuote: false,
-      limit: 5,
-      offset: 0,
-    });
-    if (res.status === "ok" && res.data.items.length > 0) {
-      const found = res.data.items[0];
-      await addWatch(found.tsCode);
-      setAddCodeInput("");
-    }
-  }, [addCodeInput, addWatch]);
+  const handleRowContextMenu = useCallback(
+    (tsCode: TsCode, x: number, y: number) => {
+      setMenuState({ tsCode, x, y });
+    },
+    [],
+  );
 
   const handleCategoryFilter = useCallback((cat: InstrumentCategory) => {
     setCategory(cat);
@@ -209,26 +199,28 @@ export default function MarketPage() {
           <div className="market-workspace-list">
             <div className="list-header">
               <div className="list-header-row">
-                <div className="segmented" role="tablist">
+                <div className="list-sort-tabs" role="tablist">
                   {SORT_TABS.map((t) => (
                     <button
                       key={t.key}
                       type="button"
                       role="tab"
                       aria-selected={sortKey === t.key}
-                      className={`segmented-item ${sortKey === t.key ? "active" : ""}`}
+                      className={`list-sort-tab ${sortKey === t.key ? "active" : ""}`}
                       onClick={() => setSortKey(t.key)}
                     >
                       {t.label}
                     </button>
                   ))}
                 </div>
-                <div className="category-filter-chips">
+              </div>
+              <div className="list-header-row">
+                <div className="list-category-chips">
                   {CATEGORY_FILTERS.map((c) => (
                     <button
                       key={c.value}
                       type="button"
-                      className={`chip filter-chip ${category === c.value ? "active" : ""}`}
+                      className={`list-category-chip ${category === c.value ? "active" : ""}`}
                       onClick={() => handleCategoryFilter(c.value)}
                     >
                       {c.label}
@@ -237,8 +229,8 @@ export default function MarketPage() {
                 </div>
               </div>
               <div className="list-header-row">
-                <div className="search-input">
-                  <Search size={14} className="search-icon" />
+                <div className="list-search-input">
+                  <Search size={13} className="search-icon" />
                   <input
                     type="search"
                     placeholder="搜索代码 / 名称"
@@ -248,30 +240,6 @@ export default function MarketPage() {
                       if (e.key === "Enter") handleSearch();
                     }}
                   />
-                </div>
-              </div>
-              <div className="list-header-row">
-                <div className="search-input add-code-input">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={9}
-                    placeholder="6 位代码加自选"
-                    value={addCodeInput}
-                    onChange={(e) => setAddCodeInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void handleAddCode();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="btn ghost btn-add-code"
-                    onClick={() => void handleAddCode()}
-                    title="加入自选"
-                    aria-label="加入自选"
-                  >
-                    <Plus size={14} />
-                  </button>
                 </div>
               </div>
             </div>
@@ -290,7 +258,7 @@ export default function MarketPage() {
                 sortKey={sortKey}
                 sortDir={sortDir}
                 starred={starred}
-                onToggleStar={handleToggleStar}
+                onContextMenu={handleRowContextMenu}
                 loading={loading}
               />
             )}
@@ -300,6 +268,15 @@ export default function MarketPage() {
           </div>
         </div>
       </div>
+      {menuState && (
+        <RowContextMenu
+          x={menuState.x}
+          y={menuState.y}
+          isStarred={starred.has(menuState.tsCode)}
+          onToggleStar={() => handleToggleStar(menuState.tsCode)}
+          onClose={() => setMenuState(null)}
+        />
+      )}
     </section>
   );
 }

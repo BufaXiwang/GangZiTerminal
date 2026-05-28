@@ -2,13 +2,10 @@
 //
 // Spec: docs/design/frontend-design.md §4 市场页 + quotes-module.md §4 list_market
 //
-// 结构：
-//   row：
-//     左：name (大字加粗) + tsCode (小灰)
-//     右：price (tabular) + change% (红绿，下方)
-//   hover 时右侧浮出 star 按钮
+// 行：左 name（带可选自选小标记 + ST 标）+ tsCode (灰小字)
+//     右 price (tabular) + change% (红绿)
 //
-// Sort 简化：默认 / 涨跌幅 / 成交额（3 个 tab 由 MarketPage 控制；本组件只接收 sortKey/sortDir 排序）
+// 自选入口：右键 row 弹 context menu（外层 MarketPage 监听），不再在行内显示 star 按钮。
 
 import { Star } from "lucide-react";
 import { useMemo } from "react";
@@ -24,7 +21,8 @@ interface MarketListProps {
   sortKey: SortKey;
   sortDir: SortDir;
   starred: Set<TsCode>;
-  onToggleStar: (tsCode: TsCode) => void;
+  /** 右键 row → 弹自选 context menu；caller 拿 mouse 位置渲染浮层 */
+  onContextMenu?: (tsCode: TsCode, clientX: number, clientY: number) => void;
   loading?: boolean;
 }
 
@@ -85,7 +83,7 @@ export function MarketList({
   sortKey,
   sortDir,
   starred,
-  onToggleStar,
+  onContextMenu,
   loading,
 }: MarketListProps) {
   const sorted = useMemo(() => {
@@ -112,9 +110,22 @@ export function MarketList({
               role="row"
               className={`market-list-row compact ${isSel ? "selected" : ""}`}
               onClick={() => onSelect(item.tsCode)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                onContextMenu?.(item.tsCode, e.clientX, e.clientY);
+              }}
             >
               <div className="row-left">
                 <div className="row-name">
+                  {isStarred && (
+                    <Star
+                      size={11}
+                      className="row-star-indicator"
+                      fill="currentColor"
+                      strokeWidth={0}
+                      aria-label="已加自选"
+                    />
+                  )}
                   <span className="instrument-name">{item.name}</span>
                   {item.isSt && <span className="chip st-chip">ST</span>}
                 </div>
@@ -126,22 +137,6 @@ export function MarketList({
                 </div>
                 <div className={`row-pct tabular ${tone}`}>{fmtPct(pct)}</div>
               </div>
-              <button
-                type="button"
-                className={`star-btn row-star ${isStarred ? "starred" : ""}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onToggleStar(item.tsCode);
-                }}
-                aria-label={isStarred ? "已加入自选" : "加入自选"}
-                title={isStarred ? "已加入自选" : "加入自选"}
-              >
-                <Star
-                  size={14}
-                  fill={isStarred ? "currentColor" : "none"}
-                  strokeWidth={1.5}
-                />
-              </button>
             </div>
           );
         })}

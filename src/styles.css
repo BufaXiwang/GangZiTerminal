@@ -554,17 +554,6 @@ body {
   color: var(--fg-strong);
 }
 
-/* add-code mini input + button */
-.search-input.add-code-input {
-  min-width: 200px;
-  padding: 0 4px 0 8px;
-  gap: 4px;
-}
-
-.btn.btn-add-code {
-  height: 24px;
-  padding: 0 6px;
-}
 
 /* -------- Metrics row (顶部 6 卡片) -------- */
 
@@ -787,25 +776,118 @@ body {
 .list-header {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 12px;
+  gap: 6px;
+  padding: 10px;
   border-bottom: 1px solid var(--border-soft);
-  background: var(--bg-card);
+  background: var(--bg-soft);
   flex: 0 0 auto;
 }
 
 .list-header-row {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
 }
 
-.list-header .search-input,
-.list-header .search-input.add-code-input {
+/* Row 1: sort tabs — underline 风格而不是 pill 框 */
+.list-sort-tabs {
+  display: inline-flex;
+  gap: 0;
   flex: 1 1 auto;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.list-sort-tab {
+  flex: 1 1 0;
+  height: 26px;
+  padding: 0 8px;
+  border: none;
+  border-right: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.list-sort-tab:last-child { border-right: none; }
+.list-sort-tab:hover:not(.active) { background: var(--bg-soft); color: var(--fg-strong); }
+.list-sort-tab.active {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  font-weight: 500;
+}
+
+/* Row 2: category chips — 紧凑 */
+.list-category-chips {
+  display: inline-flex;
+  gap: 4px;
+  flex: 1 1 auto;
+}
+
+.list-category-chip {
+  flex: 1 1 0;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: var(--bg-card);
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.list-category-chip:hover:not(.active) {
+  background: var(--bg-soft);
+  color: var(--fg-strong);
+}
+
+.list-category-chip.active {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+}
+
+/* Row 3: search — 单独整行 */
+.list-search-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.list-search-input:focus-within {
+  border-color: var(--brand);
+  background: #fff;
+}
+
+.list-search-input .search-icon { color: var(--fg-faint); flex: 0 0 auto; }
+
+.list-search-input input {
+  flex: 1 1 auto;
+  height: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 12px;
+  color: var(--fg-strong);
+  font-family: var(--font-body);
   min-width: 0;
 }
+
+.list-search-input input::placeholder { color: var(--fg-faint); }
 
 /* -------- Market List (compact 2-line rows) -------- */
 
@@ -897,16 +979,45 @@ body {
 .market-list-row.compact .row-pct.up { color: var(--chart-up); }
 .market-list-row.compact .row-pct.down { color: var(--chart-down); }
 
-/* hover-revealed star */
-.market-list-row.compact .row-star {
-  opacity: 0;
-  transition: opacity 100ms ease;
+/* inline 自选小标记（替代 hover ⭐）— 在名称前显示一个小黄五角星 */
+.row-star-indicator {
+  color: var(--state-warn);
+  flex: 0 0 auto;
+  margin-right: 4px;
+  vertical-align: middle;
 }
 
-.market-list-row.compact:hover .row-star,
-.market-list-row.compact .row-star.starred {
-  opacity: 1;
+/* 右键自选 context menu */
+.row-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 140px;
+  padding: 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
 }
+
+.row-context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  background: transparent;
+  color: var(--fg-strong);
+  font-size: 12px;
+  font-family: var(--font-body);
+  text-align: left;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background 100ms ease;
+}
+
+.row-context-menu-item:hover { background: var(--bg-soft); }
 
 .instrument-name {
   overflow: hidden;
