@@ -1157,8 +1157,13 @@ impl QuotesService {
                 tdx_input.into_iter().zip(tdx_results.into_iter())
             {
                 completed += 1;
+                // `is_display_complete` 而不是 `is_quote_complete` —— 指数 / 基金 TDX
+                // 不返回 bid/ask 五档（其他 provider 同样不返回），不该因此把它们丢去
+                // 跑 ~600ms/只的 EM→Tencent→Sina fallback。list 视图只需要 price。
+                // `is_quote_complete` 是 fallback chain 的字段完整度裁判，不是 universe
+                // batch 的接受门槛。
                 match res {
-                    Ok(q) if q.is_quote_complete() => {
+                    Ok(q) if q.is_display_complete() => {
                         let captured_at = q.captured_at;
                         let source_str = q.source.as_str().to_string();
                         self.cache.put(CachedSnapshot {

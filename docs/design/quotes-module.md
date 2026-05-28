@@ -1024,6 +1024,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 `refresh_market_quotes(scope = "universe")` 一次需要扫 ~7500 标的，是吞吐敏感路径。Quotes 对该路径**强制契约**如下：
 
 1. **批量 RPC 强制**：universe scope 实现必须用 TDX `get_security_quotes` 批量调用（每批 ≤ 80 标的），不允许逐只串行；其他 provider fallback 沿用原逐只路径。理由：TDX 协议层已经支持批量并自带 ≥80 ms/批节流，串行方案在节流下吞吐 ~6 只/秒，批量 ~80×80ms/秒 ≈ 1000 只/秒。
+   - **接受门槛**：universe batch 路径用 `is_display_complete`（只要 `price` 非空就接受为最终值），**不**用 `is_quote_complete`。理由：指数 / 基金 TDX 不返回 bid/ask 五档，且 EM / Tencent / Sina 也无；用 `is_quote_complete` 会把所有指数 / 基金错误地推进 fallback chain，每只浪费 ~600ms。`is_quote_complete` 是 fallback chain 多 provider 之间挑选的"字段完整度优先"裁判，不是 universe batch 主源的接受门槛。
+   - **fallback 触发面**：只在 TDX `Err` 或 `Ok` 但 `price` 为空时，把该标的推入 fallback queue（EM → Tencent → Sina）。
 2. **吞吐目标**：在 TDX 健康、网络正常的前提下，universe scope close / intraday 一轮完成时间 **≤ 1 分钟**（universe ~7500）。超出视为 provider 或 IO 异常，写入 `quote_refresh_state.failed`。
 3. **执行顺序**：universe scope 标的按 `InstrumentCategory` 排序进入批次队列 —— **`Stock` → `Index` → `Fund`**；同 category 内顺序不约束。理由：用户首屏感知优先级是 A 股票，索引和基金次之；按类别交付让"看得见的部分"先就绪。
 4. **进度事件**：universe scope 每完成 N 只（**N = 200**，最后一批不足也 emit）必须 emit `market-quotes-refresh-progress`，payload 见 [shared-types.md](shared-types.md) `MarketQuotesRefreshProgressPayload`。前端订阅该事件做增量列表刷新，**不要靠 polling 撞数据**。终态仍以 `market-quotes-refreshed` 为准；progress 是中间态，消费者不得用其覆盖 `quote_refresh_state` 最终行。
