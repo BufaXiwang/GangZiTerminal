@@ -277,43 +277,61 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
       include = { klines: [period as KlinePeriod] };
     }
 
-    // Retry-on-empty:
-    // 后端 startup catch-up（K 线 warmup）是异步的，UI 首次拉可能比 warmup 完成早。
-    // 拿到空且非错误时，按指数 backoff 重试 3 次（2s/4s/8s），覆盖大多数 warmup 窗口。
+    // On-demand fetch：DB 空时直接调 ensureChartData 触发后端拉数据，等完成再读。
+    // 这样无论何时切换标的 / K 线周期，都能拿到数据，不必等盘中或后台 scheduler。
     let cancelled = false;
-    let timers: number[] = [];
-    const fetchOnce = async (attempt: number): Promise<void> => {
+
+    const doFetch = async (): Promise<{ ok: boolean; points: KlineDataPoint[] }> => {
+      const res = await commands.fetchData({ tsCodes: [tsCode], include });
+      if (cancelled || id !== reqIdRef.current) return { ok: false, points: [] };
+      if (res.status === "error") {
+        setState({
+          data: [],
+          loading: false,
+          error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+          lastUpdatedMs: null,
+        });
+        return { ok: false, points: [] };
+      }
+      const points = isIntraday
+        ? extractIntraday(res.data, tsCode)
+        : extractKlines(res.data, tsCode, period as AnyKlinePeriod);
+      return { ok: true, points };
+    };
+
+    const run = async (): Promise<void> => {
       try {
-        const res = await commands.fetchData({ tsCodes: [tsCode], include });
+        // 1. 先读 DB
+        let result = await doFetch();
+        if (!result.ok) return;
+        if (result.points.length > 0) {
+          setState({
+            data: result.points,
+            loading: false,
+            error: null,
+            lastUpdatedMs: Date.now(),
+          });
+          return;
+        }
+        // 2. DB 空 → 触发后端 refresh，再读
+        const refreshRes = await commands.ensureChartData(tsCode, period);
         if (cancelled || id !== reqIdRef.current) return;
-        if (res.status === "error") {
+        if (refreshRes.status === "error") {
           setState({
             data: [],
             loading: false,
-            error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+            error: `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
             lastUpdatedMs: null,
           });
           return;
         }
-        const points = isIntraday
-          ? extractIntraday(res.data, tsCode)
-          : extractKlines(res.data, tsCode, period as AnyKlinePeriod);
-        if (points.length === 0 && attempt < 3) {
-          const delayMs = 2000 * Math.pow(2, attempt); // 2s, 4s, 8s
-          const t = window.setTimeout(() => {
-            if (!cancelled && id === reqIdRef.current) {
-              setState((s) => ({ ...s, loading: true }));
-              void fetchOnce(attempt + 1);
-            }
-          }, delayMs);
-          timers.push(t);
-          setState({ data: [], loading: false, error: null, lastUpdatedMs: null });
-          return;
-        }
+        // 3. refresh 完成后重新读 DB
+        result = await doFetch();
+        if (!result.ok) return;
         setState({
-          data: points,
+          data: result.points,
           loading: false,
-          error: null,
+          error: result.points.length === 0 ? "无可用数据" : null,
           lastUpdatedMs: Date.now(),
         });
       } catch (e) {
@@ -326,10 +344,9 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         });
       }
     };
-    void fetchOnce(0);
+    void run();
     return () => {
       cancelled = true;
-      timers.forEach((t) => window.clearTimeout(t));
     };
   }, [tsCode, period, enabled]);
 

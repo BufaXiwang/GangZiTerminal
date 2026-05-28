@@ -6,7 +6,7 @@
 //! - 对外接口的机器可读错误必须用 ErrorCode；message 仅作补充。
 //! - 写接口失败必须返回单一主 reason code，可附带 details。
 
-use crate::domain::shared::{ErrorCode, JsonValue};
+use crate::domain::shared::{ErrorCode, JsonValue, ResponseError};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -41,5 +41,15 @@ impl CommandError {
 impl From<ErrorCode> for CommandError {
     fn from(code: ErrorCode) -> Self {
         CommandError::new(code)
+    }
+}
+
+impl From<ResponseError> for CommandError {
+    fn from(e: ResponseError) -> Self {
+        CommandError {
+            code: e.code,
+            message: e.message,
+            details: None,
+        }
     }
 }

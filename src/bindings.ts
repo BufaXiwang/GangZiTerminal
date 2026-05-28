@@ -103,6 +103,26 @@ async fetchIndustryHeatmap(topN: number | null) : Promise<Result<IndustryHeatmap
 }
 },
 /**
+ * 前端 on-demand 拉数据：用户选中标的 + 切到某 chart period 时，如果 DB 空就触发后端拉一份。
+ * 
+ * 按 period 字符串分派：
+ * - `"day"` / `"week"` / `"month"` → `refresh_klines`
+ * - `"1m"` / `"5m"` / `"15m"` / `"30m"` / `"60m"` → `refresh_minute_klines`
+ * - `"intraday"` → `refresh_intraday`
+ * 
+ * 同步等待 refresh 完成；调用方拿到 Ok 后可以再次调用 fetch_data 拿数据。
+ * 
+ * 已有数据时也会重新拉（refresh 是 upsert，幂等）；UI 调用方决定是否要重新触发。
+ */
+async ensureChartData(tsCode: string, period: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ensure_chart_data", { tsCode, period }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出当前 SkillRegistry 已注册的 skill。
  * 
  * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）
