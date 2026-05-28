@@ -80,46 +80,57 @@ export default function MarketPage() {
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
 
-  // Pull list（不分页，一次性拉）。带 module-level cache，TTL 60s。
-  // 切 tab 回到市场页时立即从 cache 渲染，背景静默 refetch（如已过期）。
+  // Pull list（不分页，一次性拉）— stale-while-revalidate 策略：
+  //   1. cache 命中 → 立即渲染（瞬间）
+  //   2. cache stale (>30s) → 后台静默 refetch，不显示 loading
+  //   3. cache miss → 显示 loading + IPC fetch
+  // 后端 listMarket 是纯本地 DB + snapshot 读，没有 TDX 调用；cache 安全。
   useEffect(() => {
     let cancelled = false;
 
-    // 1. 立即用 cache（如有）
+    const doFetch = (silent: boolean) => {
+      if (!silent) {
+        setLoading(true);
+        setError(null);
+      }
+      void commands
+        .listMarket({
+          category,
+          query: query || undefined,
+          includeQuote: true,
+          limit: LIST_LIMIT,
+          offset: 0,
+        })
+        .then((res) => {
+          if (cancelled) return;
+          if (res.status === "error") {
+            if (!silent) {
+              setError(
+                `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+              );
+              setLoading(false);
+            }
+            return;
+          }
+          setItems(res.data.items);
+          setCachedList(category, query, res.data.items);
+          setLastUpdated(new Date());
+          if (!silent) setLoading(false);
+        });
+    };
+
     const cached = getCachedList(category, query);
     if (cached) {
+      // 永久 cache：先用旧数据，stale 再后台 refetch
       setItems(cached.items);
       setLastUpdated(new Date(Date.now() - cached.ageMs));
       setLoading(false);
       setError(null);
-      return; // 命中 cache → 不发起 IPC
+      if (cached.stale) doFetch(true); // silent refetch
+    } else {
+      doFetch(false);
     }
 
-    // 2. cache miss / 过期 → 发起 IPC
-    setLoading(true);
-    setError(null);
-    void commands
-      .listMarket({
-        category,
-        query: query || undefined,
-        includeQuote: true,
-        limit: LIST_LIMIT,
-        offset: 0,
-      })
-      .then((res) => {
-        if (cancelled) return;
-        if (res.status === "error") {
-          setError(
-            `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-          );
-          setLoading(false);
-          return;
-        }
-        setItems(res.data.items);
-        setCachedList(category, query, res.data.items);
-        setLastUpdated(new Date());
-        setLoading(false);
-      });
     return () => {
       cancelled = true;
     };
