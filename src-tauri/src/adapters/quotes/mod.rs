@@ -6,6 +6,8 @@
 //! - `crate::adapters::quotes::cmd::list_market`
 //! - `crate::adapters::quotes::cmd::fetch_data`
 //! - `crate::adapters::quotes::cmd::scan_market`
+//! - `crate::adapters::quotes::cmd::fetch_market_breadth`
+//! - `crate::adapters::quotes::cmd::fetch_industry_heatmap`
 //!
 //! 事件常量：
 //! - [`events::MARKET_QUOTES_REFRESHED_EVENT`] = `market-quotes-refreshed`

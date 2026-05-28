@@ -58,6 +58,8 @@ pub fn run() {
         adapters::quotes::cmd::list_market,
         adapters::quotes::cmd::fetch_data,
         adapters::quotes::cmd::scan_market,
+        adapters::quotes::cmd::fetch_market_breadth,
+        adapters::quotes::cmd::fetch_industry_heatmap,
         adapters::agent::cmd::agent_list_skills,
         adapters::account::cmd::fetch_account,
         // Spec: account-module.md §4 — operate_account 写入口只对 Agent tool /

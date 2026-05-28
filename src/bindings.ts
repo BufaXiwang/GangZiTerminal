@@ -77,6 +77,32 @@ async scanMarket(request: ScanMarketRequest) : Promise<Result<ScanMarketResponse
 }
 },
 /**
+ * 市场宽度（spec §4 `market_breadth`）。
+ * 
+ * 纯只读聚合，不触发 provider；只统计 `category == stock`。
+ */
+async fetchMarketBreadth() : Promise<Result<MarketBreadth, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_market_breadth") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 行业热度（spec §4 `industry_heatmap`）。
+ * 
+ * `top_n` 缺省时使用 5；上限 50（防止 UI 误传大值）。
+ */
+async fetchIndustryHeatmap(topN: number | null) : Promise<Result<IndustryHeatmap, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("fetch_industry_heatmap", { topN }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出当前 SkillRegistry 已注册的 skill。
  * 
  * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）
@@ -203,6 +229,42 @@ export type IndicatorBasis = { period: KlinePeriod; adjust: Adjust; fetchedAt: s
  */
 export type IndicatorName = "ma_5" | "ma_10" | "ma_20" | "ma_60" | "ema_12" | "ema_26" | "macd_dif" | "macd_dea" | "macd_hist" | "rsi_6" | "rsi_12" | "rsi_24" | "kdj_k" | "kdj_d" | "kdj_j" | "boll_upper" | "boll_mid" | "boll_lower" | "volume_ma_5" | "volume_ma_10"
 export type IndicatorSnapshot = { tsCode: TsCode; basis: IndicatorBasis; values: Partial<{ [key in string]: number | null }>; warnings?: WarningCode[] }
+/**
+ * Spec: quotes-module.md §4 `industry_heatmap`。
+ */
+export type IndustryHeatmap = { 
+/**
+ * 按 `avg_change_percent desc` 取前 N 个行业。
+ */
+topGainers: IndustryHeatmapItem[]; 
+/**
+ * 按 `avg_change_percent asc` 取前 N 个行业。
+ */
+topLosers: IndustryHeatmapItem[]; tradeDate: string; computedAt: string }
+/**
+ * Spec: quotes-module.md §4 `industry_heatmap` 单个行业项。
+ */
+export type IndustryHeatmapItem = { 
+/**
+ * 行业名称（来自 `MarketInstrument.sector`）。
+ */
+sector: string; 
+/**
+ * 该行业内有效 quote 标的的 `change_percent` 算术平均（百分点）。
+ */
+avgChangePercent: number; 
+/**
+ * 该行业参与统计的有效 quote 标的数。
+ */
+count: number; 
+/**
+ * 涨幅 top 3 的 `ts_code`（按 `change_percent desc`；不足 3 个时返回全部）。
+ */
+leaderCodes: TsCode[]; 
+/**
+ * 与 `leader_codes` 对应的名称。
+ */
+leaderNames: string[] }
 export type InstrumentCategory = "stock" | "index" | "fund"
 /**
  * Spec: quotes-module.md §2 — universe 来源。
@@ -226,6 +288,50 @@ export type ListNewsSourcesResponse = { items: NewsSource[] }
 export type MarkTriggerHandledRequest = { triggerId: string; reason: string }
 export type MarkTriggerHandledResponse = { accepted: boolean; trigger?: AccountTrigger | null; accountEventIds?: string[]; reason?: ErrorCode | null; message?: string | null }
 export type Market = "SH" | "SZ" | "BJ"
+/**
+ * Spec: quotes-module.md §4 `market_breadth`。
+ * 
+ * 全市场宽度统计；按 spec 只统计 `category == stock`（不含指数、基金）。
+ * 计算前必须先用 quote 有效性规则筛掉无可用 quote 或不匹配 eligible
+ * trade date 的标的，这些归入 `no_data`。
+ */
+export type MarketBreadth = { 
+/**
+ * 有效 quote 的标的总数。`up + down + flat == total`。
+ */
+total: number; 
+/**
+ * `change_percent > 0` 的家数。
+ */
+up: number; 
+/**
+ * `change_percent < 0` 的家数。
+ */
+down: number; 
+/**
+ * `change_percent == 0`（或缺失但 quote 仍有效）的家数。
+ */
+flat: number; 
+/**
+ * 涨停家数（按本模块顶部阈值规则）。是 `up` 的子集。
+ */
+limitUp: number; 
+/**
+ * 跌停家数（按本模块顶部阈值规则）。是 `down` 的子集。
+ */
+limitDown: number; 
+/**
+ * universe 中没有有效 quote 的标的数（snapshot missing / expired / 非 stock category 不计入此数）。
+ */
+noData: number; 
+/**
+ * 本次统计使用的 eligible trade date。
+ */
+tradeDate: string; 
+/**
+ * 计算完成时间。
+ */
+computedAt: string }
 export type MinuteKlinePeriod = "1m" | "5m" | "15m" | "30m" | "60m"
 export type MinuteKlinePoint = { timestampMs: number; open: Price; close: Price; high: Price; low: Price; volume: Volume; amount: Amount }
 export type MinuteKlineSeries = { period: MinuteKlinePeriod; points: MinuteKlinePoint[]; freshness: Freshness; warnings?: WarningCode[] }
