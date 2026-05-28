@@ -250,6 +250,20 @@ type MarketQuotesRefreshedPayload = {
   capturedAt: OccurredAt;
 };
 
+// market-quotes-refresh-progress：universe scope 中间态进度。
+// emit 节奏由 quotes-module.md "全市场 quote 刷新执行契约" 规定（默认每 200 只）。
+// 消费者只用于增量列表刷新；终态仍以 MarketQuotesRefreshedPayload 为准。
+type MarketQuotesRefreshProgressPayload = {
+  scope: "universe";
+  purpose: "intraday" | "close";
+  tradeDate?: TradeDate;
+  completed: number;        // 累计已完成数量（含失败）
+  success: number;          // 累计成功数量
+  total: number;            // 本轮目标总数
+  affectedTsCodes: TsCode[];// 本次 progress 增量写入成功的标的（自上一个 progress 起）
+  capturedAt: OccurredAt;
+};
+
 type AccountUpdatedPayload = {
   accountEventIds: string[];
   affectedOrderIds?: string[];

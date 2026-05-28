@@ -1019,6 +1019,16 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - `MarketQuotesRefreshedPayload.affectedTsCodes` 在 `subscribed` / `manual` scope 下必须尽量填写成功写入 snapshot 的标的集合；`universe` scope 数据量过大时可以省略。消费者看到 `affectedTsCodes` 缺失时必须按 `scope` 做全量重读 / 重建。
 - `failedBatches > 0` 表示本轮 quote refresh 部分失败；事件仍可 emit，但消费者必须把本次读取视为 partial，不得把缺失标的解释为确定无数据。
 
+### 全市场 quote 刷新执行契约
+
+`refresh_market_quotes(scope = "universe")` 一次需要扫 ~7500 标的，是吞吐敏感路径。Quotes 对该路径**强制契约**如下：
+
+1. **批量 RPC 强制**：universe scope 实现必须用 TDX `get_security_quotes` 批量调用（每批 ≤ 80 标的），不允许逐只串行；其他 provider fallback 沿用原逐只路径。理由：TDX 协议层已经支持批量并自带 ≥80 ms/批节流，串行方案在节流下吞吐 ~6 只/秒，批量 ~80×80ms/秒 ≈ 1000 只/秒。
+2. **吞吐目标**：在 TDX 健康、网络正常的前提下，universe scope close / intraday 一轮完成时间 **≤ 1 分钟**（universe ~7500）。超出视为 provider 或 IO 异常，写入 `quote_refresh_state.failed`。
+3. **执行顺序**：universe scope 标的按 `InstrumentCategory` 排序进入批次队列 —— **`Stock` → `Index` → `Fund`**；同 category 内顺序不约束。理由：用户首屏感知优先级是 A 股票，索引和基金次之；按类别交付让"看得见的部分"先就绪。
+4. **进度事件**：universe scope 每完成 N 只（**N = 200**，最后一批不足也 emit）必须 emit `market-quotes-refresh-progress`，payload 见 [shared-types.md](shared-types.md) `MarketQuotesRefreshProgressPayload`。前端订阅该事件做增量列表刷新，**不要靠 polling 撞数据**。终态仍以 `market-quotes-refreshed` 为准；progress 是中间态，消费者不得用其覆盖 `quote_refresh_state` 最终行。
+5. **resume 语义**：catch-up（`purpose = "close"`）必须先查 `list_close_snapshot_ts_codes(tradeDate)` 过滤已有标的，重启后从断点接续，不重跑已成功条目。`skip_existing` 行为只对 `purpose = "close"` 生效；`intraday` 仍刷全 universe（覆盖盘中变化）。
+
 ### 核心指数集合
 
 Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴露给外部调度：
@@ -1101,6 +1111,12 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 - 复权计算改为本地基于 TDX xdxr 现算（unadjusted K 线 + xdxr 事件），不再依赖 TuShare `adj_factor`。
 - 新增 cold-start seed：启动时把内置 `BUILTIN_INSTRUMENTS` upsert 入 `quote_instruments`，保证 UI 第一帧非空。
 - 交易日历改为本地推算 default + TuShare 校准 optional。
+
+**2026-05-28 (三)** — universe scope 刷新执行契约：
+
+- §5 后台刷新新增 "全市场 quote 刷新执行契约" 段，规定批量 RPC 强制、≤ 1 分钟吞吐目标、`Stock → Index → Fund` 执行顺序、每 200 只 emit 进度事件、`purpose=close` 的 resume 语义。
+- shared-types.md 新增 `MarketQuotesRefreshProgressPayload`，对应新 event `market-quotes-refresh-progress`；前端不再靠 30s polling 撞 universe catch-up 数据，订阅该事件做增量列表刷新。
+- 触发原因：冷启动测试发现 universe close catch-up 串行调用 TDX，~6 只/秒，7500 只需 ~19 分钟；TDX 协议层 `get_security_quotes` 批量已存在，pipeline 没用上。
 
 **2026-05-28 (二)** — Spec drift 补正文（实现已落，spec 落后于代码）：
 
