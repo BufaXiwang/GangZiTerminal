@@ -42,8 +42,11 @@ pub struct MicroClearReport {
 /// 给易腐 skill 结果替换 stub。
 ///
 /// Spec §4：易腐 skill 结果替换 stub 时，**必须保留 `name` + `call_id` + `ref`**，让 replay
-/// 能通过 PayloadStore 拉回。本函数把 droppable realtime parts 替换成 `<skill_result_stub />`，
-/// 具体 name / call_id / ref 由 caller 注入到 part 内容（caller 知道哪些 part 是 skill_result）。
+/// 能通过 PayloadStore 拉回。本函数扫描 droppable realtime parts，若内容形如
+/// `<skill_result name="X" call_id="Y" ref="Z">...</skill_result>` 则提取属性渲染成
+/// `<skill_result_stub name="X" call_id="Y" ref="Z" />`；无法识别时（无 skill_result 包裹的纯文本）
+/// 退化为不含属性的 `<skill_result_stub />`，但不影响 audit 真源（`agent_skill_calls` + `agent_payloads`
+/// 持久化不动）。
 pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
     let mut report = MicroClearReport {
         stubbed_parts: 0,
@@ -60,10 +63,95 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
 }
 
 fn stub_in_place(p: &mut ContextPart) {
-    // 通用 stub 占位：caller 可在替换前/后注入更精确的 name + call_id + ref。
-    p.content = ContextContent::Text("<skill_result_stub />".into());
-    p.token_estimate = Some(4);
+    let text = render_stub(&p.content);
+    p.token_estimate = Some(((text.chars().count() + 3) / 4) as u32);
+    p.content = ContextContent::Text(text);
     p.kind = ContextPartKind::SkillResultStub;
+}
+
+/// 把一段 part 内容（可能含 `<skill_result name=".." call_id=".." ref="..">...</skill_result>`）
+/// 渲染成对应的 `<skill_result_stub name=".." call_id=".." ref=".." />`。
+///
+/// Spec §4 line 511: 易腐 skill 结果替换 stub 时，必须保留 `name` + `call_id` + `ref`。
+fn render_stub(content: &ContextContent) -> String {
+    let body = match content {
+        ContextContent::Text(s) => s.clone(),
+        ContextContent::Json(v) => v.to_string(),
+    };
+    if let Some(attrs) = parse_skill_result_attrs(&body) {
+        let mut s = String::from("<skill_result_stub");
+        if let Some(name) = attrs.name {
+            s.push_str(&format!(r#" name="{}""#, escape_attr(&name)));
+        }
+        if let Some(call_id) = attrs.call_id {
+            s.push_str(&format!(r#" call_id="{}""#, escape_attr(&call_id)));
+        }
+        if let Some(payload_ref) = attrs.payload_ref {
+            s.push_str(&format!(r#" ref="{}""#, escape_attr(&payload_ref)));
+        }
+        s.push_str(" />");
+        s
+    } else {
+        "<skill_result_stub />".to_string()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SkillResultAttrs {
+    name: Option<String>,
+    call_id: Option<String>,
+    payload_ref: Option<String>,
+}
+
+/// 从 `<skill_result ...>...</skill_result>` 或 `<skill_result ... />` 头部提取
+/// `name` / `call_id` / `ref` 属性。任何属性缺失返回 None；标签不存在也返回 None。
+fn parse_skill_result_attrs(s: &str) -> Option<SkillResultAttrs> {
+    let open_pos = s.find("<skill_result")?;
+    let rest = &s[open_pos + "<skill_result".len()..];
+    let close_gt = rest.find('>')?;
+    let attrs_str = &rest[..close_gt];
+    let mut attrs = SkillResultAttrs::default();
+    attrs.name = read_attr(attrs_str, "name");
+    attrs.call_id = read_attr(attrs_str, "call_id");
+    attrs.payload_ref = read_attr(attrs_str, "ref");
+    // Heuristic: must look like a real skill_result tag (i.e. have at least name).
+    if attrs.name.is_none() && attrs.call_id.is_none() && attrs.payload_ref.is_none() {
+        return None;
+    }
+    Some(attrs)
+}
+
+fn read_attr(s: &str, key: &str) -> Option<String> {
+    // search for ` <key>=` boundary to avoid matching attribute prefixes (e.g. "ref" ⊂ "reference")
+    let mut idx = 0usize;
+    while idx < s.len() {
+        let sub = &s[idx..];
+        let p = sub.find(key)?;
+        let abs = idx + p;
+        let before_ok = abs == 0
+            || s.as_bytes()
+                .get(abs - 1)
+                .map(|b| b.is_ascii_whitespace())
+                .unwrap_or(false);
+        let after = &s[abs + key.len()..];
+        let after_trim = after.trim_start();
+        if before_ok && after_trim.starts_with('=') {
+            let after_eq = after_trim[1..].trim_start();
+            let quote = after_eq.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let inner = &after_eq[quote.len_utf8()..];
+            let end = inner.find(quote)?;
+            return Some(inner[..end].to_string());
+        }
+        idx = abs + key.len();
+    }
+    None
+}
+
+fn escape_attr(s: &str) -> String {
+    s.replace('"', "&quot;")
 }
 
 fn is_stub(p: &ContextPart) -> bool {
@@ -252,6 +340,66 @@ mod tests {
         }
         // most chat parts removed
         assert!(out.chat_parts.len() <= 1);
+    }
+
+    #[test]
+    fn micro_clear_preserves_name_call_id_ref_in_stub() {
+        // Spec §4 line 511: 易腐 skill 结果替换 stub 时，必须保留 name + call_id + ref。
+        let mut b = ContextBundle::new("r1");
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(
+                r#"<skill_result name="fetch_quote" call_id="sc_abc" ref="pl_xyz">{"price":"1.0"}</skill_result>"#
+                    .into(),
+            ),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        let rep = micro_clear(&mut b);
+        assert_eq!(rep.stubbed_parts, 1);
+        let rendered = match &b.realtime_parts[0].content {
+            ContextContent::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(rendered.contains(r#"name="fetch_quote""#), "{}", rendered);
+        assert!(rendered.contains(r#"call_id="sc_abc""#), "{}", rendered);
+        assert!(rendered.contains(r#"ref="pl_xyz""#), "{}", rendered);
+        assert!(rendered.starts_with("<skill_result_stub"));
+        assert!(rendered.ends_with("/>"));
+    }
+
+    #[test]
+    fn micro_clear_falls_back_to_bare_stub_when_no_attrs() {
+        let mut b = ContextBundle::new("r1");
+        b.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text("plain realtime data with no skill_result tag".into()),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        micro_clear(&mut b);
+        let rendered = match &b.realtime_parts[0].content {
+            ContextContent::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(rendered, "<skill_result_stub />");
+    }
+
+    #[test]
+    fn parse_skill_result_attrs_handles_quoted_values() {
+        let out =
+            parse_skill_result_attrs(r#"<skill_result name="a" call_id="sc_1" ref="pl_2">x</skill_result>"#)
+                .unwrap();
+        assert_eq!(out.name.as_deref(), Some("a"));
+        assert_eq!(out.call_id.as_deref(), Some("sc_1"));
+        assert_eq!(out.payload_ref.as_deref(), Some("pl_2"));
+    }
+
+    #[test]
+    fn parse_skill_result_attrs_returns_none_when_no_tag() {
+        assert!(parse_skill_result_attrs("hello world").is_none());
     }
 
     #[test]
