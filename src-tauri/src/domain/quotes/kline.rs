@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 /// Spec: quotes-module.md §2
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum KlinePeriod {
     Day,
@@ -15,7 +15,7 @@ pub enum KlinePeriod {
     Month,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum Adjust {
     None,

@@ -4,6 +4,7 @@
 //!
 //! 纯类型 + 规则；不依赖 tauri / rusqlite / reqwest / tdx / infrastructure / pipeline / adapters。
 
+pub mod adjust;
 pub mod errors;
 pub mod events;
 pub mod freshness_rules;
@@ -18,6 +19,7 @@ pub mod trade_calendar;
 pub mod tushare_health;
 pub mod xdxr;
 
+pub use adjust::{apply_adjust, AdjustMode};
 pub use errors::{QuoteFacadeError, QuoteFacadeErrorKind};
 pub use events::{
     MarketQuotesRefreshedPayload, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose,
