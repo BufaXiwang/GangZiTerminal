@@ -149,6 +149,21 @@ pub struct KlinePageResult {
     pub has_more: bool,
 }
 
+/// Frontend log forwarder：前端调 commands.forwardLog(msg) → 后端 tracing
+/// → tauri dev stdout，可以从开发者那里直接读 log 文件分析性能问题。
+/// 仅供 dev / 调试用，生产 build 可去掉。
+#[tauri::command]
+#[specta::specta]
+pub fn forward_log(level: String, message: String) -> Result<(), CommandError> {
+    match level.as_str() {
+        "error" => tracing::error!(target: "frontend", "{}", message),
+        "warn" => tracing::warn!(target: "frontend", "{}", message),
+        "debug" => tracing::debug!(target: "frontend", "{}", message),
+        _ => tracing::info!(target: "frontend", "{}", message),
+    }
+    Ok(())
+}
+
 /// 前端 on-demand 拉数据：用户选中标的 + 切到某 chart period 时，如果 DB 空就触发后端拉一份。
 ///
 /// 按 period 字符串分派：

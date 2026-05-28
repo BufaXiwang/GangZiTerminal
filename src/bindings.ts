@@ -161,6 +161,19 @@ async fetchKlinePage(tsCode: string, period: string, startOffset: number) : Prom
 }
 },
 /**
+ * Frontend log forwarder：前端调 commands.forwardLog(msg) → 后端 tracing
+ * → tauri dev stdout，可以从开发者那里直接读 log 文件分析性能问题。
+ * 仅供 dev / 调试用，生产 build 可去掉。
+ */
+async forwardLog(level: string, message: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("forward_log", { level, message }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出当前 SkillRegistry 已注册的 skill。
  * 
  * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）

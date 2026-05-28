@@ -6,6 +6,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { commands, type IndustryHeatmap } from "../bindings";
+import { perf } from "./perfLog";
 
 // Module-level cache：remount 时立即用上一份，无 loading 闪烁。
 let cachedData: IndustryHeatmap | null = null;
@@ -42,7 +43,12 @@ export function useIndustryHeatmap(
     const fetchOnce = (silent: boolean) => {
       const id = ++reqIdRef.current;
       if (!silent) setState((s) => ({ ...s, loading: cachedData === null }));
+      const t0 = performance.now();
+      perf(`useIndustryHeatmap IPC start (silent=${silent})`);
       void commands.fetchIndustryHeatmap(topN).then((res) => {
+        perf(
+          `useIndustryHeatmap IPC done in ${(performance.now() - t0).toFixed(1)}ms`,
+        );
         if (cancelled || id !== reqIdRef.current) return;
         if (res.status === "error") {
           if (!silent) {

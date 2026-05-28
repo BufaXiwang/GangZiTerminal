@@ -21,6 +21,7 @@ import {
   type KlinePeriod,
   type MinuteKlinePeriod,
 } from "../bindings";
+import { perf } from "../lib/perfLog";
 
 export type ChartPeriod =
   | "intraday"
@@ -238,6 +239,8 @@ export function KlineCanvas({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    const mountedAt = performance.now();
+    perf(`KlineCanvas mount tsCode=${tsCode} period=${period}`);
 
     const upColor = readCssVar("--chart-up", "#c0392b");
     const downColor = readCssVar("--chart-down", "#1f8a47");
@@ -288,6 +291,21 @@ export function KlineCanvas({
         crosshair: {
           horizontal: { line: { color: fgMuted } },
           vertical: { line: { color: fgMuted } },
+        },
+        indicator: {
+          // VOL 副图 + 其他 bar 类指标颜色按 A 股语义红涨绿跌（默认 klinecharts 是反的）
+          bars: [
+            {
+              style: "fill",
+              borderStyle: "solid",
+              borderSize: 1,
+              upColor,
+              downColor,
+              noChangeColor: fgMuted,
+              borderColor: upColor,
+              wickColor: upColor,
+            },
+          ],
         },
       },
     });
@@ -381,7 +399,11 @@ export function KlineCanvas({
 
     return () => {
       cancelled = true;
+      const tBeforeDispose = performance.now();
       dispose(container);
+      perf(
+        `KlineCanvas dispose tsCode=${tsCode} period=${period} took ${(performance.now() - tBeforeDispose).toFixed(1)}ms; lived ${(performance.now() - mountedAt).toFixed(1)}ms`,
+      );
       chartRef.current = null;
     };
   }, [tsCode, period, pricePrecision]);

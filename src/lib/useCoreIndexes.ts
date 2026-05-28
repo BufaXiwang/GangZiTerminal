@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { commands, type FetchDataItem } from "../bindings";
+import { perf } from "./perfLog";
 
 // 模块级 cache：组件 remount 时立即喂上一份，避免 mount → IPC → loading 闪烁。
 // React 切 tab 时该缓存让顶部指标卡瞬间出来，背景 polling 自然 refresh。
@@ -58,12 +59,17 @@ export function useCoreIndexes(
     const fetchOnce = (silent: boolean) => {
       const id = ++reqIdRef.current;
       if (!silent) setState((s) => ({ ...s, loading: cachedItems === null }));
+      const t0 = performance.now();
+      perf(`useCoreIndexes IPC start (silent=${silent})`);
       void commands
         .fetchData({
           tsCodes: CORE_INDEXES.map((c) => c.tsCode),
           include: { quote: true },
         })
         .then((res) => {
+          perf(
+            `useCoreIndexes IPC done in ${(performance.now() - t0).toFixed(1)}ms`,
+          );
           if (cancelled || id !== reqIdRef.current) return;
           if (res.status === "error") {
             if (!silent) {

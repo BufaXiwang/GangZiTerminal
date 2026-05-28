@@ -29,6 +29,7 @@ import {
   setCachedList,
   invalidateAllListCache,
 } from "../lib/marketListCache";
+import { perf } from "../lib/perfLog";
 import {
   commands,
   type InstrumentCategory,
@@ -62,6 +63,7 @@ function formatTime(date: Date): string {
 }
 
 export default function MarketPage() {
+  perf(`MarketPage render start ${performance.now().toFixed(1)}`);
   const [category, setCategory] = useState<InstrumentCategory>("stock");
   const [query, setQuery] = useState("");
   const [queryInput, setQueryInput] = useState("");
@@ -80,6 +82,13 @@ export default function MarketPage() {
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
 
+  useEffect(() => {
+    perf(`MarketPage mount at ${performance.now().toFixed(1)}`);
+    return () => {
+      perf(`MarketPage unmount at ${performance.now().toFixed(1)}`);
+    };
+  }, []);
+
   // Pull list（不分页，一次性拉）— stale-while-revalidate 策略：
   //   1. cache 命中 → 立即渲染（瞬间）
   //   2. cache stale (>30s) → 后台静默 refetch，不显示 loading
@@ -93,6 +102,8 @@ export default function MarketPage() {
         setLoading(true);
         setError(null);
       }
+      const t0 = performance.now();
+      perf(`listMarket IPC start (silent=${silent})`);
       void commands
         .listMarket({
           category,
@@ -102,6 +113,9 @@ export default function MarketPage() {
           offset: 0,
         })
         .then((res) => {
+          perf(
+            `listMarket IPC done in ${(performance.now() - t0).toFixed(1)}ms (items=${res.status === "ok" ? res.data.items.length : "err"})`,
+          );
           if (cancelled) return;
           if (res.status === "error") {
             if (!silent) {
@@ -121,13 +135,16 @@ export default function MarketPage() {
 
     const cached = getCachedList(category, query);
     if (cached) {
-      // 永久 cache：先用旧数据，stale 再后台 refetch
+      perf(
+        `listMarket cache HIT items=${cached.items.length} age=${cached.ageMs}ms stale=${cached.stale}`,
+      );
       setItems(cached.items);
       setLastUpdated(new Date(Date.now() - cached.ageMs));
       setLoading(false);
       setError(null);
-      if (cached.stale) doFetch(true); // silent refetch
+      if (cached.stale) doFetch(true);
     } else {
+      perf("listMarket cache MISS → IPC");
       doFetch(false);
     }
 

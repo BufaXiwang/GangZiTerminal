@@ -7,6 +7,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { commands, type MarketBreadth } from "../bindings";
+import { perf } from "./perfLog";
 
 // Module-level cache：remount 时立即用上一份，无 loading 闪烁。
 let cachedData: MarketBreadth | null = null;
@@ -42,7 +43,12 @@ export function useMarketBreadth(
     const fetchOnce = (silent: boolean) => {
       const id = ++reqIdRef.current;
       if (!silent) setState((s) => ({ ...s, loading: cachedData === null }));
+      const t0 = performance.now();
+      perf(`useMarketBreadth IPC start (silent=${silent})`);
       void commands.fetchMarketBreadth().then((res) => {
+        perf(
+          `useMarketBreadth IPC done in ${(performance.now() - t0).toFixed(1)}ms`,
+        );
         if (cancelled || id !== reqIdRef.current) return;
         if (res.status === "error") {
           if (!silent) {
