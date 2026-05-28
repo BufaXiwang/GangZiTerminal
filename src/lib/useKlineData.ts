@@ -5,7 +5,7 @@
 // 不抽整 chart wrapper（spec 明确禁止）；只抽数据拉取 + 周期切换 + loading/error 三态，
 // 供市场页 / 模拟账户页持仓详情等多处复用。
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
   type FetchInclude,
@@ -13,6 +13,10 @@ import {
   type MinuteKlinePeriod,
   type TsCode,
 } from "../bindings";
+
+const INITIAL_LIMIT = 500;
+const LOAD_MORE_STEP = 300;
+const MAX_LIMIT = 2000;
 
 // 后端 bindings 没单独导出联合，本地合成。
 type AnyKlinePeriod = KlinePeriod | MinuteKlinePeriod;
@@ -33,6 +37,12 @@ export interface UseKlineDataState {
   error: string | null;
   /** 最近一次数据刷新的本地时间戳（ms） */
   lastUpdatedMs: number | null;
+  /** 当前累计请求的 limit；UI 可用来显示"已加载 N 根" */
+  limit: number;
+  /** 用户拖到左边时调用，追加更多历史数据 */
+  requestMore: () => void;
+  /** 后端已确认无更多历史（limit 已到上限或上次返回 < limit）→ 不再 requestMore */
+  noMoreHistory: boolean;
 }
 
 /** 拓展周期：标准 K 线周期 + "intraday" 分时。 */
@@ -252,7 +262,11 @@ function toUnixSeconds(v: unknown): number | null {
 
 export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
   const { tsCode, period = "day", enabled = true } = opts;
-  const [state, setState] = useState<UseKlineDataState>({
+  const [limit, setLimit] = useState(INITIAL_LIMIT);
+  const [noMoreHistory, setNoMoreHistory] = useState(false);
+  const [innerState, setInnerState] = useState<
+    Omit<UseKlineDataState, "limit" | "requestMore" | "noMoreHistory">
+  >({
     data: [],
     loading: false,
     error: null,
@@ -260,13 +274,23 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
   });
   const reqIdRef = useRef(0);
 
+  // 换标的 / 周期时重置 limit
+  useEffect(() => {
+    setLimit(INITIAL_LIMIT);
+    setNoMoreHistory(false);
+  }, [tsCode, period]);
+
+  const requestMore = useCallback(() => {
+    setLimit((l) => Math.min(l + LOAD_MORE_STEP, MAX_LIMIT));
+  }, []);
+
   useEffect(() => {
     if (!enabled || !tsCode) {
-      setState({ data: [], loading: false, error: null, lastUpdatedMs: null });
+      setInnerState({ data: [], loading: false, error: null, lastUpdatedMs: null });
       return;
     }
     const id = ++reqIdRef.current;
-    setState((s) => ({ ...s, loading: true, error: null }));
+    setInnerState((s) => ({ ...s, loading: true, error: null }));
     const isIntraday = period === "intraday";
     let include: FetchInclude;
     if (isIntraday) {
@@ -277,15 +301,18 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
       include = { klines: [period as KlinePeriod] };
     }
 
-    // On-demand fetch：DB 空时直接调 ensureChartData 触发后端拉数据，等完成再读。
-    // 这样无论何时切换标的 / K 线周期，都能拿到数据，不必等盘中或后台 scheduler。
     let cancelled = false;
 
     const doFetch = async (): Promise<{ ok: boolean; points: KlineDataPoint[] }> => {
-      const res = await commands.fetchData({ tsCodes: [tsCode], include });
+      const res = await commands.fetchData({
+        tsCodes: [tsCode],
+        include,
+        // limit.kline / limit.minute_kline 在后端 FetchLimits 内复用同一字段名映射
+        limit: { kline: limit, minuteKline: limit },
+      });
       if (cancelled || id !== reqIdRef.current) return { ok: false, points: [] };
       if (res.status === "error") {
-        setState({
+        setInnerState({
           data: [],
           loading: false,
           error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
@@ -305,7 +332,11 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         let result = await doFetch();
         if (!result.ok) return;
         if (result.points.length > 0) {
-          setState({
+          // 若拿到的点数 < limit，说明 DB 里没有更多历史，标记 noMoreHistory
+          if (result.points.length < limit || limit >= MAX_LIMIT) {
+            setNoMoreHistory(true);
+          }
+          setInnerState({
             data: result.points,
             loading: false,
             error: null,
@@ -317,7 +348,7 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         const refreshRes = await commands.ensureChartData(tsCode, period);
         if (cancelled || id !== reqIdRef.current) return;
         if (refreshRes.status === "error") {
-          setState({
+          setInnerState({
             data: [],
             loading: false,
             error: `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
@@ -328,7 +359,10 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         // 3. refresh 完成后重新读 DB
         result = await doFetch();
         if (!result.ok) return;
-        setState({
+        if (result.points.length > 0 && result.points.length < limit) {
+          setNoMoreHistory(true);
+        }
+        setInnerState({
           data: result.points,
           loading: false,
           error: result.points.length === 0 ? "无可用数据" : null,
@@ -336,7 +370,7 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         });
       } catch (e) {
         if (cancelled || id !== reqIdRef.current) return;
-        setState({
+        setInnerState({
           data: [],
           loading: false,
           error: String(e),
@@ -348,7 +382,15 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
     return () => {
       cancelled = true;
     };
-  }, [tsCode, period, enabled]);
+  }, [tsCode, period, enabled, limit]);
 
-  return useMemo(() => state, [state]);
+  return useMemo(
+    () => ({
+      ...innerState,
+      limit,
+      requestMore: noMoreHistory ? () => {} : requestMore,
+      noMoreHistory,
+    }),
+    [innerState, limit, noMoreHistory, requestMore],
+  );
 }

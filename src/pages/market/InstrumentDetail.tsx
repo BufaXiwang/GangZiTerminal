@@ -130,6 +130,8 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
             data={kline.data}
             mode={isLineMode ? "line" : "candle"}
             autoHeight
+            seriesKey={`${item.tsCode}|${period}`}
+            onRequestMore={kline.requestMore}
           />
         )}
       </div>

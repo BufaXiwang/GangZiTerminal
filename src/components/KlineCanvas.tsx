@@ -20,6 +20,7 @@ import {
   type CandlestickData,
   type HistogramData,
   type LineData,
+  type LogicalRange,
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { KlineDataPoint } from "../lib/useKlineData";
@@ -39,6 +40,16 @@ interface KlineCanvasProps {
   upColor?: string;
   /** A 股语义下跌色（默认从 CSS var --chart-down 读取） */
   downColor?: string;
+  /**
+   * 序列标识。当 seriesKey 变化时视为换标的 / 换周期 —— 触发 fitContent 重新对齐
+   * 视图；不变时（仅 data 变长）视为 load-more —— 保持用户当前滚动位置。
+   */
+  seriesKey?: string;
+  /**
+   * 用户拖到左边附近时触发，调用方可借此追加历史数据。
+   * 内部 throttle 1.5s，避免反复 fire。
+   */
+  onRequestMore?: () => void;
 }
 
 function readCssVar(name: string, fallback: string): string {
@@ -56,6 +67,8 @@ export function KlineCanvas({
   autoHeight = false,
   upColor,
   downColor,
+  seriesKey,
+  onRequestMore,
 }: KlineCanvasProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -63,6 +76,12 @@ export function KlineCanvas({
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const lineSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
+  const prevSeriesKeyRef = useRef<string | undefined>(undefined);
+  // onRequestMore stable ref，避免每次 props 重生绑订阅
+  const onRequestMoreRef = useRef(onRequestMore);
+  useEffect(() => {
+    onRequestMoreRef.current = onRequestMore;
+  }, [onRequestMore]);
 
   // 创建 chart（仅在首次 mount 或 height/color 变化时重建）
   useEffect(() => {
@@ -149,7 +168,23 @@ export function KlineCanvas({
     ro.observe(containerRef.current);
     roRef.current = ro;
 
+    // 监听用户拖到左边 —— 触发 onRequestMore（throttle 1.5s）。
+    let lastFiredAt = 0;
+    const onRangeChange = (range: LogicalRange | null) => {
+      if (!range || !onRequestMoreRef.current) return;
+      // range.from 可能为负数（滚出范围）；< 5 视为到达左边沿。
+      if (range.from <= 5) {
+        const now = Date.now();
+        if (now - lastFiredAt > 1500) {
+          lastFiredAt = now;
+          onRequestMoreRef.current();
+        }
+      }
+    };
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange);
+
     return () => {
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange);
       ro.disconnect();
       roRef.current = null;
       chart.remove();
@@ -165,6 +200,11 @@ export function KlineCanvas({
     const up = upColor ?? readCssVar("--chart-up", "#c0392b");
     const down = downColor ?? readCssVar("--chart-down", "#1f8a47");
 
+    // seriesKey 变了 → 换标的/周期，需要 fitContent 重新对齐；
+    // 没变（仅 data 变长）→ load-more，保持用户滚动位置。
+    const isNewSeries = prevSeriesKeyRef.current !== seriesKey;
+    prevSeriesKeyRef.current = seriesKey;
+
     if (mode === "line") {
       const line = lineSeriesRef.current;
       if (!line) return;
@@ -173,7 +213,7 @@ export function KlineCanvas({
         value: d.close,
       }));
       line.setData(lineData);
-      if (data.length > 0) chartRef.current?.timeScale().fitContent();
+      if (data.length > 0 && isNewSeries) chartRef.current?.timeScale().fitContent();
       return;
     }
 
@@ -195,8 +235,8 @@ export function KlineCanvas({
     }));
     candle.setData(candleData);
     volume.setData(volumeData);
-    if (data.length > 0) chartRef.current?.timeScale().fitContent();
-  }, [data, mode, upColor, downColor]);
+    if (data.length > 0 && isNewSeries) chartRef.current?.timeScale().fitContent();
+  }, [data, mode, upColor, downColor, seriesKey]);
 
   return (
     <div
