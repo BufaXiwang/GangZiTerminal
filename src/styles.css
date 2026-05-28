@@ -761,6 +761,31 @@ body {
   font-size: 13px;
 }
 
+/* -------- List header (controls moved into list panel) -------- */
+
+.list-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-card);
+  flex: 0 0 auto;
+}
+
+.list-header-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.list-header .search-input,
+.list-header .search-input.add-code-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 /* -------- Market List (compact 2-line rows) -------- */
 
 .market-list {
