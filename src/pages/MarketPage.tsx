@@ -112,7 +112,11 @@ export default function MarketPage() {
       if (isAdd) next.add(tsCode);
       else next.delete(tsCode);
       void commands
-        .updateWatchlist(isAdd ? { add: [tsCode] } : { remove: [tsCode] })
+        .updateWatchlist(
+          isAdd
+            ? { action: "add", tsCode }
+            : { action: "remove", tsCode },
+        )
         .then((res) => {
           if (res.status === "error") {
             // 后端失败：回滚本地状态，但不阻断 UI

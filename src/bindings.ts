@@ -737,55 +737,242 @@ export interface NewsRefreshedPayload {
 // Account — fetch_account / update_watchlist / mark_trigger_handled
 //          / rebuild_account_snapshot
 //
-// Spec: docs/design/account-module.md §4
+// Spec: docs/design/account-module.md §2 §4
+// 后端 DTO: src-tauri/src/domain/account/{types,requests,triggers,events}.rs
 // 注意：operate_account 不暴露给前端。
-// 占位类型：F4 sub-agent 完成时补精确字段。
 // ============================================================================
 
+// ---- enums ----
+
+export type TradingActor = "agent";
+export type AccountActor = "agent" | "system" | "user";
+
+export type OrderStatus =
+  | "pending"
+  | "partially_filled"
+  | "filled"
+  | "cancelled"
+  | "rejected"
+  | "expired";
+export type OrderSide = "buy" | "sell";
+export type OrderType = "market" | "limit";
+export type OrderIntent =
+  | "open_position"
+  | "scale_in"
+  | "scale_out"
+  | "close_position"
+  | "direct_order";
+export type PositionStatus = "open" | "closed";
+
+export type AccountTriggerType =
+  | "stop_loss"
+  | "take_profit"
+  | "time_stop"
+  | "order_filled"
+  | "order_rejected"
+  | "order_expired"
+  | "invalidated";
+
+export type PositionStatusFilter = "open" | "closed" | "all";
+
+/** TriggerHandledFilter: bool 或 "all"。后端 untagged enum。 */
+export type TriggerHandledFilter = boolean | "all";
+
+// ---- AccountSnapshot ----
+
+/** Spec: account-module.md §2 账户快照 */
+export interface AccountSnapshot {
+  initialCash: Money;
+  cash: Money;
+  availableCash: Money;
+  frozenCash: Money;
+  marketValue: Money;
+  totalAssets: Money;
+  realizedPnl: Money;
+  unrealizedPnl: Money;
+  totalPnl: Money;
+  pricedPositionCount: number;
+  unpricedPositionCount: number;
+  valuationFreshness: Freshness;
+  openPositionCount: number;
+  pendingOrderCount: number;
+  capturedAt: OccurredAt;
+  warnings?: WarningCode[];
+}
+
+// ---- Order ----
+
+export interface Order {
+  orderId: string;
+  tsCode: TsCode;
+  side: OrderSide;
+  orderType: OrderType;
+  limitPrice?: Price;
+  quantity: Shares;
+  filledQuantity: Shares;
+  status: OrderStatus;
+  intent: OrderIntent;
+  positionId?: string;
+  reason?: string;
+  actor: TradingActor;
+  createdAt: OccurredAt;
+  updatedAt: OccurredAt;
+  expiresAt?: OccurredAt;
+}
+
+// ---- PositionProtection ----
+
+/** Spec: account-module.md §2 保护条件模型 */
+export interface PositionProtection {
+  stopLoss?: Price;
+  takeProfit?: Price;
+  timeStopAt?: OccurredAt;
+  invalidationSignals?: string[];
+  enabled: boolean;
+  revision: number;
+  updatedAt: OccurredAt;
+}
+
+// ---- Position ----
+
+/** Spec: account-module.md §2 仓位模型 */
+export interface Position {
+  positionId: string;
+  tsCode: TsCode;
+  name: string;
+  status: PositionStatus;
+  quantity: Shares;
+  sellableQuantity: Shares;
+  avgCost: Price;
+  marketPrice?: Price;
+  marketValue?: Money;
+  quoteFreshness?: Freshness;
+  realizedPnl: Money;
+  unrealizedPnl?: Money;
+  openedAt: OccurredAt;
+  closedAt?: OccurredAt;
+  protection?: PositionProtection;
+  actor: TradingActor;
+  reasoning?: string;
+  warnings?: WarningCode[];
+}
+
+// ---- Watchlist ----
+
+/** Spec: account-module.md §2 自选模型 */
+export interface WatchlistItem {
+  tsCode: TsCode;
+  name?: string;
+  addedAt: OccurredAt;
+  note?: string;
+}
+
+/** Spec: account-module.md §4 fetch_account watchlist quote 字段 */
+export interface WatchlistQuoteView {
+  price?: Price;
+  changePercent?: Percent;
+  volume?: Volume;
+  amount?: Amount;
+  source?: string;
+  freshness?: Freshness;
+}
+
+/** WatchlistItem 与可选 quote 合并：后端用 #[serde(flatten)] item。 */
+export type WatchlistItemView = WatchlistItem & {
+  quote?: WatchlistQuoteView;
+};
+
+// ---- AccountTrigger ----
+
+/** Spec: account-module.md §2 AccountTrigger。 */
+export interface AccountTrigger {
+  triggerId: string;
+  triggerType: AccountTriggerType;
+  orderId?: string;
+  positionId?: string;
+  tsCode?: TsCode;
+  price?: Price;
+  /** 触发阈值（字符串编码 Price/OccurredAt/signal label）。 */
+  threshold?: string;
+  quoteFreshness?: Freshness;
+  warnings?: WarningCode[];
+  eventId: string;
+  handled: boolean;
+  occurredAt: OccurredAt;
+}
+
+// ---- AccountEvent (loose) ----
+//
+// 完整 AccountEvent 枚举（spec §3）非常大，前端 F4 不直接渲染，先暴露为 unknown 数组。
+export type AccountEvent = unknown;
+
+// ---- fetch_account ----
+
+/** Spec: account-module.md §4 fetch_account.include */
+export interface FetchAccountInclude {
+  snapshot?: boolean;
+  positions?: boolean;
+  orders?: boolean;
+  watchlist?: boolean;
+  events?: boolean;
+  triggers?: boolean;
+}
+
 export interface FetchAccountRequest {
-  include?: {
-    snapshot?: boolean;
-    positions?: boolean;
-    watchlist?: boolean;
-    triggers?: boolean;
-    recentClosed?: boolean;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
+  include?: FetchAccountInclude;
+  positionStatus?: PositionStatusFilter;
+  orderActive?: boolean;
+  orderStatusIn?: OrderStatus[];
+  triggerHandled?: TriggerHandledFilter;
+  limit?: number;
+  offset?: number;
 }
 
 export interface FetchAccountResponse {
-  snapshot?: unknown;
-  positions?: unknown[];
-  watchlist?: unknown[];
-  triggers?: unknown[];
-  [key: string]: unknown;
+  snapshot?: AccountSnapshot;
+  positions?: Position[];
+  orders?: Order[];
+  watchlist?: WatchlistItemView[];
+  events?: AccountEvent[];
+  triggers?: AccountTrigger[];
+  warnings?: WarningCode[];
 }
 
-export interface UpdateWatchlistRequest {
-  add?: TsCode[];
-  remove?: TsCode[];
-  note?: string | null;
-  [key: string]: unknown;
-}
+// ---- update_watchlist ----
+
+/**
+ * Spec: account-module.md §4 update_watchlist
+ * 后端是 `#[serde(tag = "action", rename_all = "snake_case")]` flat enum：
+ * `{ action: "add", tsCode, note?, reason? }` / `{ action: "remove", tsCode, reason? }` /
+ * `{ action: "update_note", tsCode, note?, reason? }`
+ */
+export type UpdateWatchlistRequest =
+  | { action: "add"; tsCode: TsCode; note?: string; reason?: string }
+  | { action: "remove"; tsCode: TsCode; reason?: string }
+  | { action: "update_note"; tsCode: TsCode; note?: string; reason?: string };
 
 export interface UpdateWatchlistResponse {
-  watchlist?: unknown[];
-  [key: string]: unknown;
+  accepted: boolean;
+  reason?: ErrorCode;
+  message?: string;
+  item?: WatchlistItem;
+  accountEventIds: string[];
+  warnings?: WarningCode[];
 }
+
+// ---- mark_trigger_handled ----
 
 export interface MarkTriggerHandledRequest {
   triggerId: string;
-  outcome?: string | null;
-  [key: string]: unknown;
+  reason: string;
 }
 
 export interface MarkTriggerHandledResponse {
-  [key: string]: unknown;
-}
-
-export interface AccountSnapshot {
-  [key: string]: unknown;
+  accepted: boolean;
+  trigger?: AccountTrigger;
+  accountEventIds?: string[];
+  reason?: ErrorCode;
+  message?: string;
 }
 
 // ============================================================================
