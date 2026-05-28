@@ -369,7 +369,8 @@ impl QuotesService {
                 item.profile = Some(StockProfile::from(&inst));
             }
             if include.quote.unwrap_or(false) {
-                let (q, fresh) = self.build_full_quote(&inst, &ctx);
+                // fetch_data 是精确详情读取（spec §2 line 141）→ Detail 30s 阈值。
+                let (q, fresh) = self.build_full_quote(&inst, &ctx, FreshnessIntent::Detail);
                 if let Some(code) = fresh.warning {
                     item.warnings.push(code);
                 }
@@ -491,10 +492,14 @@ impl QuotesService {
         FetchDataResponse { errors, items }
     }
 
+    // Spec: quotes-module.md §2 line 141 — stale threshold 按读取意图选择：
+    // `detail` 30s 用于 fetch_data（精确详情）；`universe` 90s 用于 list_market /
+    // scan_market（全市场 / 大范围）。调用方必须显式传 intent。
     fn build_full_quote(
         &self,
         inst: &MarketInstrument,
         ctx: &MarketTimeContext,
+        intent: FreshnessIntent,
     ) -> (Option<StockQuote>, Freshness) {
         let eligible = eligible_trade_date(ctx);
         let mut cached = self.cache.get(&inst.ts_code).map(|c| c.quote);
@@ -522,7 +527,7 @@ impl QuotesService {
         let source = quote.source.as_str().to_string();
         let (freshness, eligibility) = derive_freshness(
             ctx,
-            FreshnessIntent::Detail,
+            intent,
             quote.trade_date,
             quote.captured_at,
             &source,
@@ -584,7 +589,8 @@ impl QuotesService {
         let mut response_warnings: Vec<WarningCode> = Vec::new();
 
         for inst in instruments.iter() {
-            let (quote_opt, freshness) = self.build_full_quote(inst, &ctx);
+            // scan_market 是全市场扫描（spec §2 line 141-142）→ Universe 90s 阈值。
+            let (quote_opt, freshness) = self.build_full_quote(inst, &ctx, FreshnessIntent::Universe);
             match quote_opt {
                 Some(q) => {
                     if matches!(freshness.status, FreshnessStatus::Missing) {
