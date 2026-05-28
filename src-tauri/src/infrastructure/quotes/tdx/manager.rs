@@ -9,7 +9,7 @@
 //! - 最大重试次数：1 次 reconnect + 1 次 retry，避免线程卡死。
 //! - per-IP 速率限制：调用之间最小间隔 `MIN_CALL_INTERVAL`。
 
-use super::{Bar, BarCategory, SecurityQuote, TdxHqClient, TdxMarket};
+use super::{Bar, BarCategory, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket};
 use crate::domain::quotes::{MinuteKlinePoint, QuoteSource, StockQuote, TradeStatus};
 use crate::domain::shared::{
     Amount, Freshness, FreshnessStatus, InstrumentCategory, OccurredAt, Price, TradeDate, TsCode,
@@ -272,6 +272,151 @@ impl TdxConnectionManager {
                 }
             }
             Err(TdxManagerError::Reconnect("retries exhausted".into()))
+        })
+        .await
+        .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
+    }
+
+    /// 取分钟 K（spec §5：分钟 K 主源 TDX）。BJ 不支持。
+    pub async fn fetch_minute_kline(
+        &self,
+        ts_code: &TsCode,
+        period: crate::domain::quotes::MinuteKlinePeriod,
+        count: u16,
+    ) -> Result<Vec<Bar>, TdxManagerError> {
+        use crate::infrastructure::quotes::tdx::adapter::minute_period_to_tdx;
+        let market = match ts_code.market() {
+            crate::domain::shared::Market::SH => TdxMarket::SH,
+            crate::domain::shared::Market::SZ => TdxMarket::SZ,
+            crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
+        };
+        let code = ts_code.as_str()[..6].to_string();
+        let inner = Arc::clone(&self.inner);
+        let cat = minute_period_to_tdx(period);
+        let count = count.min(BARS_MAX);
+        task::spawn_blocking(move || {
+            let mut guard = inner.lock().expect("tdx state poisoned");
+            if let Some(last) = guard.last_call {
+                let e = last.elapsed();
+                if e < MIN_CALL_INTERVAL {
+                    std::thread::sleep(MIN_CALL_INTERVAL - e);
+                }
+            }
+            for attempt in 0..2 {
+                if guard.client.is_none() {
+                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
+                        Ok((c, _)) => guard.client = Some(c),
+                        Err(e) => {
+                            if attempt == 1 {
+                                return Err(TdxManagerError::Reconnect(e.to_string()));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let cli = guard.client.as_mut().expect("client");
+                let res = cli.security_bars(cat, market, &code, 0, count);
+                guard.last_call = Some(Instant::now());
+                match res {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        guard.client = None;
+                        if attempt == 1 {
+                            return Err(TdxManagerError::Protocol(e.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(TdxManagerError::Reconnect("retries exhausted".into()))
+        })
+        .await
+        .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
+    }
+
+    /// 拉取 SH 或 SZ 全 universe（分页）。
+    ///
+    /// Spec: quotes-module.md §5 line 728 — TDX 是 SH / SZ universe 的主源。
+    /// `security_count` 给出总数；`security_list(market, start)` 每次返回最多 1000 条；
+    /// 调用方根据 6 位 code 前缀分类为 stock / index / fund。
+    pub async fn fetch_universe(
+        &self,
+        market: TdxMarket,
+    ) -> Result<Vec<SecurityListEntry>, TdxManagerError> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let mut guard = inner.lock().expect("tdx state poisoned");
+            if let Some(last) = guard.last_call {
+                let e = last.elapsed();
+                if e < MIN_CALL_INTERVAL {
+                    std::thread::sleep(MIN_CALL_INTERVAL - e);
+                }
+            }
+            // 确保连接
+            for attempt in 0..2 {
+                if guard.client.is_none() {
+                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
+                        Ok((c, _)) => guard.client = Some(c),
+                        Err(e) => {
+                            if attempt == 1 {
+                                return Err(TdxManagerError::Reconnect(e.to_string()));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            if guard.client.is_none() {
+                return Err(TdxManagerError::Reconnect("client not established".into()));
+            }
+            // 先拿总数
+            let count = {
+                let cli = guard.client.as_mut().expect("client present");
+                let r = cli.security_count(market);
+                guard.last_call = Some(Instant::now());
+                match r {
+                    Ok(n) => n,
+                    Err(e) => {
+                        guard.client = None;
+                        return Err(TdxManagerError::Protocol(e.to_string()));
+                    }
+                }
+            };
+            let mut out: Vec<SecurityListEntry> = Vec::with_capacity(count as usize);
+            let mut start: u16 = 0;
+            const PAGE: u16 = 1000;
+            while start < count {
+                if let Some(last) = guard.last_call {
+                    let e = last.elapsed();
+                    if e < MIN_CALL_INTERVAL {
+                        std::thread::sleep(MIN_CALL_INTERVAL - e);
+                    }
+                }
+                let res = {
+                    let cli = guard.client.as_mut().expect("client present");
+                    cli.security_list(market, start)
+                };
+                guard.last_call = Some(Instant::now());
+                match res {
+                    Ok(mut page) => {
+                        if page.is_empty() {
+                            break;
+                        }
+                        let got = page.len() as u16;
+                        out.append(&mut page);
+                        // 防止 wrap：用实际读取条数推进 start
+                        start = start.saturating_add(if got > 0 { got } else { PAGE });
+                        if got < PAGE {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        guard.client = None;
+                        return Err(TdxManagerError::Protocol(e.to_string()));
+                    }
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?

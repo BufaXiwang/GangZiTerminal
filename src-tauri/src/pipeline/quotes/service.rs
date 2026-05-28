@@ -626,38 +626,111 @@ impl QuotesService {
 
     // ====================================================================== refresh hooks
 
+    /// Universe refresh — 按 spec §5 line 728-730 顺序执行：
+    /// 1. TDX 主源 SH / SZ universe；
+    /// 2. Eastmoney 补 BJ；
+    /// 3. TuShare enrich（有 token 时补 industry / list_date / fund_type / 等）。
+    ///
+    /// 任何一步失败不阻断后续步骤；缺 token 仅 skip enrich。
     pub async fn refresh_market_instruments(&self) -> Result<(), ResponseError> {
-        if !self.tushare.has_token() {
-            tracing::info!(target: "quotes.refresh", "tushare token missing; skip universe enrich");
-            return Ok(());
-        }
+        let now = Utc::now();
         let mut all_items: Vec<MarketInstrument> = Vec::new();
-        match self.tushare.fetch_stock_basic().await {
-            Ok(mut v) => all_items.append(&mut v),
-            Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "stock_basic failed"),
-        }
-        // SH / SZ / BJ 指数（spec §2 universe 必须覆盖 BJ）。
-        for mkt in TushareClient::standard_index_markets() {
-            match self.tushare.fetch_index_basic(mkt).await {
-                Ok(mut v) => all_items.append(&mut v),
-                Err(e) => tracing::warn!(target: "quotes.refresh", market = %mkt, error = %e, "index_basic failed"),
+
+        // 1. TDX 主源 SH / SZ
+        for tdx_market in [
+            crate::infrastructure::quotes::tdx::TdxMarket::SH,
+            crate::infrastructure::quotes::tdx::TdxMarket::SZ,
+        ] {
+            match self.tdx.fetch_universe(tdx_market).await {
+                Ok(entries) => {
+                    let market = match tdx_market {
+                        crate::infrastructure::quotes::tdx::TdxMarket::SH => {
+                            crate::domain::shared::Market::SH
+                        }
+                        crate::infrastructure::quotes::tdx::TdxMarket::SZ => {
+                            crate::domain::shared::Market::SZ
+                        }
+                    };
+                    for entry in entries {
+                        if let Some(item) = tdx_entry_to_instrument(&entry, market, now) {
+                            all_items.push(item);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "quotes.refresh", market = ?tdx_market, error = %e, "tdx universe failed");
+                }
             }
         }
-        match self.tushare.fetch_fund_basic().await {
-            Ok(mut v) => all_items.append(&mut v),
-            Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "fund_basic failed"),
+
+        // 2. Eastmoney 补 BJ
+        match self.eastmoney.fetch_bj_universe().await {
+            Ok(entries) => {
+                for (code6, name) in entries {
+                    let ts = format!("{}.BJ", code6);
+                    if let Ok(ts_code) = TsCode::parse(&ts) {
+                        all_items.push(MarketInstrument {
+                            ts_code,
+                            name,
+                            category: InstrumentCategory::Stock,
+                            market: crate::domain::shared::Market::BJ,
+                            board: Some("主板".to_string()),
+                            sector: None,
+                            status: Some(InstrumentStatus::Listed),
+                            is_st: None,
+                            publisher: None,
+                            index_category: None,
+                            fund_type: None,
+                            management: None,
+                            list_date: None,
+                            source: crate::domain::quotes::InstrumentSource::Eastmoney,
+                            updated_at: now,
+                        });
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "eastmoney bj universe failed"),
         }
+
+        // 写入主源结果（即使 enrich 阶段失败，主源 universe 也已落盘）。
         if !all_items.is_empty() {
             self.repo()
                 .upsert_instruments(&all_items)
                 .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
+        }
 
-            // 类别变更：让 snapshot cache 中的过期类别条目失效（spec §2 不变量）。
-            if let Ok(map) = self.repo().instrument_category_map() {
-                let removed = self.cache.invalidate_if_category_changed(&map);
-                if removed > 0 {
-                    tracing::info!(target: "quotes.refresh", removed, "invalidated stale snapshot entries due to category change");
+        // 3. TuShare enrich（仅 token 可用时执行，非阻塞）
+        if self.tushare.has_token() {
+            let mut enrich: Vec<MarketInstrument> = Vec::new();
+            match self.tushare.fetch_stock_basic().await {
+                Ok(mut v) => enrich.append(&mut v),
+                Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "tushare stock_basic enrich failed"),
+            }
+            for mkt in TushareClient::standard_index_markets() {
+                match self.tushare.fetch_index_basic(mkt).await {
+                    Ok(mut v) => enrich.append(&mut v),
+                    Err(e) => tracing::warn!(target: "quotes.refresh", market = %mkt, error = %e, "tushare index_basic enrich failed"),
                 }
+            }
+            match self.tushare.fetch_fund_basic().await {
+                Ok(mut v) => enrich.append(&mut v),
+                Err(e) => tracing::warn!(target: "quotes.refresh", error = %e, "tushare fund_basic enrich failed"),
+            }
+            if !enrich.is_empty() {
+                // upsert_instruments 用 COALESCE 保留主源已写入字段，新字段填补（spec §2 line 96）。
+                self.repo()
+                    .upsert_instruments(&enrich)
+                    .map_err(|e| ResponseError::with_message(ErrorCode::DbError, e.to_string()))?;
+            }
+        } else {
+            tracing::info!(target: "quotes.refresh", "tushare token missing; skip universe enrich (main universe still written from tdx/em)");
+        }
+
+        // 类别变更：让 snapshot cache 中的过期类别条目失效（spec §2 不变量）。
+        if let Ok(map) = self.repo().instrument_category_map() {
+            let removed = self.cache.invalidate_if_category_changed(&map);
+            if removed > 0 {
+                tracing::info!(target: "quotes.refresh", removed, "invalidated stale snapshot entries due to category change");
             }
         }
         Ok(())
@@ -1272,6 +1345,51 @@ fn period_key(p: KlinePeriod) -> String {
 
 fn minute_period_key(p: MinuteKlinePeriod) -> String {
     p.as_str().to_string()
+}
+
+/// 把 TDX `SecurityListEntry` + 推断 market 翻译成 `MarketInstrument`。
+///
+/// 未识别前缀（spec §2 类别表外）返回 None — 调用方 skip 该条。
+fn tdx_entry_to_instrument(
+    entry: &crate::infrastructure::quotes::tdx::SecurityListEntry,
+    market: crate::domain::shared::Market,
+    now: chrono::DateTime<Utc>,
+) -> Option<MarketInstrument> {
+    use crate::infrastructure::quotes::universe::classify;
+    if entry.code.len() < 6 {
+        return None;
+    }
+    let cls = classify(market, &entry.code)?;
+    let market_suffix = match market {
+        crate::domain::shared::Market::SH => "SH",
+        crate::domain::shared::Market::SZ => "SZ",
+        crate::domain::shared::Market::BJ => "BJ",
+    };
+    let ts_str = format!("{}.{}", &entry.code[..6], market_suffix);
+    let ts_code = TsCode::parse(&ts_str).ok()?;
+    let name = entry.name.trim().to_string();
+    let is_st = if matches!(cls.category, InstrumentCategory::Stock) {
+        Some(name.contains("ST"))
+    } else {
+        None
+    };
+    Some(MarketInstrument {
+        ts_code,
+        name,
+        category: cls.category,
+        market,
+        board: cls.board.map(|s| s.to_string()),
+        sector: None,
+        status: Some(InstrumentStatus::Listed),
+        is_st,
+        publisher: None,
+        index_category: None,
+        fund_type: None,
+        management: None,
+        list_date: None,
+        source: crate::domain::quotes::InstrumentSource::Tdx,
+        updated_at: now,
+    })
 }
 
 fn derive_trade_status(inst: &MarketInstrument, ctx: &MarketTimeContext) -> TradeStatus {
@@ -1932,11 +2050,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_market_instruments_skipped_without_token() {
+    async fn refresh_market_instruments_returns_ok_without_token() {
         let svc = make_service();
-        // 没有 token —— 应静默 Ok(())
+        // 没有 tushare token 时，主源仍走 TDX/EM；测试环境网络可能不可达，
+        // 但 spec §5 要求函数不报错（warnings only）。
         let res = svc.refresh_market_instruments().await;
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn tdx_entry_to_instrument_sh_main_board() {
+        use crate::infrastructure::quotes::tdx::SecurityListEntry;
+        let entry = SecurityListEntry {
+            code: "600519".into(),
+            volunit: 100,
+            decimal_point: 2,
+            name: "贵州茅台".into(),
+            pre_close: 1500.0,
+        };
+        let now = Utc::now();
+        let inst = tdx_entry_to_instrument(&entry, crate::domain::shared::Market::SH, now).unwrap();
+        assert_eq!(inst.ts_code.as_str(), "600519.SH");
+        assert!(matches!(inst.category, InstrumentCategory::Stock));
+        assert_eq!(inst.board.as_deref(), Some("主板"));
+        assert_eq!(inst.source, crate::domain::quotes::InstrumentSource::Tdx);
+        assert!(matches!(inst.status, Some(InstrumentStatus::Listed)));
+    }
+
+    #[test]
+    fn tdx_entry_to_instrument_sz_chinext() {
+        use crate::infrastructure::quotes::tdx::SecurityListEntry;
+        let entry = SecurityListEntry {
+            code: "300750".into(),
+            volunit: 100,
+            decimal_point: 2,
+            name: "宁德时代".into(),
+            pre_close: 200.0,
+        };
+        let now = Utc::now();
+        let inst = tdx_entry_to_instrument(&entry, crate::domain::shared::Market::SZ, now).unwrap();
+        assert!(matches!(inst.category, InstrumentCategory::Stock));
+        assert_eq!(inst.board.as_deref(), Some("创业板"));
+    }
+
+    #[test]
+    fn tdx_entry_to_instrument_unknown_prefix_returns_none() {
+        use crate::infrastructure::quotes::tdx::SecurityListEntry;
+        let entry = SecurityListEntry {
+            code: "888888".into(),
+            volunit: 100,
+            decimal_point: 2,
+            name: "???".into(),
+            pre_close: 0.0,
+        };
+        let now = Utc::now();
+        assert!(tdx_entry_to_instrument(&entry, crate::domain::shared::Market::SH, now).is_none());
+    }
+
+    #[test]
+    fn tdx_entry_to_instrument_st_flag_inferred() {
+        use crate::infrastructure::quotes::tdx::SecurityListEntry;
+        let entry = SecurityListEntry {
+            code: "600519".into(),
+            volunit: 100,
+            decimal_point: 2,
+            name: "ST贵州".into(),
+            pre_close: 0.0,
+        };
+        let now = Utc::now();
+        let inst = tdx_entry_to_instrument(&entry, crate::domain::shared::Market::SH, now).unwrap();
+        assert_eq!(inst.is_st, Some(true));
     }
 
     #[tokio::test]

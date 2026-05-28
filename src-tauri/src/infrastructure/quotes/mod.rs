@@ -14,6 +14,7 @@ pub mod tdx;
 pub mod tencent;
 pub mod trade_calendar;
 pub mod tushare;
+pub mod universe;
 
 pub use config::QuotesConfig;
 pub use eastmoney::EastmoneyProvider;

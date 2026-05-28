@@ -441,6 +441,51 @@ impl EastmoneyProvider {
         }
         Ok(out)
     }
+
+    /// 拉取 BJ universe（北交所主板）。
+    ///
+    /// Spec: quotes-module.md §5 line 729 — Eastmoney 补 BJ。
+    /// 使用 `qt/clist/get` 的 `m:0+t:81+s:2048` 筛选；返回 (code6, name)。
+    pub async fn fetch_bj_universe(&self) -> Result<Vec<(String, String)>, EmError> {
+        // 单页足够 (BJ 标的总数 ~250)；pz=500 保险。
+        let url = "https://82.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=500\
+            &fid=f12&fs=m:0+t:81+s:2048&fields=f12,f14";
+        #[derive(Deserialize)]
+        struct Resp {
+            data: Option<RespData>,
+        }
+        #[derive(Deserialize)]
+        struct RespData {
+            #[serde(default)]
+            diff: Vec<Row>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            #[serde(default)]
+            f12: Option<String>,
+            #[serde(default)]
+            f14: Option<String>,
+        }
+        let resp: Resp = self
+            .client
+            .get(url)
+            .timeout(KLINE_TIMEOUT)
+            .send()
+            .await?
+            .json()
+            .await
+            .map_err(|e| EmError::Parse(e.to_string()))?;
+        let data = resp.data.ok_or(EmError::Empty)?;
+        let mut out = Vec::with_capacity(data.diff.len());
+        for r in data.diff.into_iter() {
+            if let (Some(code), Some(name)) = (r.f12, r.f14) {
+                if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
+                    out.push((code, name));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub(crate) fn em_div100(v: f64) -> Option<Price> {
