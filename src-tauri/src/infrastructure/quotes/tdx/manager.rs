@@ -338,6 +338,112 @@ impl TdxConnectionManager {
         .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
     }
 
+    /// 全量历史分页拉取 K 线（spec §5 "K 线"：TDX 主源 + 修订记录 D2.5）。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 + §4 ensure_chart_data
+    ///
+    /// 循环 `start = 0, 800, 1600, ...`：每次 `security_bars(cat, market, code, start, 800)`，
+    /// 累计直到：
+    /// 1. 返回 batch 为空 → break；
+    /// 2. 返回 batch < 800 根 → append 后 break（这是最早一段，listing 之前没数据）；
+    /// 3. 累计 `start >= HARD_CAP (50_000)` → break 防失控。
+    ///
+    /// **顺序契约**：底层 `security_bars` 单次返回升序（oldest first）。`start` 增大代表更早
+    /// 的历史段，因此新 batch 需 **prepend** 到累计 Vec 前面，最终保证整体升序。
+    ///
+    /// **耗时警告**：老股可达 10+ TDX 调用 × ~100-500ms + 80ms 间隔，可能耗时 3-10s。
+    /// 调用方应在 UI 显示 loading。中间 batch 失败 → 整体 abort（partial 落库无意义）。
+    ///
+    /// BJ 不支持（同 `fetch_kline`）。
+    pub async fn fetch_kline_paginated(
+        &self,
+        ts_code: &TsCode,
+        period: crate::domain::quotes::KlinePeriod,
+    ) -> Result<Vec<Bar>, TdxManagerError> {
+        use crate::infrastructure::quotes::tdx::adapter::kline_period_to_tdx;
+        let market = match ts_code.market() {
+            crate::domain::shared::Market::SH => TdxMarket::SH,
+            crate::domain::shared::Market::SZ => TdxMarket::SZ,
+            crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
+        };
+        let code = ts_code.as_str()[..6].to_string();
+        let cat = kline_period_to_tdx(period);
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            const HARD_CAP: u32 = 50_000;
+            let mut all: Vec<Bar> = Vec::new();
+            let mut start: u32 = 0;
+            loop {
+                if start >= HARD_CAP {
+                    break;
+                }
+                let start_u16 = start as u16;
+                let count_u16: u16 = BARS_MAX;
+                // 一次 batch：完整复用与 fetch_kline 一致的速率 + 重连 + 重试逻辑。
+                let mut guard = inner.lock().expect("tdx state poisoned");
+                if let Some(last) = guard.last_call {
+                    let e = last.elapsed();
+                    if e < MIN_CALL_INTERVAL {
+                        std::thread::sleep(MIN_CALL_INTERVAL - e);
+                    }
+                }
+                let mut batch_res: Result<Vec<Bar>, TdxManagerError> =
+                    Err(TdxManagerError::Reconnect("retries exhausted".into()));
+                for attempt in 0..2 {
+                    if guard.client.is_none() {
+                        match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
+                            Ok((c, _)) => guard.client = Some(c),
+                            Err(e) => {
+                                if attempt == 1 {
+                                    batch_res =
+                                        Err(TdxManagerError::Reconnect(e.to_string()));
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    let cli = guard.client.as_mut().expect("client");
+                    let res = cli.security_bars(cat, market, &code, start_u16, count_u16);
+                    guard.last_call = Some(Instant::now());
+                    match res {
+                        Ok(v) => {
+                            batch_res = Ok(v);
+                            break;
+                        }
+                        Err(e) => {
+                            guard.client = None;
+                            if attempt == 1 {
+                                batch_res = Err(TdxManagerError::Protocol(e.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                drop(guard);
+
+                let batch = batch_res?;
+                let n = batch.len();
+                let truncated = n < BARS_MAX as usize;
+                if n == 0 {
+                    break;
+                }
+                // batch 升序；更早的页 prepend 到累计 Vec 前。
+                let mut merged: Vec<Bar> = Vec::with_capacity(n + all.len());
+                merged.extend(batch);
+                merged.extend(all);
+                all = merged;
+                if truncated {
+                    break;
+                }
+                start = start.saturating_add(BARS_MAX as u32);
+            }
+            Ok(all)
+        })
+        .await
+        .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
+    }
+
     /// 取分钟 K（spec §5：分钟 K 主源 TDX）。BJ 不支持。
     pub async fn fetch_minute_kline(
         &self,
@@ -694,6 +800,49 @@ fn map_security_quote(
     }
 }
 
+/// 分页聚合器：抽象掉 TDX socket，纯粹按 `fetch(start, count)` 闭包做分页 loop。
+///
+/// Spec: docs/design/quotes-module.md §5 K 线 + §4 ensure_chart_data。
+///
+/// 终止条件（与 `fetch_kline_paginated` 内联实现保持一致）：
+/// 1. 闭包返回 `Err` → 立即 abort，整体失败（partial 段无意义）；
+/// 2. 闭包返回空 batch → break；
+/// 3. 返回 batch < `page_size` → append 后 break；
+/// 4. `start >= hard_cap` → break。
+///
+/// **顺序契约**：每次 batch 升序，新（更早）batch prepend 到累计前；最终 Vec 升序。
+pub(crate) fn aggregate_paginated_bars<F>(
+    page_size: u16,
+    hard_cap: u32,
+    mut fetch: F,
+) -> Result<Vec<Bar>, TdxManagerError>
+where
+    F: FnMut(u32, u16) -> Result<Vec<Bar>, TdxManagerError>,
+{
+    let mut all: Vec<Bar> = Vec::new();
+    let mut start: u32 = 0;
+    loop {
+        if start >= hard_cap {
+            break;
+        }
+        let batch = fetch(start, page_size)?;
+        let n = batch.len();
+        let truncated = n < page_size as usize;
+        if n == 0 {
+            break;
+        }
+        let mut merged: Vec<Bar> = Vec::with_capacity(n + all.len());
+        merged.extend(batch);
+        merged.extend(all);
+        all = merged;
+        if truncated {
+            break;
+        }
+        start = start.saturating_add(page_size as u32);
+    }
+    Ok(all)
+}
+
 /// 把 TDX 分钟 Bar 翻译为 MinuteKlinePoint。
 pub fn map_minute_bar(b: &Bar) -> Option<MinuteKlinePoint> {
     use chrono::TimeZone;
@@ -837,6 +986,112 @@ mod tests {
         );
         assert!(q.price.is_none());
         assert!(q.change.is_none());
+    }
+
+    fn mk_bar(year: u16, month: u8, day: u8) -> Bar {
+        Bar {
+            year,
+            month: month as u16,
+            day: day as u16,
+            hour: 0,
+            minute: 0,
+            open: 1.0,
+            close: 1.0,
+            high: 1.0,
+            low: 1.0,
+            volume: 0.0,
+            amount: 0.0,
+        }
+    }
+
+    #[test]
+    fn aggregate_paginated_bars_merges_pages_in_ascending_order() {
+        // 模拟 3 个 batch：start=0 拿到最新 800（2024 段），start=800 拿到 800 中段（2023），
+        // start=1600 拿到 200 早段（2022，不足 800 → 终止）。
+        // 每个 batch 内部升序，全部合并后整体升序：2022 → 2023 → 2024。
+        let pages: std::collections::HashMap<u32, Vec<Bar>> = {
+            let mut m = std::collections::HashMap::new();
+            let p0: Vec<Bar> = (0..800).map(|i| mk_bar(2024, 1, (i % 28 + 1) as u8)).collect();
+            let p1: Vec<Bar> = (0..800).map(|i| mk_bar(2023, 1, (i % 28 + 1) as u8)).collect();
+            let p2: Vec<Bar> = (0..200).map(|i| mk_bar(2022, 1, (i % 28 + 1) as u8)).collect();
+            m.insert(0, p0);
+            m.insert(800, p1);
+            m.insert(1600, p2);
+            m
+        };
+        let calls = std::cell::Cell::new(0u32);
+        let res = aggregate_paginated_bars(800, 50_000, |start, count| {
+            assert_eq!(count, 800);
+            calls.set(calls.get() + 1);
+            Ok(pages.get(&start).cloned().unwrap_or_default())
+        })
+        .unwrap();
+        assert_eq!(res.len(), 1800);
+        // 升序：最早段（2022）在前
+        assert_eq!(res[0].year, 2022);
+        assert_eq!(res[199].year, 2022);
+        assert_eq!(res[200].year, 2023);
+        assert_eq!(res[999].year, 2023);
+        assert_eq!(res[1000].year, 2024);
+        assert_eq!(res[1799].year, 2024);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn aggregate_paginated_bars_stops_on_empty_page() {
+        // 第一批返回 800，第二批返回 0 → break，不再继续。
+        let calls = std::cell::Cell::new(0u32);
+        let res = aggregate_paginated_bars(800, 50_000, |start, _count| {
+            calls.set(calls.get() + 1);
+            if start == 0 {
+                Ok((0..800).map(|i| mk_bar(2024, 1, (i % 28 + 1) as u8)).collect())
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap();
+        assert_eq!(res.len(), 800);
+        assert_eq!(calls.get(), 2); // 第二次返回空才 break
+    }
+
+    #[test]
+    fn aggregate_paginated_bars_respects_hard_cap() {
+        // 每个 batch 都恰好 800（永不 truncate），hard_cap=2400 → 应在 start=2400 break，
+        // 总共 3 次调用、2400 条。
+        let calls = std::cell::Cell::new(0u32);
+        let res = aggregate_paginated_bars(800, 2400, |_start, _count| {
+            calls.set(calls.get() + 1);
+            Ok((0..800).map(|i| mk_bar(2020, 1, (i % 28 + 1) as u8)).collect())
+        })
+        .unwrap();
+        assert_eq!(res.len(), 2400);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn aggregate_paginated_bars_aborts_on_error() {
+        // 中间 batch 失败 → 整体 abort，不返回 partial。
+        let res = aggregate_paginated_bars(800, 50_000, |start, _count| {
+            if start == 0 {
+                Ok((0..800).map(|i| mk_bar(2024, 1, (i % 28 + 1) as u8)).collect())
+            } else {
+                Err(TdxManagerError::Protocol("simulated mid-batch failure".into()))
+            }
+        });
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn aggregate_paginated_bars_single_short_page() {
+        // 新上市股票：第一 batch < page_size，直接 truncate break。
+        let calls = std::cell::Cell::new(0u32);
+        let res = aggregate_paginated_bars(800, 50_000, |_start, _count| {
+            calls.set(calls.get() + 1);
+            Ok((0..50).map(|i| mk_bar(2025, 6, (i % 28 + 1) as u8)).collect())
+        })
+        .unwrap();
+        assert_eq!(res.len(), 50);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

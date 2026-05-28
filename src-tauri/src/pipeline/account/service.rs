@@ -352,7 +352,19 @@ impl AccountService {
             let items = repo.list_watchlist().unwrap_or_default();
             let views: Vec<WatchlistItemView> = items
                 .into_iter()
-                .map(|item| {
+                .map(|mut item| {
+                    // 历史数据迁移：旧 watchlist 行 name 可能 null（早期 update_watchlist
+                    // 没存 name）。渲染时回查 quote_instruments 补上，避免 UI 显示 "-"。
+                    if item.name.is_none() {
+                        if let Ok(Some(inst)) =
+                            crate::pipeline::quotes::facade::get_instrument(
+                                &self.db,
+                                &item.ts_code,
+                            )
+                        {
+                            item.name = Some(inst.name);
+                        }
+                    }
                     let quote = match self.gateway.get_snapshot(&item.ts_code) {
                         Ok(snap) => Some(WatchlistQuoteView {
                             price: snap.quote.price,
@@ -465,9 +477,19 @@ impl AccountService {
                     };
                 }
                 let existing = repo.get_watchlist(&ts_code).ok().flatten();
+                // 新增时从 quote_instruments 查 name 填上；已存在的保留之前的 name。
+                // 之前 name 永远 None → UI 渲染 "-"，体验差。
+                let resolved_name = existing.as_ref().and_then(|e| e.name.clone()).or_else(
+                    || {
+                        crate::pipeline::quotes::facade::get_instrument(&self.db, &ts_code)
+                            .ok()
+                            .flatten()
+                            .map(|i| i.name)
+                    },
+                );
                 let item = WatchlistItem {
                     ts_code: ts_code.clone(),
-                    name: existing.as_ref().and_then(|e| e.name.clone()),
+                    name: resolved_name,
                     added_at: existing.as_ref().map(|e| e.added_at).unwrap_or(now),
                     note: note.clone(),
                 };
