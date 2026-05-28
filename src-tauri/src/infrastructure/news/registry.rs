@@ -18,23 +18,37 @@ use std::sync::RwLock;
 /// 新增 / 删除 / 修改 source 必须改这里并重新部署；`enabled` 字段同样在代码中固化。
 /// `feed_url` 为 None 的 source 在 provider 拉取时会立即失败（写入 NewsFailure），
 /// 但仍然出现在 `list_news_sources` 中，避免 UI 把"未配置"误认为"无新闻"。
+/// NewsNow 公开实例（参考 https://github.com/ourongxing/newsnow）。
+/// 自部署后可改环境变量替换，但 spec §2 source 是 compile-time。
+const NEWSNOW_BASE: &str = "https://newsnow.busiyi.world/api/s";
+
 const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
     // (source_id, provider, display_name, feed_url, enabled)
     (
-        "rss:sample",
-        "rss",
-        "Sample RSS feed",
-        Some("https://example.com/feed.xml"),
+        "newsnow:cls-telegraph",
+        "newsnow",
+        "财联社电报",
+        Some("https://newsnow.busiyi.world/api/s?id=cls-telegraph&latest"),
         true,
     ),
     (
-        "newsnow:hot",
+        "newsnow:wallstreetcn-quick",
         "newsnow",
-        "NewsNow hot channel",
-        None,
+        "华尔街见闻快讯",
+        Some("https://newsnow.busiyi.world/api/s?id=wallstreetcn-quick&latest"),
+        true,
+    ),
+    (
+        "newsnow:jin10",
+        "newsnow",
+        "金十数据",
+        Some("https://newsnow.busiyi.world/api/s?id=jin10&latest"),
         true,
     ),
 ];
+
+#[allow(dead_code)] // 留作未来 add-source UI 落地时的 endpoint base 引用
+const _: &str = NEWSNOW_BASE;
 
 pub struct SourceRegistry {
     by_id: RwLock<HashMap<String, NewsSourceRef>>,
@@ -48,13 +62,22 @@ impl SourceRegistry {
     }
 
     /// 启动时把默认 source 同步到 DB；并把 DB 中已知 source 加载进 registry。
+    ///
+    /// 同步策略（spec §2 "NewsSource 编译期常量"）：
+    /// - DEFAULT_SOURCES 中的每条都做 upsert（强制覆盖 feed_url / display_name / enabled），
+    ///   因为 source 是 compile-time 真源，DB 行只是衍生缓存。
+    /// - DB 中存在但不在 DEFAULT_SOURCES 的 source 直接删除（清理旧 stub / 已下线 channel）。
     pub fn bootstrap(&self, repo: &NewsRepository<'_>) -> rusqlite::Result<()> {
         let now = Utc::now();
-        for (sid, provider, display, feed_url, enabled) in DEFAULT_SOURCES {
-            // 不要覆盖既有 enabled / feed_url，只在不存在时插入
-            if repo.get_source(sid)?.is_none() {
-                repo.upsert_source(sid, provider, Some(display), *enabled, *feed_url, now)?;
+        let default_ids: std::collections::HashSet<&str> =
+            DEFAULT_SOURCES.iter().map(|(sid, ..)| *sid).collect();
+        for s in repo.list_sources()? {
+            if !default_ids.contains(s.source_id.as_str()) {
+                repo.delete_source(&s.source_id)?;
             }
+        }
+        for (sid, provider, display, feed_url, enabled) in DEFAULT_SOURCES {
+            repo.upsert_source(sid, provider, Some(display), *enabled, *feed_url, now)?;
         }
         let mut map = self.by_id.write().expect("registry poisoned");
         map.clear();

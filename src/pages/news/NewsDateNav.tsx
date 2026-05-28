@@ -1,12 +1,15 @@
-// NewsDateNav — 顶部横向日期 chip 滑动器。
+// NewsDateNav — 顶部横向时间轴（点-线样式）。
 //
 // Spec: docs/design/frontend-design.md §4 资讯页（时间线推荐结构）
 //
-// 展示最近 N 天（含今天）的 chip，每个 chip：
-//   - 日期（MM-DD）+ "周X"
-//   - 该天的资讯条数徽标
-//   - 点击 → 触发 onSelect(date) 让父级把主时间线滚到对应日期段
-//   - 当前 viewport 的日期高亮（由父组件决定 activeDate）
+// 视觉：
+//   日期1     日期2     日期3     ...
+//     ●────────●────────●────────...
+//   (count)  (count)  (count)
+//
+//   - active 点放大并高亮，背景圈
+//   - today 点带 brand 描边
+//   - 条数 0 显示 "—" 灰色；> 0 显示数字
 //
 // 不发请求，纯展示组件。
 
@@ -60,13 +63,11 @@ export function NewsDateNav({
     return out;
   }, [daysBack]);
 
-  const scrollerRef = useRef<HTMLDivElement | null>(null);
-  const activeChipRef = useRef<HTMLButtonElement | null>(null);
+  const activeStopRef = useRef<HTMLButtonElement | null>(null);
 
-  // 当 activeDate 变化时，把高亮 chip 滚到可视区域内
   useEffect(() => {
-    if (!activeChipRef.current) return;
-    activeChipRef.current.scrollIntoView({
+    if (!activeStopRef.current) return;
+    activeStopRef.current.scrollIntoView({
       behavior: "smooth",
       block: "nearest",
       inline: "center",
@@ -74,7 +75,8 @@ export function NewsDateNav({
   }, [activeDate]);
 
   return (
-    <div className="news-date-nav" ref={scrollerRef}>
+    <div className="news-date-timeline" role="tablist">
+      <div className="news-date-timeline-line" aria-hidden="true" />
       {days.map((d) => {
         const count = countsByDate[d.key] ?? 0;
         const isActive = activeDate === d.key;
@@ -82,21 +84,23 @@ export function NewsDateNav({
           <button
             key={d.key}
             type="button"
-            ref={isActive ? activeChipRef : null}
-            className={`news-date-chip ${isActive ? "active" : ""} ${d.isToday ? "today" : ""}`}
+            role="tab"
+            ref={isActive ? activeStopRef : null}
+            className={`news-date-timeline-stop${isActive ? " active" : ""}${d.isToday ? " today" : ""}`}
             onClick={() => onSelect(d.key)}
             aria-pressed={isActive}
-            title={d.key}
+            title={`${d.key}${count > 0 ? ` · ${count} 条` : ""}`}
           >
-            <div className="news-date-chip-top">
-              <span className="news-date-chip-md tabular">{d.label}</span>
-              <span className="news-date-chip-wd">
-                {d.isToday ? "今天" : d.weekday}
-              </span>
-            </div>
-            <div className="news-date-chip-count">
-              {count > 0 ? <span className="news-date-chip-badge">{count}</span> : <span className="news-date-chip-badge empty">—</span>}
-            </div>
+            <span className="news-date-timeline-label tabular">
+              {d.isToday ? "今天" : d.label}
+            </span>
+            <span className="news-date-timeline-wd">
+              {d.isToday ? d.label : d.weekday}
+            </span>
+            <span className="news-date-timeline-dot" aria-hidden="true" />
+            <span className={`news-date-timeline-count${count === 0 ? " empty" : ""}`}>
+              {count > 0 ? count : "—"}
+            </span>
           </button>
         );
       })}

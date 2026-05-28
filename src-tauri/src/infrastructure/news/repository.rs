@@ -233,6 +233,14 @@ impl<'a> NewsRepository<'a> {
         })
     }
 
+    /// 删除一个 source（清理旧 source_id 用；当前只在 registry bootstrap 调用）。
+    pub fn delete_source(&self, source_id: &str) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            conn.execute("DELETE FROM news_sources WHERE source_id = ?1", params![source_id])?;
+            Ok(())
+        })
+    }
+
     pub fn record_source_refresh_ok(&self, source_id: &str, when: DateTime<Utc>) -> rusqlite::Result<()> {
         let when_s = format_dt(&when);
         self.db.with(|conn| {

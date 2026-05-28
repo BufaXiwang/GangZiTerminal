@@ -1421,104 +1421,109 @@ body {
 
 /* === Date nav (横向滚动) === */
 
-.news-date-nav {
+/* News date timeline — 横向点-线时间轴。 */
+.news-date-timeline {
+  position: relative;
   display: flex;
-  gap: 6px;
+  gap: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: 4px 2px 8px;
+  padding: 6px 4px 10px;
   flex: 0 0 auto;
   scrollbar-width: thin;
 }
 
-.news-date-nav::-webkit-scrollbar {
+.news-date-timeline::-webkit-scrollbar {
   height: 6px;
 }
 
-.news-date-nav::-webkit-scrollbar-thumb {
+.news-date-timeline::-webkit-scrollbar-thumb {
   background: var(--border-default);
   border-radius: 3px;
 }
 
-.news-date-chip {
+/* 贯穿的水平线：垂直定位到 dot 中心。 */
+.news-date-timeline-line {
+  position: absolute;
+  left: 30px;
+  right: 30px;
+  top: 50%;
+  height: 1px;
+  background: var(--border-default);
+  pointer-events: none;
+}
+
+.news-date-timeline-stop {
+  position: relative;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  min-width: 64px;
-  padding: 6px 10px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  min-width: 70px;
+  padding: 2px 4px;
+  background: transparent;
+  border: none;
   cursor: pointer;
   font-family: var(--font-body);
   color: var(--fg-default);
-  transition: background 100ms ease, border-color 100ms ease, color 100ms ease;
   scroll-snap-align: center;
 }
 
-.news-date-chip:hover {
-  background: var(--bg-soft);
-  border-color: var(--border-strong);
-}
-
-.news-date-chip.active {
-  background: var(--brand-soft);
-  border-color: var(--brand);
-  color: var(--brand-strong);
-}
-
-.news-date-chip.today {
-  border-color: var(--brand);
-}
-
-.news-date-chip-top {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-}
-
-.news-date-chip-md {
-  font-size: 13px;
+.news-date-timeline-label {
+  font-size: 12px;
   font-weight: 600;
   color: var(--fg-strong);
-  line-height: 1;
+  line-height: 1.1;
 }
 
-.news-date-chip.active .news-date-chip-md {
-  color: var(--brand-strong);
-}
-
-.news-date-chip-wd {
+.news-date-timeline-wd {
   font-size: 10px;
   color: var(--fg-muted);
   line-height: 1;
 }
 
-.news-date-chip-count {
-  margin-top: 2px;
+/* 点：8px 圆，hover 略亮，active 放大并加圈，today 描边。 */
+.news-date-timeline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-strong);
+  margin: 4px 0 2px;
+  position: relative;
+  z-index: 1;
+  transition: background 100ms ease, transform 100ms ease, box-shadow 100ms ease;
 }
 
-.news-date-chip-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 14px;
-  padding: 0 4px;
-  border-radius: 7px;
-  background: var(--brand-soft);
+.news-date-timeline-stop:hover .news-date-timeline-dot {
+  background: var(--fg-default);
+}
+
+.news-date-timeline-stop.today .news-date-timeline-dot {
+  background: var(--bg-app);
+  box-shadow: 0 0 0 2px var(--brand);
+}
+
+.news-date-timeline-stop.active .news-date-timeline-dot {
+  background: var(--brand);
+  transform: scale(1.5);
+  box-shadow: 0 0 0 3px var(--brand-soft);
+}
+
+.news-date-timeline-stop.active .news-date-timeline-label {
   color: var(--brand-strong);
+}
+
+.news-date-timeline-count {
   font-size: 10px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  color: var(--brand-strong);
+  min-height: 12px;
   line-height: 1;
 }
 
-.news-date-chip-badge.empty {
-  background: transparent;
+.news-date-timeline-count.empty {
   color: var(--fg-faint);
 }
 

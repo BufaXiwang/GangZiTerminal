@@ -20,9 +20,20 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 ## 获取方式
 
 - 通过配置的 NewsNow endpoint 拉取列表。
-- endpoint、鉴权和部署方式属于 adapter 配置。
+- 上游：[ourongxing/newsnow](https://github.com/ourongxing/newsnow)。公开实例 `https://newsnow.busiyi.world/api/s?id=<channel>&latest`。
+- endpoint、鉴权和部署方式属于 adapter 配置。Spec §2 NewsSource 是 compile-time 常量；当前默认 source 直接走公开实例，要换自部署改 registry 即可。
 - 支持按频道 / 分类配置 sources。
 - refresh 可以按 source 并行，但必须限制并发。
+
+### 默认 channel（compile-time）
+
+| source_id | display_name | channel |
+|---|---|---|
+| `newsnow:cls-telegraph` | 财联社电报 | `cls-telegraph` |
+| `newsnow:wallstreetcn-quick` | 华尔街见闻快讯 | `wallstreetcn-quick` |
+| `newsnow:jin10` | 金十数据 | `jin10` |
+
+支持的全量 channel 见 NewsNow upstream `getters.ts`，覆盖财联社 / 华尔街见闻 / 金十 / 36 氪快讯 / 格隆汇 / 知乎 / V2EX / 微博 / 抖音 等。新增默认 source 须改 `infrastructure/news/registry.rs::DEFAULT_SOURCES` 并同步更新这张表。
 
 默认限制：
 
