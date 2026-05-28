@@ -280,6 +280,64 @@ impl TdxConnectionManager {
         .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
     }
 
+    /// 取日 / 周 / 月 K（spec §5：TDX 是日 / 周 / 月 K 主源）。BJ 不支持。
+    ///
+    /// 单次拉取根数受 TDX 协议限制，count 自动 clamp 到 `BARS_MAX` (800)。
+    pub async fn fetch_kline(
+        &self,
+        ts_code: &TsCode,
+        period: crate::domain::quotes::KlinePeriod,
+        count: u16,
+    ) -> Result<Vec<Bar>, TdxManagerError> {
+        use crate::infrastructure::quotes::tdx::adapter::kline_period_to_tdx;
+        let market = match ts_code.market() {
+            crate::domain::shared::Market::SH => TdxMarket::SH,
+            crate::domain::shared::Market::SZ => TdxMarket::SZ,
+            crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
+        };
+        let code = ts_code.as_str()[..6].to_string();
+        let inner = Arc::clone(&self.inner);
+        let cat = kline_period_to_tdx(period);
+        let count = count.min(BARS_MAX);
+        task::spawn_blocking(move || {
+            let mut guard = inner.lock().expect("tdx state poisoned");
+            if let Some(last) = guard.last_call {
+                let e = last.elapsed();
+                if e < MIN_CALL_INTERVAL {
+                    std::thread::sleep(MIN_CALL_INTERVAL - e);
+                }
+            }
+            for attempt in 0..2 {
+                if guard.client.is_none() {
+                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
+                        Ok((c, _)) => guard.client = Some(c),
+                        Err(e) => {
+                            if attempt == 1 {
+                                return Err(TdxManagerError::Reconnect(e.to_string()));
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let cli = guard.client.as_mut().expect("client");
+                let res = cli.security_bars(cat, market, &code, 0, count);
+                guard.last_call = Some(Instant::now());
+                match res {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        guard.client = None;
+                        if attempt == 1 {
+                            return Err(TdxManagerError::Protocol(e.to_string()));
+                        }
+                    }
+                }
+            }
+            Err(TdxManagerError::Reconnect("retries exhausted".into()))
+        })
+        .await
+        .map_err(|e| TdxManagerError::Protocol(format!("join: {e}")))?
+    }
+
     /// 取分钟 K（spec §5：分钟 K 主源 TDX）。BJ 不支持。
     pub async fn fetch_minute_kline(
         &self,

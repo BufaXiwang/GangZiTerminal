@@ -124,9 +124,11 @@ impl TradeCalendar for TradeCalendarRepo {
         if let Some(v) = self.cache.read().expect("cal cache poisoned").get(&d).copied() {
             return v;
         }
+        // Spec: quotes-module.md §5 "交易日历" — DB miss 时使用 domain 本地日历
+        // (含中国法定假日 + 调休)，而不是简单的周一到周五推算。
         let v = match self.query_db(d) {
             Some(open) => open,
-            None => WeekdayCalendar.is_trade_day(d),
+            None => crate::domain::quotes::is_trading_day(d),
         };
         self.cache.write().expect("cal cache poisoned").insert(d, v);
         v
@@ -174,6 +176,17 @@ mod tests {
         let tue = NaiveDate::from_ymd_opt(2026, 5, 26).unwrap();
         assert!(!repo.is_trade_day(sat));
         assert!(repo.is_trade_day(tue));
+    }
+
+    #[test]
+    fn trade_calendar_repo_db_miss_uses_local_holiday_table() {
+        // Spec drift fix: DB miss 时使用 domain 本地日历，识别春节假日。
+        // 2024-02-12 是 2024 春节核心；旧的 WeekdayCalendar fallback 错误地返回 true。
+        let db = make_db();
+        let repo = TradeCalendarRepo::new(db);
+        let spring_festival = NaiveDate::from_ymd_opt(2024, 2, 12).unwrap();
+        // 周一但是春节 → 应该 false
+        assert!(!repo.is_trade_day(spring_festival));
     }
 
     #[test]

@@ -195,6 +195,44 @@ pub fn map_minute_bar(b: &Bar) -> Option<MinuteKlinePoint> {
     })
 }
 
+/// 把 TDX 协议层 `XdxrRecord` 翻译到 domain `XdxrEvent`。
+///
+/// Spec: docs/design/quotes-module.md §2 "本地复权计算（基于 TDX xdxr）"。
+///
+/// 不可识别 category（不在 1..=14 之内）返回 None；调用方应 skip。
+/// 各 category 按 spec 注释填充对应字段（非 1/11/12 的字段子集对复权无影响，但保留供未来用）。
+pub fn tdx_xdxr_to_domain(
+    ts_code: &TsCode,
+    record: &super::XdxrRecord,
+    fetched_at: TimestampMs,
+) -> Option<crate::domain::quotes::XdxrEvent> {
+    use crate::domain::quotes::{XdxrCategory, XdxrEvent};
+    let date = NaiveDate::from_ymd_opt(
+        record.year as i32,
+        record.month as u32,
+        record.day as u32,
+    )?;
+    let occur_date = TradeDate::from_naive(date);
+    let category = XdxrCategory::from_u8(record.category)?;
+    Some(XdxrEvent {
+        ts_code: ts_code.clone(),
+        occur_date,
+        category,
+        fenhong: record.fenhong.map(|v| v as f64),
+        peigujia: record.peigujia.map(|v| v as f64),
+        songzhuangu: record.songzhuangu.map(|v| v as f64),
+        peigu: record.peigu.map(|v| v as f64),
+        suogu: record.suogu.map(|v| v as f64),
+        xingquanjia: record.xingquanjia.map(|v| v as f64),
+        fenshu: record.fenshu.map(|v| v as f64),
+        panqianliutong: record.panqianliutong,
+        qianzongguben: record.qianzongguben,
+        panhouliutong: record.panhouliutong,
+        houzongguben: record.houzongguben,
+        fetched_at,
+    })
+}
+
 pub fn kline_period_to_tdx(p: KlinePeriod) -> BarCategory {
     match p {
         KlinePeriod::Day => BarCategory::Day,
