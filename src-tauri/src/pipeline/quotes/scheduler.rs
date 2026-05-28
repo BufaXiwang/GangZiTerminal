@@ -161,6 +161,7 @@ pub fn spawn_full_scheduler(
             let mut last_run_kline_for: Option<chrono::NaiveDate> = None;
             let mut last_run_daily_basic_for: Option<chrono::NaiveDate> = None;
             let mut last_run_events_for: Option<chrono::NaiveDate> = None;
+            let mut last_run_universe_for: Option<chrono::NaiveDate> = None;
             loop {
                 tokio::select! {
                     _ = stop_rx.recv() => break,
@@ -172,6 +173,17 @@ pub fn spawn_full_scheduler(
                         let h = shanghai_now.time().hour();
                         let m = shanghai_now.time().minute();
                         let is_trade_day = cal.is_trade_day(today);
+
+                        // 08:30 universe refresh（spec §5 line 795 "启动 + 每日 08:30"）
+                        if h == 8 && m == 30
+                            && last_run_universe_for != Some(today)
+                            && is_trade_day
+                        {
+                            if let Err(e) = svc.refresh_market_instruments().await {
+                                warn!(target: "quotes.scheduler.universe_daily", error = ?e, "08:30 universe refresh failed");
+                            }
+                            last_run_universe_for = Some(today);
+                        }
 
                         // 09:00 daily_basic（最新已完成交易日）
                         if h == 9 && m == 0
