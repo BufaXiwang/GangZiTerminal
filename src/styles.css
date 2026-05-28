@@ -116,6 +116,9 @@ body {
   display: flex;
   height: 100vh;
   background: var(--bg-app);
+  /* macOS titleBarStyle=Overlay：原生红绿灯按钮浮在 app 顶左角；
+     给整个 shell 顶部留 28px 让 sidebar 内容避开，不被遮挡。 */
+  padding-top: 28px;
 }
 
 .sidebar {
