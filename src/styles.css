@@ -1628,6 +1628,220 @@ body {
   font-size: 12px;
 }
 
+/* -------- PositionsPanel -------- */
+
+.positions-panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.panel-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-soft);
+}
+
+.panel-section-title {
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.panel-section-meta {
+  font-size: 11px;
+}
+
+.positions-table {
+  flex: 0 0 auto;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.positions-table-header {
+  display: grid;
+  grid-template-columns: 100px 1fr 80px 80px 80px 80px 100px 110px 80px 240px;
+  align-items: center;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11px;
+  color: var(--fg-muted);
+  padding: 0 4px;
+}
+
+.positions-th {
+  padding: 6px 8px;
+}
+
+.positions-th.right {
+  text-align: right;
+}
+
+.positions-table-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.positions-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 80px 80px 80px 80px 100px 110px 80px 240px;
+  align-items: center;
+  padding: 0 4px;
+  border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+
+.positions-row:hover {
+  background: var(--bg-soft);
+}
+
+.positions-row.selected {
+  background: var(--brand-soft);
+}
+
+.positions-cell {
+  padding: 0 8px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--fg-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.positions-cell.right {
+  justify-content: flex-end;
+}
+
+.positions-cell.left {
+  justify-content: flex-start;
+}
+
+.positions-cell.warn {
+  color: var(--state-warn);
+}
+
+.positions-cell .lock-mark {
+  color: var(--state-warn);
+  font-weight: 600;
+}
+
+.positions-empty {
+  padding: 48px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+}
+
+.position-warning-chip {
+  color: var(--state-warn);
+  font-size: 11px;
+  cursor: help;
+}
+
+.protection-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.protection-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.protection-chip.protection-stop {
+  color: var(--chart-up);
+  border-color: rgba(192, 57, 43, 0.3);
+  background: rgba(192, 57, 43, 0.06);
+}
+
+.protection-chip.protection-take {
+  color: var(--chart-down);
+  border-color: rgba(31, 138, 71, 0.3);
+  background: rgba(31, 138, 71, 0.06);
+}
+
+.protection-chip.protection-time {
+  color: var(--state-info);
+  border-color: rgba(94, 123, 154, 0.3);
+  background: rgba(94, 123, 154, 0.06);
+}
+
+.protection-chip.protection-signal {
+  color: var(--state-warn);
+  border-color: rgba(201, 138, 30, 0.3);
+  background: rgba(201, 138, 30, 0.06);
+}
+
+.positions-chart-block {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--border-soft);
+  background: var(--bg-card);
+}
+
+.positions-chart-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+
+.positions-chart-name {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--fg-strong);
+  font-size: 14px;
+}
+
+.positions-chart-code {
+  font-size: 11px;
+}
+
+.positions-chart-meta {
+  margin-left: auto;
+  font-size: 11px;
+}
+
+.positions-chart {
+  flex: 1 1 auto;
+  padding: 12px 16px;
+  min-height: 0;
+}
+
 .add-watchlist-modal-placeholder {
   margin: auto;
   background: var(--bg-card);
