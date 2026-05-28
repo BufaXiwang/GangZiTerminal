@@ -552,13 +552,15 @@ external read request
 
 ### 读取接口
 
-Quotes 对外暴露三类读取 command：
+Quotes 对外暴露以下读取 command：
 
 | Command | 用途 | 读取路径 |
 |---|---|---|
 | `list_market` | 股票 / 指数 / 场内基金全列表，可选携带实时行情摘要 | `MarketInstrument` 本地读模型 + `MARKET_SNAPSHOT` |
 | `fetch_data` | 按 `tsCodes` 读取行情、K 线、分时、分钟 K、详情、基本面、公司事件 | 本地 snapshot / cache / DB |
 | `scan_market` | 从本地 universe 扫描候选标的，返回轻量排名结果 | 本地 snapshot / `daily_basic` / K 线派生数据 |
+| `market_breadth` | 全市场涨跌家数 + 涨停 / 跌停统计 | 本地 snapshot / `quote_close_snapshot` |
+| `industry_heatmap` | 按行业聚合的涨幅 top N 卡片 | 本地 snapshot / `quote_close_snapshot` |
 
 #### `list_market`
 
@@ -717,6 +719,63 @@ type ScanMarketResponse = ScanResult & {
 - 调用方需要深入分析候选标的时，必须再用 `fetch_data({ tsCodes })` 读取详情。
 - `scan_market` 使用 quote 字段时必须先应用 quote 有效性规则；`isTradingTime = true` 时使用 `tradeDate = currentTradeDate` 且未硬过期的 quote，`isTradingTime = false` 时使用 `tradeDate = latestCompletedTradeDate` 的 quote。
 - `scan_market` 不触发远端 provider；缺失、过期或字段不足只通过 item warning / response warning 表达。
+
+#### `market_breadth`
+
+```ts
+type MarketBreadth = {
+  total: number;        // 有有效 quote 的标的总数；up + down + flat == total
+  up: number;           // changePercent > 0
+  down: number;         // changePercent < 0
+  flat: number;         // changePercent == 0（或缺失但 quote 仍有效）
+  limitUp: number;      // 涨停家数（详见下方阈值规则）；是 up 的子集
+  limitDown: number;    // 跌停家数；是 down 的子集
+  noData: number;       // universe 中没有有效 quote 的标的数
+  tradeDate: TradeDate;
+  computedAt: OccurredAt;
+};
+```
+
+规则：
+
+- 仅统计 `category == stock`；指数 / 基金不计入 `total` 也不计入 `noData`。
+- 必须先应用 quote 有效性规则：`isTradingTime = true` 时使用 `tradeDate = currentTradeDate` 且未硬过期的 quote；`isTradingTime = false` 时使用 `tradeDate = latestCompletedTradeDate` 的 quote。无有效 quote 的 stock 计入 `noData`，不进入 `total`。
+- `market_breadth` 不触发远端 provider；只读 `MARKET_SNAPSHOT` 和 `quote_close_snapshot`。
+- 涨停 / 跌停阈值复用 `compute_limit_band` 规则（与 `StockQuote.limitUp` / `limitDown` 完全一致的派生口径）；
+  - 主板：±10%（ST：±5%）
+  - 创业板（300/301）/ 科创板（688/689）：±20%
+  - 北交所：±30%
+  - 指数 / 部分基金：`bounded = false`，永远不计为涨停 / 跌停
+- 判定使用 `changePercent.abs() >= up_percent - 0.05`（百分点 epsilon），允许撮合 tick 抖动；这与对外 `limit_up` filter 用 `price == limitUp` 的精确口径不冲突，但允许该 API 在涨停板附近的边界 case 把"实质涨停"统计进来。
+
+#### `industry_heatmap`
+
+```ts
+type IndustryHeatmapItem = {
+  sector: string;             // MarketInstrument.sector
+  avgChangePercent: number;   // 该行业内有效 quote 标的的 changePercent 算术平均（百分点）
+  count: number;              // 该行业参与统计的有效 quote 标的数
+  leaderCodes: TsCode[];      // 涨幅 top 3（按 changePercent desc + tsCode asc）
+  leaderNames: string[];      // 对应名称
+};
+
+type IndustryHeatmap = {
+  topGainers: IndustryHeatmapItem[];  // 按 avgChangePercent desc 取前 N
+  topLosers: IndustryHeatmapItem[];   // 按 avgChangePercent asc 取前 N
+  tradeDate: TradeDate;
+  computedAt: OccurredAt;
+};
+```
+
+规则：
+
+- 仅统计 `category == stock`，行业归属来自 `MarketInstrument.sector`。
+- `sector` 为 `null` 或空串 → 归入虚拟桶 `"未分类"`，**不**参与 `topGainers` / `topLosers`（避免空数据噪音淹没卡片）。
+- 无有效 quote 的标的不参与统计；行业内若全部无 quote 则该行业不出现。
+- `topN` 默认 5；caller 可传 1–50。当行业总数 < `topN` 时返回全部。
+- `leaderCodes` / `leaderNames` 按 `changePercent desc, tsCode asc` 取前 3；不足 3 时返回实际数量。
+- `industry_heatmap` 不触发远端 provider；只读 `MARKET_SNAPSHOT` 和 `quote_close_snapshot`。
+- 调用方需要看具体标的时再用 `fetch_data({ tsCodes })` 拉详情。
 
 ### 内部 Rust API
 
@@ -934,6 +993,8 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 - `fetch_data({ tsCodes, include })` 只读本地 DB / snapshot；需要远端刷新必须走显式 refresh / 后台任务。
 - `fetch_data.tsCodes` 必须校验格式、数量上限和请求顺序。
 - `scan_market` 返回候选排名结果和 snapshot 覆盖率；需要详情时再调用 `fetch_data({ tsCodes })`。
+- `market_breadth` 仅统计 `category == stock`；涨停 / 跌停判定与 `compute_limit_band` 阈值一致（主板 10% / 创业板 / 科创板 20% / 北交所 30% / ST 5%）。
+- `industry_heatmap` 按 `MarketInstrument.sector` 聚合 stock 标的；sector 缺失 / 空串归入"未分类"且不参与 top 列表。
 - `MARKET_SNAPSHOT` item 带 `category/tradeDate/capturedAt/source`，对外 freshness 由 query facade 派生；breadth 只统计 `category == stock`。
 - 分钟 K / 分时通过 series-level freshness 表达，不在每个点位重复 freshness。
 - K 线读取必须使用 `TsCode`；已知 `ts_code` 必须贯穿到 provider/cache。
