@@ -385,6 +385,29 @@ impl<'a> QuotesRepository<'a> {
         })
     }
 
+    /// 查 `quote_klines_daily` 中 `(ts_code, period, adjust='none')` 的最早 `trade_date`。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 "K 线" — D2.5 TuShare 长历史扩展用，
+    /// 用于判定 TuShare 段补到 DB 现有数据的早一天为止。
+    pub fn min_kline_trade_date(
+        &self,
+        ts_code: &TsCode,
+        period: KlinePeriod,
+    ) -> rusqlite::Result<Option<TradeDate>> {
+        self.db.with(|conn| {
+            let res: Option<String> = conn
+                .query_row(
+                    "SELECT MIN(trade_date) FROM quote_klines_daily
+                     WHERE ts_code = ?1 AND period = ?2 AND adjust = 'none'",
+                    params![ts_code.as_str(), period.as_str()],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map(|o| o.flatten())?;
+            Ok(res.and_then(|s| TradeDate::parse(&s).ok()))
+        })
+    }
+
     // ====================================================================== klines (minute)
 
     /// 查 `quote_klines_minute` 中 `(ts_code, period)` 的最新 `ts_ms`。

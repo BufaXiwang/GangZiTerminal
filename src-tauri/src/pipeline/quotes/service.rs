@@ -1221,21 +1221,34 @@ impl QuotesService {
     // ====================================================================== refresh_klines
 
     /// 拉取 K 线 — TDX-primary + 增量（spec §1 line 15-16 + §5 line 800-810）。
-    ///
-    /// 路径：
-    /// 1. 查 `max(trade_date)` from `quote_klines_daily` WHERE `adjust='none'`；
-    ///    无数据 → 拉 365 天；有数据 → 从 `max+1` 开始（增量）。
-    /// 2. TDX `fetch_kline(period, count)` 拉 unadjusted Bar。
-    /// 3. 失败 → EM `fetch_daily_kline` fallback（仅 Day period；EM 不提供 W/M）。
-    /// 4. 都失败 → 该 (ts_code, period) 计入 failed，continue。
-    /// 5. Adapter Bar → KlinePoint → repo `upsert_daily_klines(adjust=none)`。
-    /// 6. TuShare 长历史扩展（spec §5 line 805）：TODO(D2.5)。
-    /// 7. 写入 unadjusted 后，invalidate 该 ts_code 的 qfq/hfq cache（spec §2 "xdxr 事件刷新时整体失效"
-    ///    包含 base unadjusted 更新；下次读取重算）。
+    /// 等价于 `refresh_klines_extended(scope, periods, None)`。
     pub async fn refresh_klines(
         &self,
         scope: RefreshDataScope,
         periods: Vec<KlinePeriod>,
+    ) -> Result<RefreshDataResult, ResponseError> {
+        self.refresh_klines_extended(scope, periods, None).await
+    }
+
+    /// 拉取 K 线 — 同 `refresh_klines`，但允许指定 `history_days` 触发 TuShare 长历史扩展。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 "K 线" + 修订记录 "D2.5 TuShare 长历史 K 线扩展"。
+    ///
+    /// 路径：
+    /// 1. 查 `max(trade_date)` from `quote_klines_daily` WHERE `adjust='none'`；
+    ///    无数据 → 拉 365 天；有数据 → 从 `max+1` 开始（增量）。
+    /// 2. TDX `fetch_kline(period, count)` 拉 unadjusted Bar (受 ~800 根单次限制)。
+    /// 3. 失败 → EM `fetch_daily_kline` fallback（仅 Day period；EM 不提供 W/M）。
+    /// 4. **TuShare 长历史扩展**（D2.5）：当 `history_days > TDX 单次根数限制` 且
+    ///    `TushareHealthState.is_available = true` 时，调 `tushare.fetch_kline(...)`
+    ///    补拉早于 DB `min(trade_date)` 的段；落 `adjust='none'`，复权统一走本地算法。
+    ///    长历史段失败不影响 TDX 段；series 仍可用，附 `data_partial` warning。
+    /// 5. 写入 unadjusted 后，invalidate 该 ts_code 的 qfq/hfq cache。
+    pub async fn refresh_klines_extended(
+        &self,
+        scope: RefreshDataScope,
+        periods: Vec<KlinePeriod>,
+        history_days: Option<u32>,
     ) -> Result<RefreshDataResult, ResponseError> {
         let ts_codes = self.resolve_data_scope(&scope)?;
         let periods = if periods.is_empty() {
@@ -1328,10 +1341,32 @@ impl QuotesService {
                     }
                 }
 
-                // ⑥ TuShare 长历史扩展（spec §5 line 805）。
-                // TODO(D2.5): 当请求回溯窗口超出 TDX 单次根数限制且 TushareHealthState.is_available
-                //             时，调 tushare.fetch_kline 补更早的 unadjusted 历史段。
-                //             D2 范围只做近 365 天 TDX 主路径。
+                // ⑥ TuShare 长历史扩展（spec §5 line 805 + 修订记录 D2.5）。
+                //    触发条件：调用方请求回溯 > TDX 单次根数限制 (~800) 且 TuShare 健康。
+                //    长历史段失败不影响 TDX 段；series 仍可用，附 data_partial warning。
+                const TDX_SINGLE_FETCH_LIMIT: u32 = 800;
+                if let Some(hist_days) = history_days {
+                    if hist_days > TDX_SINGLE_FETCH_LIMIT && self.health.is_available() {
+                        // 找当前 DB 中该 ts_code+period 的 min(trade_date)；TuShare 拉它之前的段。
+                        match self.fetch_tushare_history(ts, *period, hist_days, now).await {
+                            Ok(filled) if filled > 0 => {
+                                self.adjust_cache.invalidate(ts);
+                            }
+                            Ok(_) => {} // TuShare 返回 0 行：可能 listing 早于回溯窗口，无 warning。
+                            Err(e) => {
+                                tracing::debug!(
+                                    target: "quotes.refresh.kline",
+                                    ts = ts.as_str(),
+                                    error = %e,
+                                    "tushare long-history fetch failed; tdx segment still ok"
+                                );
+                                if !warnings.contains(&WarningCode::DataPartial) {
+                                    warnings.push(WarningCode::DataPartial);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1347,6 +1382,57 @@ impl QuotesService {
             warnings,
             affected_ts_codes: ts_codes,
         })
+    }
+
+    /// TuShare 长历史拉取（D2.5）：补 DB `min(trade_date)` 之前的 unadjusted 段。
+    ///
+    /// Spec: quotes-module.md §5 "K 线" + 修订记录 D2.5。
+    ///
+    /// 返回新落库的行数；0 表示无可补段（TuShare 未返回早期数据或区间已覆盖）。
+    async fn fetch_tushare_history(
+        &self,
+        ts: &TsCode,
+        period: KlinePeriod,
+        history_days: u32,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<usize, String> {
+        // ① 目标窗口：今日 - history_days .. 今日 - TDX 段已覆盖起点。
+        let today = now.date_naive();
+        let target_start = today - chrono::Duration::days(history_days as i64);
+        let repo = self.repo();
+        let min_existing = repo
+            .min_kline_trade_date(ts, period)
+            .ok()
+            .flatten()
+            .map(|td| td.as_naive());
+        let end = match min_existing {
+            Some(d) => d - chrono::Duration::days(1), // 早于 DB 最早一根
+            None => today,
+        };
+        if end <= target_start {
+            return Ok(0); // 已覆盖
+        }
+        // ② TuShare 拉取：buffer 30 天避免边界 race。
+        let s_buffer = target_start - chrono::Duration::days(30);
+        let s_str = s_buffer.format("%Y%m%d").to_string();
+        let e_str = end.format("%Y%m%d").to_string();
+        match self.tushare.fetch_kline(ts, period, &s_str, &e_str).await {
+            Ok(pts) if !pts.is_empty() => {
+                let n = pts.len();
+                // ③ 落 unadjusted；upsert 处理重叠区间。
+                let _ = repo.upsert_daily_klines(ts, period, AdjEnum::None, &pts, "tushare", now);
+                self.health.record_success();
+                Ok(n)
+            }
+            Ok(_) => {
+                self.health.record_success(); // 调用成功，只是无数据
+                Ok(0)
+            }
+            Err(e) => {
+                self.health.record_failure(e.to_string());
+                Err(e.to_string())
+            }
+        }
     }
 
     // ====================================================================== refresh_xdxr_events
@@ -2940,6 +3026,118 @@ mod tests {
             .unwrap();
         assert_eq!(res.total, 1);
         assert_eq!(res.success + res.failed, res.total);
+    }
+
+    /// D2.5 长历史扩展（spec §5 line 805 + 修订记录）。
+    ///
+    /// 触发条件：history_days > 800（TDX 单次根数限制）且 TushareHealthState.is_available。
+    /// 测试环境无 token → health unavailable → TuShare 路径被 gate 跳过；
+    /// refresh_klines_extended 仍 ok，只走 TDX 主路径，长历史段静默跳过（无 DataPartial warning）。
+    #[tokio::test]
+    async fn refresh_klines_extended_long_history_gated_by_health() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 显式确认 health 不可用（无 token）。
+        assert!(!svc.health.is_available());
+        let res = svc
+            .refresh_klines_extended(
+                RefreshDataScope::Manual { ts_codes: vec![ts.clone()] },
+                vec![KlinePeriod::Day],
+                Some(1800), // 远超 TDX 800 上限
+            )
+            .await
+            .unwrap();
+        // 当 health unavailable 时，TuShare 长历史路径不发起，
+        // 也不应产生 data_partial（spec：失败才标，gate 跳过不标）。
+        assert!(
+            !res.warnings.contains(&WarningCode::DataPartial),
+            "tushare path gated by health should not push data_partial"
+        );
+        assert_eq!(res.affected_ts_codes.len(), 1);
+    }
+
+    /// 边界：history_days ≤ TDX 单次限制 → 完全不走 TuShare 路径，即使 health.is_available。
+    #[tokio::test]
+    async fn refresh_klines_extended_short_history_skips_tushare() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let res = svc
+            .refresh_klines_extended(
+                RefreshDataScope::Manual { ts_codes: vec![ts] },
+                vec![KlinePeriod::Day],
+                Some(400), // < 800，不应触发 TuShare 段
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+        assert!(!res.warnings.contains(&WarningCode::DataPartial));
+    }
+
+    /// refresh_klines 旧接口等价于 refresh_klines_extended(.., .., None)，
+    /// 不应触发任何长历史扩展逻辑。
+    #[tokio::test]
+    async fn refresh_klines_back_compat_is_no_history_days() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let res = svc
+            .refresh_klines(
+                RefreshDataScope::Manual { ts_codes: vec![ts] },
+                vec![KlinePeriod::Day],
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.total, 1);
+    }
+
+    /// repo.min_kline_trade_date 在 DB 中 seed 多条 bar 后返回最早的。
+    #[test]
+    fn min_kline_trade_date_returns_earliest() {
+        use crate::domain::shared::{Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar1 = KlinePoint {
+            date: TradeDate::parse("20240601").unwrap(),
+            open: Price(Decimal::new(10000, 2)),
+            close: Price(Decimal::new(10000, 2)),
+            high: Price(Decimal::new(10000, 2)),
+            low: Price(Decimal::new(10000, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        let bar2 = KlinePoint {
+            date: TradeDate::parse("20240615").unwrap(),
+            open: Price(Decimal::new(10000, 2)),
+            close: Price(Decimal::new(10000, 2)),
+            high: Price(Decimal::new(10000, 2)),
+            low: Price(Decimal::new(10000, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(
+                &ts,
+                KlinePeriod::Day,
+                AdjEnum::None,
+                &[bar1, bar2],
+                "test",
+                Utc::now(),
+            )
+            .unwrap();
+        let min = svc
+            .repo()
+            .min_kline_trade_date(&ts, KlinePeriod::Day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(min.format(), "20240601");
+        let min_empty = svc
+            .repo()
+            .min_kline_trade_date(&TsCode::parse("000999.SH").unwrap(), KlinePeriod::Day)
+            .unwrap();
+        assert!(min_empty.is_none());
     }
 
     #[tokio::test]
