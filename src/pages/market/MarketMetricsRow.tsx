@@ -12,14 +12,16 @@ import { BreadthCard } from "./BreadthCard";
 import { HeatmapCard } from "./HeatmapCard";
 
 interface MarketMetricsRowProps {
-  /** 当前选中的 tsCode，用于高亮对应 IndexCard */
   selected?: string | null;
   onSelectIndex?: (tsCode: string) => void;
+  /** 顶部右上角小字（如 "已更新 19:30:00"） */
+  statusText?: string;
 }
 
 export function MarketMetricsRow({
   selected,
   onSelectIndex,
+  statusText,
 }: MarketMetricsRowProps) {
   const indexes = useCoreIndexes();
   const breadth = useMarketBreadth();
@@ -27,6 +29,12 @@ export function MarketMetricsRow({
 
   return (
     <div className="market-metrics-row">
+      {statusText && (
+        <div className="market-metrics-status">
+          <span className="status-dot ok" aria-hidden />
+          {statusText}
+        </div>
+      )}
       {CORE_INDEXES.map((info) => {
         const item = indexes.items.find((i) => i.tsCode === info.tsCode);
         return (

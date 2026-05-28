@@ -135,30 +135,52 @@ function extractKlines(
   tsCode: TsCode,
   period: AnyKlinePeriod,
 ): KlineDataPoint[] {
-  if (!raw || typeof raw !== "object") return [];
+  if (!raw || typeof raw !== "object") {
+    console.warn("[extractKlines] raw not object", raw);
+    return [];
+  }
   const root = raw as Record<string, unknown>;
-  // 后端返回 { items: FetchDataItem[] }；找第一个匹配 tsCode 的 item。
   const itemsArr = (root.items ?? []) as unknown;
-  if (!Array.isArray(itemsArr)) return [];
+  if (!Array.isArray(itemsArr)) {
+    console.warn("[extractKlines] items not array", root);
+    return [];
+  }
   const target = itemsArr.find(
     (it) =>
       it &&
       typeof it === "object" &&
       (it as Record<string, unknown>).tsCode === tsCode,
   ) as Record<string, unknown> | undefined;
-  if (!target) return [];
+  if (!target) {
+    console.warn("[extractKlines] no target for tsCode", tsCode, itemsArr);
+    return [];
+  }
   const isMinute = isMinutePeriod(period);
   const klineGroup = (
     isMinute ? target.minuteKlines ?? target.minute_klines : target.klines
   ) as Record<string, unknown> | undefined;
-  if (!klineGroup) return [];
+  if (!klineGroup) {
+    console.warn("[extractKlines] no klineGroup. target keys:", Object.keys(target), "target:", target);
+    return [];
+  }
   const series = klineGroup[period];
-  if (!series || typeof series !== "object") return [];
+  if (!series || typeof series !== "object") {
+    console.warn("[extractKlines] no series for period", period, "klineGroup keys:", Object.keys(klineGroup), "klineGroup:", klineGroup);
+    return [];
+  }
   const points = (series as Record<string, unknown>).points;
-  if (!Array.isArray(points)) return [];
-  return points
+  if (!Array.isArray(points)) {
+    console.warn("[extractKlines] points not array", series);
+    return [];
+  }
+  if (points.length > 0) {
+    console.log("[extractKlines] first raw point:", points[0]);
+  }
+  const out = points
     .map((row) => normalizeKlineRow(row))
     .filter((r): r is KlineDataPoint => r !== null);
+  console.log("[extractKlines]", points.length, "raw →", out.length, "normalized");
+  return out;
 }
 
 function normalizeKlineRow(row: unknown): KlineDataPoint | null {
@@ -236,7 +258,6 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
     error: null,
     lastUpdatedMs: null,
   });
-  // 用于忽略竞态：每次请求带 token，只有 token 与最新一致才更新 state
   const reqIdRef = useRef(0);
 
   useEffect(() => {
@@ -255,13 +276,16 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
     } else {
       include = { klines: [period as KlinePeriod] };
     }
-    void commands
-      .fetchData({ tsCodes: [tsCode], include })
-      .then((res) => {
-        if (id !== reqIdRef.current) return; // stale request
-        // DEBUG
-        // eslint-disable-next-line no-console
-        console.log("[useKlineData] fetchData result:", { tsCode, period, status: res.status, data: res.status === "ok" ? res.data : null });
+
+    // Retry-on-empty:
+    // 后端 startup catch-up（K 线 warmup）是异步的，UI 首次拉可能比 warmup 完成早。
+    // 拿到空且非错误时，按指数 backoff 重试 3 次（2s/4s/8s），覆盖大多数 warmup 窗口。
+    let cancelled = false;
+    let timers: number[] = [];
+    const fetchOnce = async (attempt: number): Promise<void> => {
+      try {
+        const res = await commands.fetchData({ tsCodes: [tsCode], include });
+        if (cancelled || id !== reqIdRef.current) return;
         if (res.status === "error") {
           setState({
             data: [],
@@ -274,15 +298,39 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
         const points = isIntraday
           ? extractIntraday(res.data, tsCode)
           : extractKlines(res.data, tsCode, period as AnyKlinePeriod);
-        // eslint-disable-next-line no-console
-        console.log("[useKlineData] parsed points:", points.length, points.slice(0, 2));
+        if (points.length === 0 && attempt < 3) {
+          const delayMs = 2000 * Math.pow(2, attempt); // 2s, 4s, 8s
+          const t = window.setTimeout(() => {
+            if (!cancelled && id === reqIdRef.current) {
+              setState((s) => ({ ...s, loading: true }));
+              void fetchOnce(attempt + 1);
+            }
+          }, delayMs);
+          timers.push(t);
+          setState({ data: [], loading: false, error: null, lastUpdatedMs: null });
+          return;
+        }
         setState({
           data: points,
           loading: false,
           error: null,
           lastUpdatedMs: Date.now(),
         });
-      });
+      } catch (e) {
+        if (cancelled || id !== reqIdRef.current) return;
+        setState({
+          data: [],
+          loading: false,
+          error: String(e),
+          lastUpdatedMs: null,
+        });
+      }
+    };
+    void fetchOnce(0);
+    return () => {
+      cancelled = true;
+      timers.forEach((t) => window.clearTimeout(t));
+    };
   }, [tsCode, period, enabled]);
 
   return useMemo(() => state, [state]);

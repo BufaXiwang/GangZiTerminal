@@ -19,7 +19,6 @@
 
 import { Plus, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { PageShell } from "../components/PageShell";
 import { useWatchlistStore } from "../lib/watchlistStore";
 import { InstrumentDetail } from "./market/InstrumentDetail";
 import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
@@ -196,23 +195,16 @@ export default function MarketPage() {
       : lastUpdated
         ? `已更新 ${formatTime(lastUpdated)}`
         : "等待数据";
-  const statusTone = error
-    ? "error"
-    : loading
-      ? "loading"
-      : lastUpdated
-        ? "ok"
-        : "stale";
 
-  // PageShell 顶部 controls 留空（自动刷新由各 hook 周期 polling 处理，不再需要按钮）
+  // 不再用 PageShell 的 section-head；状态时间放进 MetricsRow 右上角小字。
   return (
-    <PageShell
-      title="市场"
-      status={status}
-      statusTone={statusTone}
-    >
+    <section className="market-page-section">
       <div className="market-page">
-        <MarketMetricsRow selected={selected} onSelectIndex={handleSelectIndex} />
+        <MarketMetricsRow
+          selected={selected}
+          onSelectIndex={handleSelectIndex}
+          statusText={status}
+        />
         <div className="market-workspace">
           <div className="market-workspace-list">
             <div className="list-header">
@@ -308,7 +300,7 @@ export default function MarketPage() {
           </div>
         </div>
       </div>
-    </PageShell>
+    </section>
   );
 }
 
