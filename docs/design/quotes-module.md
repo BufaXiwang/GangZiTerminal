@@ -570,6 +570,8 @@ Quotes 对外暴露以下读取 command：
 | `scan_market` | 从本地 universe 扫描候选标的，返回轻量排名结果 | 本地 snapshot / `daily_basic` / K 线派生数据 |
 | `market_breadth` | 全市场涨跌家数 + 涨停 / 跌停统计 | 本地 snapshot / `quote_close_snapshot` |
 | `industry_heatmap` | 按行业聚合的涨幅 top N 卡片 | 本地 snapshot / `quote_close_snapshot` |
+| `ensure_chart_data` | 前端切换标的 / 周期时，DB 空就触发后端拉一份 | 触发 `refresh_klines` / `refresh_minute_klines` / `refresh_intraday` |
+| `extend_chart_history` | 前端 K 线图左拉到尽头时扩展更深历史 | 触发 `refresh_klines_extended(target_days)` |
 
 #### `list_market`
 
@@ -785,6 +787,37 @@ type IndustryHeatmap = {
 - `leaderCodes` / `leaderNames` 按 `changePercent desc, tsCode asc` 取前 3；不足 3 时返回实际数量。
 - `industry_heatmap` 不触发远端 provider；只读 `MARKET_SNAPSHOT` 和 `quote_close_snapshot`。
 - 调用方需要看具体标的时再用 `fetch_data({ tsCodes })` 拉详情。
+
+#### `ensure_chart_data`
+
+**用途**：UI 切换到某标的 + 某 chart period 时，如果 DB 没数据就触发后端拉一份，**不阻塞 UI 主流程但同步等待结果**。
+
+```ts
+ensure_chart_data(ts_code: TsCode, period: ChartPeriod): Promise<void>
+// ChartPeriod = "intraday" | "1m" | "5m" | "15m" | "30m" | "60m" | "day" | "week" | "month"
+```
+
+行为：
+- `period ∈ {day, week, month}` → 内部走 `refresh_klines(scope=Subscribed[ts_code], periods=[period])`。
+- `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`。
+- `period == intraday` → `refresh_intraday(...)`。
+- 已有数据时也会重新拉（upsert 幂等）；UI 调用方决定何时触发。
+
+#### `extend_chart_history`
+
+**用途**：用户在 K 线图左拉到尽头时，扩展该 ts_code 的历史深度。
+
+```ts
+extend_chart_history(ts_code: TsCode, period: "day" | "week" | "month", target_days: u32): Promise<void>
+```
+
+行为：
+- `target_days ≤ 800` → 走 TDX 主路径（单次 fetch 上限 ~800 根，约 3 年日 K）。
+- `target_days > 800` 且 `TushareHealthState.isAvailable = true` → 调用 `refresh_klines_extended` 内 TuShare 长历史扩展段，落库 `adjust = none`。
+- 否则（token 缺失或 health 不可用）silent skip 长历史段，只返回 TDX 已拉的部分。
+- 分钟 K / 分时**不**走此命令（分钟 K 一天 240 根，单次 fetch 已足够；不需要"更深历史"语义）。
+
+调用频率：UI 每次左拉到边界增加 ~300 天再调一次。建议 UI 内部对 `target_days` 设置上限（如 2000 天）。
 
 ### 内部 Rust API
 

@@ -145,6 +145,13 @@ export default function AccountPage() {
         <AccountSummary snapshot={snapshot} loading={loading} error={error} />
 
         <div className="account-workspace">
+          <div className="account-workspace-side">
+            <WatchlistPanel
+              items={watchlistItems}
+              onOpenAdd={() => setAddOpen(true)}
+              loading={loading}
+            />
+          </div>
           <div className="account-workspace-main">
             <PositionsPanel
               positions={positions}
@@ -152,13 +159,6 @@ export default function AccountPage() {
               selected={selectedPosition}
               onSelect={setSelectedPosition}
               selectedItem={selectedPositionItem}
-            />
-          </div>
-          <div className="account-workspace-side">
-            <WatchlistPanel
-              items={watchlistItems}
-              onOpenAdd={() => setAddOpen(true)}
-              loading={loading}
             />
           </div>
         </div>

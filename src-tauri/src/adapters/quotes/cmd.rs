@@ -66,6 +66,48 @@ pub fn fetch_industry_heatmap(
     Ok(service.industry_heatmap(n))
 }
 
+/// 前端左拉到尽头时触发：扩展该 ts_code 的历史 K 线深度到 `target_days`。
+///
+/// - `target_days <= TDX_SINGLE_FETCH_LIMIT (800)`：走 TDX 主路径（最多 ~3 年）
+/// - `target_days > 800` 且 TushareHealthState.isAvailable：走 TuShare 长历史扩展段
+/// - 否则 silent skip 长历史
+///
+/// `period` 字符串："day" / "week" / "month"。分钟 K 不走此命令（TDX 限 800 根，分钟 K 一天就 240 根）。
+///
+/// Spec: docs/design/quotes-module.md §4 + §5 K 线长历史
+#[tauri::command]
+#[specta::specta]
+pub async fn extend_chart_history(
+    ts_code: String,
+    period: String,
+    target_days: u32,
+    service: State<'_, Arc<QuotesService>>,
+) -> Result<(), CommandError> {
+    let code = TsCode::parse(&ts_code)
+        .map_err(|e| CommandError::with_message(ErrorCode::InvalidInput, e.to_string()))?;
+    let kp = match period.as_str() {
+        "day" => KlinePeriod::Day,
+        "week" => KlinePeriod::Week,
+        "month" => KlinePeriod::Month,
+        _ => {
+            return Err(CommandError::with_message(
+                ErrorCode::InvalidInput,
+                format!(
+                    "extend_chart_history only supports day/week/month, got {}",
+                    period
+                ),
+            ))
+        }
+    };
+    let scope = RefreshDataScope::Subscribed {
+        ts_codes: vec![code],
+    };
+    service
+        .refresh_klines_extended(scope, vec![kp], Some(target_days))
+        .await?;
+    Ok(())
+}
+
 /// 前端 on-demand 拉数据：用户选中标的 + 切到某 chart period 时，如果 DB 空就触发后端拉一份。
 ///
 /// 按 period 字符串分派：

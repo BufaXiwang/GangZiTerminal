@@ -123,6 +123,25 @@ async ensureChartData(tsCode: string, period: string) : Promise<Result<null, Com
 }
 },
 /**
+ * 前端左拉到尽头时触发：扩展该 ts_code 的历史 K 线深度到 `target_days`。
+ * 
+ * - `target_days <= TDX_SINGLE_FETCH_LIMIT (800)`：走 TDX 主路径（最多 ~3 年）
+ * - `target_days > 800` 且 TushareHealthState.isAvailable：走 TuShare 长历史扩展段
+ * - 否则 silent skip 长历史
+ * 
+ * `period` 字符串："day" / "week" / "month"。分钟 K 不走此命令（TDX 限 800 根，分钟 K 一天就 240 根）。
+ * 
+ * Spec: docs/design/quotes-module.md §4 + §5 K 线长历史
+ */
+async extendChartHistory(tsCode: string, period: string, targetDays: number) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("extend_chart_history", { tsCode, period, targetDays }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出当前 SkillRegistry 已注册的 skill。
  * 
  * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）

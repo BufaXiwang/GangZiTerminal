@@ -296,10 +296,14 @@ export function KlineCanvas({
     let currentLimit = INITIAL_LIMIT;
     const loadedTs = new Set<number>();
 
+    // 仅日/周/月 K 走后端 extend_chart_history（拉更长 TDX/TuShare 历史）；
+    // 分钟 K 和分时不支持扩展（数据单位太细，靠初始 limit 已足够）。
+    const supportsBackendExtend =
+      period === "day" || period === "week" || period === "month";
+
     const setupLoadMore = () => {
       chart.setLoadDataCallback(({ type, callback }) => {
         if (cancelled) return;
-        // 仅处理 'forward'（用户左拉加载更早 bars）；'init'/'backward' 忽略
         if (type !== "forward") {
           callback([], false);
           return;
@@ -309,19 +313,31 @@ export function KlineCanvas({
           return;
         }
         currentLimit = Math.min(currentLimit + FORWARD_STEP, MAX_LIMIT);
-        void fetchKlineData(tsCode, period, currentLimit).then(
-          (all) => {
-            if (cancelled) return;
-            const newBars = all.filter((b) => !loadedTs.has(b.timestamp));
-            newBars.forEach((b) => loadedTs.add(b.timestamp));
-            const stillForward =
-              all.length >= currentLimit && currentLimit < MAX_LIMIT;
-            callback(newBars, stillForward);
-          },
-          () => {
-            if (!cancelled) callback([], false);
-          },
-        );
+
+        const doFetch = () =>
+          fetchKlineData(tsCode, period, currentLimit).then(
+            (all) => {
+              if (cancelled) return;
+              const newBars = all.filter((b) => !loadedTs.has(b.timestamp));
+              newBars.forEach((b) => loadedTs.add(b.timestamp));
+              const stillForward =
+                all.length >= currentLimit && currentLimit < MAX_LIMIT;
+              callback(newBars, stillForward);
+            },
+            () => {
+              if (!cancelled) callback([], false);
+            },
+          );
+
+        if (supportsBackendExtend) {
+          // 先后端 extend（触发 TDX / TuShare 拉更多历史 K 线写 DB），再读
+          void commands
+            .extendChartHistory(tsCode, period, currentLimit)
+            .then(() => doFetch())
+            .catch(() => doFetch()); // extend 失败也至少把现有 DB 重读
+        } else {
+          void doFetch();
+        }
       });
     };
 
