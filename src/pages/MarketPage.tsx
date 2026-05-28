@@ -15,6 +15,7 @@
 import { ChevronLeft, ChevronRight, RefreshCcw, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { PageShell } from "../components/PageShell";
+import { useWatchlistStore } from "../lib/watchlistStore";
 import { MarketHeader } from "./market/MarketHeader";
 import { InstrumentDetail } from "./market/InstrumentDetail";
 import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
@@ -49,7 +50,9 @@ export default function MarketPage() {
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selected, setSelected] = useState<TsCode | null>(null);
-  const [starred, setStarred] = useState<Set<TsCode>>(new Set());
+  const starred = useWatchlistStore((s) => s.codes);
+  const addWatch = useWatchlistStore((s) => s.add);
+  const removeWatch = useWatchlistStore((s) => s.remove);
   const [sortKey, setSortKey] = useState<SortKey>("amount");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
@@ -105,38 +108,17 @@ export default function MarketPage() {
     });
   }, []);
 
-  const handleToggleStar = useCallback((tsCode: TsCode) => {
-    setStarred((prev) => {
-      const next = new Set(prev);
-      const isAdd = !next.has(tsCode);
-      if (isAdd) next.add(tsCode);
-      else next.delete(tsCode);
-      void commands
-        .updateWatchlist(
-          isAdd
-            ? { action: "add", tsCode }
-            : { action: "remove", tsCode },
-        )
-        .then((res) => {
-          if (res.status === "error") {
-            // 后端失败：回滚本地状态，但不阻断 UI
-            // eslint-disable-next-line no-console
-            console.error(
-              "updateWatchlist failed:",
-              res.error.code,
-              res.error.message,
-            );
-            setStarred((cur) => {
-              const r = new Set(cur);
-              if (isAdd) r.delete(tsCode);
-              else r.add(tsCode);
-              return r;
-            });
-          }
-        });
-      return next;
-    });
-  }, []);
+  const handleToggleStar = useCallback(
+    (tsCode: TsCode) => {
+      // 走 zustand store：optimistic 更新 + 后端失败回滚；跨页面同步。
+      if (starred.has(tsCode)) {
+        void removeWatch(tsCode);
+      } else {
+        void addWatch(tsCode);
+      }
+    },
+    [starred, addWatch, removeWatch],
+  );
 
   const handleSearch = useCallback(() => {
     setOffset(0);
