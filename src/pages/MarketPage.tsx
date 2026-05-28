@@ -37,12 +37,11 @@ interface TabDef {
 }
 
 const SORT_TABS: TabDef[] = [
-  { key: "default", label: "默认" },
   { key: "changePercent", label: "涨跌" },
   { key: "amount", label: "成交" },
 ];
 
-const CATEGORY_FILTERS: { value: InstrumentCategory; label: string }[] = [
+const CATEGORY_OPTIONS: { value: InstrumentCategory; label: string }[] = [
   { value: "stock", label: "股票" },
   { value: "index", label: "指数" },
   { value: "fund", label: "基金" },
@@ -198,7 +197,21 @@ export default function MarketPage() {
         <div className="market-workspace">
           <div className="market-workspace-list">
             <div className="list-header">
+              {/* 单行：左 category dropdown + 右 sort tab（涨跌 / 成交） */}
               <div className="list-header-row">
+                <select
+                  className="list-category-select"
+                  value={category}
+                  onChange={(e) =>
+                    handleCategoryFilter(e.target.value as InstrumentCategory)
+                  }
+                >
+                  {CATEGORY_OPTIONS.map((c) => (
+                    <option key={c.value} value={c.value}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
                 <div className="list-sort-tabs" role="tablist">
                   {SORT_TABS.map((t) => (
                     <button
@@ -210,20 +223,6 @@ export default function MarketPage() {
                       onClick={() => setSortKey(t.key)}
                     >
                       {t.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="list-header-row">
-                <div className="list-category-chips">
-                  {CATEGORY_FILTERS.map((c) => (
-                    <button
-                      key={c.value}
-                      type="button"
-                      className={`list-category-chip ${category === c.value ? "active" : ""}`}
-                      onClick={() => handleCategoryFilter(c.value)}
-                    >
-                      {c.label}
                     </button>
                   ))}
                 </div>

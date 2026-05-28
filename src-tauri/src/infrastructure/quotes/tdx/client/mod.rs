@@ -23,8 +23,12 @@ pub mod cmd_test_hooks {
         super::cmd::security_bars::build(category, market, code, start, count)
     }
 
-    pub fn parse_security_bars(body: &[u8], category: BarCategory) -> Result<Vec<Bar>> {
-        super::cmd::security_bars::parse(body, category)
+    pub fn parse_security_bars(
+        body: &[u8],
+        category: BarCategory,
+        is_index: bool,
+    ) -> Result<Vec<Bar>> {
+        super::cmd::security_bars::parse(body, category, is_index)
     }
 }
 
@@ -144,6 +148,10 @@ impl TdxHqClient {
     }
 
     /// K-line bars. `count` is capped server-side around 800.
+    ///
+    /// 指数（SH 000xxx / 999xxx, SZ 399xxx）每根 bar 比股票多 4 字节
+    /// (up_count/down_count)。caller 必须按 code/market 正确传 `is_index`，
+    /// 否则解码会逐 bar 累计 4 字节漂移导致价格全部错位。
     pub fn security_bars(
         &mut self,
         category: BarCategory,
@@ -154,7 +162,8 @@ impl TdxHqClient {
     ) -> Result<Vec<Bar>> {
         let pkg = cmd::security_bars::build(category, market.as_u8(), code, start, count)?;
         let body = frame::request(&mut self.sock, &pkg)?;
-        cmd::security_bars::parse(&body, category)
+        let is_index = cmd::security_bars::is_index_code(code, market.as_u8());
+        cmd::security_bars::parse(&body, category, is_index)
     }
 
     /// Real-time L1 quotes for up to ~80 (market, code) pairs.

@@ -46,7 +46,15 @@ pub fn build(
     Ok(pkg)
 }
 
-pub fn parse(body: &[u8], category: BarCategory) -> Result<Vec<Bar>> {
+/// Parse a `0x052d` K-line response.
+///
+/// **`is_index`**：指数 K 线（pytdx `get_index_bars`）每根 bar 在 vol/amount 之后
+/// 多 4 字节 (up_count u16 + down_count u16)。我们不需要这两个字段，但必须读掉
+/// 否则 pos 会漂移 4N 字节导致后续 bar 解码错乱。**这是历史 K 线错位 bug 的根因**。
+///
+/// 个股 / ETF / 场内基金：is_index = false。
+/// 指数（SH 000xxx, SZ 399xxx 等）：is_index = true。
+pub fn parse(body: &[u8], category: BarCategory, is_index: bool) -> Result<Vec<Bar>> {
     if body.len() < 2 {
         return Err(Error::Protocol("security_bars: short body".into()));
     }
@@ -73,6 +81,16 @@ pub fn parse(body: &[u8], category: BarCategory) -> Result<Vec<Bar>> {
         let amount = get_volume(dbvol_raw);
         pos += 4;
 
+        // 指数 bars 在此处有额外 4 字节 up_count/down_count（pytdx get_index_bars）。
+        if is_index {
+            if body.len() < pos + 4 {
+                return Err(Error::Protocol(
+                    "security_bars: truncated index up/down_count".into(),
+                ));
+            }
+            pos += 4;
+        }
+
         let open_v = (open_diff + pre_diff_base) as f64 / 1000.0;
         let abs_open = open_diff + pre_diff_base;
         let close_v = (abs_open + close_diff) as f64 / 1000.0;
@@ -96,4 +114,20 @@ pub fn parse(body: &[u8], category: BarCategory) -> Result<Vec<Bar>> {
         });
     }
     Ok(out)
+}
+
+/// 协议层 helper：判断 6 位 code 是否为指数。
+/// SH: `000xxx` (上证指数 / 行业指数 / ETF 指数等) / `999xxx`
+/// SZ: `399xxx` (深证成指 / 创业板指 / 中证指数等)
+pub fn is_index_code(code: &str, market: u8) -> bool {
+    if code.len() != 6 {
+        return false;
+    }
+    match market {
+        // SH = 1 in TDX protocol (TdxMarket::SH)
+        1 => code.starts_with("000") || code.starts_with("999"),
+        // SZ = 0
+        0 => code.starts_with("399"),
+        _ => false,
+    }
 }
