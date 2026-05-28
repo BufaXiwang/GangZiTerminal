@@ -7,6 +7,10 @@
 import { useEffect, useRef, useState } from "react";
 import { commands, type IndustryHeatmap } from "../bindings";
 
+// Module-level cache：remount 时立即用上一份，无 loading 闪烁。
+let cachedData: IndustryHeatmap | null = null;
+let cachedAt = 0;
+
 export interface UseIndustryHeatmapState {
   data: IndustryHeatmap | null;
   loading: boolean;
@@ -24,40 +28,45 @@ export function useIndustryHeatmap(
   opts: UseIndustryHeatmapOptions = {},
 ): UseIndustryHeatmapState {
   const { enabled = true, intervalMs = 60_000, topN = 5 } = opts;
-  const [state, setState] = useState<UseIndustryHeatmapState>({
-    data: null,
-    loading: false,
+  const [state, setState] = useState<UseIndustryHeatmapState>(() => ({
+    data: cachedData,
+    loading: cachedData === null,
     error: null,
-    lastUpdatedMs: null,
-  });
+    lastUpdatedMs: cachedAt || null,
+  }));
   const reqIdRef = useRef(0);
 
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
-    const fetchOnce = () => {
+    const fetchOnce = (silent: boolean) => {
       const id = ++reqIdRef.current;
-      setState((s) => ({ ...s, loading: true }));
+      if (!silent) setState((s) => ({ ...s, loading: cachedData === null }));
       void commands.fetchIndustryHeatmap(topN).then((res) => {
         if (cancelled || id !== reqIdRef.current) return;
         if (res.status === "error") {
-          setState((s) => ({
-            ...s,
-            loading: false,
-            error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-          }));
+          if (!silent) {
+            setState((s) => ({
+              ...s,
+              loading: false,
+              error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+            }));
+          }
           return;
         }
+        cachedData = res.data;
+        cachedAt = Date.now();
         setState({
           data: res.data,
           loading: false,
           error: null,
-          lastUpdatedMs: Date.now(),
+          lastUpdatedMs: cachedAt,
         });
       });
     };
-    fetchOnce();
-    const timer = window.setInterval(fetchOnce, intervalMs);
+    const stale = cachedData === null || Date.now() - cachedAt > 60_000;
+    fetchOnce(!stale);
+    const timer = window.setInterval(() => fetchOnce(true), intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);

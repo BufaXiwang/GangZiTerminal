@@ -9,6 +9,11 @@
 import { useEffect, useRef, useState } from "react";
 import { commands, type FetchDataItem } from "../bindings";
 
+// 模块级 cache：组件 remount 时立即喂上一份，避免 mount → IPC → loading 闪烁。
+// React 切 tab 时该缓存让顶部指标卡瞬间出来，背景 polling 自然 refresh。
+let cachedItems: FetchDataItem[] | null = null;
+let cachedAt = 0;
+
 export interface CoreIndexInfo {
   tsCode: string;
   label: string;
@@ -38,20 +43,21 @@ export function useCoreIndexes(
   opts: UseCoreIndexesOptions = {},
 ): UseCoreIndexesState {
   const { enabled = true, intervalMs = 30_000 } = opts;
-  const [state, setState] = useState<UseCoreIndexesState>({
-    items: [],
-    loading: false,
+  // 初始 state 直接从 module cache 来；切 tab remount 瞬时渲染。
+  const [state, setState] = useState<UseCoreIndexesState>(() => ({
+    items: cachedItems ?? [],
+    loading: cachedItems === null,
     error: null,
-    lastUpdatedMs: null,
-  });
+    lastUpdatedMs: cachedAt || null,
+  }));
   const reqIdRef = useRef(0);
 
   useEffect(() => {
     if (!enabled) return;
     let cancelled = false;
-    const fetchOnce = () => {
+    const fetchOnce = (silent: boolean) => {
       const id = ++reqIdRef.current;
-      setState((s) => ({ ...s, loading: true }));
+      if (!silent) setState((s) => ({ ...s, loading: cachedItems === null }));
       void commands
         .fetchData({
           tsCodes: CORE_INDEXES.map((c) => c.tsCode),
@@ -60,23 +66,29 @@ export function useCoreIndexes(
         .then((res) => {
           if (cancelled || id !== reqIdRef.current) return;
           if (res.status === "error") {
-            setState((s) => ({
-              ...s,
-              loading: false,
-              error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-            }));
+            if (!silent) {
+              setState((s) => ({
+                ...s,
+                loading: false,
+                error: `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+              }));
+            }
             return;
           }
+          cachedItems = res.data.items;
+          cachedAt = Date.now();
           setState({
             items: res.data.items,
             loading: false,
             error: null,
-            lastUpdatedMs: Date.now(),
+            lastUpdatedMs: cachedAt,
           });
         });
     };
-    fetchOnce();
-    const timer = window.setInterval(fetchOnce, intervalMs);
+    // 有 cache 且 < 30s → 静默 refetch；否则正常 loading
+    const stale = cachedItems === null || Date.now() - cachedAt > 30_000;
+    fetchOnce(!stale);
+    const timer = window.setInterval(() => fetchOnce(true), intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
