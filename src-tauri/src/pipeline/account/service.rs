@@ -2804,30 +2804,42 @@ impl AccountService {
         }
 
         // riskEquity = cash + sum(positionRiskValue)
+        //
+        // Spec: account-module.md §2 — "已估值仓位用 marketValue，未估值仓位用
+        // remainingCostBasis；任何仓位不得按 0 计入风险敞口"。
+        // 每个 open position 都试图从 gateway 取 fresh quote：
+        //   - 成功且 Fresh → marketPrice * quantity
+        //   - missing / stale / 失败 → avg_cost * quantity（remainingCostBasis）
+        // 当前 order 的 ts_code 若调用方已经传入 fresh snapshot，复用之以避免重复查询。
         let positions = repo
             .list_positions(Some(PositionStatus::Open), 10_000, 0)
             .unwrap_or_default();
         let mut risk_equity = meta.cash.0;
         let mut current_ts_market_value = Decimal::ZERO;
+        let mut position_risk_values: Vec<Decimal> = Vec::with_capacity(positions.len());
         for p in &positions {
-            // 已估值 → marketValue；否则 remainingCostBasis
-            let value = if let Some(sn) = snapshot {
-                if p.ts_code == *ts_code {
-                    if let Some(price) = sn.quote.price {
-                        price.0 * Decimal::from(p.quantity.0)
-                    } else {
-                        p.avg_cost.0 * Decimal::from(p.quantity.0)
-                    }
-                } else {
-                    p.avg_cost.0 * Decimal::from(p.quantity.0)
-                }
+            // 优先级 1：当前 order 的 ts_code 用调用方传入的 snapshot（已经过 fresh 校验）。
+            let value = if p.ts_code == *ts_code {
+                snapshot
+                    .and_then(|sn| sn.quote.price.map(|pr| pr.0 * Decimal::from(p.quantity.0)))
+                    .unwrap_or_else(|| p.avg_cost.0 * Decimal::from(p.quantity.0))
             } else {
-                p.avg_cost.0 * Decimal::from(p.quantity.0)
+                // 其他 position：调用 gateway 拉取 quote；只接受 Fresh，stale / missing fallback 到 remainingCostBasis。
+                match self.gateway.get_snapshot(&p.ts_code) {
+                    Ok(sn) if matches!(sn.quote.freshness.status, FreshnessStatus::Fresh) => {
+                        match sn.quote.price {
+                            Some(pr) => pr.0 * Decimal::from(p.quantity.0),
+                            None => p.avg_cost.0 * Decimal::from(p.quantity.0),
+                        }
+                    }
+                    _ => p.avg_cost.0 * Decimal::from(p.quantity.0),
+                }
             };
             if p.ts_code == *ts_code {
                 current_ts_market_value = value;
             }
             risk_equity += value;
+            position_risk_values.push(value);
         }
         let risk_equity_safe = if risk_equity > Decimal::ZERO {
             risk_equity
@@ -2869,20 +2881,12 @@ impl AccountService {
                 "single position ratio exceeded".into(),
             ));
         }
-        // gross exposure ratio
-        let post_gross: Decimal = positions
-            .iter()
-            .map(|p| {
-                let v = if p.ts_code == *ts_code {
-                    current_ts_market_value
-                } else {
-                    p.avg_cost.0 * Decimal::from(p.quantity.0)
-                };
-                v
-            })
-            .sum::<Decimal>()
-            + current_ts_pending_value
-            + new_buy_value;
+        // gross exposure ratio：用与 risk_equity 一致的 per-position 估值（marketValue 优先，
+        // stale/missing fallback 到 remainingCostBasis，永不按 0 计入）。
+        let post_gross: Decimal =
+            position_risk_values.iter().copied().sum::<Decimal>()
+                + current_ts_pending_value
+                + new_buy_value;
         let mger =
             Decimal::from_f64_retain(policy.max_gross_exposure_ratio).unwrap_or(Decimal::ZERO);
         if post_gross > risk_equity_safe * mger {
@@ -4515,6 +4519,214 @@ mod tests {
         );
         assert!(!resp.accepted);
         assert_eq!(resp.reason, Some(ErrorCode::RiskLimitExceeded));
+    }
+
+    #[test]
+    fn risk_check_uses_fresh_marketvalue_for_each_position() {
+        // Spec: account-module.md §2 — riskEquity = cash + sum(positionRiskValue)：
+        // 已估值仓位用 marketValue，未估值仓位用 remainingCostBasis；任何仓位不得按 0 计入。
+        //
+        // 场景：3 open positions A/B/C，cash = 970_000
+        //   A: 200 sh @ avg 50 → gateway 返回 fresh 100  → marketValue = 20_000
+        //   B: 200 sh @ avg 50 → gateway 返回 missing   → fallback avg = 10_000
+        //   C: 200 sh @ avg 50 → gateway 返回 fresh 80   → marketValue = 16_000
+        // 正确 risk_equity = 970_000 + 20_000 + 10_000 + 16_000 = 1_016_000
+        //                  gross exposure = 46_000 (A+B+C 用上述估值)
+        // 旧实现 risk_equity = 970_000 + 3 * 10_000 = 1_000_000
+        //                  gross exposure = 30_000 (全部按 avg)
+        //
+        // 设置 max_gross_exposure_ratio = 0.045（即允许的 gross ≈ 45_720）：
+        //   * 正确实现：post_gross = 46_000 + new_buy(1_000) = 47_000 > 45_720 → 拒绝
+        //   * 旧实现：  post_gross = 30_000 + 1_000      = 31_000 < 45_720 → 通过
+        // 测试新实现必须拒绝，证明 B/C 的 marketValue 没被忽略。
+        let (db, svc, gw) = setup_account_with_tight_risk(
+            1_000_000,
+            AccountRiskPolicy {
+                max_single_position_ratio: 0.99,
+                max_gross_exposure_ratio: 0.045,
+                max_order_value_ratio: 0.99,
+                max_daily_new_orders: 100,
+            },
+        );
+        let code_a = seed_inst(&db, "600000.SH");
+        let code_b = seed_inst(&db, "600001.SH");
+        let code_c = seed_inst(&db, "600002.SH");
+        let code_d = seed_inst(&db, "600003.SH");
+
+        // Adjust cash to 970_000 (simulate the 30_000 spent on A+B+C avg cost).
+        let repo = AccountRepository::new(&db);
+        repo.update_cash(Money(Decimal::from(970_000)), Utc::now()).unwrap();
+
+        // Insert 3 open positions directly.
+        let make_pos = |id: &str, code: &TsCode| Position {
+            position_id: id.into(),
+            ts_code: code.clone(),
+            name: "T".into(),
+            status: PositionStatus::Open,
+            quantity: Shares(200),
+            sellable_quantity: Shares(200),
+            avg_cost: Price(Decimal::from(50)),
+            market_price: None,
+            market_value: None,
+            quote_freshness: None,
+            realized_pnl: Money(Decimal::ZERO),
+            unrealized_pnl: None,
+            opened_at: Utc::now(),
+            closed_at: None,
+            protection: None,
+            actor: TradingActor::Agent,
+            reasoning: None,
+            warnings: vec![],
+        };
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &make_pos("pos_a", &code_a))?;
+            AccountRepository::upsert_position(tx, &make_pos("pos_b", &code_b))?;
+            AccountRepository::upsert_position(tx, &make_pos("pos_c", &code_c))?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Gateway: A & C return fresh quotes; B missing.
+        gw.set(
+            &code_a,
+            Ok(mock_snapshot(
+                &code_a,
+                vec![(99.0, 1)],
+                vec![(100.0, 1)], // price = 100
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        gw.set(
+            &code_c,
+            Ok(mock_snapshot(
+                &code_c,
+                vec![(79.0, 1)],
+                vec![(80.0, 1)], // price = 80
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        // B is intentionally unset → gateway returns QuoteMissing → fallback to avg.
+
+        // D quote: fresh, price = 10, qty = 100 → new_buy = 1_000
+        let d_snap = mock_snapshot(
+            &code_d,
+            vec![(9.0, 100)],
+            vec![(10.0, 100)],
+            TradeStatus::Trading,
+            FreshnessStatus::Fresh,
+        );
+        let instrument_d = MarketInstrument {
+            ts_code: code_d.clone(),
+            name: "D".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+
+        // 正确实现下 gross = 46_000 + 1_000 > 45_720 → RiskLimitExceeded.
+        let res = svc.risk_check_buy(
+            &code_d,
+            Price(Decimal::from(10)),
+            Shares(100),
+            Some(&d_snap),
+            &instrument_d,
+        );
+        match res {
+            Err((ErrorCode::RiskLimitExceeded, _)) => {}
+            other => panic!(
+                "expected RiskLimitExceeded (proves marketValue used for B/C), got {:?}",
+                other
+            ),
+        }
+
+        // Sanity check: if we loosen gross to 0.05 (50_720), it should now pass —
+        // 证明拒绝原因确实来自 gross exposure 的精确计算而非别的因素。
+        let (db2, svc2, gw2) = setup_account_with_tight_risk(
+            1_000_000,
+            AccountRiskPolicy {
+                max_single_position_ratio: 0.99,
+                max_gross_exposure_ratio: 0.05,
+                max_order_value_ratio: 0.99,
+                max_daily_new_orders: 100,
+            },
+        );
+        let a2 = seed_inst(&db2, "600000.SH");
+        let b2 = seed_inst(&db2, "600001.SH");
+        let c2 = seed_inst(&db2, "600002.SH");
+        let d2 = seed_inst(&db2, "600003.SH");
+        let repo2 = AccountRepository::new(&db2);
+        repo2.update_cash(Money(Decimal::from(970_000)), Utc::now()).unwrap();
+        repo2.tx(|tx| {
+            AccountRepository::upsert_position(tx, &make_pos("pos_a", &a2))?;
+            AccountRepository::upsert_position(tx, &make_pos("pos_b", &b2))?;
+            AccountRepository::upsert_position(tx, &make_pos("pos_c", &c2))?;
+            Ok(())
+        })
+        .unwrap();
+        gw2.set(
+            &a2,
+            Ok(mock_snapshot(
+                &a2,
+                vec![(99.0, 1)],
+                vec![(100.0, 1)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        gw2.set(
+            &c2,
+            Ok(mock_snapshot(
+                &c2,
+                vec![(79.0, 1)],
+                vec![(80.0, 1)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let d_snap2 = mock_snapshot(
+            &d2,
+            vec![(9.0, 100)],
+            vec![(10.0, 100)],
+            TradeStatus::Trading,
+            FreshnessStatus::Fresh,
+        );
+        let instrument_d2 = MarketInstrument {
+            ts_code: d2.clone(),
+            name: "D".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let res2 = svc2.risk_check_buy(
+            &d2,
+            Price(Decimal::from(10)),
+            Shares(100),
+            Some(&d_snap2),
+            &instrument_d2,
+        );
+        assert!(res2.is_ok(), "with looser gross ratio should pass: {:?}", res2);
     }
 
     // ------------------------------------------------------------------
