@@ -370,24 +370,40 @@ impl QuotesService {
             if let Some(periods) = include.klines.as_ref() {
                 let mut klines = std::collections::BTreeMap::new();
                 for p in periods {
-                    // Spec §2: 本地存 unadjusted；qfq 由 read 时基于 xdxr 事件现算（带 cache）。
-                    let (series, used_none) =
-                        match self.read_kline_series_with_adjust(ts_code, *p, AdjEnum::Qfq, kline_limit) {
-                            Ok(Some(s)) => {
-                                // 如果 series 带 QfqMissing warning（xdxr 缺失 → 实际是 unadjusted）
-                                // 则按 spec §2 line 233 标 using_unadjusted_kline。
-                                let lacks_xdxr = s.warnings.contains(&WarningCode::QfqMissing);
-                                (Some(s), lacks_xdxr)
+                    // Spec §2 三态语义已由 read_kline_series_with_adjust 内部正确判定：
+                    //  - 状态 A：series.warnings 含 QfqMissing；
+                    //  - 状态 B：无 warning（合理终态）；
+                    //  - 状态 C：series.warnings 含 UsingUnadjustedKline。
+                    // qfq 读不到 → fallback adjust='none' 并标 UsingUnadjustedKline。
+                    let series = match self.read_kline_series_with_adjust(
+                        ts_code,
+                        *p,
+                        AdjEnum::Qfq,
+                        kline_limit,
+                    ) {
+                        Ok(Some(s)) => Some(s),
+                        _ => match repo
+                            .load_kline_series(ts_code, *p, AdjEnum::None, kline_limit)
+                        {
+                            Ok(Some(mut s)) => {
+                                if !s.warnings.contains(&WarningCode::UsingUnadjustedKline) {
+                                    s.warnings.push(WarningCode::UsingUnadjustedKline);
+                                }
+                                Some(s)
                             }
-                            _ => match repo.load_kline_series(ts_code, *p, AdjEnum::None, kline_limit) {
-                                Ok(Some(s)) => (Some(s), true),
-                                _ => (None, false),
-                            },
-                        };
-                    if let Some(mut s) = series {
-                        if used_none {
-                            s.warnings.push(WarningCode::UsingUnadjustedKline);
-                            item.warnings.push(WarningCode::UsingUnadjustedKline);
+                            _ => None,
+                        },
+                    };
+                    if let Some(s) = series {
+                        // 透传 series 上的 warning 到 item 级（QfqMissing / UsingUnadjustedKline）。
+                        for w in &s.warnings {
+                            if matches!(
+                                w,
+                                WarningCode::QfqMissing | WarningCode::UsingUnadjustedKline
+                            ) && !item.warnings.contains(w)
+                            {
+                                item.warnings.push(*w);
+                            }
                         }
                         klines.insert(period_key(*p), s);
                     }
@@ -1413,9 +1429,14 @@ impl QuotesService {
     /// 1. `adjust == None` → 直接读 `adjust='none'` 行。
     /// 2. `adjust == Qfq / Hfq`：
     ///    a. 算 cache key `(ts_code, period, adjust, xdxr_version)`；hit → 返回。
-    ///    b. miss → 读 unadjusted + 读 xdxr events → `apply_adjust`；
-    ///       结果写 cache。
-    /// 3. xdxr 完全缺失 → warning `qfq_missing`，返回 unadjusted 当 fallback。
+    ///    b. miss → 读 unadjusted + 读 xdxr events → `apply_adjust`；结果写 cache。
+    /// 3. xdxr 三态语义判定（spec §2 line 233-240）：
+    ///    - **状态 A · 全局未刷新**：`quote_refresh_state` 没有 `kind="xdxr"` 记录
+    ///      → push `qfq_missing` warning（语义："xdxr 尚未刷新，结果可能扭曲"）。
+    ///    - **状态 B · 该标的天然无除权**：xdxr 已刷新过但本 ts_code 的 events 为空
+    ///      → 合理终态，**不**返回 warning。
+    ///    - **状态 C · 该标的部分历史缺失**：events 起点晚于 unadjusted K 线起点
+    ///      → push `using_unadjusted_kline` warning（语义："复权数据可能不完整"）。
     pub fn read_kline_series_with_adjust(
         &self,
         ts_code: &TsCode,
@@ -1449,6 +1470,8 @@ impl QuotesService {
             AdjEnum::None => crate::domain::quotes::AdjustMode::None,
         };
         let adjusted_points = crate::domain::quotes::apply_adjust(&unadj.points, &events, mode);
+        // 三态判定 —— 先查 xdxr 是否曾经刷新过（任意 trade_date）。
+        let xdxr_refreshed = repo.has_refresh_state("xdxr").unwrap_or(false);
         let mut series = KlineSeries {
             period,
             adjust,
@@ -1456,8 +1479,18 @@ impl QuotesService {
             freshness: unadj.freshness,
             warnings: unadj.warnings,
         };
-        if events.is_empty() {
+        if !xdxr_refreshed {
+            // 状态 A：xdxr 全局从未刷新 → qfq/hfq 等同 unadjusted，语义 "尚未刷新"。
             series.warnings.push(WarningCode::QfqMissing);
+        } else if events.is_empty() {
+            // 状态 B：该标的（指数 / 未除权股 / ETF）天然无除权事件 → 合理终态，不发 warning。
+        } else if let (Some(first_event), Some(first_bar)) =
+            (events.first(), series.points.first())
+        {
+            // 状态 C：events 起点晚于 K 线起点 → 历史段未被复权 factor 覆盖。
+            if first_event.occur_date > first_bar.date {
+                series.warnings.push(WarningCode::UsingUnadjustedKline);
+            }
         }
         self.adjust_cache.put(key, series.clone());
         Ok(Some(series))
@@ -2993,6 +3026,156 @@ mod tests {
         assert_eq!(series.points[0].close.0, Decimal::new(20000, 2));
     }
 
+    // ----------------------------------------------------------------- xdxr 三态（spec §2 line 233-240）
+    //
+    // 状态 A：xdxr 全局未刷新（quote_refresh_state 无 kind="xdxr"）
+    //         → 任意 ts_code 读 qfq 应附 QfqMissing。
+    // 状态 B：xdxr 刷新过但该 ts_code 自然无 events（指数 / 未除权股 / ETF）
+    //         → 不发 warning（合理终态）。
+    // 状态 C：xdxr 刷新过且本 ts_code 有 events，但 events[0] 晚于 K 线起点
+    //         → 附 UsingUnadjustedKline。
+
+    fn seed_unadj_bar(svc: &QuotesService, ts: &TsCode, date: &str, close: f64) {
+        use crate::domain::shared::{Price, Volume};
+        use rust_decimal::prelude::FromPrimitive;
+        let p = Price(Decimal::from_f64(close).unwrap());
+        let bar = KlinePoint {
+            date: TradeDate::parse(date).unwrap(),
+            open: p,
+            close: p,
+            high: p,
+            low: p,
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+    }
+
+    #[test]
+    fn xdxr_state_a_no_refresh_state_pushes_qfq_missing() {
+        // 状态 A：DB 中 quote_refresh_state 没有 kind="xdxr" 记录 → 读 qfq 必须 QfqMissing。
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        seed_unadj_bar(&svc, &ts, "20240620", 200.0);
+        // 显式确认没有 xdxr refresh_state
+        assert!(!svc.repo().has_refresh_state("xdxr").unwrap());
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            series.warnings.contains(&WarningCode::QfqMissing),
+            "state A must push qfq_missing"
+        );
+        assert!(
+            !series.warnings.contains(&WarningCode::UsingUnadjustedKline),
+            "state A only pushes qfq_missing, not using_unadjusted_kline"
+        );
+    }
+
+    #[test]
+    fn xdxr_state_b_refreshed_but_no_events_no_warning() {
+        // 状态 B：xdxr 已刷新过（refresh_state 存在）但本 ts_code 的 events 为 0
+        //        → 合理终态，**不**发 warning。
+        let svc = make_service();
+        seed_instrument(&svc, "000300.SH", "沪深300", InstrumentCategory::Index);
+        let ts = TsCode::parse("000300.SH").unwrap();
+        seed_unadj_bar(&svc, &ts, "20240620", 3500.0);
+        // 写入一条 xdxr refresh_state（模拟 refresh_xdxr_events 已跑过；任意标的 / trade_date 均可）。
+        let td = TradeDate::parse("20240620").unwrap();
+        svc.repo()
+            .record_refresh_state("xdxr", td, 5000, 4900, 100, Utc::now())
+            .unwrap();
+        // 本 ts_code 没有任何 events（指数 / 未除权股）。
+        assert!(svc.repo().list_xdxr_events(&ts).unwrap().is_empty());
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !series.warnings.contains(&WarningCode::QfqMissing),
+            "state B must not push qfq_missing"
+        );
+        assert!(
+            !series.warnings.contains(&WarningCode::UsingUnadjustedKline),
+            "state B must not push using_unadjusted_kline (natural no-event terminal)"
+        );
+    }
+
+    #[test]
+    fn xdxr_state_c_events_start_later_than_kline_start_pushes_using_unadjusted() {
+        // 状态 C：xdxr 已刷新，且该 ts_code 有 events，但 events[0].occur_date > bars[0].date
+        //        → 历史段未被复权 factor 覆盖，必须 UsingUnadjustedKline。
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // K 线起点 2014-06-01；事件起点 2014-06-30（晚于 K 线起点）。
+        seed_unadj_bar(&svc, &ts, "20140601", 200.0);
+        seed_unadj_bar(&svc, &ts, "20140630", 198.8);
+        let td = TradeDate::parse("20140630").unwrap();
+        svc.repo()
+            .record_refresh_state("xdxr", td, 1, 1, 0, Utc::now())
+            .unwrap();
+        let ev = crate::domain::quotes::XdxrEvent::dividend_and_split(
+            ts.clone(),
+            TradeDate::parse("20140630").unwrap(),
+            Some(12.0),
+            Some(0.0),
+            Some(1.0),
+            Some(0.0),
+            1_700_000_000_000,
+        );
+        svc.repo().upsert_xdxr_events(&ts, &[ev]).unwrap();
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(
+            series.warnings.contains(&WarningCode::UsingUnadjustedKline),
+            "state C must push using_unadjusted_kline"
+        );
+        assert!(
+            !series.warnings.contains(&WarningCode::QfqMissing),
+            "state C is not state A (refresh has happened)"
+        );
+    }
+
+    #[test]
+    fn xdxr_state_c_full_coverage_no_warning() {
+        // 边界：events[0] 等于 K 线起点 → 复权数据完整 → 无 warning。
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        seed_unadj_bar(&svc, &ts, "20140630", 198.8);
+        let td = TradeDate::parse("20140630").unwrap();
+        svc.repo()
+            .record_refresh_state("xdxr", td, 1, 1, 0, Utc::now())
+            .unwrap();
+        // event occur_date 等于 K 线起点 → first_event.occur_date NOT > first_bar.date。
+        let ev = crate::domain::quotes::XdxrEvent::dividend_and_split(
+            ts.clone(),
+            TradeDate::parse("20140630").unwrap(),
+            Some(12.0),
+            Some(0.0),
+            Some(1.0),
+            Some(0.0),
+            1_700_000_000_000,
+        );
+        svc.repo().upsert_xdxr_events(&ts, &[ev]).unwrap();
+        let series = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert!(!series.warnings.contains(&WarningCode::QfqMissing));
+        assert!(
+            !series.warnings.contains(&WarningCode::UsingUnadjustedKline),
+            "events covering full kline range should not push any warning"
+        );
+    }
+
     #[test]
     fn read_kline_qfq_with_xdxr_applies_factor_and_caches() {
         use crate::domain::shared::{Amount, Price, Volume};
@@ -3097,6 +3280,17 @@ mod tests {
             1_700_000_000_000,
         );
         svc.repo().upsert_xdxr_events(&ts, &[ev]).unwrap();
+        // 模拟 refresh_xdxr_events 完成（spec §2 三态判定需要 refresh_state 标记）。
+        svc.repo()
+            .record_refresh_state(
+                "xdxr",
+                TradeDate::parse("20140630").unwrap(),
+                1,
+                1,
+                0,
+                Utc::now(),
+            )
+            .unwrap();
         // 显式 invalidate（refresh_xdxr_events 内部会调；这里测函数式）
         svc.adjust_cache.invalidate(&ts);
         let s2 = svc

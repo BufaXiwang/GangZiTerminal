@@ -816,6 +816,22 @@ impl<'a> QuotesRepository<'a> {
 
     // ====================================================================== refresh_state
 
+    /// 判断指定 `refresh_kind` 是否曾经成功记录过（任意 trade_date）。
+    ///
+    /// Spec: quotes-module.md §2 "本地复权计算" — xdxr 三态判定中区分
+    /// 状态 A (从未刷新) 与 状态 B / C (已刷新)。本函数只看 `refresh_kind` 是否存在；
+    /// 不读 success/failed 计数。
+    pub fn has_refresh_state(&self, kind: &str) -> rusqlite::Result<bool> {
+        self.db.with(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM quote_refresh_state WHERE refresh_kind = ?1)",
+                params![kind],
+                |r| r.get(0),
+            )?;
+            Ok(exists != 0)
+        })
+    }
+
     /// 读取最近一次指定 kind / trade_date 的 refresh 状态。
     pub fn read_refresh_state(
         &self,
