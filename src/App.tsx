@@ -7,7 +7,7 @@
 // hash 路由对桌面端最稳。
 
 import { useEffect } from "react";
-import { Route, Routes } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { ROUTES } from "./lib/router";
 import { useWatchlistStore } from "./lib/watchlistStore";
@@ -15,6 +15,8 @@ import MarketPage from "./pages/MarketPage";
 import NewsPage from "./pages/NewsPage";
 import AccountPage from "./pages/AccountPage";
 
+// Keep-alive：所有 tab 同时挂载，靠 display 切换。切回来时不重建组件树，
+// 不重跑 useEffect / IPC / KLineChart init，几乎瞬时。代价是常驻内存。
 export default function App() {
   // 一次性加载自选列表，市场页 ⭐ 与模拟账户页共享这份集合。
   const loadWatchlist = useWatchlistStore((s) => s.load);
@@ -22,14 +24,25 @@ export default function App() {
     void loadWatchlist();
   }, [loadWatchlist]);
 
+  const { pathname } = useLocation();
+  const active =
+    pathname === ROUTES.news
+      ? "news"
+      : pathname === ROUTES.account
+        ? "account"
+        : "market";
+
   return (
     <AppShell>
-      <Routes>
-        <Route path={ROUTES.market} element={<MarketPage />} />
-        <Route path={ROUTES.news} element={<NewsPage />} />
-        <Route path={ROUTES.account} element={<AccountPage />} />
-        <Route path="*" element={<MarketPage />} />
-      </Routes>
+      <div style={{ display: active === "market" ? "contents" : "none" }}>
+        <MarketPage />
+      </div>
+      <div style={{ display: active === "news" ? "contents" : "none" }}>
+        <NewsPage />
+      </div>
+      <div style={{ display: active === "account" ? "contents" : "none" }}>
+        <AccountPage />
+      </div>
     </AppShell>
   );
 }
