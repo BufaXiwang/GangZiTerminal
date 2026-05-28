@@ -1,0 +1,458 @@
+/*
+ * GangZi Terminal — global styles & design tokens.
+ *
+ * Spec: docs/design/frontend-design.md §2 视觉系统
+ *
+ * 单一色彩入口：所有页面、组件只读这里定义的 CSS variables，不硬编码色值。
+ */
+
+:root {
+  /* 背景 — 暖白纸面 */
+  --bg-app: #faf6ee;
+  --bg-card: #ffffff;
+  --bg-soft: #f3ede0;
+
+  /* 文字 */
+  --fg-strong: #2f2618;
+  --fg-default: #5c5042;
+  --fg-muted: #897866;
+  --fg-faint: #b8a995;
+
+  /* 边框 */
+  --border-strong: #d8c9b3;
+  --border-default: #e5d9c5;
+  --border-soft: #efe7d7;
+
+  /* 品牌（中性偏暖棕） */
+  --brand: #8a6532;
+  --brand-strong: #5e4220;
+  --brand-soft: #ead9be;
+
+  /* 行情（A 股语义：红涨绿跌） */
+  --chart-up: #c0392b;
+  --chart-down: #1f8a47;
+
+  /* 状态 */
+  --state-warn: #c98a1e;
+  --state-info: #5e7b9a;
+  --state-stale: #b8a995;
+
+  /* 字体 */
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+  --font-display: 'Source Serif 4', 'Source Serif Pro', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', Menlo, monospace;
+
+  /* 圆角 */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(47, 38, 24, 0.05);
+  --shadow-md: 0 2px 6px rgba(47, 38, 24, 0.08);
+
+  /* 布局尺寸 */
+  --sidebar-width: 72px;
+  --section-head-height: 56px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background: var(--bg-app);
+  color: var(--fg-default);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* -------- 工具类 -------- */
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+}
+
+.up {
+  color: var(--chart-up);
+}
+
+.down {
+  color: var(--chart-down);
+}
+
+.flat {
+  color: var(--fg-muted);
+}
+
+.muted {
+  color: var(--fg-muted);
+}
+
+.faint {
+  color: var(--fg-faint);
+}
+
+/* -------- AppShell / Sidebar -------- */
+
+.app-shell {
+  display: flex;
+  min-height: 100vh;
+  background: var(--bg-app);
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  flex: 0 0 var(--sidebar-width);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 0;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border-default);
+}
+
+.sidebar-logo {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-sm);
+  background: var(--brand);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 18px;
+  margin-bottom: 24px;
+  user-select: none;
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  padding: 0 12px;
+}
+
+.sidebar-link {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  text-decoration: none;
+  transition: background 120ms ease, color 120ms ease;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.sidebar-link:hover {
+  background: var(--bg-card);
+  color: var(--fg-strong);
+}
+
+.sidebar-link.active {
+  background: var(--bg-card);
+  color: var(--brand-strong);
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-sm);
+}
+
+.sidebar-link:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* -------- 主内容区 -------- */
+
+.main-content {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.main-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* -------- PageShell -------- */
+
+.page-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: 24px 32px;
+  gap: 16px;
+}
+
+.page-shell-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.page-shell-control-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.page-shell-workspace {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* -------- SectionHead -------- */
+
+.section-head-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.section-head-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--fg-strong);
+  line-height: 1.2;
+  margin: 0;
+}
+
+.section-head-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.section-head-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* -------- 通用按钮（ghost / primary） -------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 500;
+  border: 1px solid var(--border-default);
+  background: var(--bg-card);
+  color: var(--fg-strong);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.btn:hover {
+  background: var(--bg-soft);
+  border-color: var(--border-strong);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+.btn.primary {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+}
+
+.btn.primary:hover {
+  background: var(--brand-strong);
+  border-color: var(--brand-strong);
+}
+
+.btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-muted);
+}
+
+.btn.ghost:hover {
+  background: var(--bg-soft);
+  color: var(--fg-strong);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* -------- chip / segmented -------- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 12px;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  font-size: 12px;
+  border: 1px solid var(--border-soft);
+}
+
+.chip.active {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  border-color: var(--brand-soft);
+}
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-card);
+}
+
+.segmented-item {
+  height: 28px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border-default);
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--font-body);
+}
+
+.segmented-item:last-child {
+  border-right: none;
+}
+
+.segmented-item.active {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+
+.segmented-item:hover:not(.active) {
+  background: var(--bg-soft);
+  color: var(--fg-strong);
+}
+
+/* -------- 状态指示 -------- */
+
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.status-dot.ok {
+  background: var(--chart-down);
+}
+
+.status-dot.warn {
+  background: var(--state-warn);
+}
+
+.status-dot.error {
+  background: var(--chart-up);
+}
+
+.status-dot.loading {
+  background: var(--state-info);
+}
+
+.status-dot.stale {
+  background: var(--state-stale);
+}
+
+/* -------- placeholder/empty -------- */
+
+.placeholder-block {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  padding: 48px;
+  background: var(--bg-card);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  font-size: 13px;
+}
+
+.placeholder-block .placeholder-title {
+  font-family: var(--font-display);
+  font-size: 16px;
+  color: var(--fg-strong);
+}
+
+/* -------- 滚动条 -------- */
+
+.main-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.main-scroll::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 4px;
+}
+
+.main-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
+
+.main-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
