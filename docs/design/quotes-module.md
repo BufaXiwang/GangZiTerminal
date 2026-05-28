@@ -821,7 +821,7 @@ TDX > Eastmoney
 TDX (minute_time 0x0fb4) > Eastmoney
 ```
 
-- TDX 协议原生支持当日 240 点分时（含集合竞价），是主路径。
+- TDX `minute_time` 协议返回当日 240 点分时（09:30–14:59，每分钟一点），覆盖连续竞价段；**不含**集合竞价（09:15–09:25 / 14:57–15:00）。集合竞价价格由 `MARKET_SNAPSHOT` 的实时 quote 单独承载，不进 `IntradaySeries`。
 - Eastmoney 仅作 TDX 失败 / BJ 的 fallback。
 - 分时只返回一个交易日的 `IntradaySeries`，与 §4 `fetch_data` 契约一致。
 
@@ -871,6 +871,11 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | `daily_basic` | 每个交易日盘后刷新，仅在 `TushareHealthState.isAvailable = true` 时触发；不可用时跳过并保留上次结果 |
 | `company_events` | 每日低频刷新，覆盖未来 N 天事件窗口；仅在 `TushareHealthState.isAvailable = true` 时触发 |
 | 交易日历 | 进程启动时使用内置推算结果；`TushareHealthState.isAvailable = true` 时每日校准一次 |
+
+时段判定：
+
+- **`is_trading_time`**：是否处于**报价时段**（连续竞价 09:30–11:30 + 13:00–15:00），仅用于实时 quote refresh 节奏判断。
+- **`is_in_trading_session`**：是否处于**分时 / 分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_intraday` / `refresh_minute_klines` 的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
 
 规则：
 
