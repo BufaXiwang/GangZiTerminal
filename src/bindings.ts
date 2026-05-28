@@ -32,10 +32,52 @@ export type CommandResult<T, E = CommandError> =
   | { status: "ok"; data: T }
   | { status: "error"; error: E };
 
-export type ErrorCode = string;
+/**
+ * Spec: shared-types.md §5 — 封闭集合（与 src-tauri/src/domain/shared/codes.rs::ErrorCode 对齐）。
+ *
+ * 历史：F1 / F2 阶段 `ErrorCode` 是开放 string；现在收紧成闭合 union，但保留
+ * 后端 IPC 框架可能返回的额外 code（如 `ipc.unknown`、`tauri.*`）—— 这些走 string fallback。
+ * 实际后端 DTO 的 code 都必须是下面 union 之一；前端 ResponseError / FetchNewsError /
+ * WarmArticlesError 等都基于这个类型，跟 Rust serde 一致。
+ */
+export type ErrorCode =
+  | "invalid_input"
+  | "not_found"
+  | "provider_unavailable"
+  | "rate_limited"
+  | "db_error"
+  | "parse_error"
+  | "quote_missing"
+  | "quote_stale"
+  | "quote_price_missing"
+  | "depth_missing"
+  | "outside_trading_session"
+  | "instrument_not_tradable"
+  | "instrument_suspended"
+  | "limit_up_down_blocked"
+  | "insufficient_cash"
+  | "insufficient_sellable_quantity"
+  | "invalid_lot_size"
+  | "order_not_pending"
+  | "risk_limit_exceeded"
+  | "strategy_required"
+  | "duplicate_event"
+  | "version_conflict"
+  | "article_extract_failed"
+  | "tool_timeout"
+  | "provider_context_too_long";
+
+/**
+ * 前端 IPC wrapper 可能产生的 envelope code（非后端 ErrorCode），
+ * 仅在 invoke 失败 / 反序列化失败时出现。
+ */
+export type IpcEnvelopeCode = "ipc.unknown";
+
+/** CommandError.code 包括后端 ErrorCode + 前端 wrapper code。 */
+export type AnyErrorCode = ErrorCode | IpcEnvelopeCode | (string & {});
 
 export interface CommandError {
-  code: ErrorCode;
+  code: AnyErrorCode;
   message?: string;
   details?: unknown;
 }
@@ -118,7 +160,7 @@ export interface Freshness {
 }
 
 export interface ResponseError {
-  code: string;
+  code: ErrorCode;
   message?: string;
   field?: string;
   tsCode?: TsCode;
@@ -523,56 +565,172 @@ export interface PingResult {
 // News — fetch_news / list_news_sources / warm_articles
 //
 // Spec: docs/design/news-module.md §4 §5
-// 占位类型：F3 sub-agent 完成时补精确字段。
+// 后端 DTO: src-tauri/src/domain/news/{types, source, errors, events}.rs
 // ============================================================================
 
+/** Spec: news-module.md §4 fetch_news. */
 export interface FetchNewsRequest {
-  sourceKeys?: string[] | null;
-  from?: string | null;
-  to?: string | null;
-  keyword?: string | null;
-  limit?: number | null;
-  offset?: number | null;
-  [key: string]: unknown;
+  /** FTS 文本查询；trim + 折叠连续空白后才能命中。 */
+  query?: string;
+  /** sourceId 数组；未知 source 后端会返回 invalid_input。 */
+  sources?: string[];
+  /** ISO-8601。 */
+  publishedFrom?: OccurredAt;
+  /** ISO-8601。 */
+  publishedTo?: OccurredAt;
+  /** 是否附带本地 ArticleContent；不会触发远端抽取。 */
+  includeArticle?: boolean;
+  /** 默认 50，最大 200。 */
+  limit?: number;
+  /** 默认 0。 */
+  offset?: number;
 }
 
-export interface NewsItem {
+/** Spec: news-module.md §4 fetch_news item.article。 */
+export interface ArticleSnippet {
+  title?: string;
+  content: string;
+  fetchedAt?: OccurredAt;
+}
+
+export interface NewsItemFreshness {
+  /** 距离 fetchedAt 的毫秒数。 */
+  ageMs?: number;
+  articleFetchedAt?: OccurredAt;
+}
+
+export interface FetchNewsItem {
   id: string;
-  sourceKey?: string | null;
-  title?: string | null;
-  url?: string | null;
-  publishedAt?: string | null;
-  [key: string]: unknown;
+  /** sourceId，与 NewsSource.sourceId 对应。 */
+  source: string;
+  title: string;
+  summary?: string;
+  url?: string;
+  publishedAt?: OccurredAt;
+  /** 已清洗 + 截断的正文摘录，默认前 500 字符。 */
+  articleExcerpt?: string;
+  /** includeArticle=true 时存在；缺失正文时返回 article_missing warning，不返回 article。 */
+  article?: ArticleSnippet;
+  freshness?: NewsItemFreshness;
+  warnings: WarningCode[];
+  errors: ErrorCode[];
+}
+
+export interface FetchNewsError {
+  field?: string;
+  code: ErrorCode;
+  message?: string;
+}
+
+export interface FetchNewsPage {
+  limit: number;
+  offset: number;
+  hasMore: boolean;
 }
 
 export interface FetchNewsResponse {
-  items: NewsItem[];
-  total?: number | null;
-  [key: string]: unknown;
+  items: FetchNewsItem[];
+  errors?: FetchNewsError[];
+  page: FetchNewsPage;
+}
+
+/** Spec: news-module.md §2 NewsSource。 */
+export interface NewsSourceLastError {
+  code: ErrorCode;
+  message?: string;
+  occurredAt: OccurredAt;
 }
 
 export interface NewsSource {
-  key: string;
-  name?: string | null;
-  enabled?: boolean | null;
-  [key: string]: unknown;
+  /** `namespace:channel` 形式。 */
+  sourceId: string;
+  /** Provider key（"rss" / "newsnow" / ...）。 */
+  provider: string;
+  displayName?: string;
+  enabled: boolean;
+  dynamic?: boolean;
+  lastRefreshAt?: OccurredAt;
+  lastError?: NewsSourceLastError;
 }
 
 export interface ListNewsSourcesResponse {
-  sources: NewsSource[];
-  [key: string]: unknown;
+  items: NewsSource[];
 }
 
+/** Spec: news-module.md §4 warm_articles. */
 export interface WarmArticlesRequest {
-  ids?: string[];
-  urls?: string[];
-  [key: string]: unknown;
+  /** 指定要 warm 的 NewsItem.id 列表（最多 200）。 */
+  newsIds?: string[];
+  /** 未传 newsIds 时按 recent_limit 拿最近未抽取的（默认 50，最大 200）。 */
+  recentLimit?: number;
+  /** 强制重新抽取，即使本地已有 ArticleContent。 */
+  force?: boolean;
 }
 
-export interface WarmArticlesResponse {
-  ok: boolean;
-  results?: unknown[];
-  [key: string]: unknown;
+/** NewsRefreshStage —— 与 Rust 端 NewsRefreshStage 对齐。 */
+export type NewsRefreshStage = "fetch" | "normalize" | "save" | "article";
+
+export interface NewsFailure {
+  provider: string;
+  source?: string;
+  code: ErrorCode;
+  message?: string;
+  details?: unknown;
+  stage?: NewsRefreshStage;
+  retryable?: boolean;
+  occurredAt: OccurredAt;
+}
+
+export interface NewsRefreshWarning {
+  provider: string;
+  source?: string;
+  code: WarningCode;
+  message?: string;
+  stage?: NewsRefreshStage;
+  skippedCount?: number;
+  occurredAt: OccurredAt;
+}
+
+export interface WarmArticlesResult {
+  batchId: string;
+  requestedCount: number;
+  attemptedCount: number;
+  articleUpdatedCount: number;
+  articleUpdatedNewsIds: string[];
+  warnings?: NewsRefreshWarning[];
+  failures?: NewsFailure[];
+}
+
+export type WarmArticlesErrorField = "newsIds" | "recentLimit";
+
+export interface WarmArticlesErrorBody {
+  code: ErrorCode;
+  field?: WarmArticlesErrorField;
+  message?: string;
+}
+
+/**
+ * Discriminated union — Rust 端用 `#[serde(untagged)]`，但每个分支 `ok: true | false`
+ * 充当判别字段（TrueFlag / FalseFlag 序列化为 bool literal）。
+ */
+export type WarmArticlesResponse =
+  | { ok: true; result: WarmArticlesResult }
+  | { ok: false; error: WarmArticlesErrorBody };
+
+/** Spec: shared-types.md §6 news-refreshed event payload。 */
+export interface NewsRefreshedPayload {
+  batchId: string;
+  fetchedCount: number;
+  skippedCount: number;
+  savedCount: number;
+  articleUpdatedCount: number;
+  newIds: string[];
+  updatedIds: string[];
+  articleUpdatedNewsIds: string[];
+  failedCount: number;
+  firstFailure?: NewsFailure;
+  failures?: NewsFailure[];
+  warnings?: NewsRefreshWarning[];
 }
 
 // ============================================================================
