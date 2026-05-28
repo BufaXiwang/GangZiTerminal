@@ -1254,10 +1254,18 @@ impl QuotesService {
         trade_date: Option<TradeDate>,
     ) -> Result<RefreshDataResult, ResponseError> {
         if !self.tushare.has_token() {
-            return Err(ResponseError::with_message(
-                ErrorCode::ProviderUnavailable,
-                "tushare token missing for daily_basic",
-            ));
+            // Spec §5 line 764: "TuShare token 缺失时，这些读模型保持旧数据并返回 freshness / warning"。
+            tracing::info!(
+                target: "quotes.refresh",
+                "tushare token missing; daily_basic refresh skipped, keeping local data"
+            );
+            return Ok(RefreshDataResult {
+                total: 0,
+                success: 0,
+                failed: 0,
+                warnings: vec![WarningCode::DataPartial],
+                affected_ts_codes: Vec::new(),
+            });
         }
         let now = Utc::now();
         let eligible = eligible_trade_date(&self.market_time_now());
@@ -1319,10 +1327,18 @@ impl QuotesService {
         window_days: Option<i64>,
     ) -> Result<RefreshDataResult, ResponseError> {
         if !self.tushare.has_token() {
-            return Err(ResponseError::with_message(
-                ErrorCode::ProviderUnavailable,
-                "tushare token missing for company events",
-            ));
+            // Spec §5 line 764: "TuShare token 缺失时，这些读模型保持旧数据并返回 freshness / warning"。
+            tracing::info!(
+                target: "quotes.refresh",
+                "tushare token missing; company events refresh skipped, keeping local data"
+            );
+            return Ok(RefreshDataResult {
+                total: 0,
+                success: 0,
+                failed: 0,
+                warnings: vec![WarningCode::DataPartial],
+                affected_ts_codes: Vec::new(),
+            });
         }
         let now = Utc::now();
         let window_days = window_days.unwrap_or(30);
@@ -2088,17 +2104,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_daily_basic_requires_tushare_token() {
+    async fn refresh_daily_basic_without_token_returns_ok_with_warning() {
+        // Spec §5 line 764: token 缺失保持旧数据 + warning，不报错。
         let svc = make_service();
         let res = svc
             .refresh_daily_basic(RefreshDataScope::Universe, None)
             .await
-            .unwrap_err();
-        assert_eq!(res.code, ErrorCode::ProviderUnavailable);
+            .unwrap();
+        assert_eq!(res.total, 0);
+        assert_eq!(res.success, 0);
+        assert_eq!(res.failed, 0);
+        assert!(res.warnings.contains(&WarningCode::DataPartial));
+        assert!(res.affected_ts_codes.is_empty());
     }
 
     #[tokio::test]
-    async fn refresh_company_events_requires_token() {
+    async fn refresh_company_events_without_token_returns_ok_with_warning() {
         let svc = make_service();
         let res = svc
             .refresh_company_events(
@@ -2108,8 +2129,10 @@ mod tests {
                 None,
             )
             .await
-            .unwrap_err();
-        assert_eq!(res.code, ErrorCode::ProviderUnavailable);
+            .unwrap();
+        assert_eq!(res.total, 0);
+        assert!(res.warnings.contains(&WarningCode::DataPartial));
+        assert!(res.affected_ts_codes.is_empty());
     }
 
     #[test]
