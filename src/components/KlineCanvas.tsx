@@ -1,27 +1,25 @@
-// KlineCanvas — KLineChart 实现版（替代 lightweight-charts）。
+// KlineCanvas — KLineChart v9 实现版。
 //
 // Spec: docs/design/frontend-design.md §5 K 线图
 //
-// 优势 vs lightweight-charts：
-// - 内置 setDataLoader（type='init'/'forward' 自动驱动 load-more 左拉加载历史）
-// - 内置 30+ 技术指标（MA / MACD / KDJ / BOLL / RSI 等）
-// - 默认 A 股红涨绿跌（通过 styles 覆盖）
-// - 内置中文 locale
+// 数据流（v9 API）：
+//   init(container, options) → Chart
+//   chart.applyNewData(dataList, hasMoreOlder)  ← 初始数据
+//   chart.setLoadDataCallback({type:'forward'}) ← 用户左拉触发
+//   chart.setPriceVolumePrecision(price, vol)
+//   chart.setStyles({candle.bar.upColor/downColor + grid + crosshair})
+//   chart.createIndicator('VOL')  ← 成交量副图
 //
-// 设计：组件 owns 整个数据流：
-//   useEffect on (tsCode, period) → init chart + setDataLoader
-//   getBars callback 内部：
-//     'init' → 调 fetch_data；空就 ensure_chart_data + 重试
-//     'forward' → 增大 limit 重拉，给出 prepended slice
-// loading/error 自维护并覆盖显示。
+// 组件 owns 整个数据流：useEffect on (tsCode, period) → 重建 chart。
+// loading/empty/error 自维护 + overlay 显示。
 
 import { useEffect, useRef, useState } from "react";
 import {
   init,
   dispose,
+  LoadDataType,
   type Chart,
   type KLineData,
-  type Period,
 } from "klinecharts";
 import {
   commands,
@@ -42,11 +40,8 @@ export type ChartPeriod =
   | "month";
 
 interface KlineCanvasProps {
-  /** 标的 ts_code（带市场后缀 e.g. 000001.SH）*/
   tsCode: string;
-  /** 周期 */
   period: ChartPeriod;
-  /** 价格精度（指数 2，股票 2，基金 3）。可省略，默认 2 */
   pricePrecision?: number;
 }
 
@@ -65,29 +60,6 @@ function isMinutePeriod(p: ChartPeriod): p is MinuteKlinePeriod {
   return (MINUTE_PERIODS as readonly string[]).includes(p);
 }
 
-function periodToKLineChart(p: ChartPeriod): Period {
-  switch (p) {
-    case "intraday":
-      return { type: "minute", span: 1 };
-    case "1m":
-      return { type: "minute", span: 1 };
-    case "5m":
-      return { type: "minute", span: 5 };
-    case "15m":
-      return { type: "minute", span: 15 };
-    case "30m":
-      return { type: "minute", span: 30 };
-    case "60m":
-      return { type: "hour", span: 1 };
-    case "day":
-      return { type: "day", span: 1 };
-    case "week":
-      return { type: "week", span: 1 };
-    case "month":
-      return { type: "month", span: 1 };
-  }
-}
-
 function readCssVar(name: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   const v = getComputedStyle(document.documentElement)
@@ -96,7 +68,6 @@ function readCssVar(name: string, fallback: string): string {
   return v || fallback;
 }
 
-// 后端 fetch_data 返回 → KLineData[]
 async function fetchKlineData(
   tsCode: string,
   period: ChartPeriod,
@@ -262,33 +233,55 @@ export function KlineCanvas({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    const container = containerRef.current;
+    if (!container) return;
+
     const upColor = readCssVar("--chart-up", "#c0392b");
     const downColor = readCssVar("--chart-down", "#1f8a47");
-    const bgCard = readCssVar("--bg-card", "#ffffff");
     const borderSoft = readCssVar("--border-soft", "#efe7d7");
-    const fgDefault = readCssVar("--fg-default", "#5c5042");
     const fgMuted = readCssVar("--fg-muted", "#897866");
 
-    const chart = init(containerRef.current, {
+    const chart = init(container, {
       locale: "zh-CN",
       styles: {
         candle: {
+          type: "candle_solid",
           bar: {
             upColor,
             downColor,
+            noChangeColor: fgMuted,
             upBorderColor: upColor,
             downBorderColor: downColor,
+            noChangeBorderColor: fgMuted,
             upWickColor: upColor,
             downWickColor: downColor,
+            noChangeWickColor: fgMuted,
+          },
+          priceMark: {
+            high: { color: fgMuted },
+            low: { color: fgMuted },
+            last: {
+              upColor,
+              downColor,
+              noChangeColor: fgMuted,
+              line: { dashedValue: [4, 4] },
+            },
           },
         },
         grid: {
           horizontal: { color: borderSoft },
           vertical: { color: borderSoft },
         },
-        xAxis: { axisLine: { color: borderSoft }, tickText: { color: fgMuted } },
-        yAxis: { axisLine: { color: borderSoft }, tickText: { color: fgMuted } },
+        xAxis: {
+          axisLine: { color: borderSoft },
+          tickText: { color: fgMuted },
+          tickLine: { color: borderSoft },
+        },
+        yAxis: {
+          axisLine: { color: borderSoft },
+          tickText: { color: fgMuted },
+          tickLine: { color: borderSoft },
+        },
         crosshair: {
           horizontal: { line: { color: fgMuted } },
           vertical: { line: { color: fgMuted } },
@@ -301,80 +294,79 @@ export function KlineCanvas({
       return;
     }
     chartRef.current = chart;
-    chart.setSymbol({ ticker: tsCode, pricePrecision, volumePrecision: 0 });
-    chart.setPeriod(periodToKLineChart(period));
+    chart.setPriceVolumePrecision(pricePrecision, 0);
+    // 副图：成交量
+    chart.createIndicator("VOL", false, { id: "vol_pane" });
 
-    // 用 closure 跟踪当前 limit + 已加载的 timestamps（避免重复）
+    let cancelled = false;
     let currentLimit = INITIAL_LIMIT;
     const loadedTs = new Set<number>();
-    let cancelled = false;
 
-    chart.setDataLoader({
-      getBars: async ({ type, callback }) => {
+    const setupLoadMore = () => {
+      chart.setLoadDataCallback(({ type, callback }) => {
         if (cancelled) return;
-        if (type === "init") {
-          setStatus("loading");
-          setErrorMsg(null);
-          try {
-            let data = await fetchKlineData(tsCode, period, currentLimit);
-            if (data.length === 0) {
-              // DB 空 → 触发后端 refresh，再读
-              const refreshRes = await commands.ensureChartData(tsCode, period);
-              if (cancelled) return;
-              if (refreshRes.status === "error") {
-                setStatus("error");
-                setErrorMsg(
-                  `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
-                );
-                callback([], false);
-                return;
-              }
-              data = await fetchKlineData(tsCode, period, currentLimit);
-            }
-            if (cancelled) return;
-            if (data.length === 0) {
-              setStatus("empty");
-              callback([], false);
-              return;
-            }
-            data.forEach((b) => loadedTs.add(b.timestamp));
-            setStatus("ok");
-            callback(data, { forward: data.length >= currentLimit });
-          } catch (e) {
-            if (cancelled) return;
-            setStatus("error");
-            setErrorMsg(String(e));
-            callback([], false);
-          }
-        } else if (type === "forward") {
-          // 用户左拉到尽头 → 加大 limit 再取，给出 prepended slice
-          if (currentLimit >= MAX_LIMIT) {
-            callback([], false);
-            return;
-          }
-          currentLimit = Math.min(currentLimit + FORWARD_STEP, MAX_LIMIT);
-          try {
-            const all = await fetchKlineData(tsCode, period, currentLimit);
+        if (type !== LoadDataType.Forward) {
+          callback([], false);
+          return;
+        }
+        if (currentLimit >= MAX_LIMIT) {
+          callback([], false);
+          return;
+        }
+        currentLimit = Math.min(currentLimit + FORWARD_STEP, MAX_LIMIT);
+        void fetchKlineData(tsCode, period, currentLimit).then(
+          (all) => {
             if (cancelled) return;
             const newBars = all.filter((b) => !loadedTs.has(b.timestamp));
             newBars.forEach((b) => loadedTs.add(b.timestamp));
             const stillForward =
               all.length >= currentLimit && currentLimit < MAX_LIMIT;
-            callback(newBars, { forward: stillForward });
-          } catch (e) {
-            if (cancelled) return;
-            callback([], false);
+            callback(newBars, stillForward);
+          },
+          () => {
+            if (!cancelled) callback([], false);
+          },
+        );
+      });
+    };
+
+    void (async () => {
+      try {
+        setStatus("loading");
+        setErrorMsg(null);
+        let data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
+        if (data.length === 0) {
+          // DB 空 → 触发 backend refresh
+          const refreshRes = await commands.ensureChartData(tsCode, period);
+          if (cancelled) return;
+          if (refreshRes.status === "error") {
+            setStatus("error");
+            setErrorMsg(
+              `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
+            );
+            return;
           }
-        } else {
-          // backward (newer) / update — 我们不主动推送
-          callback([], false);
+          data = await fetchKlineData(tsCode, period, INITIAL_LIMIT);
         }
-      },
-    });
+        if (cancelled) return;
+        if (data.length === 0) {
+          setStatus("empty");
+          return;
+        }
+        data.forEach((b) => loadedTs.add(b.timestamp));
+        chart.applyNewData(data, data.length >= INITIAL_LIMIT);
+        setupLoadMore();
+        setStatus("ok");
+      } catch (e) {
+        if (cancelled) return;
+        setStatus("error");
+        setErrorMsg(String(e));
+      }
+    })();
 
     return () => {
       cancelled = true;
-      if (containerRef.current) dispose(containerRef.current);
+      dispose(container);
       chartRef.current = null;
     };
   }, [tsCode, period, pricePrecision]);
