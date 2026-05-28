@@ -14,7 +14,7 @@
 //! - 2026：根据国务院 2025-11 发布的 2026 假日安排通知初稿；如有官方修订需同步更新。
 //! - 2027+：未发布，留待官方通知发布后续填。
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
 /// 中国 A 股法定节假日（交易所休市日）。按年组织、按日期升序。
 ///
@@ -183,6 +183,55 @@ pub fn next_trading_day(date: NaiveDate) -> NaiveDate {
     x
 }
 
+// Spec: docs/design/quotes-module.md §5 后台刷新表（交易时段 guard）
+//
+// A 股交易时段（北京时间 UTC+8）：
+//   开盘集合竞价      09:15-09:25
+//   连续竞价上午      09:30-11:30
+//   连续竞价下午      13:00-14:57
+//   收盘集合竞价      14:57-15:00
+//
+// 下面两个函数为 pipeline 层的"分时 / 分钟 K 远端拉取 guard"提供纯计算判定。
+// 调用方必须把 `now` 转换成北京时间 (`Asia/Shanghai`) 后再传入 — 函数本身不感知时区，
+// 全部按 `NaiveDateTime` 当作"北京墙钟时间"解释。
+//
+// 设计取舍（Spec §5 "分时" / "分钟 K"）：
+// - 9:15-9:25 集合竞价期间 TDX `minute_time` 协议会返回当日已生成的分时点（含集合竞价首点），
+//   所以即使 `MarketTimeContext.is_trading_time` 是 false（连续竞价语义），分时 / 分钟 K
+//   refresh 也应当能发起请求。
+// - 因此本 guard 用 `[09:15, 15:00]`，比 `MarketTimeContext.is_trading_time` 的
+//   `[09:30, 11:30) ∪ [13:00, 15:00)` 更宽，专门给"intraday / minute-K 数据是否还在生成"用，
+//   不混淆 quote 时段判断。
+// - 午休 11:30-13:00 期间分时数据不再变化，但已生成的部分仍存在；为了让"盘中首次打开 app
+//   午休时刻"能补拉到上午的数据，**guard 在午休时段保持 true**，把"是否补拉"的细节交给
+//   pipeline 层（已有 DB 数据可跳过远端拉取）。
+
+const SESSION_OPEN_BJ: NaiveTime = match NaiveTime::from_hms_opt(9, 15, 0) {
+    Some(t) => t,
+    None => unreachable!(),
+};
+const SESSION_CLOSE_BJ: NaiveTime = match NaiveTime::from_hms_opt(15, 0, 0) {
+    Some(t) => t,
+    None => unreachable!(),
+};
+
+/// 给定北京时间 `now`，判断是否处于"分时 / 分钟 K 数据可能还在变化"的窗口。
+///
+/// 规则（spec §5 后台刷新表 + intraday TDX-primary）：
+/// 1. `now.date()` 不是交易日 → false。
+/// 2. `now.time()` ∉ `[09:15, 15:00]`（北京墙钟） → false。
+/// 3. 否则 true（含午休 11:30-13:00；分时点已经生成在那也合理）。
+///
+/// **调用方契约**：`now` 必须为北京时间 (`Asia/Shanghai`) 的 `NaiveDateTime`；
+/// caller 负责 timezone 转换。
+pub fn is_in_trading_session(now: NaiveDateTime) -> bool {
+    if !is_trading_day(now.date()) {
+        return false;
+    }
+    let t = now.time();
+    t >= SESSION_OPEN_BJ && t <= SESSION_CLOSE_BJ
+}
+
 /// 闭区间 `[start, end]` 之间所有交易日，按升序。
 pub fn trading_days_between(start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
     if end < start {
@@ -315,5 +364,72 @@ mod tests {
     fn new_year_2026_closed() {
         assert!(!is_trading_day(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()));
         assert!(!is_trading_day(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()));
+    }
+
+    // ----------------------------------------------------------------- is_in_trading_session
+
+    fn bj(y: i32, m: u32, d: u32, hh: u32, mm: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(hh, mm, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn session_continuous_morning_is_in() {
+        // 普通周五 2024-03-15 10:00 北京
+        assert!(is_in_trading_session(bj(2024, 3, 15, 10, 0)));
+    }
+
+    #[test]
+    fn session_call_auction_is_in() {
+        // 2024-03-15 09:20 — 开盘集合竞价
+        assert!(is_in_trading_session(bj(2024, 3, 15, 9, 20)));
+        // 09:15 lower boundary inclusive
+        assert!(is_in_trading_session(bj(2024, 3, 15, 9, 15)));
+    }
+
+    #[test]
+    fn session_just_before_open_is_out() {
+        // 09:14 北京 — 集合竞价开始前一分钟
+        assert!(!is_in_trading_session(bj(2024, 3, 15, 9, 14)));
+    }
+
+    #[test]
+    fn session_lunch_is_in() {
+        // 12:00 北京 — 午休（仍在 9:15-15:00 之间；按 guard 设计保留 true）
+        assert!(is_in_trading_session(bj(2024, 3, 15, 12, 0)));
+    }
+
+    #[test]
+    fn session_after_close_is_out() {
+        // 16:00 北京 — 收盘后
+        assert!(!is_in_trading_session(bj(2024, 3, 15, 16, 0)));
+        // 15:01 北京 — 收盘后
+        assert!(!is_in_trading_session(bj(2024, 3, 15, 15, 1)));
+    }
+
+    #[test]
+    fn session_15_00_inclusive_boundary() {
+        // 15:00 整点：spec/讨论上属于"集合竞价收盘最后一刻"，按 guard 设计仍 true。
+        // 若策略改成 exclusive，请修改 SESSION_CLOSE_BJ 比较为 `<`。
+        assert!(is_in_trading_session(bj(2024, 3, 15, 15, 0)));
+    }
+
+    #[test]
+    fn session_holiday_2024_02_12_spring_festival_is_out() {
+        // 2024-02-12 春节，即使是 10:00 也是 false
+        assert!(!is_in_trading_session(bj(2024, 2, 12, 10, 0)));
+    }
+
+    #[test]
+    fn session_saturday_2024_03_16_is_out() {
+        assert!(!is_in_trading_session(bj(2024, 3, 16, 10, 0)));
+    }
+
+    #[test]
+    fn session_compensatory_workday_2025_02_08_morning_is_in() {
+        // 春节补班 2025-02-08 周六 10:00 北京 — 视为交易日
+        assert!(is_in_trading_session(bj(2025, 2, 8, 10, 0)));
     }
 }

@@ -46,7 +46,8 @@ pub use scan::{
 };
 pub use sources::core_indexes;
 pub use trade_calendar::{
-    is_trading_day, next_trading_day, previous_trading_day, trading_days_between,
+    is_in_trading_session, is_trading_day, next_trading_day, previous_trading_day,
+    trading_days_between,
 };
 pub use tushare_health::{TushareHealthConfig, TushareHealthState};
 pub use xdxr::{XdxrCategory, XdxrEvent};
