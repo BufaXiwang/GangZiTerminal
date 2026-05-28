@@ -14,6 +14,7 @@ pub mod limit;
 pub mod quote;
 pub mod scan;
 pub mod sources;
+pub mod trade_calendar;
 pub mod tushare_health;
 pub mod xdxr;
 
@@ -42,6 +43,9 @@ pub use scan::{
     ScanOp, ScanResult, ScanSortBy, ScanUniverse,
 };
 pub use sources::core_indexes;
+pub use trade_calendar::{
+    is_trading_day, next_trading_day, previous_trading_day, trading_days_between,
+};
 pub use tushare_health::{TushareHealthConfig, TushareHealthState};
 pub use xdxr::{XdxrCategory, XdxrEvent};
 

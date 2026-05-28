@@ -37,3 +37,22 @@
 
 如果未来路线图明确加入回测或离线分析，再单独评估。
 
+---
+
+## 交易日历假日表续更
+
+**状态**：每年滚动维护，由人工 PR 提交。
+
+**位置**：`src-tauri/src/domain/quotes/trade_calendar.rs::HOLIDAYS` + `COMPENSATORY_WORKDAYS`。
+
+**维护节奏**：
+- 国务院办公厅一般在每年 11-12 月发布次年法定节假日通知（例：[国办发明电〔2024〕14号](https://www.gov.cn/zhengce/zhengceku/) 即 2025 年安排）。
+- 发布后 1 周内提 PR 续更对应年份的 `HOLIDAYS` 和 `COMPENSATORY_WORKDAYS`，并补 `is_trading_day(...)` 测试用例覆盖关键日（春节首/末、国庆、调休补班）。
+
+**当前覆盖**：
+- 2024 / 2025：已确认。
+- 2026：基于国务院 2025-11 发布的初版通知；如有官方修订需同步更新。`COMPENSATORY_WORKDAYS` 2026 段暂缺（待官方通知发布后核对补齐）。
+- 2027+：未发布，待官方通知后续补。
+
+**TuShare 校准**：`TushareHealthState.isAvailable = true` 时由 pipeline 调 `trade_cal` 校准本地推算；差异点以 TuShare 为准并记录修正日志（见 spec quotes-module.md §5 "交易日历"）。
+
