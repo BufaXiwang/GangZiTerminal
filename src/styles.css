@@ -1842,6 +1842,115 @@ body {
   min-height: 0;
 }
 
+/* -------- WatchlistPanel -------- */
+
+.watchlist-panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.watchlist-add-btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.watchlist-table {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.watchlist-table-header {
+  display: grid;
+  grid-template-columns: 100px 1fr 80px 80px 90px 50px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 11px;
+  color: var(--fg-muted);
+  padding: 0 4px;
+}
+
+.watchlist-th {
+  padding: 6px 8px;
+}
+
+.watchlist-th.right {
+  text-align: right;
+}
+
+.watchlist-table-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.watchlist-row {
+  display: grid;
+  grid-template-columns: 100px 1fr 80px 80px 90px 50px;
+  align-items: center;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 0 4px;
+}
+
+.watchlist-row.stale .watchlist-cell.tabular {
+  color: var(--fg-faint);
+}
+
+.watchlist-cell {
+  padding: 0 8px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.watchlist-cell.right {
+  justify-content: flex-end;
+}
+
+.watchlist-cell.left {
+  justify-content: flex-start;
+}
+
+.watchlist-note-chip {
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+  cursor: help;
+}
+
+.watchlist-remove-btn {
+  height: 26px;
+  width: 26px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+}
+
+.watchlist-remove-btn:hover {
+  color: var(--chart-up);
+  background: rgba(192, 57, 43, 0.08);
+}
+
+.watchlist-empty {
+  padding: 36px 16px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
 .add-watchlist-modal-placeholder {
   margin: auto;
   background: var(--bg-card);
