@@ -25,9 +25,16 @@ interface WatchlistPanelProps {
   items: WatchlistItemView[];
   loading: boolean;
   onOpenAdd: () => void;
+  /** 点击行（非操作按钮）→ 弹 K 线 modal */
+  onSelect?: (tsCode: TsCode, name?: string | null) => void;
 }
 
-export function WatchlistPanel({ items, loading, onOpenAdd }: WatchlistPanelProps) {
+export function WatchlistPanel({
+  items,
+  loading,
+  onOpenAdd,
+  onSelect,
+}: WatchlistPanelProps) {
   const remove = useWatchlistStore((s) => s.remove);
   const [busy, setBusy] = useState<TsCode | null>(null);
 
@@ -69,15 +76,9 @@ export function WatchlistPanel({ items, loading, onOpenAdd }: WatchlistPanelProp
           {items.length === 0 && !loading && (
             <div className="watchlist-empty">
               <div className="muted">暂无自选标的</div>
-              <button
-                type="button"
-                className="btn"
-                onClick={onOpenAdd}
-                style={{ marginTop: 12 }}
-              >
-                <Plus size={12} />
-                添加自选
-              </button>
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+                点击右上角添加
+              </div>
             </div>
           )}
           {items.map((it) => {
@@ -88,7 +89,8 @@ export function WatchlistPanel({ items, loading, onOpenAdd }: WatchlistPanelProp
               <div
                 key={it.tsCode}
                 role="row"
-                className={`watchlist-row ${isStale ? "stale" : ""}`}
+                className={`watchlist-row ${isStale ? "stale" : ""} ${onSelect ? "clickable" : ""}`}
+                onClick={() => onSelect?.(it.tsCode, it.name)}
               >
                 <div className="watchlist-cell left tabular">{it.tsCode}</div>
                 <div className="watchlist-cell left">
@@ -128,7 +130,10 @@ export function WatchlistPanel({ items, loading, onOpenAdd }: WatchlistPanelProp
                   <button
                     type="button"
                     className="btn ghost watchlist-remove-btn"
-                    onClick={() => void handleRemove(it.tsCode, it.name)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleRemove(it.tsCode, it.name);
+                    }}
                     disabled={busy === it.tsCode}
                     title="从自选中移除"
                     aria-label="从自选中移除"

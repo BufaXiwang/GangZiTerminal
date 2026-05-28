@@ -365,8 +365,11 @@ export function KlineCanvas({
           return;
         }
         data.forEach((b) => loadedTs.add(b.timestamp));
-        chart.applyNewData(data, data.length >= INITIAL_LIMIT);
+        // 总是允许 forward callback —— 即使 DB 只有 ~150 bars (< INITIAL_LIMIT)，
+        // extend_chart_history 仍能让后端去 TDX 拉更早历史。callback 自己会按
+        // currentLimit >= MAX_LIMIT 或返回无新 bar 时给 callback([], false) 终止。
         setupLoadMore();
+        chart.applyNewData(data, true);
         setStatus("ok");
       } catch (e) {
         if (cancelled) return;

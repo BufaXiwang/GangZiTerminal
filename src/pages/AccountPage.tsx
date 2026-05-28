@@ -32,6 +32,7 @@ import { AccountSummary } from "./account/AccountSummary";
 import { AddWatchlistModal } from "./account/AddWatchlistModal";
 import { PositionsPanel } from "./account/PositionsPanel";
 import { WatchlistPanel } from "./account/WatchlistPanel";
+import { KlineModal } from "../components/KlineModal";
 
 export default function AccountPage() {
   const [snapshot, setSnapshot] = useState<AccountSnapshot | null>(null);
@@ -42,6 +43,11 @@ export default function AccountPage() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selectedPosition, setSelectedPosition] = useState<TsCode | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  // K 线 modal（点击自选行弹出）
+  const [klineModal, setKlineModal] = useState<{
+    tsCode: TsCode;
+    name?: string | null;
+  } | null>(null);
 
   const setStoreItems = useWatchlistStore((s) => s.setItems);
   const watchlistItems = useWatchlistStore((s) => s.items);
@@ -150,6 +156,7 @@ export default function AccountPage() {
               items={watchlistItems}
               onOpenAdd={() => setAddOpen(true)}
               loading={loading}
+              onSelect={(tsCode, name) => setKlineModal({ tsCode, name })}
             />
           </div>
           <div className="account-workspace-main">
@@ -168,6 +175,14 @@ export default function AccountPage() {
         open={addOpen}
         onClose={() => setAddOpen(false)}
         onDone={handleAddDone}
+      />
+
+      <KlineModal
+        open={klineModal !== null}
+        tsCode={klineModal?.tsCode ?? null}
+        name={klineModal?.name}
+        category="stock"
+        onClose={() => setKlineModal(null)}
       />
     </>
   );

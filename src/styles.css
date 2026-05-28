@@ -1269,6 +1269,59 @@ body {
   pointer-events: none;
 }
 
+/* -------- KlineModal -------- */
+.kline-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  background: rgba(47, 38, 24, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.kline-modal {
+  width: 66vw;
+  height: 76vh;
+  max-width: 1400px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.kline-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  flex: 0 0 auto;
+}
+
+.kline-modal-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.kline-modal-period {
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border-soft);
+  flex: 0 0 auto;
+}
+
+.kline-modal-chart {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+}
+
 .detail-footer {
   display: flex;
   align-items: center;
@@ -2017,9 +2070,8 @@ body {
 }
 
 .account-workspace-side {
-  flex: 0 0 40%;
-  min-width: 320px;
-  max-width: 540px;
+  flex: 0 0 280px;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg-card);
@@ -2304,6 +2356,14 @@ body {
   align-items: center;
   border-bottom: 1px solid var(--border-soft);
   padding: 0 4px;
+}
+
+.watchlist-row.clickable {
+  cursor: pointer;
+}
+
+.watchlist-row.clickable:hover {
+  background: var(--bg-soft);
 }
 
 .watchlist-row.stale .watchlist-cell.tabular {
