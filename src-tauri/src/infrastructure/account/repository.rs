@@ -115,6 +115,28 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    /// Insert meta row inside an existing transaction (atomic with event append).
+    ///
+    /// Spec: account-module.md §3 数据流 — 所有状态变化必须先写 `account_events`,
+    /// 再更新派生缓存。`account_initialized` event 与 `account_meta` 写入必须原子。
+    pub fn insert_meta_in_tx(
+        tx: &Transaction<'_>,
+        initial_cash: Money,
+        now: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT OR IGNORE INTO account_meta (id, initial_cash, cash, initialized_at, updated_at)
+             VALUES (1, ?, ?, ?, ?)",
+            params![
+                initial_cash.0.to_string(),
+                initial_cash.0.to_string(),
+                now.to_rfc3339(),
+                now.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_cash(&self, cash: Money, now: OccurredAt) -> rusqlite::Result<()> {
         self.db.with(|c| {
             c.execute(

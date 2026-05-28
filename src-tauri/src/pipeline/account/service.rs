@@ -180,9 +180,11 @@ impl AccountService {
             return self.fetch_snapshot_only();
         }
 
-        // 写 meta + account_initialized event（同事务）
-        repo.insert_meta(initial_cash, now)
-            .map_err(|_| ErrorCode::DbError)?;
+        // 写 meta + account_initialized event（同事务，原子）。
+        //
+        // Spec: account-module.md §3 数据流 — 所有状态变化必须先写 account_events,
+        // 再更新派生缓存。先 append event（分配较小 seq），再 insert meta；
+        // 若 tx 中途失败则两者都回滚，保证不会出现 "meta 已写但事件缺失" 的状态。
         repo.tx(|tx| {
             let ev = AccountEvent {
                 event_id: new_id("evt"),
@@ -197,6 +199,7 @@ impl AccountService {
                 occurred_at: now,
             };
             AccountRepository::append_event(tx, &ev)?;
+            AccountRepository::insert_meta_in_tx(tx, initial_cash, now)?;
             Ok(())
         })
         .map_err(|_| ErrorCode::DbError)?;
@@ -3204,6 +3207,48 @@ mod tests {
         // 不同 initialCash → 失败
         let err = svc.initialize_account_if_needed(Money(Decimal::from(2_000_000))).unwrap_err();
         assert_eq!(err, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn initialize_account_writes_meta_and_event_atomically() {
+        // Spec: account-module.md §3 数据流 — 所有状态变化必须先写 account_events，再更新派生。
+        // 验证：account_initialized event 与 account_meta 写入在同一 tx 内完成；
+        // event 先于 meta 分配 seq（事件源是真源），两者都存在。
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| {
+            let mut all = Vec::new();
+            all.extend(crate::infrastructure::quotes::migrations());
+            all.extend(crate::infrastructure::account::migrations());
+            run_migrations(c, all).unwrap();
+        });
+        let gw = Arc::new(MockQuoteGateway::new());
+        let svc = AccountService::new(db.clone(), gw, AccountServiceConfig::default());
+        let initial_cash = Money(Decimal::from(1_000_000));
+        svc.initialize_account_if_needed(initial_cash).unwrap();
+
+        let repo = AccountRepository::new(&db);
+        let meta = repo.get_meta().unwrap().expect("meta should exist");
+        assert_eq!(meta.initial_cash, initial_cash);
+        assert_eq!(meta.cash, initial_cash);
+
+        // event 必须存在；首次 init 时它是 seq=1（即先于任何 meta 派生的）。
+        let events = repo.list_events(10, 0).unwrap();
+        let init_evt = events
+            .iter()
+            .find(|e| e.event_type == AccountEventType::AccountInitialized)
+            .expect("account_initialized event should exist");
+        assert_eq!(init_evt.actor, AccountActor::System.as_str());
+        // 通过 seq 查询确认 event 在最小 seq（事件源先于派生）。
+        db.with(|c| {
+            let seq: i64 = c
+                .query_row(
+                    "SELECT seq FROM account_events WHERE event_type = 'account_initialized'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(seq, 1, "account_initialized must be the very first event (seq=1)");
+        });
     }
 
     #[test]
