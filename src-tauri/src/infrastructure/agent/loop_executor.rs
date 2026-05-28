@@ -19,12 +19,13 @@
 
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest,
-    AgentStopReason, ContextBundle, RunSummary,
+    AgentStopReason, ContextBundle, ContextContent, ContextPart, ContextPartKind, RunSummary,
 };
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::agent::context_compaction::{compact_context, CompactPolicy};
 use crate::infrastructure::agent::skill_parser::{ParserEvent, SkillCallParser};
 use crate::infrastructure::agent::skill_registry::{DispatchError, SkillRegistry};
+use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -77,6 +78,12 @@ pub async fn run_agent_loop(
     event_tx: Sender<AgentEvent>,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
+
+    // Spec §2 line 209-210, §5 line 533: 每次 Agent loop 启动时,Infra 用 `SystemPromptBuilder`
+    // 把 enabled `SkillSpec` 集合编译成 system prompt 前缀,自动 prepend 到 ContextBundle.systemParts。
+    // Runtime 不需要手动塞;这里在 emit run_start 之前一次性 prepend。
+    prepend_skill_list_to_system_parts(&mut context, &registry);
+
     send_event(
         &event_tx,
         AgentEvent::RunStart {
@@ -374,6 +381,28 @@ async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopEr
     tx.send(e).await.map_err(|_| LoopError::EventChannelClosed)
 }
 
+/// Spec §2 System Prompt Skill 清单 / §5 line 533:
+/// 用 `SystemPromptBuilder` 把已注册的 SkillSpec 列表编译成 markdown 前缀,
+/// 作为 `kind = "system"` 的 ContextPart 自动 prepend 到 `systemParts`(droppable=false)。
+///
+/// 注意:protocol_preamble 即便没有任何 skill 也注入,保证模型始终知道 `<use_skill>` 文本协议。
+fn prepend_skill_list_to_system_parts(context: &mut ContextBundle, registry: &SkillRegistry) {
+    let skills = registry.list_skills();
+    let prompt = build_system_prompt(&skills, "");
+    if prompt.is_empty() {
+        return;
+    }
+    let token_estimate = ((prompt.chars().count() + 3) / 4) as u32;
+    let part = ContextPart {
+        kind: ContextPartKind::System,
+        content: ContextContent::Text(prompt),
+        freshness: None,
+        token_estimate: Some(token_estimate),
+        droppable: false,
+    };
+    context.system_parts.insert(0, part);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +654,79 @@ mod tests {
             }
         }
         assert!(saw_error_with_code);
+    }
+
+    #[tokio::test]
+    async fn loop_prepends_skill_list_to_system_parts_on_start() {
+        // Spec §2 / §5 line 533: 每次 Agent loop 启动时,Infra 自动 prepend SkillSpec 清单
+        // 到 ContextBundle.systemParts;Runtime 不需要手动塞。
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        registry.register_skill(spec("echo"), echo_handler()).unwrap();
+
+        // Capture the systemParts via a custom provider that snapshots context.
+        struct SnapshotProvider {
+            captured: Arc<std::sync::Mutex<Vec<crate::domain::agent::ContextPart>>>,
+        }
+        #[async_trait::async_trait]
+        impl ProviderStream for SnapshotProvider {
+            async fn next_turn(
+                &mut self,
+                _messages: &[AgentMessage],
+                context: &ContextBundle,
+                _event_tx: &Sender<AgentEvent>,
+                _run_id: &str,
+            ) -> Result<ProviderTurnOutcome, LoopError> {
+                *self.captured.lock().unwrap() = context.system_parts.clone();
+                Ok(ProviderTurnOutcome {
+                    text: "bye".into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                })
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Box::new(SnapshotProvider {
+            captured: Arc::clone(&captured),
+        });
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
+        let _ = run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            .await
+            .unwrap();
+        let parts = captured.lock().unwrap().clone();
+        assert!(!parts.is_empty(), "system_parts should have been prepended");
+        let head = match &parts[0].content {
+            crate::domain::agent::ContextContent::Text(s) => s.clone(),
+            _ => panic!("expected Text"),
+        };
+        assert!(head.contains("## echo"), "system prompt missing skill section: {}", head);
+        assert!(head.contains("use_skill"), "missing protocol preamble: {}", head);
+        // droppable=false invariant (skill list is identity / system content)
+        assert!(!parts[0].droppable);
+    }
+
+    #[tokio::test]
+    async fn loop_emits_run_start_with_model_from_channel() {
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![Ok(ProviderTurnOutcome {
+                text: "x".into(),
+                usage_input: 0,
+                usage_output: 0,
+                stop_reason: AgentStopReason::Completed,
+            })],
+            index: 0,
+        });
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let _ = run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            .await
+            .unwrap();
+        // First event should be RunStart with the channel's model.
+        let first = rx.recv().await.unwrap();
+        match first {
+            AgentEvent::RunStart { model, .. } => assert_eq!(model, "fake-model"),
+            other => panic!("expected RunStart, got {:?}", other),
+        }
     }
 
     #[tokio::test]
