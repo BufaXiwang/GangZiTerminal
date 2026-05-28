@@ -6,7 +6,14 @@
 // 供市场页 / 模拟账户页持仓详情等多处复用。
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { commands, type KlinePeriod, type TsCode } from "../bindings";
+import {
+  commands,
+  type AnyKlinePeriod,
+  type FetchInclude,
+  type KlinePeriod,
+  type MinuteKlinePeriod,
+  type TsCode,
+} from "../bindings";
 
 export interface KlineDataPoint {
   /** UNIX timestamp（秒）。日 K / 分钟 K 都用秒级。 */
@@ -28,13 +35,23 @@ export interface UseKlineDataState {
 
 export interface UseKlineDataOptions {
   tsCode: TsCode | null;
-  /** 默认 'day' */
-  period?: KlinePeriod;
+  /** 默认 'day'。支持 day/week/month + 1m/5m/15m/30m/60m。 */
+  period?: AnyKlinePeriod;
   /** 是否启用（false 时不发请求，常用于条件渲染） */
   enabled?: boolean;
 }
 
-const MINUTE_PERIODS: KlinePeriod[] = ["1m", "5m", "15m", "30m", "60m"];
+const MINUTE_PERIODS: readonly MinuteKlinePeriod[] = [
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "60m",
+] as const;
+
+function isMinutePeriod(p: AnyKlinePeriod): p is MinuteKlinePeriod {
+  return (MINUTE_PERIODS as readonly string[]).includes(p);
+}
 
 /**
  * 从后端 fetch_data 返回里抽 K 线数组。
@@ -45,22 +62,30 @@ const MINUTE_PERIODS: KlinePeriod[] = ["1m", "5m", "15m", "30m", "60m"];
 function extractKlines(
   raw: unknown,
   tsCode: TsCode,
-  period: KlinePeriod,
+  period: AnyKlinePeriod,
 ): KlineDataPoint[] {
   if (!raw || typeof raw !== "object") return [];
   const root = raw as Record<string, unknown>;
-  const items = (root.items ?? root.data ?? {}) as Record<string, unknown>;
-  const entry = items[tsCode];
-  if (!entry || typeof entry !== "object") return [];
-  const isMinute = MINUTE_PERIODS.includes(period);
-  const bag = entry as Record<string, unknown>;
+  // 后端返回 { items: FetchDataItem[] }；找第一个匹配 tsCode 的 item。
+  const itemsArr = (root.items ?? []) as unknown;
+  if (!Array.isArray(itemsArr)) return [];
+  const target = itemsArr.find(
+    (it) =>
+      it &&
+      typeof it === "object" &&
+      (it as Record<string, unknown>).tsCode === tsCode,
+  ) as Record<string, unknown> | undefined;
+  if (!target) return [];
+  const isMinute = isMinutePeriod(period);
   const klineGroup = (
-    isMinute ? bag.minute_klines ?? bag.minuteKlines : bag.klines
+    isMinute ? target.minuteKlines ?? target.minute_klines : target.klines
   ) as Record<string, unknown> | undefined;
   if (!klineGroup) return [];
   const series = klineGroup[period];
-  if (!Array.isArray(series)) return [];
-  return series
+  if (!series || typeof series !== "object") return [];
+  const points = (series as Record<string, unknown>).points;
+  if (!Array.isArray(points)) return [];
+  return points
     .map((row) => normalizeKlineRow(row))
     .filter((r): r is KlineDataPoint => r !== null);
 }
@@ -68,9 +93,10 @@ function extractKlines(
 function normalizeKlineRow(row: unknown): KlineDataPoint | null {
   if (!row || typeof row !== "object") return null;
   const r = row as Record<string, unknown>;
-  // 兼容多种字段命名：trade_date / date / time / timestamp / ts
+  // 后端 KlinePoint.date = TradeDate (YYYYMMDD)
+  //      MinuteKlinePoint.timestampMs = ms
   const timeRaw =
-    r.time ?? r.timestamp ?? r.ts ?? r.trade_date ?? r.date ?? r.dt;
+    r.timestampMs ?? r.timestamp_ms ?? r.date ?? r.tradeDate ?? r.trade_date ?? r.time;
   const time = toUnixSeconds(timeRaw);
   if (time == null) return null;
   const open = toNumber(r.open ?? r.o);
@@ -149,12 +175,11 @@ export function useKlineData(opts: UseKlineDataOptions): UseKlineDataState {
     }
     const id = ++reqIdRef.current;
     setState((s) => ({ ...s, loading: true, error: null }));
-    const isMinute = MINUTE_PERIODS.includes(period);
-    const include = isMinute
-      ? { minute_klines: [period] }
-      : { klines: [period] };
+    const include: FetchInclude = isMinutePeriod(period)
+      ? { minuteKlines: [period] }
+      : { klines: [period as KlinePeriod] };
     void commands
-      .fetchData({ ts_codes: [tsCode], include })
+      .fetchData({ tsCodes: [tsCode], include })
       .then((res) => {
         if (id !== reqIdRef.current) return; // stale request
         if (res.status === "error") {
