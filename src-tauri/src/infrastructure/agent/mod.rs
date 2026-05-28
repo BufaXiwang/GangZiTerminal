@@ -26,6 +26,9 @@ pub mod skill_registry;
 pub mod system_prompt;
 
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
+pub use context_compaction::{
+    compact_context, decide_tier, estimate_context_tokens, CompactPolicy,
+};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};

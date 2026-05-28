@@ -14,9 +14,11 @@
 //! - `drop_oldest_chat_until`：按 soft limit 丢弃最旧 chat part
 //! - `compact_context(bundle, policy)`：spec §4 描述的纯计算 API
 //! - `decide_tier`：纯判定函数
+//! - `estimate_context_tokens(context, channel)`：spec §5 描述的纯计算 token 估算
 
 use crate::domain::agent::{
-    CompactTier, ContextBundle, ContextContent, ContextPart, ContextPartKind, ContextWindowLimits,
+    CompactTier, ContextBundle, ContextWindowLimits, ContextContent, ContextPart, ContextPartKind,
+    ProviderChannel, TokenEstimate,
 };
 
 /// 压缩策略（spec §4）。
@@ -206,6 +208,32 @@ pub fn decide_tier(
         }
     }
     None
+}
+
+/// `estimate_context_tokens(context, channel)` — spec §5 描述的纯计算 token 估算。
+///
+/// 行为：按 `ContextBundle::estimated_tokens()` 启发式求和（4 字符 / token），
+/// 与 `channel.context_window_tokens` 对照判断是否超过 soft limit。
+/// 当 channel 没有声明 `context_window_tokens` 时,使用 `ContextWindowLimits::default()` 的
+/// `soft_limit_tokens` 作为软限制。
+pub fn estimate_context_tokens(
+    context: &ContextBundle,
+    channel: &ProviderChannel,
+) -> TokenEstimate {
+    let total_tokens = context.estimated_tokens();
+    // Spec §4: soft limit drives MicroClear。channel 没声明窗口大小时退化到默认软限制。
+    let soft_limit = channel
+        .context_window_tokens
+        .map(|w| {
+            // 默认软限制按窗口的 ~33% 估算(与 ContextWindowLimits::default 60k / 180k 比例一致)。
+            (w as u64 * 1).max(1) / 3
+        })
+        .map(|v| v.min(u32::MAX as u64) as u32)
+        .unwrap_or(ContextWindowLimits::default().soft_limit_tokens);
+    TokenEstimate {
+        total_tokens,
+        over_soft_limit: total_tokens > soft_limit,
+    }
 }
 
 /// `compact_context(bundle, policy)` — spec §5 描述的纯计算 API。
@@ -400,6 +428,70 @@ mod tests {
     #[test]
     fn parse_skill_result_attrs_returns_none_when_no_tag() {
         assert!(parse_skill_result_attrs("hello world").is_none());
+    }
+
+    #[test]
+    fn estimate_context_tokens_returns_over_soft_limit_when_above() {
+        use crate::domain::agent::{ProviderChannel, WireFormat};
+        let mut b = ContextBundle::new("r1");
+        b.chat_parts.push(chat(&"x".repeat(40_000), true)); // ~10k tokens
+        let channel = ProviderChannel {
+            channel_id: "c".into(),
+            provider: "p".into(),
+            wire_format: WireFormat::Messages,
+            base_url: None,
+            model: "m".into(),
+            stream: true,
+            supports_vision: false,
+            supports_thinking: false,
+            max_output_tokens: None,
+            context_window_tokens: Some(9000), // soft = 9000/3 = 3000
+        };
+        let est = estimate_context_tokens(&b, &channel);
+        assert!(est.total_tokens >= 10_000);
+        assert!(est.over_soft_limit);
+    }
+
+    #[test]
+    fn estimate_context_tokens_under_soft_limit_when_small() {
+        use crate::domain::agent::{ProviderChannel, WireFormat};
+        let b = ContextBundle::new("r1");
+        let channel = ProviderChannel {
+            channel_id: "c".into(),
+            provider: "p".into(),
+            wire_format: WireFormat::Messages,
+            base_url: None,
+            model: "m".into(),
+            stream: true,
+            supports_vision: false,
+            supports_thinking: false,
+            max_output_tokens: None,
+            context_window_tokens: Some(200_000),
+        };
+        let est = estimate_context_tokens(&b, &channel);
+        assert_eq!(est.total_tokens, 0);
+        assert!(!est.over_soft_limit);
+    }
+
+    #[test]
+    fn estimate_context_tokens_falls_back_to_default_limits_without_window() {
+        use crate::domain::agent::{ProviderChannel, WireFormat};
+        let b = ContextBundle::new("r1");
+        let channel = ProviderChannel {
+            channel_id: "c".into(),
+            provider: "p".into(),
+            wire_format: WireFormat::Messages,
+            base_url: None,
+            model: "m".into(),
+            stream: true,
+            supports_vision: false,
+            supports_thinking: false,
+            max_output_tokens: None,
+            context_window_tokens: None,
+        };
+        let est = estimate_context_tokens(&b, &channel);
+        // No window: default soft_limit_tokens is 60_000; empty bundle is 0 → under.
+        assert!(!est.over_soft_limit);
     }
 
     #[test]
