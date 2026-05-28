@@ -60,7 +60,10 @@ pub fn run() {
         adapters::quotes::cmd::scan_market,
         adapters::agent::cmd::agent_list_skills,
         adapters::account::cmd::fetch_account,
-        adapters::account::cmd::operate_account,
+        // Spec: account-module.md §4 — operate_account 写入口只对 Agent tool /
+        // 外部自动化决策运行时暴露，不能注册为 Tauri command 供前端直接 invoke。
+        // 函数实现保留为 #[allow(dead_code)]，将由 Phase 3 Agent Runtime
+        // 通过 SkillRegistry 注册为 skill。
         adapters::account::cmd::update_watchlist,
         adapters::account::cmd::mark_trigger_handled,
         adapters::account::cmd::rebuild_account_snapshot,
