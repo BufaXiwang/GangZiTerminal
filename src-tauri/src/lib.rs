@@ -91,11 +91,19 @@ pub fn run() {
             let db_path = resolve_db_path(app.handle())?;
             let db = AppDb::open(&db_path).expect("failed to open AppDb");
             db.with(|conn| {
+                // rusqlite_migration 用 user_version 跟踪"已 apply 第 N 个 migration"，
+                // **按全局位置 (0-indexed) 判定**，不感知 BC 拆分。所以这里的拼接顺序
+                // 必须是 append-only：新增 BC migration 时只能加到当前列表末尾，
+                // 否则会把后面 BC 的旧 migration 错位变成"需要重跑"，CREATE TABLE 直接 panic。
+                //
+                // 当前固定顺序（不要重排）：news → agent → account → quotes
+                // quotes 排最后是因为 quotes 是目前唯一有 M002 的 BC（D1 引入 xdxr 表）；
+                // 其他 BC 加 M002 时，自行把那个 BC 移到当前末尾。
                 let mut all = Vec::new();
                 all.extend(news_migrations());
-                all.extend(quotes_migrations());
                 all.extend(agent_migrations());
                 all.extend(account_migrations());
+                all.extend(quotes_migrations());
                 run_migrations(conn, all).expect("failed to apply migrations");
             });
 
