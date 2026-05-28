@@ -9,8 +9,7 @@
 //   footer：freshness 时间 + source（小灰字）
 
 import { useState } from "react";
-import { KlineCanvas } from "../../components/KlineCanvas";
-import { useKlineData, type ChartPeriod } from "../../lib/useKlineData";
+import { KlineCanvas, type ChartPeriod } from "../../components/KlineCanvas";
 import { KlinePeriodTabs } from "./KlinePeriodTabs";
 import type { ListMarketItem } from "../../bindings";
 
@@ -52,19 +51,8 @@ function fmtPct(v: number | undefined | null): string {
   return `${sign}${v.toFixed(2)}%`;
 }
 
-function fmtFreshness(ts: number | null): string {
-  if (!ts) return "";
-  const d = new Date(ts);
-  return d.toLocaleTimeString("zh-CN", { hour12: false });
-}
-
 export function InstrumentDetail({ item }: InstrumentDetailProps) {
   const [period, setPeriod] = useState<ChartPeriod>("day");
-  const kline = useKlineData({
-    tsCode: item?.tsCode ?? null,
-    period,
-    enabled: !!item,
-  });
 
   if (!item) {
     return (
@@ -77,7 +65,7 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
   const q = item.quote;
   const pct = q?.changePercent;
   const tone = changeClass(pct);
-  const isLineMode = period === "intraday";
+  const pricePrecision = item.category === "fund" ? 3 : 2;
 
   return (
     <div className="instrument-detail">
@@ -117,30 +105,17 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
         <KlinePeriodTabs value={period} onChange={setPeriod} />
       </div>
 
-      {/* K 线区域（占满剩余高度） */}
+      {/* K 线区域（KlineCanvas 内部自己管 loading/empty/error + load-more） */}
       <div className="detail-chart">
-        {kline.loading && kline.data.length === 0 ? (
-          <div className="detail-chart-status">加载中</div>
-        ) : kline.error ? (
-          <div className="detail-chart-status">加载失败：{kline.error}</div>
-        ) : kline.data.length === 0 ? (
-          <div className="detail-chart-status">暂无数据</div>
-        ) : (
-          <KlineCanvas
-            data={kline.data}
-            mode={isLineMode ? "line" : "candle"}
-            autoHeight
-            seriesKey={`${item.tsCode}|${period}`}
-            onRequestMore={kline.requestMore}
-          />
-        )}
+        <KlineCanvas
+          tsCode={item.tsCode}
+          period={period}
+          pricePrecision={pricePrecision}
+        />
       </div>
 
-      {/* 极简 footer：刷新时间 */}
+      {/* 极简 footer：交易日 */}
       <div className="detail-footer">
-        <span className="muted">
-          {kline.lastUpdatedMs ? `更新 ${fmtFreshness(kline.lastUpdatedMs)}` : ""}
-        </span>
         {q?.tradeDate && (
           <span className="muted">交易日 {q.tradeDate}</span>
         )}

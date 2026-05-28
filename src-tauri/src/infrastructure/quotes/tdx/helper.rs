@@ -29,6 +29,17 @@ pub fn get_price(data: &[u8], pos: &mut usize) -> Result<i64> {
                 return Err(Error::Protocol("get_price: truncated varint".into()));
             }
             byte = data[p];
+            // 防 shift >= 64 UB：i64 << 64+ 在 release 是 wrap，曾导致
+            // pre_diff_base 漂移 ~82M 让后续 bar 全部错位。协议正常 i64
+            // 价格 diff 不会超过 10 字节 varint；超长 byte stream 多半是
+            // server 异常 —— 截断停止比累垃圾值更安全。
+            if shift >= 64 {
+                // 仍要消耗当前 byte 推进 pos，但忽略其高位贡献。
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                continue;
+            }
             value += ((byte & 0x7f) as i64) << shift;
             shift += 7;
             if byte & 0x80 == 0 {
@@ -156,5 +167,24 @@ mod tests {
         let mut pos = 0;
         assert_eq!(get_price(&buf, &mut pos).unwrap(), 64);
         assert_eq!(pos, 2);
+    }
+
+    /// Regression: shift >= 64 在 release 模式下 `i64 << shift` 是 UB，
+    /// 历史出过 pre_diff_base 漂移 ~82M 的 bug 导致 K 线整条偏移。
+    /// 现在 saturating 截断后超长 varint 应返回有限值 + 不 panic。
+    #[test]
+    fn price_long_varint_no_overflow_panic() {
+        // 12 字节 varint：前 11 字节都设 continuation bit；最后字节终止。
+        // 这种字节流是异常的，shift 累计 6 + 7*11 = 83 远超 64。
+        let buf = [
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+        ];
+        let mut pos = 0;
+        // 不应 panic 或产生 INT_MAX 量级的垃圾值
+        let v = get_price(&buf, &mut pos).unwrap();
+        assert!(pos == 12);
+        // shift=63 前都正常累加（实际只有 byte 8 处 shift=55 计入），
+        // shift>=64 之后 byte 全部忽略。结果至少有限。
+        assert!(v.abs() < i64::MAX / 2);
     }
 }

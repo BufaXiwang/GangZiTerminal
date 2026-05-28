@@ -1,55 +1,91 @@
-// KlineCanvas — 纯渲染 K 线 + 成交量 容器。
+// KlineCanvas — KLineChart 实现版（替代 lightweight-charts）。
 //
 // Spec: docs/design/frontend-design.md §5 K 线图
 //
-// 设计契约：
-// - 不是 wrapper：只接收外部喂来的 candle 数据，自己只负责创建 / 销毁 chart
-//   实例 + 调 setData() + ResizeObserver。
-// - 周期切换、数据拉取、loading / error 状态由调用方页面控制（参考 useKlineData）。
-// - A 股语义：上涨 --chart-up（红），下跌 --chart-down（绿）。
+// 优势 vs lightweight-charts：
+// - 内置 setDataLoader（type='init'/'forward' 自动驱动 load-more 左拉加载历史）
+// - 内置 30+ 技术指标（MA / MACD / KDJ / BOLL / RSI 等）
+// - 默认 A 股红涨绿跌（通过 styles 覆盖）
+// - 内置中文 locale
+//
+// 设计：组件 owns 整个数据流：
+//   useEffect on (tsCode, period) → init chart + setDataLoader
+//   getBars callback 内部：
+//     'init' → 调 fetch_data；空就 ensure_chart_data + 重试
+//     'forward' → 增大 limit 重拉，给出 prepended slice
+// loading/error 自维护并覆盖显示。
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  CandlestickSeries,
-  HistogramSeries,
-  LineSeries,
-  ColorType,
-  createChart,
-  type IChartApi,
-  type ISeriesApi,
-  type CandlestickData,
-  type HistogramData,
-  type LineData,
-  type LogicalRange,
-  type UTCTimestamp,
-} from "lightweight-charts";
-import type { KlineDataPoint } from "../lib/useKlineData";
+  init,
+  dispose,
+  type Chart,
+  type KLineData,
+  type Period,
+} from "klinecharts";
+import {
+  commands,
+  type FetchInclude,
+  type KlinePeriod,
+  type MinuteKlinePeriod,
+} from "../bindings";
+
+export type ChartPeriod =
+  | "intraday"
+  | "1m"
+  | "5m"
+  | "15m"
+  | "30m"
+  | "60m"
+  | "day"
+  | "week"
+  | "month";
 
 interface KlineCanvasProps {
-  data: KlineDataPoint[];
-  /** "candle"（默认）= K 线 + 成交量；"line" = 单线（用于分时 close 价）。 */
-  mode?: "candle" | "line";
-  /** 容器高度（px）。默认 480。spec §5 要求稳定容器尺寸，不允许内部跳动。 */
-  height?: number;
-  /**
-   * 自适应高度：忽略 height，按父容器实际高度渲染。
-   * 注意：父容器必须有 min-height: 0 + flex 约束，否则会塌成 0。
-   */
-  autoHeight?: boolean;
-  /** A 股语义上涨色（默认从 CSS var --chart-up 读取） */
-  upColor?: string;
-  /** A 股语义下跌色（默认从 CSS var --chart-down 读取） */
-  downColor?: string;
-  /**
-   * 序列标识。当 seriesKey 变化时视为换标的 / 换周期 —— 触发 fitContent 重新对齐
-   * 视图；不变时（仅 data 变长）视为 load-more —— 保持用户当前滚动位置。
-   */
-  seriesKey?: string;
-  /**
-   * 用户拖到左边附近时触发，调用方可借此追加历史数据。
-   * 内部 throttle 1.5s，避免反复 fire。
-   */
-  onRequestMore?: () => void;
+  /** 标的 ts_code（带市场后缀 e.g. 000001.SH）*/
+  tsCode: string;
+  /** 周期 */
+  period: ChartPeriod;
+  /** 价格精度（指数 2，股票 2，基金 3）。可省略，默认 2 */
+  pricePrecision?: number;
+}
+
+const INITIAL_LIMIT = 500;
+const FORWARD_STEP = 300;
+const MAX_LIMIT = 2000;
+const MINUTE_PERIODS: readonly MinuteKlinePeriod[] = [
+  "1m",
+  "5m",
+  "15m",
+  "30m",
+  "60m",
+] as const;
+
+function isMinutePeriod(p: ChartPeriod): p is MinuteKlinePeriod {
+  return (MINUTE_PERIODS as readonly string[]).includes(p);
+}
+
+function periodToKLineChart(p: ChartPeriod): Period {
+  switch (p) {
+    case "intraday":
+      return { type: "minute", span: 1 };
+    case "1m":
+      return { type: "minute", span: 1 };
+    case "5m":
+      return { type: "minute", span: 5 };
+    case "15m":
+      return { type: "minute", span: 15 };
+    case "30m":
+      return { type: "minute", span: 30 };
+    case "60m":
+      return { type: "hour", span: 1 };
+    case "day":
+      return { type: "day", span: 1 };
+    case "week":
+      return { type: "week", span: 1 };
+    case "month":
+      return { type: "month", span: 1 };
+  }
 }
 
 function readCssVar(name: string, fallback: string): string {
@@ -60,196 +96,308 @@ function readCssVar(name: string, fallback: string): string {
   return v || fallback;
 }
 
-export function KlineCanvas({
-  data,
-  mode = "candle",
-  height = 480,
-  autoHeight = false,
-  upColor,
-  downColor,
-  seriesKey,
-  onRequestMore,
-}: KlineCanvasProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const lineSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const roRef = useRef<ResizeObserver | null>(null);
-  const prevSeriesKeyRef = useRef<string | undefined>(undefined);
-  // onRequestMore stable ref，避免每次 props 重生绑订阅
-  const onRequestMoreRef = useRef(onRequestMore);
-  useEffect(() => {
-    onRequestMoreRef.current = onRequestMore;
-  }, [onRequestMore]);
+// 后端 fetch_data 返回 → KLineData[]
+async function fetchKlineData(
+  tsCode: string,
+  period: ChartPeriod,
+  limit: number,
+): Promise<KLineData[]> {
+  const isIntraday = period === "intraday";
+  let include: FetchInclude;
+  if (isIntraday) {
+    include = { intraday: true };
+  } else if (isMinutePeriod(period)) {
+    include = { minuteKlines: [period] };
+  } else {
+    include = { klines: [period as KlinePeriod] };
+  }
+  const res = await commands.fetchData({
+    tsCodes: [tsCode],
+    include,
+    limit: { kline: limit, minuteKline: limit },
+  });
+  if (res.status === "error") {
+    throw new Error(
+      `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+    );
+  }
+  const items = (res.data.items ?? []) as Array<Record<string, unknown>>;
+  const target = items.find((it) => it.tsCode === tsCode);
+  if (!target) return [];
 
-  // 创建 chart（仅在首次 mount 或 height/color 变化时重建）
+  if (isIntraday) {
+    const intraday = target.intraday as Record<string, unknown> | undefined;
+    if (!intraday) return [];
+    const points = intraday.points;
+    const tradeDate =
+      typeof intraday.tradeDate === "string" ? intraday.tradeDate : undefined;
+    if (!Array.isArray(points)) return [];
+    return points
+      .map((row) => normalizeMinutePoint(row, tradeDate))
+      .filter((r): r is KLineData => r !== null);
+  }
+
+  if (isMinutePeriod(period)) {
+    const group = (target.minuteKlines ?? target.minute_klines) as
+      | Record<string, unknown>
+      | undefined;
+    if (!group) return [];
+    const series = group[period] as Record<string, unknown> | undefined;
+    if (!series) return [];
+    const points = series.points;
+    if (!Array.isArray(points)) return [];
+    return points
+      .map((row) => normalizeMinuteKline(row))
+      .filter((r): r is KLineData => r !== null);
+  }
+
+  const group = target.klines as Record<string, unknown> | undefined;
+  if (!group) return [];
+  const series = group[period] as Record<string, unknown> | undefined;
+  if (!series) return [];
+  const points = series.points;
+  if (!Array.isArray(points)) return [];
+  return points
+    .map((row) => normalizeDayKline(row))
+    .filter((r): r is KLineData => r !== null);
+}
+
+function toNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function tradeDateToMillis(td: unknown): number | null {
+  if (typeof td !== "string" || !/^\d{8}$/.test(td)) return null;
+  const y = Number(td.slice(0, 4));
+  const m = Number(td.slice(4, 6)) - 1;
+  const d = Number(td.slice(6, 8));
+  return Date.UTC(y, m, d);
+}
+
+function normalizeDayKline(row: unknown): KLineData | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  const ts = tradeDateToMillis(r.date ?? r.tradeDate ?? r.trade_date);
+  const open = toNumber(r.open);
+  const high = toNumber(r.high);
+  const low = toNumber(r.low);
+  const close = toNumber(r.close);
+  if (ts == null || open == null || high == null || low == null || close == null)
+    return null;
+  return {
+    timestamp: ts,
+    open,
+    high,
+    low,
+    close,
+    volume: toNumber(r.volume) ?? undefined,
+    turnover: toNumber(r.amount) ?? undefined,
+  };
+}
+
+function normalizeMinuteKline(row: unknown): KLineData | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  const tsRaw = toNumber(r.timestampMs ?? r.timestamp_ms);
+  const open = toNumber(r.open);
+  const high = toNumber(r.high);
+  const low = toNumber(r.low);
+  const close = toNumber(r.close);
+  if (tsRaw == null || open == null || high == null || low == null || close == null)
+    return null;
+  return {
+    timestamp: tsRaw,
+    open,
+    high,
+    low,
+    close,
+    volume: toNumber(r.volume) ?? undefined,
+    turnover: toNumber(r.amount) ?? undefined,
+  };
+}
+
+function normalizeMinutePoint(
+  row: unknown,
+  tradeDate: string | undefined,
+): KLineData | null {
+  if (!row || typeof row !== "object") return null;
+  const r = row as Record<string, unknown>;
+  const timeStr = typeof r.time === "string" ? r.time : null;
+  const price = toNumber(r.price);
+  if (price == null || !timeStr || !tradeDate || !/^\d{8}$/.test(tradeDate))
+    return null;
+  const digits = timeStr.replace(/\D/g, "");
+  const hh = Number(digits.slice(0, 2));
+  const mm = Number(digits.slice(2, 4));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  const y = Number(tradeDate.slice(0, 4));
+  const mo = Number(tradeDate.slice(4, 6)) - 1;
+  const d = Number(tradeDate.slice(6, 8));
+  const ts = Date.UTC(y, mo, d, hh, mm);
+  return {
+    timestamp: ts,
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    volume: toNumber(r.volume) ?? undefined,
+  };
+}
+
+export function KlineCanvas({
+  tsCode,
+  period,
+  pricePrecision = 2,
+}: KlineCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<Chart | null>(null);
+  const [status, setStatus] = useState<"loading" | "empty" | "error" | "ok">(
+    "loading",
+  );
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
   useEffect(() => {
     if (!containerRef.current) return;
-    const up = upColor ?? readCssVar("--chart-up", "#c0392b");
-    const down = downColor ?? readCssVar("--chart-down", "#1f8a47");
+    const upColor = readCssVar("--chart-up", "#c0392b");
+    const downColor = readCssVar("--chart-down", "#1f8a47");
+    const bgCard = readCssVar("--bg-card", "#ffffff");
+    const borderSoft = readCssVar("--border-soft", "#efe7d7");
     const fgDefault = readCssVar("--fg-default", "#5c5042");
     const fgMuted = readCssVar("--fg-muted", "#897866");
-    const borderSoft = readCssVar("--border-soft", "#efe7d7");
-    const bgCard = readCssVar("--bg-card", "#ffffff");
 
-    const initialHeight = autoHeight
-      ? containerRef.current.clientHeight || height
-      : height;
-    const chart = createChart(containerRef.current, {
-      width: containerRef.current.clientWidth,
-      height: initialHeight,
-      layout: {
-        background: { type: ColorType.Solid, color: bgCard },
-        textColor: fgDefault,
-        fontFamily:
-          "'IBM Plex Mono', 'SF Mono', Menlo, 'Inter', -apple-system, sans-serif",
-      },
-      grid: {
-        vertLines: { color: borderSoft },
-        horzLines: { color: borderSoft },
-      },
-      rightPriceScale: { borderColor: borderSoft },
-      timeScale: {
-        borderColor: borderSoft,
-        timeVisible: true,
-        secondsVisible: false,
-      },
-      crosshair: {
-        vertLine: { color: fgMuted, width: 1, style: 2 },
-        horzLine: { color: fgMuted, width: 1, style: 2 },
-      },
-    });
-
-    chartRef.current = chart;
-
-    if (mode === "line") {
-      const lineSeries = chart.addSeries(LineSeries, {
-        color: up,
-        lineWidth: 2,
-      });
-      lineSeriesRef.current = lineSeries;
-    } else {
-      const candleSeries = chart.addSeries(CandlestickSeries, {
-        upColor: up,
-        downColor: down,
-        borderUpColor: up,
-        borderDownColor: down,
-        wickUpColor: up,
-        wickDownColor: down,
-      });
-      // 成交量放在独立 pane（lightweight-charts v5 panes API）
-      const volumeSeries = chart.addSeries(
-        HistogramSeries,
-        {
-          priceFormat: { type: "volume" },
-          priceScaleId: "",
+    const chart = init(containerRef.current, {
+      locale: "zh-CN",
+      styles: {
+        candle: {
+          bar: {
+            upColor,
+            downColor,
+            upBorderColor: upColor,
+            downBorderColor: downColor,
+            upWickColor: upColor,
+            downWickColor: downColor,
+          },
         },
-        1,
-      );
-      volumeSeries.priceScale().applyOptions({
-        scaleMargins: { top: 0.1, bottom: 0 },
-      });
-      candleSeriesRef.current = candleSeries;
-      volumeSeriesRef.current = volumeSeries;
-    }
-
-    // ResizeObserver：容器宽度变化自适应；autoHeight 时同时跟踪高度。
-    const ro = new ResizeObserver(() => {
-      if (!containerRef.current || !chartRef.current) return;
-      const opts: { width: number; height?: number } = {
-        width: containerRef.current.clientWidth,
-      };
-      if (autoHeight) {
-        opts.height = containerRef.current.clientHeight;
-      }
-      chartRef.current.applyOptions(opts);
+        grid: {
+          horizontal: { color: borderSoft },
+          vertical: { color: borderSoft },
+        },
+        xAxis: { axisLine: { color: borderSoft }, tickText: { color: fgMuted } },
+        yAxis: { axisLine: { color: borderSoft }, tickText: { color: fgMuted } },
+        crosshair: {
+          horizontal: { line: { color: fgMuted } },
+          vertical: { line: { color: fgMuted } },
+        },
+      },
     });
-    ro.observe(containerRef.current);
-    roRef.current = ro;
-
-    // 监听用户拖到左边 —— 触发 onRequestMore（throttle 1.5s）。
-    let lastFiredAt = 0;
-    const onRangeChange = (range: LogicalRange | null) => {
-      if (!range || !onRequestMoreRef.current) return;
-      // range.from 可能为负数（滚出范围）；< 5 视为到达左边沿。
-      if (range.from <= 5) {
-        const now = Date.now();
-        if (now - lastFiredAt > 1500) {
-          lastFiredAt = now;
-          onRequestMoreRef.current();
-        }
-      }
-    };
-    chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange);
-
-    return () => {
-      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onRangeChange);
-      ro.disconnect();
-      roRef.current = null;
-      chart.remove();
-      chartRef.current = null;
-      candleSeriesRef.current = null;
-      volumeSeriesRef.current = null;
-      lineSeriesRef.current = null;
-    };
-  }, [height, autoHeight, upColor, downColor, mode]);
-
-  // 数据更新
-  useEffect(() => {
-    const up = upColor ?? readCssVar("--chart-up", "#c0392b");
-    const down = downColor ?? readCssVar("--chart-down", "#1f8a47");
-
-    // seriesKey 变了 → 换标的/周期，需要 fitContent 重新对齐；
-    // 没变（仅 data 变长）→ load-more，保持用户滚动位置。
-    const isNewSeries = prevSeriesKeyRef.current !== seriesKey;
-    prevSeriesKeyRef.current = seriesKey;
-
-    if (mode === "line") {
-      const line = lineSeriesRef.current;
-      if (!line) return;
-      const lineData: LineData<UTCTimestamp>[] = data.map((d) => ({
-        time: d.time as UTCTimestamp,
-        value: d.close,
-      }));
-      line.setData(lineData);
-      if (data.length > 0 && isNewSeries) chartRef.current?.timeScale().fitContent();
+    if (!chart) {
+      setStatus("error");
+      setErrorMsg("chart init failed");
       return;
     }
+    chartRef.current = chart;
+    chart.setSymbol({ ticker: tsCode, pricePrecision, volumePrecision: 0 });
+    chart.setPeriod(periodToKLineChart(period));
 
-    const candle = candleSeriesRef.current;
-    const volume = volumeSeriesRef.current;
-    if (!candle || !volume) return;
+    // 用 closure 跟踪当前 limit + 已加载的 timestamps（避免重复）
+    let currentLimit = INITIAL_LIMIT;
+    const loadedTs = new Set<number>();
+    let cancelled = false;
 
-    const candleData: CandlestickData<UTCTimestamp>[] = data.map((d) => ({
-      time: d.time as UTCTimestamp,
-      open: d.open,
-      high: d.high,
-      low: d.low,
-      close: d.close,
-    }));
-    const volumeData: HistogramData<UTCTimestamp>[] = data.map((d) => ({
-      time: d.time as UTCTimestamp,
-      value: d.volume ?? 0,
-      color: d.close >= d.open ? up : down,
-    }));
-    candle.setData(candleData);
-    volume.setData(volumeData);
-    if (data.length > 0 && isNewSeries) chartRef.current?.timeScale().fitContent();
-  }, [data, mode, upColor, downColor, seriesKey]);
+    chart.setDataLoader({
+      getBars: async ({ type, callback }) => {
+        if (cancelled) return;
+        if (type === "init") {
+          setStatus("loading");
+          setErrorMsg(null);
+          try {
+            let data = await fetchKlineData(tsCode, period, currentLimit);
+            if (data.length === 0) {
+              // DB 空 → 触发后端 refresh，再读
+              const refreshRes = await commands.ensureChartData(tsCode, period);
+              if (cancelled) return;
+              if (refreshRes.status === "error") {
+                setStatus("error");
+                setErrorMsg(
+                  `${refreshRes.error.code}${refreshRes.error.message ? `: ${refreshRes.error.message}` : ""}`,
+                );
+                callback([], false);
+                return;
+              }
+              data = await fetchKlineData(tsCode, period, currentLimit);
+            }
+            if (cancelled) return;
+            if (data.length === 0) {
+              setStatus("empty");
+              callback([], false);
+              return;
+            }
+            data.forEach((b) => loadedTs.add(b.timestamp));
+            setStatus("ok");
+            callback(data, { forward: data.length >= currentLimit });
+          } catch (e) {
+            if (cancelled) return;
+            setStatus("error");
+            setErrorMsg(String(e));
+            callback([], false);
+          }
+        } else if (type === "forward") {
+          // 用户左拉到尽头 → 加大 limit 再取，给出 prepended slice
+          if (currentLimit >= MAX_LIMIT) {
+            callback([], false);
+            return;
+          }
+          currentLimit = Math.min(currentLimit + FORWARD_STEP, MAX_LIMIT);
+          try {
+            const all = await fetchKlineData(tsCode, period, currentLimit);
+            if (cancelled) return;
+            const newBars = all.filter((b) => !loadedTs.has(b.timestamp));
+            newBars.forEach((b) => loadedTs.add(b.timestamp));
+            const stillForward =
+              all.length >= currentLimit && currentLimit < MAX_LIMIT;
+            callback(newBars, { forward: stillForward });
+          } catch (e) {
+            if (cancelled) return;
+            callback([], false);
+          }
+        } else {
+          // backward (newer) / update — 我们不主动推送
+          callback([], false);
+        }
+      },
+    });
+
+    return () => {
+      cancelled = true;
+      if (containerRef.current) dispose(containerRef.current);
+      chartRef.current = null;
+    };
+  }, [tsCode, period, pricePrecision]);
 
   return (
     <div
-      ref={containerRef}
       style={{
-        width: "100%",
-        height: autoHeight ? "100%" : height,
-        flex: autoHeight ? "1 1 auto" : undefined,
+        position: "relative",
+        flex: "1 1 auto",
         minHeight: 0,
-        background: "var(--bg-card)",
-        border: "1px solid var(--border-default)",
-        borderRadius: "var(--radius-sm)",
+        width: "100%",
       }}
-    />
+    >
+      <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+      {status === "loading" && (
+        <div className="detail-chart-status overlay">加载中</div>
+      )}
+      {status === "empty" && (
+        <div className="detail-chart-status overlay">暂无数据</div>
+      )}
+      {status === "error" && (
+        <div className="detail-chart-status overlay">加载失败：{errorMsg}</div>
+      )}
+    </div>
   );
 }

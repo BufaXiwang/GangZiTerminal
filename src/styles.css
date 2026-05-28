@@ -1236,6 +1236,14 @@ body {
   font-size: 12px;
 }
 
+/* KlineCanvas 内部 overlay：盖在 chart 容器上方，背景半透明 */
+.detail-chart-status.overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.6);
+  pointer-events: none;
+}
+
 .detail-footer {
   display: flex;
   align-items: center;
