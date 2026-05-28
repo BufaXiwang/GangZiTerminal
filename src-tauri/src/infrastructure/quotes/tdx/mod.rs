@@ -43,4 +43,5 @@ pub use error::{Error, Result};
 pub use hosts::HQ_HOSTS;
 pub use types::{
     Bar, BarCategory, Market as TdxMarket, QuoteLevel, SecurityListEntry, SecurityQuote,
+    XdxrRecord,
 };

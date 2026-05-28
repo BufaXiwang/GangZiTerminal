@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use super::error::{Error, Result};
 use super::hosts::HQ_HOSTS;
-use super::types::{Bar, BarCategory, Market, SecurityListEntry, SecurityQuote};
+use super::types::{Bar, BarCategory, Market, SecurityListEntry, SecurityQuote, XdxrRecord};
 
 /// Blocking Tdx HQ client. Open with [`connect`](Self::connect) (or
 /// [`connect_default`](Self::connect_default)) and call methods directly.
@@ -161,6 +161,14 @@ impl TdxHqClient {
         let pkg = cmd::security_quotes::build(&stocks)?;
         let body = frame::request(&mut self.sock, &pkg)?;
         cmd::security_quotes::parse(&body)
+    }
+
+    /// 除权除息 / 公司行动历史。返回 `XdxrRecord` 序列；上层（pipeline）负责
+    /// 翻译 category 1 等记录为 qfq / hfq 计算输入。
+    pub fn security_xdxr(&mut self, market: Market, code: &str) -> Result<Vec<XdxrRecord>> {
+        let pkg = cmd::security_xdxr::build(market.as_u8(), code)?;
+        let body = frame::request(&mut self.sock, &pkg)?;
+        cmd::security_xdxr::parse(&body)
     }
 }
 

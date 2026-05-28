@@ -133,3 +133,60 @@ pub struct QuoteLevel {
     pub bid_vol: f64,
     pub ask_vol: f64,
 }
+
+/// 除权除息 / 公司行动信息分类（mirrors pytdx `XDXR_CATEGORY_MAPPING`）。
+///
+/// 不同 category 决定 `XdxrRecord` 里哪些字段有值——参见 `pytdx/parser/get_xdxr_info.py`。
+/// 这是协议层的原样转录；上层（pipeline / domain）负责把 raw 字段翻译成 qfq / hfq 计算输入。
+///
+/// | id | name | semantics |
+/// |---|---|---|
+/// | 1  | 除权除息 (Cash dividend + bonus + rights) | 填 `fenhong / peigujia / songzhuangu / peigu` |
+/// | 2  | 送配股上市 (Bonus/rights listing) | 填 share-structure 4 字段 |
+/// | 3  | 非流通股上市 (Non-tradable shares listed) | 填 share-structure 4 字段 |
+/// | 4  | 未知股本变动 (Unknown share change) | 填 share-structure 4 字段 |
+/// | 5  | 股本变化 (Share structure change) | 填 share-structure 4 字段 |
+/// | 6  | 增发新股 (New share offering) | 填 share-structure 4 字段 |
+/// | 7  | 股份回购 (Share buyback) | 填 share-structure 4 字段 |
+/// | 8  | 增发新股上市 (New issue listed) | 填 share-structure 4 字段 |
+/// | 9  | 转配股上市 (Converted rights listing) | 填 share-structure 4 字段 |
+/// | 10 | 可转债上市 (Convertible bond listing) | 填 share-structure 4 字段 |
+/// | 11 | 扩缩股 (Share split/consolidation) | 填 `suogu` |
+/// | 12 | 非流通股缩股 (Non-tradable consolidation) | 填 `suogu` |
+/// | 13 | 送认购权证 (Call warrant) | 填 `xingquanjia / fenshu` |
+/// | 14 | 送认沽权证 (Put warrant) | 填 `xingquanjia / fenshu` |
+///
+/// Category 1 是 qfq/hfq 复权计算最核心的输入：每个除权日的 `fenhong`（每 10 股派息）、
+/// `songzhuangu`（每 10 股送转股本）、`peigu`（每 10 股配股股数）、`peigujia`（配股价）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct XdxrRecord {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    /// 事件分类 1..=14；未知值原样保留。
+    pub category: u8,
+
+    // Category == 1（除权除息）：以下 4 个字段才有值
+    /// 每 10 股派息（人民币元）
+    pub fenhong: Option<f32>,
+    /// 配股价（人民币元）
+    pub peigujia: Option<f32>,
+    /// 每 10 股送转股本（股）
+    pub songzhuangu: Option<f32>,
+    /// 每 10 股配股股数（股）
+    pub peigu: Option<f32>,
+
+    // Category in [11, 12]：缩股比例
+    pub suogu: Option<f32>,
+
+    // Category in [13, 14]：权证
+    pub xingquanjia: Option<f32>,
+    pub fenshu: Option<f32>,
+
+    // 其他 category：股本结构变动，4 个字段都是 `get_volume` 解码后的浮点
+    pub panqianliutong: Option<f64>,
+    pub qianzongguben: Option<f64>,
+    pub panhouliutong: Option<f64>,
+    pub houzongguben: Option<f64>,
+}
+
