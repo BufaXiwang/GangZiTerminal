@@ -370,11 +370,6 @@ impl QuotesService {
             if let Some(periods) = include.klines.as_ref() {
                 let mut klines = std::collections::BTreeMap::new();
                 for p in periods {
-                    // Spec §2 三态语义已由 read_kline_series_with_adjust 内部正确判定：
-                    //  - 状态 A：series.warnings 含 QfqMissing；
-                    //  - 状态 B：无 warning（合理终态）；
-                    //  - 状态 C：series.warnings 含 UsingUnadjustedKline。
-                    // qfq 读不到 → fallback adjust='none' 并标 UsingUnadjustedKline。
                     let series = match self.read_kline_series_with_adjust(
                         ts_code,
                         *p,
@@ -382,9 +377,7 @@ impl QuotesService {
                         kline_limit,
                     ) {
                         Ok(Some(s)) => Some(s),
-                        _ => match repo
-                            .load_kline_series(ts_code, *p, AdjEnum::None, kline_limit)
-                        {
+                        _ => match repo.load_kline_series(ts_code, *p, AdjEnum::None, kline_limit) {
                             Ok(Some(mut s)) => {
                                 if !s.warnings.contains(&WarningCode::UsingUnadjustedKline) {
                                     s.warnings.push(WarningCode::UsingUnadjustedKline);

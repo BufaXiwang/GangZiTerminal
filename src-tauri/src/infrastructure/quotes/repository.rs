@@ -320,8 +320,23 @@ impl<'a> QuotesRepository<'a> {
                 let amount: Option<String> = row.get(6)?;
                 let source: String = row.get(7)?;
                 let fetched: String = row.get(8)?;
+                // 健壮性：trade_date 解析失败的行（如历史 corrupt 数据）跳过 + log，
+                // 不让整批查询返回 Err。
+                let date = match TradeDate::parse(&td) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "quotes.repo.load_kline",
+                            ts = ts_code.as_str(),
+                            period = period.as_str(),
+                            bad_trade_date = td.as_str(),
+                            "skip row with invalid trade_date"
+                        );
+                        continue;
+                    }
+                };
                 let p = KlinePoint {
-                    date: TradeDate::parse(&td).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    date,
                     open: Price(Decimal::from_str(&open).unwrap_or_default()),
                     close: Price(Decimal::from_str(&close).unwrap_or_default()),
                     high: Price(Decimal::from_str(&high).unwrap_or_default()),
