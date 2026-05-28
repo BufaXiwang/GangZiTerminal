@@ -6,7 +6,7 @@
 //! - 同步 TCP；async wrapper 使用 `tokio::task::spawn_blocking`。
 //! - 失败后丢弃 client；下次重连（spec §5 reference 规则）。
 
-use super::{Bar, BarCategory, TdxHqClient, TdxMarket};
+use super::{Bar, BarCategory, MinuteTimePoint, TdxHqClient, TdxMarket};
 use crate::domain::quotes::{
     KlinePeriod, KlinePoint, MinuteKlinePeriod, MinuteKlinePoint, QuoteDepthLevel, QuoteSource,
     StockQuote, TradeStatus,
@@ -233,6 +233,65 @@ pub fn tdx_xdxr_to_domain(
     })
 }
 
+/// 把 TDX `MinuteTimePoint` 序列翻译成 domain `quote_intraday` repo 的 upsert tuple
+/// `(time, price, volume, amount)`，时间按 index 派生（spec §5 line 820 + minute_time 协议）。
+///
+/// pytdx `get_minute_time_data` 返回 240 个点对应 A 股标准连续竞价时段的每分钟：
+/// - 上午 120 点：09:30 → 11:29（含端点逐分钟）
+/// - 下午 120 点：13:00 → 14:59
+///
+/// 一些行情服务器实测会返回 241 点（多出 15:00 收盘集合竞价末端价格）或 242 点；
+/// 本适配器按"前 240 点 → 标准 240 槽位"映射，多余点 append 在 14:59 之后向 15:00 方向递推。
+/// 点数 < 240 时按已有 N 点对齐前 N 个槽位，剩余分钟该 `time` 缺席。
+///
+/// `price` 用 `f64_to_price` 校验（>0 + finite）；不合法点 skip。
+/// `volume` 直接转换（已是 i64）；`amount` 不由协议返回，置 None。
+pub fn tdx_minute_time_to_intraday_points(
+    points: &[MinuteTimePoint],
+) -> Vec<(String, Price, Option<Volume>, Option<Amount>)> {
+    let slots = trading_minute_slots();
+    let mut out: Vec<(String, Price, Option<Volume>, Option<Amount>)> =
+        Vec::with_capacity(points.len());
+    for (idx, pt) in points.iter().enumerate() {
+        let time = if idx < slots.len() {
+            slots[idx].to_string()
+        } else {
+            // > 240 点：第 241 点视为 15:00 收盘集合竞价末端，后续逐分钟延伸（实际极少出现）。
+            let extra = idx - slots.len(); // 0 → 15:00, 1 → 15:01 ...
+            let m = 15u32 * 60 + extra as u32;
+            format!("{:02}:{:02}", m / 60, m % 60)
+        };
+        let Some(price) = f64_to_price(pt.price) else {
+            continue;
+        };
+        let volume = if pt.volume > 0 {
+            Some(Volume(pt.volume))
+        } else {
+            None
+        };
+        out.push((time, price, volume, None));
+    }
+    out
+}
+
+/// A 股连续竞价 240 个分钟槽位（北京时间 `HH:MM`，升序）。
+///
+/// 09:30 ~ 11:29（120 个） + 13:00 ~ 14:59（120 个）= 240。
+fn trading_minute_slots() -> Vec<String> {
+    let mut slots = Vec::with_capacity(240);
+    // 上午 09:30 ~ 11:29
+    for m in 0..120u32 {
+        let total = 9 * 60 + 30 + m;
+        slots.push(format!("{:02}:{:02}", total / 60, total % 60));
+    }
+    // 下午 13:00 ~ 14:59
+    for m in 0..120u32 {
+        let total = 13 * 60 + m;
+        slots.push(format!("{:02}:{:02}", total / 60, total % 60));
+    }
+    slots
+}
+
 pub fn kline_period_to_tdx(p: KlinePeriod) -> BarCategory {
     match p {
         KlinePeriod::Day => BarCategory::Day,
@@ -321,4 +380,101 @@ pub async fn async_connect_bestip(timeout: Duration) -> super::Result<TdxHqClien
 fn _use_helper(b: &Bar) -> Option<KlinePoint> {
     let _ = code6;
     map_daily_bar(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trading_minute_slots_count_240() {
+        let s = trading_minute_slots();
+        assert_eq!(s.len(), 240);
+        assert_eq!(s.first().unwrap(), "09:30");
+        // 上午最后一槽 = 11:29
+        assert_eq!(s[119], "11:29");
+        // 下午第一槽 = 13:00
+        assert_eq!(s[120], "13:00");
+        // 下午最后一槽 = 14:59
+        assert_eq!(s.last().unwrap(), "14:59");
+    }
+
+    #[test]
+    fn minute_time_adapter_maps_first_three_slots() {
+        let pts = vec![
+            MinuteTimePoint {
+                price: 10.0,
+                volume: 100,
+            },
+            MinuteTimePoint {
+                price: 10.5,
+                volume: 200,
+            },
+            MinuteTimePoint {
+                price: 10.6,
+                volume: 0, // 无成交 → volume None
+            },
+        ];
+        let out = tdx_minute_time_to_intraday_points(&pts);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "09:30");
+        assert_eq!(out[1].0, "09:31");
+        assert_eq!(out[2].0, "09:32");
+        assert_eq!(out[2].2, None);
+        assert!(out[3..].iter().next().is_none());
+    }
+
+    #[test]
+    fn minute_time_adapter_skips_nonfinite_or_nonpositive_price() {
+        let pts = vec![
+            MinuteTimePoint {
+                price: 0.0,
+                volume: 100,
+            },
+            MinuteTimePoint {
+                price: f64::NAN,
+                volume: 100,
+            },
+            MinuteTimePoint {
+                price: 11.0,
+                volume: 100,
+            },
+        ];
+        let out = tdx_minute_time_to_intraday_points(&pts);
+        // 前两点被 f64_to_price 过滤；第 3 点 idx=2 → "09:32"
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "09:32");
+    }
+
+    #[test]
+    fn minute_time_adapter_full_240_points() {
+        // 模拟 TDX 返回 240 点 → 全部覆盖 9:30-14:59 槽位
+        let pts: Vec<MinuteTimePoint> = (0..240)
+            .map(|i| MinuteTimePoint {
+                price: 10.0 + (i as f64) * 0.001,
+                volume: 100,
+            })
+            .collect();
+        let out = tdx_minute_time_to_intraday_points(&pts);
+        assert_eq!(out.len(), 240);
+        assert_eq!(out.first().unwrap().0, "09:30");
+        assert_eq!(out.last().unwrap().0, "14:59");
+        // 中点：午休前后过渡
+        assert_eq!(out[119].0, "11:29");
+        assert_eq!(out[120].0, "13:00");
+    }
+
+    #[test]
+    fn minute_time_adapter_handles_241_point_overflow() {
+        // 241 点：第 241 个映射到 15:00（多余点向后延伸）
+        let pts: Vec<MinuteTimePoint> = (0..241)
+            .map(|i| MinuteTimePoint {
+                price: 10.0 + (i as f64) * 0.001,
+                volume: 1,
+            })
+            .collect();
+        let out = tdx_minute_time_to_intraday_points(&pts);
+        assert_eq!(out.len(), 241);
+        assert_eq!(out[240].0, "15:00");
+    }
 }
