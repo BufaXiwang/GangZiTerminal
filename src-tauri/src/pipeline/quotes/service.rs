@@ -1134,65 +1134,51 @@ impl QuotesService {
                 tdx_targets = tdx_input.len(),
                 bj_targets = bj_codes.len(),
                 total,
-                "universe TDX batch pass starting"
+                "universe TDX streaming pass starting"
             );
 
-            let tdx_results = self
-                .tdx
-                .fetch_quotes(tdx_input.clone(), trade_date, now)
-                .await;
-
-            tracing::info!(
-                target: "quotes.refresh.universe",
-                tdx_targets = tdx_input.len(),
-                elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
-                "universe TDX batch pass returned"
-            );
-
+            // **Streaming chunks**：pipeline 主动按 80 一批驱动 TDX，每批 ~200ms。
+            // 每批完成后立即 write DB + emit progress，让 UI 在 25s 期间持续填充而不是
+            // 干等 15s。`fetch_quotes` 接受 ≤ 80 即触发单次 TDX RPC（manager 内部
+            // QUOTE_BATCH_MAX = 80），刚好对齐。
+            const TDX_CHUNK: usize = 80;
             let mut completed: u32 = 0;
             let mut affected_in_batch: Vec<TsCode> = Vec::new();
             let mut fallback_queue: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
 
-            for ((ts, cat, name), res) in
-                tdx_input.into_iter().zip(tdx_results.into_iter())
-            {
-                completed += 1;
-                // `is_display_complete` 而不是 `is_quote_complete` —— 指数 / 基金 TDX
-                // 不返回 bid/ask 五档（其他 provider 同样不返回），不该因此把它们丢去
-                // 跑 ~600ms/只的 EM→Tencent→Sina fallback。list 视图只需要 price。
-                // `is_quote_complete` 是 fallback chain 的字段完整度裁判，不是 universe
-                // batch 的接受门槛。
-                match res {
-                    Ok(q) if q.is_display_complete() => {
-                        let captured_at = q.captured_at;
-                        let source_str = q.source.as_str().to_string();
-                        self.cache.put(CachedSnapshot {
-                            quote: q.clone(),
-                            captured_at,
-                            trade_date,
-                            source: source_str,
-                        });
-                        if matches!(req.purpose, RefreshPurpose::Close) {
-                            let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
+            for chunk in tdx_input.chunks(TDX_CHUNK) {
+                let chunk_vec: Vec<_> = chunk.to_vec();
+                let results = self.tdx.fetch_quotes(chunk_vec, trade_date, now).await;
+                for ((ts, cat, name), res) in chunk.iter().zip(results.into_iter()) {
+                    completed += 1;
+                    // `is_display_complete` 而不是 `is_quote_complete` —— 指数 / 基金 TDX
+                    // 不返回 bid/ask 五档（其他 provider 同样不返回），不该因此把它们丢去
+                    // 跑 ~600ms/只的 EM→Tencent→Sina fallback。list 视图只需要 price。
+                    match res {
+                        Ok(q) if q.is_display_complete() => {
+                            let captured_at = q.captured_at;
+                            let source_str = q.source.as_str().to_string();
+                            self.cache.put(CachedSnapshot {
+                                quote: q.clone(),
+                                captured_at,
+                                trade_date,
+                                source: source_str,
+                            });
+                            if matches!(req.purpose, RefreshPurpose::Close) {
+                                let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
+                            }
+                            success += 1;
+                            affected.push(ts.clone());
+                            affected_in_batch.push(ts.clone());
                         }
-                        success += 1;
-                        affected.push(ts.clone());
-                        affected_in_batch.push(ts.clone());
-                    }
-                    _ => {
-                        // TDX 失败或字段不全 — 推入 fallback chain (EM → Tencent → Sina)。
-                        fallback_queue.push((ts, cat, name));
+                        _ => {
+                            // TDX 失败或字段不全 — 推入 fallback chain (EM → Tencent → Sina)。
+                            fallback_queue.push((ts.clone(), *cat, name.clone()));
+                        }
                     }
                 }
-                if affected_in_batch.len() >= PROGRESS_BATCH {
-                    tracing::info!(
-                        target: "quotes.refresh.universe",
-                        completed,
-                        success,
-                        total,
-                        batch_size = affected_in_batch.len(),
-                        "emit progress (tdx batch path)"
-                    );
+                // 每 TDX chunk 一次 emit；spec §5 N=80 (transport batch size) 是流式底线。
+                if !affected_in_batch.is_empty() {
                     self.emit_progress(MarketQuotesRefreshProgressPayload {
                         scope: RefreshScopeKind::Universe,
                         purpose: req.purpose,
@@ -1205,6 +1191,14 @@ impl QuotesService {
                     });
                 }
             }
+
+            tracing::info!(
+                target: "quotes.refresh.universe",
+                tdx_targets = tdx_input.len(),
+                tdx_elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
+                success_after_tdx = success,
+                "universe TDX streaming pass returned"
+            );
 
             tracing::info!(
                 target: "quotes.refresh.universe",

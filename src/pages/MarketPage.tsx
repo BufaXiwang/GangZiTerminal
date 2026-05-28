@@ -82,8 +82,10 @@ export default function MarketPage() {
   const [sortKey, setSortKey] = useState<SortKey>("amount");
   const [sortDir] = useState<SortDir>("desc");
   const [refreshTick, setRefreshTick] = useState(0);
-  // universe scope refresh 进度事件触发的去抖 refetch（spec §5 全市场刷新执行契约）
-  const progressDebounceRef = useRef<number | null>(null);
+  // universe scope refresh 进度事件触发的 throttle refetch（spec §5 全市场刷新执行契约）
+  // Leading-edge：第一个事件立即 refetch，之后至少 500ms 间隔，让冷启动期间 UI 持续流式填充。
+  const lastProgressRefetchRef = useRef<number>(0);
+  const pendingProgressTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     perf(`MarketPage mount at ${performance.now().toFixed(1)}`);
@@ -92,30 +94,38 @@ export default function MarketPage() {
     };
   }, []);
 
-  // 订阅 universe refresh progress event — 后台 batch refresh 时每 200 只 emit 一次，
-  // 这里做 1.5s debounce 静默 refetch listMarket，让冷启动期间用户看到列表逐步填充。
+  // 订阅 universe refresh progress event — pipeline 每 80 只 emit 一次。
+  // Leading-edge throttle 500ms：第一个事件立即刷，让 UI 在 ~200ms 后就开始填充。
   useEffect(() => {
+    const THROTTLE_MS = 500;
     let unlisten: (() => void) | null = null;
+    const doRefetch = () => {
+      lastProgressRefetchRef.current = Date.now();
+      invalidateAllListCache();
+      setRefreshTick((t) => t + 1);
+    };
     void listen<unknown>("market-quotes-refresh-progress", (event) => {
       const p = (event.payload as { payload?: { completed?: number; success?: number; total?: number } } | undefined)?.payload;
       perf(
         `progress event completed=${p?.completed ?? "?"} success=${p?.success ?? "?"} total=${p?.total ?? "?"}`,
       );
-      if (progressDebounceRef.current != null) {
-        window.clearTimeout(progressDebounceRef.current);
+      const elapsed = Date.now() - lastProgressRefetchRef.current;
+      if (elapsed >= THROTTLE_MS) {
+        // leading edge：立即刷
+        doRefetch();
+      } else if (pendingProgressTimerRef.current == null) {
+        // trailing edge：保证最后一次也能 refetch
+        pendingProgressTimerRef.current = window.setTimeout(() => {
+          pendingProgressTimerRef.current = null;
+          doRefetch();
+        }, THROTTLE_MS - elapsed);
       }
-      progressDebounceRef.current = window.setTimeout(() => {
-        progressDebounceRef.current = null;
-        // 数据库刚被 batch 写入新行，cache 必须失效让 listMarket 走 IPC 读 fresh state。
-        invalidateAllListCache();
-        setRefreshTick((t) => t + 1);
-      }, 1500);
     }).then((un) => {
       unlisten = un;
     });
     return () => {
-      if (progressDebounceRef.current != null) {
-        window.clearTimeout(progressDebounceRef.current);
+      if (pendingProgressTimerRef.current != null) {
+        window.clearTimeout(pendingProgressTimerRef.current);
       }
       unlisten?.();
     };
