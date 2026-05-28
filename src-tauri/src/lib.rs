@@ -227,6 +227,42 @@ pub fn run() {
                     if let Err(e) = svc.refresh_market_quotes(req).await {
                         tracing::warn!(target: "quotes.startup", error = ?e, "core quote refresh failed");
                     }
+
+                    // 4) K 线日线预热（核心指数）— 小而快（~4 codes），先跑，UI 切到指数 K 线立即可见。
+                    //    Universe 级 K 线刷新交给 scheduler 16:00 / 下次启动后台。
+                    let core = svc.core_indexes();
+                    let kline_scope = crate::domain::quotes::RefreshDataScope::Subscribed { ts_codes: core };
+                    if let Err(e) = svc.refresh_klines(kline_scope, vec![crate::domain::quotes::KlinePeriod::Day]).await {
+                        tracing::warn!(target: "quotes.startup", error = ?e, "kline warmup failed");
+                    }
+
+                    // 5) Close snapshot catch-up（universe，慢 — 单独 spawn 不阻塞后续）
+                    //
+                    // scheduler 在 h==15 && m>=30 触发一次 close snapshot；如果用户在 15:30
+                    // 之后冷启动 app，会永久错过当天窗口。这里启动时检查 latest_completed
+                    // _trade_date 的 close snapshot 是否完整；不完整就立即触发一次。
+                    //
+                    // Spec: quotes-module.md §5 "失败时可低频重试直到获得最新已完成交易日快照"。
+                    let ctx = svc.market_time_now();
+                    let last_td = ctx.latest_completed_trade_date;
+                    if !svc.close_snapshot_complete(last_td).await {
+                        tracing::info!(
+                            target: "quotes.startup",
+                            trade_date = %last_td.format(),
+                            "close snapshot incomplete; triggering universe catch-up (background)"
+                        );
+                        let svc_close = Arc::clone(&svc);
+                        tauri::async_runtime::spawn(async move {
+                            let req = crate::pipeline::quotes::service::RefreshMarketQuotesRequest {
+                                scope: crate::domain::quotes::RefreshMarketQuotesScope::Universe,
+                                purpose: crate::domain::quotes::RefreshPurpose::Close,
+                                trade_date: Some(last_td),
+                            };
+                            if let Err(e) = svc_close.refresh_market_quotes(req).await {
+                                tracing::warn!(target: "quotes.startup", error = ?e, "close snapshot catch-up failed");
+                            }
+                        });
+                    }
                 });
             }
 
