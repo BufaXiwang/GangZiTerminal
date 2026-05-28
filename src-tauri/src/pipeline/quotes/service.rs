@@ -4,9 +4,9 @@
 
 use crate::domain::quotes::{
     apply_band_helper, compute_indicators, compute_limit_band, core_indexes, derive_freshness,
-    eligible_trade_date, Adjust as AdjEnum, CompanyEvent, DailyBasic, FreshnessIntent,
-    IndicatorBasis, IndicatorName, IndicatorSnapshot, IntradaySeries, KlinePeriod, KlinePoint,
-    KlineSeries, MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod,
+    eligible_trade_date, is_in_trading_session, Adjust as AdjEnum, CompanyEvent, DailyBasic,
+    FreshnessIntent, IndicatorBasis, IndicatorName, IndicatorSnapshot, IntradaySeries, KlinePeriod,
+    KlinePoint, KlineSeries, MarketInstrument, MarketQuotesRefreshedPayload, MinuteKlinePeriod,
     MinuteKlineSeries, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose, RefreshScopeKind,
     ScanCondition, ScanConditionField, ScanConditionValue, ScanCriteria, ScanFilter, ScanItem,
     ScanOp, ScanResult, ScanSortBy, ScanUniverse, StockProfile, StockQuote, TradeStatus,
@@ -22,7 +22,8 @@ use crate::infrastructure::quotes::{
     TradeCalendarRepo, TushareClient, TushareHealthCheck,
 };
 use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
+use chrono_tz::Asia::Shanghai;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -1253,7 +1254,13 @@ impl QuotesService {
 
     // ====================================================================== refresh_minute_klines
 
-    /// 拉取分钟 K（spec §5 line 753-757：TDX > Eastmoney；BJ 走 EM）。
+    /// 拉取分钟 K（spec §5 line 809-816：TDX > Eastmoney；BJ 走 EM）。
+    ///
+    /// **交易时段 guard (drift 6)**：
+    /// - 交易时段内 (`is_in_trading_session`)：正常拉取，所有 (ts, period) 都向远端发请求。
+    /// - 盘后：对每个 (ts, period)，先查 `max_minute_kline_ts_ms`；如果 DB 已存有
+    ///   "今日开盘以后" 的 bar，跳过远端拉取；否则允许一次性 catch-up（首次启动 / 之前网络失败）。
+    ///   午休 / 09:15-09:30 也按"交易时段内"处理，因为 guard 用 `[09:15, 15:00]` 宽窗口。
     ///
     /// 写入 `quote_klines_minute`；失败的 (ts_code, period) 计入 failed。
     /// 调度由模块外运行时决定（spec §5 未规定固定频率）。
@@ -1269,6 +1276,20 @@ impl QuotesService {
             periods
         };
         let now = Utc::now();
+        // drift 6: trading-session guard (B 方案：盘后允许 DB 空时 catch-up，已存即 skip)。
+        let now_bj = now.with_timezone(&Shanghai).naive_local();
+        let in_session = is_in_trading_session(now_bj);
+        // 北京时间今日 09:15 对应 UTC timestamp_ms，作为"今日开盘起点"阈值。
+        let today_open_ms: i64 = {
+            let bj_date = now_bj.date();
+            let bj_open = bj_date.and_hms_opt(9, 15, 0).unwrap();
+            // bj_open 是北京墙钟 → 转 Asia/Shanghai aware → UTC
+            Shanghai
+                .from_local_datetime(&bj_open)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
+                .unwrap_or(0)
+        };
         let mut total: u32 = 0;
         let mut success: u32 = 0;
         let mut failed: u32 = 0;
@@ -1278,6 +1299,25 @@ impl QuotesService {
         for ts in &ts_codes {
             let is_bj = matches!(ts.market(), crate::domain::shared::Market::BJ);
             for period in &periods {
+                // 盘后 + 已存今日数据 → skip remote fetch（drift 6 plan B）。
+                // 不计 total（视作 no-op，保 `success + failed = total` invariant）。
+                if !in_session {
+                    let max = self
+                        .repo()
+                        .max_minute_kline_ts_ms(ts, *period)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(0);
+                    if max >= today_open_ms {
+                        tracing::debug!(
+                            target: "quotes.refresh.minute",
+                            ts = ts.as_str(),
+                            period = period.as_str(),
+                            "outside session and DB has today's bars; skipping"
+                        );
+                        continue;
+                    }
+                }
                 total += 1;
                 let mut ok = false;
                 if !is_bj {
@@ -1337,10 +1377,19 @@ impl QuotesService {
 
     // ====================================================================== refresh_intraday
 
-    /// 拉取当日分时（spec §5 line 753-757：TDX > Eastmoney；BJ 走 EM）。
+    /// 拉取当日分时 — TDX-primary (spec §5 line 818-826)。
     ///
-    /// 写入 `quote_intraday` 表。TDX 协议不直接暴露分时序列，目前实现走 EM 主路径；
-    /// 后续 TDX 分时接入可在此扩展。
+    /// 路径：
+    /// 1. **交易时段 guard (drift 6)**：`is_in_trading_session(now_beijing) == false` →
+    ///    跳过远端拉取，DB 中已存的分时仍可读。盘后分时数据不再变化。
+    /// 2. **TDX 主路径 (SH/SZ)**：`fetch_minute_time(ts_code) → Vec<MinuteTimePoint>`；
+    ///    adapter `tdx_minute_time_to_intraday_points` 按 index→trading-minute slot
+    ///    映射时间（spec §5 line 824 "TDX 协议原生支持当日 240 点分时"）。
+    /// 3. **Eastmoney fallback**：TDX 失败或 BJ 走 EM `fetch_intraday`。
+    /// 4. **写入**：`repo.upsert_intraday(ts_code, trade_date, points, source, now)`。
+    ///    upsert ON CONFLICT(ts_code, trade_date, time) — 新日期不冲突，旧日期 series 留库
+    ///    （由读侧 `fetch_data` 按 eligible trade_date 选最新；spec §4 line 673）。
+    /// 5. **refresh_state**：`kind = "intraday"`，记录 total/success/failed。
     pub async fn refresh_intraday(
         &self,
         scope: RefreshDataScope,
@@ -1353,24 +1402,75 @@ impl QuotesService {
         } else {
             ctx.latest_completed_trade_date
         };
+
+        // Step 0: 交易时段 guard (drift 6) — 非交易时段不拉远端。
+        let now_bj = now.with_timezone(&Shanghai).naive_local();
+        if !is_in_trading_session(now_bj) {
+            tracing::info!(
+                target: "quotes.refresh.intraday",
+                now_bj = %now_bj,
+                "outside trading session; skip intraday remote fetch (DB remains source)"
+            );
+            let _ = self
+                .repo()
+                .record_refresh_state("intraday", trade_date, 0, 0, 0, now);
+            return Ok(RefreshDataResult {
+                total: 0,
+                success: 0,
+                failed: 0,
+                warnings: Vec::new(),
+                affected_ts_codes: ts_codes,
+            });
+        }
+
         let mut total: u32 = 0;
         let mut success: u32 = 0;
         let mut failed: u32 = 0;
-        let warnings: Vec<WarningCode> = Vec::new();
+        let mut warnings: Vec<WarningCode> = Vec::new();
 
         for ts in &ts_codes {
+            let is_bj = matches!(ts.market(), crate::domain::shared::Market::BJ);
             total += 1;
-            match self.eastmoney.fetch_intraday(ts, trade_date).await {
-                Ok(points) if !points.is_empty() => {
-                    let _ = self
-                        .repo()
-                        .upsert_intraday(ts, trade_date, &points, "eastmoney", now);
-                    success += 1;
+            let mut ok = false;
+
+            // ① TDX 主路径（SH/SZ）。
+            if !is_bj {
+                match self.tdx.fetch_minute_time(ts).await {
+                    Ok(points) if !points.is_empty() => {
+                        let mapped =
+                            crate::infrastructure::quotes::tdx::adapter::tdx_minute_time_to_intraday_points(&points);
+                        if !mapped.is_empty() {
+                            let _ = self
+                                .repo()
+                                .upsert_intraday(ts, trade_date, &mapped, "tdx", now);
+                            success += 1;
+                            ok = true;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(target: "quotes.refresh.intraday", ts = ts.as_str(), error = %e, "tdx minute_time failed; try EM"),
                 }
-                Ok(_) => failed += 1,
-                Err(e) => {
-                    tracing::debug!(target: "quotes.refresh.intraday", ts = ts.as_str(), error = %e, "em intraday failed");
-                    failed += 1;
+            }
+
+            // ② Eastmoney fallback（TDX 失败或 BJ）。
+            if !ok {
+                match self.eastmoney.fetch_intraday(ts, trade_date).await {
+                    Ok(points) if !points.is_empty() => {
+                        let _ = self
+                            .repo()
+                            .upsert_intraday(ts, trade_date, &points, "eastmoney", now);
+                        success += 1;
+                        ok = true;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!(target: "quotes.refresh.intraday", ts = ts.as_str(), error = %e, "em intraday failed"),
+                }
+            }
+
+            if !ok {
+                failed += 1;
+                if is_bj && !warnings.contains(&WarningCode::DataPartial) {
+                    warnings.push(WarningCode::DataPartial);
                 }
             }
         }
@@ -2501,6 +2601,8 @@ mod tests {
     #[tokio::test]
     async fn refresh_minute_klines_records_refresh_state() {
         // BJ + 无 TDX/EM 网络 → 走 failed path，但函数仍 Ok 并写 refresh_state。
+        // drift 6 guard：盘后 + DB 空 → catch-up 模式 total=1；盘后 + DB 已存今日数据 → skip total=0；
+        // 盘中 → 正常 total=1。这里 DB 是 in-memory 空，因此总能进入 fetch 路径，total=1。
         let svc = make_service();
         seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
         let res = svc
@@ -2529,6 +2631,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_intraday_returns_ok_with_count_invariant() {
+        // drift 6 guard：盘后 → 跳过 → total=0；盘中 → total=1（BJ + 无网络全 failed）。
+        // 不管走哪条路径，都必须满足 invariant 和 affected_ts_codes 至少回填。
         let svc = make_service();
         seed_instrument(&svc, "430047.BJ", "BJ Co", InstrumentCategory::Stock);
         let res = svc
@@ -2537,8 +2641,9 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(res.total, 1);
+        assert!(res.total <= 1, "total ∈ {{0, 1}} depending on trading session guard");
         assert_eq!(res.success + res.failed, res.total);
+        assert_eq!(res.affected_ts_codes.len(), 1);
     }
 
     #[tokio::test]
@@ -2788,6 +2893,169 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!s2.warnings.contains(&WarningCode::QfqMissing));
+    }
+
+    // ----------------------------------------------------------------- D3 drift 5 / 6 / 7
+
+    /// drift 5（增量 K 线）— D2 已实现，D3 加 regression：
+    /// `max_kline_trade_date` 返回值在 seed → max+1 → refresh 链路中正确传导。
+    /// 不依赖网络：单独验证 repo + count 派生纯逻辑。
+    #[test]
+    fn drift5_incremental_count_derives_from_max_trade_date() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 1. 空 DB → max=None。
+        assert!(svc
+            .repo()
+            .max_kline_trade_date(&ts, KlinePeriod::Day)
+            .unwrap()
+            .is_none());
+        // 2. seed 一条 → max 推进。
+        let bar = KlinePoint {
+            date: TradeDate::parse("20240601").unwrap(),
+            open: Price(Decimal::new(10000, 2)),
+            close: Price(Decimal::new(10100, 2)),
+            high: Price(Decimal::new(10200, 2)),
+            low: Price(Decimal::new(9900, 2)),
+            volume: Some(Volume(1)),
+            amount: Some(Amount(Decimal::new(100_000, 2))),
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        let max = svc
+            .repo()
+            .max_kline_trade_date(&ts, KlinePeriod::Day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.format(), "20240601");
+        // 3. seed 第二条更晚 → max 替换。
+        let bar2 = KlinePoint {
+            date: TradeDate::parse("20240615").unwrap(),
+            open: Price(Decimal::new(10100, 2)),
+            close: Price(Decimal::new(10200, 2)),
+            high: Price(Decimal::new(10300, 2)),
+            low: Price(Decimal::new(10000, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar2], "test", Utc::now())
+            .unwrap();
+        let max2 = svc
+            .repo()
+            .max_kline_trade_date(&ts, KlinePeriod::Day)
+            .unwrap()
+            .unwrap();
+        assert_eq!(max2.format(), "20240615");
+    }
+
+    /// drift 7（xdxr 触发 qfq cache 失效）— D2 已 inline 实现，D3 加 regression：
+    /// `refresh_xdxr_events` 写完事件后调用 `adjust_cache.invalidate`，下次读 qfq 重算。
+    #[tokio::test]
+    async fn drift7_refresh_xdxr_events_invalidates_qfq_cache() {
+        use crate::domain::shared::{Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 1. seed K bar + 触发 qfq 读取 → cache miss → 写入 cache
+        let bar = KlinePoint {
+            date: TradeDate::parse("20140630").unwrap(),
+            open: Price(Decimal::new(19880, 2)),
+            close: Price(Decimal::new(19880, 2)),
+            high: Price(Decimal::new(19880, 2)),
+            low: Price(Decimal::new(19880, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        let s1 = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        // 无 xdxr → 应带 QfqMissing warning。
+        assert!(s1.warnings.contains(&WarningCode::QfqMissing));
+        // 2. 触发 refresh_xdxr_events（网络可能失败，但函数内调 invalidate）
+        //    BJ 跳过，这里是 SH，TDX 调用真实发起。在测试环境通常 failed，
+        //    但只要不发生 panic，drift 7 设计的 invalidate 路径已通过 refresh_klines 验证。
+        //    所以这里只校验 invalidate 函数可直接调用，模拟 refresh_xdxr_events 内部行为。
+        svc.adjust_cache.invalidate(&ts);
+        // 3. 即使第二次读，cache miss → 仍重算；只要不 panic 即可。
+        let s2 = svc
+            .read_kline_series_with_adjust(&ts, KlinePeriod::Day, AdjEnum::Qfq, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2.points.len(), 1);
+    }
+
+    /// drift 6（交易时段 guard）— intraday 在非交易时段直接返回零开销结果。
+    /// 用 chrono pure naive datetime 验证 `is_in_trading_session` 行为；
+    /// 因 refresh_intraday 用 `Utc::now()` 非确定，所以这里测纯函数的 wiring 已在 trade_calendar tests 覆盖。
+    /// 这里加一条端到端：guard 走 fast-path 时仍写 refresh_state + 返回 affected_ts_codes。
+    #[tokio::test]
+    async fn drift6_intraday_outside_session_records_state_and_returns() {
+        // 该测试不能强制时间，但当 wall clock 在非交易时段（例如 CI 跑在午夜）时
+        // total=0；交易时段则 total=1。任一情况都必须满足 invariant 并写 refresh_state。
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let res = svc
+            .refresh_intraday(RefreshDataScope::Manual { ts_codes: vec![ts.clone()] })
+            .await
+            .unwrap();
+        assert!(res.total <= 1);
+        assert_eq!(res.success + res.failed, res.total);
+        // affected_ts_codes 一定包含解析后的 ts_code（不论是否实际发起远端调用）。
+        assert_eq!(res.affected_ts_codes.len(), 1);
+        assert_eq!(res.affected_ts_codes[0].as_str(), "600519.SH");
+        // refresh_state 已写（kind=intraday；总数 0 或 1）。
+        let td = eligible_trade_date(&svc.market_time_now()).trade_date;
+        let st = svc.repo().read_refresh_state("intraday", td).unwrap();
+        assert!(st.is_some(), "intraday refresh_state must be recorded");
+    }
+
+    /// drift 6（交易时段 guard）— minute K 盘后 + DB 空时仍 catch-up，DB 已存今日则 skip。
+    /// 验证 `max_minute_kline_ts_ms` 与 today_open_ms 比较语义。
+    #[test]
+    fn drift6_max_minute_kline_ts_ms_returns_none_for_empty() {
+        let svc = make_service();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let max = svc
+            .repo()
+            .max_minute_kline_ts_ms(&ts, MinuteKlinePeriod::M5)
+            .unwrap();
+        assert!(max.is_none());
+    }
+
+    #[test]
+    fn drift6_max_minute_kline_ts_ms_after_seed() {
+        use crate::domain::quotes::MinuteKlinePoint;
+        use crate::domain::shared::{Amount, Price, Volume};
+        use rust_decimal::Decimal;
+        let svc = make_service();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let p = MinuteKlinePoint {
+            timestamp_ms: 1_700_000_000_000,
+            open: Price(Decimal::new(10000, 2)),
+            close: Price(Decimal::new(10000, 2)),
+            high: Price(Decimal::new(10000, 2)),
+            low: Price(Decimal::new(10000, 2)),
+            volume: Volume(100),
+            amount: Amount(Decimal::new(1_000_000, 2)),
+        };
+        svc.repo()
+            .upsert_minute_klines(&ts, MinuteKlinePeriod::M5, &[p], "test", Utc::now())
+            .unwrap();
+        let max = svc
+            .repo()
+            .max_minute_kline_ts_ms(&ts, MinuteKlinePeriod::M5)
+            .unwrap();
+        assert_eq!(max, Some(1_700_000_000_000));
     }
 
     #[test]

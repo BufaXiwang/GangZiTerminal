@@ -387,6 +387,30 @@ impl<'a> QuotesRepository<'a> {
 
     // ====================================================================== klines (minute)
 
+    /// 查 `quote_klines_minute` 中 `(ts_code, period)` 的最新 `ts_ms`。
+    ///
+    /// 用于 drift 6 交易时段 guard：盘后判断是否已经存过当日数据，避免重复拉取。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 后台刷新表（交易时段 guard）。
+    pub fn max_minute_kline_ts_ms(
+        &self,
+        ts_code: &TsCode,
+        period: MinuteKlinePeriod,
+    ) -> rusqlite::Result<Option<i64>> {
+        self.db.with(|conn| {
+            let res: Option<i64> = conn
+                .query_row(
+                    "SELECT MAX(ts_ms) FROM quote_klines_minute
+                     WHERE ts_code = ?1 AND period = ?2",
+                    params![ts_code.as_str(), period.as_str()],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()
+                .map(|o| o.flatten())?;
+            Ok(res)
+        })
+    }
+
     pub fn upsert_minute_klines(
         &self,
         ts_code: &TsCode,
