@@ -94,10 +94,12 @@ export default function MarketPage() {
     };
   }, []);
 
-  // 订阅 universe refresh progress event — pipeline 每 80 只 emit 一次。
-  // Leading-edge throttle 500ms：第一个事件立即刷，让 UI 在 ~200ms 后就开始填充。
+  // 订阅 universe refresh progress event — pipeline 每 80 只 emit 一次（一轮 ~94 次）。
+  // Throttle 2.5s：冷启动仍每 2.5s 增量填充（比 25s 空窗好得多）；稳态下一轮刷新
+  // 只重拉 ~6 次而非 ~30 次，避免整列表高频重渲染拖慢交互。
+  // 终态由 trailing-edge timer 兜底，保证最后一拨数据也刷到。
   useEffect(() => {
-    const THROTTLE_MS = 500;
+    const THROTTLE_MS = 2500;
     let unlisten: (() => void) | null = null;
     const doRefetch = () => {
       lastProgressRefetchRef.current = Date.now();
