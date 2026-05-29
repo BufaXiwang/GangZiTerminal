@@ -24,6 +24,7 @@ import { useWatchlistStore } from "../lib/watchlistStore";
 import { InstrumentDetail } from "./market/InstrumentDetail";
 import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
 import { MarketMetricsRow } from "./market/MarketMetricsRow";
+import { RowContextMenu } from "./market/RowContextMenu";
 import { CORE_INDEXES } from "../lib/useCoreIndexes";
 import {
   getCachedList,

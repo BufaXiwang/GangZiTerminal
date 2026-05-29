@@ -96,7 +96,8 @@ function NewsRow({
   sourceName: string;
 }) {
   const acc = sourceAccent(it.source);
-  const hasWarn = it.warnings.length > 0;
+  const warnings = it.warnings ?? [];
+  const hasWarn = warnings.length > 0;
   const body = it.articleExcerpt ?? it.summary ?? "";
   const bodyRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
@@ -123,7 +124,7 @@ function NewsRow({
     >
       <div className="news-row-time tabular">
         <span className="news-row-dot" />
-        {formatHHmm(it.publishedAt)}
+        {formatHHmm(it.publishedAt ?? undefined)}
       </div>
       <div className="news-row-body">
         <h3 className="news-row-title">
@@ -132,7 +133,7 @@ function NewsRow({
             <BookOpen size={13} className="news-row-article-icon" aria-label="已抽取正文" />
           )}
           {hasWarn && (
-            <AlertTriangle size={13} className="news-row-warn-icon" aria-label={it.warnings.join(", ")} />
+            <AlertTriangle size={13} className="news-row-warn-icon" aria-label={warnings.join(", ")} />
           )}
         </h3>
         {body && (

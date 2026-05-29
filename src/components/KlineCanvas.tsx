@@ -14,7 +14,15 @@
 // loading/empty/error 自维护 + overlay 显示。
 
 import { useEffect, useRef, useState } from "react";
-import { init, dispose, type Chart, type KLineData } from "klinecharts";
+import {
+  init,
+  dispose,
+  CandleType,
+  PolygonType,
+  LineType,
+  type Chart,
+  type KLineData,
+} from "klinecharts";
 import {
   commands,
   type FetchInclude,
@@ -255,7 +263,7 @@ export function KlineCanvas({
       locale: "zh-CN",
       styles: {
         candle: {
-          type: "candle_solid",
+          type: CandleType.CandleSolid,
           bar: {
             upColor,
             downColor,
@@ -300,14 +308,12 @@ export function KlineCanvas({
           // VOL 副图 + 其他 bar 类指标颜色按 A 股语义红涨绿跌（默认 klinecharts 是反的）
           bars: [
             {
-              style: "fill",
-              borderStyle: "solid",
+              style: PolygonType.Fill,
+              borderStyle: LineType.Solid,
               borderSize: 1,
               upColor,
               downColor,
               noChangeColor: fgMuted,
-              borderColor: upColor,
-              wickColor: upColor,
             },
           ],
         },

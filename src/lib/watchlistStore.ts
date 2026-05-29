@@ -81,7 +81,9 @@ export const useWatchlistStore = create<WatchlistState>((set, get) => ({
     next.add(tsCode);
     set({ codes: next });
     const res = await commands.updateWatchlist(
-      note ? { action: "add", tsCode, note } : { action: "add", tsCode },
+      note
+        ? { action: "add", ts_code: tsCode, note }
+        : { action: "add", ts_code: tsCode },
     );
     if (res.status === "error" || !res.data.accepted) {
       // rollback
@@ -106,7 +108,7 @@ export const useWatchlistStore = create<WatchlistState>((set, get) => ({
     // 同步移除 items（让 UI 立即响应）
     const nextItems = get().items.filter((it) => it.tsCode !== tsCode);
     set({ codes: next, items: nextItems });
-    const res = await commands.updateWatchlist({ action: "remove", tsCode });
+    const res = await commands.updateWatchlist({ action: "remove", ts_code: tsCode });
     if (res.status === "error" || !res.data.accepted) {
       // rollback
       const rollback = new Set(get().codes);

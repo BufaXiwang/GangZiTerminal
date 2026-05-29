@@ -13,7 +13,6 @@
 import { Clock, Shield, ShieldOff, Target, TrendingDown } from "lucide-react";
 import { useEffect } from "react";
 import { KlineCanvas } from "../../components/KlineCanvas";
-import { useKlineData } from "../../lib/useKlineData";
 import type {
   Position,
   PositionProtection,
@@ -135,12 +134,6 @@ export function PositionsPanel({
     }
   }, [selected, positions, onSelect]);
 
-  const kline = useKlineData({
-    tsCode: selectedItem?.tsCode ?? null,
-    period: "day",
-    enabled: !!selectedItem,
-  });
-
   return (
     <div className="positions-panel">
       <div className="panel-section-head">
@@ -175,7 +168,7 @@ export function PositionsPanel({
           {positions.map((p) => {
             const isSel = p.tsCode === selected;
             const pct = pnlPct(p);
-            const chips = buildProtectionChips(p.protection);
+            const chips = buildProtectionChips(p.protection ?? undefined);
             const isTOnePlus = p.sellableQuantity < p.quantity;
             return (
               <div
@@ -273,14 +266,9 @@ export function PositionsPanel({
           )}
         </div>
         <div className="positions-chart">
-          {!selectedItem ? null : kline.loading && kline.data.length === 0 ? (
-            <div className="detail-chart-status">加载中</div>
-          ) : kline.error ? (
-            <div className="detail-chart-status">加载失败：{kline.error}</div>
-          ) : kline.data.length === 0 ? (
-            <div className="detail-chart-status">暂无 K 线数据</div>
-          ) : (
-            <KlineCanvas data={kline.data} mode="candle" height={320} />
+          {/* KlineCanvas 内部自管 loading/empty/error + load-more */}
+          {selectedItem && (
+            <KlineCanvas tsCode={selectedItem.tsCode} period="day" />
           )}
         </div>
       </div>
