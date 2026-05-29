@@ -8,6 +8,7 @@ export const ROUTES = {
   market: "/",
   news: "/news",
   account: "/account",
+  settings: "/settings",
 } as const;
 
 export type RouteKey = keyof typeof ROUTES;

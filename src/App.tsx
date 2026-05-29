@@ -14,6 +14,7 @@ import { useWatchlistStore } from "./lib/watchlistStore";
 import MarketPage from "./pages/MarketPage";
 import NewsPage from "./pages/NewsPage";
 import AccountPage from "./pages/AccountPage";
+import SettingsPage from "./pages/SettingsPage";
 
 // Keep-alive：所有 tab 同时挂载，靠 display 切换。切回来时不重建组件树，
 // 不重跑 useEffect / IPC / KLineChart init，几乎瞬时。代价是常驻内存。
@@ -30,7 +31,9 @@ export default function App() {
       ? "news"
       : pathname === ROUTES.account
         ? "account"
-        : "market";
+        : pathname === ROUTES.settings
+          ? "settings"
+          : "market";
 
   return (
     <AppShell>
@@ -42,6 +45,9 @@ export default function App() {
       </div>
       <div style={{ display: active === "account" ? "contents" : "none" }}>
         <AccountPage />
+      </div>
+      <div style={{ display: active === "settings" ? "contents" : "none" }}>
+        <SettingsPage />
       </div>
     </AppShell>
   );

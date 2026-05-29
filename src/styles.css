@@ -2855,3 +2855,380 @@ body {
   background: var(--bg-soft);
 }
 
+/* ============================================================
+ * 设置页 — Agent 模型渠道管理
+ * Spec: docs/design/frontend-design.md §设置页
+ * ============================================================ */
+
+.settings-workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  max-width: 920px;
+  padding-bottom: 24px;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.settings-section-title {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg-strong);
+  margin: 0;
+}
+
+.settings-section-hint {
+  font-size: 12px;
+}
+
+.settings-current-empty,
+.settings-empty {
+  font-size: 13px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+}
+
+.settings-current-select {
+  height: 32px;
+  max-width: 360px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-card);
+  color: var(--fg-strong);
+  font-family: var(--font-body);
+  font-size: 13px;
+}
+
+/* -------- 渠道列表 -------- */
+
+.settings-channel-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-card);
+}
+
+.settings-channel-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-channel-row:last-child {
+  border-bottom: none;
+}
+
+.settings-channel-row.active {
+  background: var(--brand-soft);
+}
+
+.settings-channel-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-channel-name {
+  font-size: 13px;
+  color: var(--fg-default);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-channel-model {
+  font-weight: 600;
+  color: var(--fg-strong);
+  font-family: var(--font-mono);
+}
+
+.settings-active-chip {
+  flex: 0 0 auto;
+}
+
+.settings-channel-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+
+.settings-wire-badge {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+}
+
+.settings-channel-host {
+  color: var(--fg-muted);
+  font-size: 12px;
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings-key-status {
+  color: var(--fg-faint);
+}
+
+.settings-key-status.set {
+  color: var(--chart-down);
+}
+
+.settings-disabled-tag {
+  color: var(--state-warn);
+}
+
+.settings-remove-btn {
+  flex: 0 0 auto;
+  width: 32px;
+  padding: 0;
+  justify-content: center;
+  color: var(--fg-muted);
+}
+
+.settings-remove-btn:hover:not(:disabled) {
+  color: var(--chart-up);
+}
+
+/* -------- 添加渠道表单 -------- */
+
+.settings-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  padding: 16px;
+}
+
+.settings-add-tabs {
+  align-self: flex-start;
+}
+
+.settings-form-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.settings-preset-cards {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.settings-preset-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 120px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.settings-preset-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-soft);
+}
+
+.settings-preset-card.active {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.settings-preset-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.settings-preset-sub {
+  font-size: 11px;
+}
+
+.settings-field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-field-wide {
+  grid-column: 1 / -1;
+}
+
+.settings-field-label {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.settings-input {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-card);
+  color: var(--fg-strong);
+  font-family: var(--font-body);
+  font-size: 13px;
+  outline: none;
+}
+
+.settings-input:focus-visible {
+  border-color: var(--brand);
+  outline: 2px solid var(--brand);
+  outline-offset: 0;
+}
+
+.settings-input[readonly] {
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  cursor: default;
+}
+
+.settings-textarea {
+  height: auto;
+  padding: 8px 10px;
+  resize: vertical;
+  line-height: 1.5;
+  font-family: var(--font-mono);
+}
+
+.settings-manual-count {
+  font-size: 11px;
+}
+
+.settings-conn-summary {
+  font-size: 12px;
+  padding: 6px 10px;
+  background: var(--bg-soft);
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+}
+
+/* -------- 模型多选 -------- */
+
+.settings-model-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-model-picker-head {
+  font-size: 12px;
+}
+
+.settings-model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+
+.settings-model-item {
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-model-item:last-child {
+  border-bottom: none;
+}
+
+.settings-model-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.settings-model-label:hover {
+  background: var(--bg-soft);
+}
+
+.settings-model-id {
+  font-family: var(--font-mono);
+  color: var(--fg-strong);
+}
+
+.settings-model-display {
+  font-size: 12px;
+}
+
+/* -------- 表单反馈 / 操作 -------- */
+
+.settings-form-error {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--chart-up);
+}
+
+.settings-form-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.settings-spin {
+  animation: settings-spin 800ms linear infinite;
+}
+
+@keyframes settings-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-spin {
+    animation: none;
+  }
+}
+

@@ -5,13 +5,14 @@
 // 保留窄图标导航；不在侧栏塞复杂状态。
 
 import { NavLink } from "react-router-dom";
-import { Newspaper, TrendingUp, Wallet } from "lucide-react";
+import { Newspaper, Settings, TrendingUp, Wallet } from "lucide-react";
 import { ROUTES } from "../lib/router";
 
 const NAV_ITEMS = [
   { to: ROUTES.market, label: "市场", icon: TrendingUp },
   { to: ROUTES.news, label: "资讯", icon: Newspaper },
   { to: ROUTES.account, label: "模拟账户", icon: Wallet },
+  { to: ROUTES.settings, label: "设置", icon: Settings },
 ] as const;
 
 export function Sidebar() {
