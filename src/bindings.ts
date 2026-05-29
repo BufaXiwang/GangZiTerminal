@@ -206,6 +206,94 @@ async agentListSkills() : Promise<Result<SkillSpec[], CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * 返回内置快速预设（DeepSeek / OpenAI / Anthropic 官方）。
+ * 
+ * Spec §5 前端命令：`agent_channel_presets`
+ */
+async agentChannelPresets() : Promise<Result<ChannelPresetView[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_channel_presets") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 调对应 wireFormat 的 `/models` 接口发现可用模型。
+ * 
+ * Spec §5 模型发现 API：发现失败时调用方引导用户手填模型名。
+ */
+async agentDiscoverModels(wireFormat: WireFormat, baseUrl: string, apiKey: string) : Promise<Result<DiscoveredModel[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_discover_models", { wireFormat, baseUrl, apiKey }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 添加一条渠道。生成 channelId（`ch_<uuid>`），stream=true，能力缺省 false。
+ * 若是首条渠道，自动设为 active。
+ * 
+ * Spec §2：每个确认保留的模型各成一条 ProviderChannel；维护 active 渠道。
+ */
+async agentAddChannel(input: AddChannelInput) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_add_channel", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 列出所有渠道（**屏蔽 apiKey 明文**）。
+ * 
+ * Spec §5 前端命令：`agent_list_channels`（屏蔽 apiKey）
+ */
+async agentListChannels() : Promise<Result<ProviderChannelView[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_list_channels") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 删除一条渠道。
+ */
+async agentRemoveChannel(channelId: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_remove_channel", { channelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 设置当前 active 渠道。
+ * 
+ * Spec §5 前端命令：`agent_set_active_channel`
+ */
+async agentSetActiveChannel(channelId: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_set_active_channel", { channelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 读取当前 active 渠道（屏蔽 apiKey）。
+ */
+async agentGetActiveChannel() : Promise<Result<ProviderChannelView | null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_get_active_channel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async fetchAccount(request: FetchAccountRequest) : Promise<Result<FetchAccountResponse, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("fetch_account", { request }) };
@@ -275,12 +363,28 @@ export type AccountTrigger = { triggerId: string; triggerType: AccountTriggerTyp
  */
 threshold?: string | null; quoteFreshness?: Freshness | null; warnings?: WarningCode[]; eventId: string; handled: boolean; occurredAt: string }
 export type AccountTriggerType = "stop_loss" | "take_profit" | "time_stop" | "order_filled" | "order_rejected" | "order_expired" | "invalidated"
+/**
+ * 添加渠道的请求 —— 一条确认保留的模型成一条渠道。
+ */
+export type AddChannelInput = { 
+/**
+ * 用户输入的渠道名（展示用 provider name）。
+ */
+provider: string; wireFormat: WireFormat; baseUrl?: string | null; apiKey: string; model: string; 
+/**
+ * 可选能力标记；缺省 false。
+ */
+supportsVision?: boolean | null; supportsThinking?: boolean | null; maxOutputTokens?: number | null; contextWindowTokens?: number | null }
 export type Adjust = "none" | "qfq" | "hfq"
 /**
  * 成交额，CNY。
  */
 export type Amount = string
 export type ArticleSnippet = { title?: string | null; content: string; fetchedAt?: string | null }
+/**
+ * 快速预设视图（返回给设置页）。
+ */
+export type ChannelPresetView = { key: string; provider: string; wireFormat: WireFormat; baseUrl: string }
 export type CommandError = { code: ErrorCode; message?: string | null; details?: JsonValue | null }
 /**
  * Spec: quotes-module.md §2 CompanyEvent
@@ -291,6 +395,10 @@ export type CompanyEventType = "dividend" | "suspension" | "resume" | "st" | "ea
  * Spec: quotes-module.md §2 基本面读模型
  */
 export type DailyBasic = { tsCode: TsCode; tradeDate: string; pe?: number | null; peTtm?: number | null; pb?: number | null; ps?: number | null; psTtm?: number | null; turnoverRate?: number | null; turnoverRateFloat?: number | null; volumeRatio?: number | null; totalMv?: Money | null; circMv?: Money | null; source: string; fetchedAt: string }
+/**
+ * 发现到的单个可用模型。
+ */
+export type DiscoveredModel = { id: string; displayName?: string | null }
 export type ErrorCode = "invalid_input" | "not_found" | "provider_unavailable" | "rate_limited" | "db_error" | "parse_error" | "quote_missing" | "quote_stale" | "quote_price_missing" | "depth_missing" | "outside_trading_session" | "instrument_not_tradable" | "instrument_suspended" | "limit_up_down_blocked" | "insufficient_cash" | "insufficient_sellable_quantity" | "invalid_lot_size" | "order_not_pending" | "risk_limit_exceeded" | "strategy_required" | "duplicate_event" | "version_conflict" | "article_extract_failed" | "tool_timeout" | "provider_context_too_long"
 export type FetchAccountInclude = { snapshot?: boolean | null; positions?: boolean | null; orders?: boolean | null; watchlist?: boolean | null; events?: boolean | null; triggers?: boolean | null }
 export type FetchAccountRequest = { include?: FetchAccountInclude | null; positionStatus?: PositionStatusFilter | null; orderActive?: boolean | null; orderStatusIn?: OrderStatus[] | null; triggerHandled?: TriggerHandledFilter | null; limit?: number | null; offset?: number | null }
@@ -483,6 +591,16 @@ export type PositionStatusFilter = "open" | "closed" | "all"
  */
 export type Price = string
 /**
+ * 渠道视图 —— **屏蔽 apiKey 明文**，只回 `apiKeySet: bool`。
+ * 
+ * Spec §2：apiKey 只写不读；list / get DTO 必须屏蔽明文。
+ */
+export type ProviderChannelView = { channelId: string; provider: string; wireFormat: WireFormat; baseUrl?: string | null; model: string; enabled: boolean; isActive: boolean; 
+/**
+ * apiKey 是否已设置（永远不回传明文）。
+ */
+apiKeySet: boolean }
+/**
  * Spec: quotes-module.md §2 行情 DTO
  */
 export type QuoteDepthLevel = { price?: Price | null; volume?: Volume | null }
@@ -596,6 +714,22 @@ export type WatchlistItemView = ({ tsCode: TsCode; name?: string | null; addedAt
  * Spec: account-module.md §4 (fetch_account watchlist quote 字段)
  */
 export type WatchlistQuoteView = { price?: Price | null; changePercent?: number | null; volume?: Volume | null; amount?: Amount | null; source?: string | null; freshness?: Freshness | null }
+/**
+ * Wire format 标识 — channel adapter 选择哪个 provider 实现。
+ */
+export type WireFormat = 
+/**
+ * Anthropic `/v1/messages`
+ */
+"messages" | 
+/**
+ * OpenAI `/v1/responses`
+ */
+"responses" | 
+/**
+ * OpenAI-compatible `/v1/chat/completions`
+ */
+"chat_completions"
 
 /** tauri-specta globals **/
 

@@ -49,11 +49,11 @@ use crate::pipeline::quotes::scheduler::{
 use crate::pipeline::quotes::service::QuotesService;
 use rust_decimal::Decimal;
 
-/// Tauri 主入口。`main.rs` 调用 `gangzi_terminal::run()` 启动 app。
-pub fn run() {
-    infrastructure::tracing::init();
-
-    let specta_builder = Builder::<tauri::Wry>::new().commands(collect_commands![
+/// 构造 specta command Builder（命令清单的唯一真源）。
+/// 既用于 `run()` 的 invoke_handler + 启动期 TS 导出，也用于 test 里离线重新生成
+/// `src/bindings.ts`（无需启动 GUI app）。
+fn build_specta_builder() -> Builder<tauri::Wry> {
+    Builder::<tauri::Wry>::new().commands(collect_commands![
         adapters::ping::ping,
         adapters::system::open_external,
         adapters::news::cmd::fetch_news,
@@ -85,19 +85,30 @@ pub fn run() {
         adapters::account::cmd::update_watchlist,
         adapters::account::cmd::mark_trigger_handled,
         adapters::account::cmd::rebuild_account_snapshot,
-    ]);
+    ])
+}
 
-    #[cfg(debug_assertions)]
-    specta_builder
+/// 把 specta 类型导出到 `src/bindings.ts`。i64 输出为 TS Number（实际值远小于
+/// MAX_SAFE_INTEGER；Money/Price/Amount 走 rust_decimal serialize-as-string 不受影响）。
+#[cfg(debug_assertions)]
+fn export_ts_bindings(builder: &Builder<tauri::Wry>) {
+    builder
         .export(
             specta_typescript::Typescript::default()
-                // i64 在我们这里只用于 ageMs / Shares / Volume / TimestampMs 等，
-                // 实际值远小于 Number.MAX_SAFE_INTEGER (2^53-1)。允许 TS Number 输出。
-                // Money / Price / Amount 走 rust_decimal serialize-as-string，不受此影响。
                 .bigint(specta_typescript::BigIntExportBehavior::Number),
             "../src/bindings.ts",
         )
         .expect("failed to export specta typescript bindings");
+}
+
+/// Tauri 主入口。`main.rs` 调用 `gangzi_terminal::run()` 启动 app。
+pub fn run() {
+    infrastructure::tracing::init();
+
+    let specta_builder = build_specta_builder();
+
+    #[cfg(debug_assertions)]
+    export_ts_bindings(&specta_builder);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -404,4 +415,17 @@ fn resolve_db_path(handle: &tauri::AppHandle) -> Result<std::path::PathBuf, Box<
     let dir = handle.path().app_data_dir()?;
     std::fs::create_dir_all(&dir).ok();
     Ok(dir.join("gangzi.db"))
+}
+
+#[cfg(test)]
+mod specta_export_tests {
+    use super::*;
+
+    /// 离线重新生成 `src/bindings.ts`（无需启动 GUI app）。命令清单变更后跑
+    /// `cargo test export_ts_bindings_is_current` 即可刷新前端类型。
+    #[test]
+    fn export_ts_bindings_is_current() {
+        let builder = build_specta_builder();
+        export_ts_bindings(&builder);
+    }
 }
