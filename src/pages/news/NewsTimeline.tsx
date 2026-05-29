@@ -85,35 +85,66 @@ function highlight(text: string, query: string): React.ReactNode {
   );
 }
 
-/** 行内正文：折叠 3 行；实测真溢出（scrollHeight>clientHeight）才显示"展开"。 */
-function RowBody({ text, query }: { text: string; query: string }) {
-  const ref = useRef<HTMLDivElement>(null);
+/** 单条资讯行：正文行内折叠 3 行；正文真溢出时**整行可点**展开/收起（不必点按钮）。 */
+function NewsRow({
+  it,
+  query,
+  sourceName,
+}: {
+  it: FetchNewsItem;
+  query: string;
+  sourceName: string;
+}) {
+  const acc = sourceAccent(it.source);
+  const hasWarn = it.warnings.length > 0;
+  const body = it.articleExcerpt ?? it.summary ?? "";
+  const bodyRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [overflow, setOverflow] = useState(false);
-  // 只在折叠态测量（open 时 clamp 解除会让 scrollHeight==clientHeight）。
+  // 只在折叠态测量真实溢出（open 时 clamp 解除会让 scrollHeight==clientHeight）。
   useLayoutEffect(() => {
     if (open) return;
-    const el = ref.current;
+    const el = bodyRef.current;
     if (el) setOverflow(el.scrollHeight > el.clientHeight + 1);
-  }, [text, open]);
+  }, [body, open]);
+
   return (
-    <>
-      <div ref={ref} className={`news-row-body-text${open ? " open" : ""}`}>
-        {highlight(text, query)}
+    <div
+      className={`news-row acc-${acc}${open ? " expanded" : ""}${overflow ? " clickable" : ""}`}
+      onClick={() => overflow && setOpen((v) => !v)}
+      role={overflow ? "button" : undefined}
+      tabIndex={overflow ? 0 : undefined}
+      onKeyDown={(e) => {
+        if (overflow && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          setOpen((v) => !v);
+        }
+      }}
+    >
+      <div className="news-row-time tabular">
+        <span className="news-row-dot" />
+        {formatHHmm(it.publishedAt)}
       </div>
-      {overflow && (
-        <button
-          type="button"
-          className="news-row-expand"
-          onClick={(e) => {
-            e.stopPropagation();
-            setOpen((v) => !v);
-          }}
-        >
-          {open ? "收起" : "展开"}
-        </button>
-      )}
-    </>
+      <div className="news-row-body">
+        <h3 className="news-row-title">
+          {highlight(it.title, query)}
+          {it.article && (
+            <BookOpen size={13} className="news-row-article-icon" aria-label="已抽取正文" />
+          )}
+          {hasWarn && (
+            <AlertTriangle size={13} className="news-row-warn-icon" aria-label={it.warnings.join(", ")} />
+          )}
+        </h3>
+        {body && (
+          <div ref={bodyRef} className={`news-row-body-text${open ? " open" : ""}`}>
+            {highlight(body, query)}
+          </div>
+        )}
+        {/* 提示文字（视觉），整行点击即切换，无需点它 */}
+        {overflow && <span className="news-row-expand">{open ? "收起" : "展开"}</span>}
+      </div>
+      <span className={`news-src-tag acc-${acc}`}>{sourceName}</span>
+    </div>
   );
 }
 
@@ -246,43 +277,14 @@ export function NewsTimeline({
             <span className="news-day-label">{g.label}</span>
             <span className="news-day-count">{g.items.length} 条</span>
           </header>
-          {g.items.map((it) => {
-            const hasWarn = it.warnings.length > 0;
-            const acc = sourceAccent(it.source);
-            // 正文：有抽取正文用之；否则用 summary（快讯多为空）。
-            const body = it.articleExcerpt ?? it.summary ?? "";
-            return (
-              <div key={it.id} className={`news-row acc-${acc}`}>
-                <div className="news-row-time tabular">
-                  <span className="news-row-dot" />
-                  {formatHHmm(it.publishedAt)}
-                </div>
-                <div className="news-row-body">
-                  <h3 className="news-row-title">
-                    {highlight(it.title, query)}
-                    {it.article && (
-                      <BookOpen
-                        size={13}
-                        className="news-row-article-icon"
-                        aria-label="已抽取正文"
-                      />
-                    )}
-                    {hasWarn && (
-                      <AlertTriangle
-                        size={13}
-                        className="news-row-warn-icon"
-                        aria-label={it.warnings.join(", ")}
-                      />
-                    )}
-                  </h3>
-                  {body && <RowBody text={body} query={query} />}
-                </div>
-                <span className={`news-src-tag acc-${acc}`}>
-                  {sourceNames[it.source] ?? it.source}
-                </span>
-              </div>
-            );
-          })}
+          {g.items.map((it) => (
+            <NewsRow
+              key={it.id}
+              it={it}
+              query={query}
+              sourceName={sourceNames[it.source] ?? it.source}
+            />
+          ))}
         </section>
       ))}
 

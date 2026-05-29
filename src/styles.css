@@ -1704,6 +1704,10 @@ body {
 .news-row:first-child::before { top: 10px; }
 .news-row:last-child::before { bottom: auto; height: 14px; }
 
+.news-row.clickable {
+  cursor: pointer;
+}
+
 .news-row:hover {
   background: var(--bg-soft);
 }
