@@ -7,6 +7,7 @@
 // - 失败时保留上一份数据，单字段缺失时由调用方渲染 "-"。
 
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { commands, type FetchDataItem } from "../bindings";
 import { perf } from "./perfLog";
 
@@ -95,9 +96,34 @@ export function useCoreIndexes(
     const stale = cachedItems === null || Date.now() - cachedAt > 30_000;
     fetchOnce(!stale);
     const timer = window.setInterval(() => fetchOnce(true), intervalMs);
+
+    // 订阅 universe progress 事件，节流 2.5s 静默 refetch —— 让指数卡和
+    // 详情头（同样按 progress/2.5s 刷）同节奏读同一 cache，显示一致的最新价。
+    let lastBg = 0;
+    let pendingTimer: number | null = null;
+    let unlisten: (() => void) | null = null;
+    const bg = () => {
+      lastBg = Date.now();
+      fetchOnce(true);
+    };
+    void listen("market-quotes-refresh-progress", () => {
+      const elapsed = Date.now() - lastBg;
+      if (elapsed >= 2500) bg();
+      else if (pendingTimer == null) {
+        pendingTimer = window.setTimeout(() => {
+          pendingTimer = null;
+          bg();
+        }, 2500 - elapsed);
+      }
+    }).then((un) => {
+      unlisten = un;
+    });
+
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      if (pendingTimer != null) window.clearTimeout(pendingTimer);
+      unlisten?.();
     };
   }, [enabled, intervalMs]);
 

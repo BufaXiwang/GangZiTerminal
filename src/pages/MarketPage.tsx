@@ -197,21 +197,28 @@ export default function MarketPage() {
     };
   }, [category, query, refreshTick]);
 
-  // 加载默认选中的核心指数 quote（externalItem 形式，确保 detail 立即有数据可展示 K 线）
+  // 选中核心指数时加载并**持续刷新**其 quote（externalItem 形式）。
+  // 依赖 [selected, refreshTick]：refreshTick 在 universe progress 事件时 +1
+  //（2.5s 节流），让指数详情头报价与顶部指数卡同源、同节奏刷新，避免详情头
+  // 选中后冻结、与卡片显示不同价格。非核心指数 selected 时该 effect 早退，
+  // 详情走 list item（已随 progress 刷新）。
   useEffect(() => {
-    void (async () => {
-      const info = CORE_INDEXES.find((c) => c.tsCode === DEFAULT_SELECTED);
-      if (!info) return;
-      const res = await commands.fetchData({
-        tsCodes: [DEFAULT_SELECTED],
-        include: { quote: true },
+    if (!selected) return;
+    const info = CORE_INDEXES.find((c) => c.tsCode === selected);
+    if (!info) return;
+    let cancelled = false;
+    void commands
+      .fetchData({ tsCodes: [selected], include: { quote: true } })
+      .then((res) => {
+        if (cancelled) return;
+        if (res.status === "ok" && res.data.items.length > 0) {
+          setExternalItem(buildExternalItem(res.data.items[0], info.label));
+        }
       });
-      if (res.status === "ok" && res.data.items.length > 0) {
-        const fdItem = res.data.items[0];
-        setExternalItem(buildExternalItem(fdItem, info.label));
-      }
-    })();
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [selected, refreshTick]);
 
   const handleToggleStar = useCallback(
     (tsCode: TsCode) => {
@@ -244,18 +251,9 @@ export default function MarketPage() {
     setRefreshTick((t) => t + 1);
   }, []);
 
-  const handleSelectIndex = useCallback(async (tsCode: string) => {
+  // 选中指数：只 setSelected，quote 由上面的 [selected, refreshTick] effect 统一加载 + 刷新。
+  const handleSelectIndex = useCallback((tsCode: string) => {
     setSelected(tsCode);
-    const info = CORE_INDEXES.find((c) => c.tsCode === tsCode);
-    if (!info) return;
-    const res = await commands.fetchData({
-      tsCodes: [tsCode],
-      include: { quote: true },
-    });
-    if (res.status === "ok" && res.data.items.length > 0) {
-      const fdItem = res.data.items[0];
-      setExternalItem(buildExternalItem(fdItem, info.label));
-    }
   }, []);
 
   const selectedItem = useMemo(() => {
