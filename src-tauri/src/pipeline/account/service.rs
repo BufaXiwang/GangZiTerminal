@@ -288,9 +288,12 @@ impl AccountService {
                     p.sellable_quantity = Shares(sellable);
                 }
                 p.protection = repo.get_protection(&p.position_id).ok().flatten();
-                // 行情字段
-                match self.gateway.get_snapshot(&p.ts_code) {
-                    Ok(snap) => {
+                // 行情字段 — 持仓表是**显示读取**：用 display 路径（stale 照常返回 +
+                // 跨日回落 + Universe intent），与自选一致；stale-but-priced 持仓正常
+                // 估值显示，由 freshness 标记。交易写路径另走 fail-closed get_snapshot。
+                // Spec account §4 line 459。
+                match self.gateway.get_display_snapshot(&p.ts_code) {
+                    Some(snap) => {
                         if let Some(price) = snap.quote.price {
                             p.market_price = Some(price);
                             p.market_value = Some(Money(price.0 * Decimal::from(p.quantity.0)));
@@ -300,8 +303,8 @@ impl AccountService {
                         }
                         p.quote_freshness = Some(snap.quote.freshness.clone());
                     }
-                    Err(e) => {
-                        let warn = quote_err_to_warning(e.kind);
+                    None => {
+                        let warn = WarningCode::QuoteMissing;
                         p.warnings.push(warn);
                         p.quote_freshness = Some(missing_freshness(warn));
                     }

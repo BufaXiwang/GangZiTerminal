@@ -3,7 +3,7 @@
 //! Spec: docs/design/account-module.md §2 (账户估值和仓位价格计算)
 
 use crate::domain::account::types::{AccountSnapshot, Position, PositionStatus};
-use crate::domain::quotes::{MarketQuoteSnapshot, QuoteFacadeError, QuoteFacadeErrorKind};
+use crate::domain::quotes::MarketQuoteSnapshot;
 use crate::domain::shared::{
     Freshness, FreshnessStatus, Money, OccurredAt, TsCode, WarningCode,
 };
@@ -72,9 +72,13 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
         }
         set.into_values().collect()
     };
-    let quote_results: HashMap<String, Result<MarketQuoteSnapshot, QuoteFacadeError>> = codes
+    // 估值是**显示读取**：用 display 路径（stale 照常返回 + 跨日回落），不用交易级
+    // fail-closed get_snapshot——否则 stale-but-priced 持仓会被当成 unpriced、整账
+    // valuationFreshness 错误地降成 missing。交易写路径另走 fail-closed。
+    // Spec account §4 line 459 + §2 valuationFreshness 聚合（stale 无 missing → stale）。
+    let quote_results: HashMap<String, Option<MarketQuoteSnapshot>> = codes
         .iter()
-        .map(|c| (c.as_str().to_string(), input.gateway.get_snapshot(c)))
+        .map(|c| (c.as_str().to_string(), input.gateway.get_display_snapshot(c)))
         .collect();
 
     let mut priced = 0u32;
@@ -89,7 +93,7 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
         total_realized += p.realized_pnl.0;
         let q = quote_results.get(p.ts_code.as_str());
         match q {
-            Some(Ok(snap)) => {
+            Some(Some(snap)) => {
                 if let Some(price) = snap.quote.price {
                     let mv = price.0 * Decimal::from(p.quantity.0);
                     let unreal = (price.0 - p.avg_cost.0) * Decimal::from(p.quantity.0);
@@ -103,22 +107,15 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
                     any_valued = true;
                     weakest_status = weaken_status(weakest_status, snap.quote.freshness.status);
                 } else {
-                    // quote 存在但 price 缺失 → unpriced
+                    // quote 存在但 price 缺失 → unpriced（无法估值，按 missing 子 quote 聚合）
                     p.quote_freshness = Some(snap.quote.freshness.clone());
                     p.warnings.push(WarningCode::QuotePriceMissing);
                     unpriced += 1;
-                    weakest_status = FreshnessStatus::Stale; // 用 stale 表达部分估值
                 }
             }
-            Some(Err(e)) => {
-                let warn = match e.kind {
-                    QuoteFacadeErrorKind::QuoteMissing => WarningCode::QuoteMissing,
-                    QuoteFacadeErrorKind::QuoteStale => WarningCode::QuoteStale,
-                    QuoteFacadeErrorKind::QuotePriceMissing => WarningCode::QuotePriceMissing,
-                    QuoteFacadeErrorKind::NotFound => WarningCode::InstrumentMissing,
-                    QuoteFacadeErrorKind::DepthMissing => WarningCode::DepthMissing,
-                    _ => WarningCode::QuoteMissing,
-                };
+            // display 路径无可用 quote（含完全无 quote / instrument 缺失）→ unpriced
+            _ => {
+                let warn = WarningCode::QuoteMissing;
                 p.warnings.push(warn);
                 p.quote_freshness = Some(Freshness {
                     status: FreshnessStatus::Missing,
@@ -128,9 +125,6 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
                     source: None,
                     warning: Some(warn),
                 });
-                unpriced += 1;
-            }
-            None => {
                 unpriced += 1;
             }
         }
@@ -155,8 +149,12 @@ pub fn rebuild_snapshot(input: SnapshotBuildInput<'_>) -> rusqlite::Result<Snaps
     if unpriced > 0 {
         warnings.push(WarningCode::DataPartial);
     }
-    if matches!(valuation_status, FreshnessStatus::Stale) && !warnings.contains(&WarningCode::QuoteStale) {
-        // 已经有 data_partial 时不冗余
+    // 估值整体 stale（有 stale 子 quote、无 missing）→ 附 quote_stale，供 UI 提示
+    // "估值基于过期行情"。Spec §2 valuationFreshness 聚合 + warnings。
+    if matches!(valuation_status, FreshnessStatus::Stale)
+        && !warnings.contains(&WarningCode::QuoteStale)
+    {
+        warnings.push(WarningCode::QuoteStale);
     }
 
     let total_assets = cash.0 + total_market_value;
