@@ -1178,3 +1178,144 @@ mod tests {
         assert_eq!(p.volume.unwrap().0, 50000);
     }
 }
+
+/// 性能 / 准确性集成测试（联网打 live TDX，默认 #[ignore]）。
+///
+/// 运行：cargo test --manifest-path src-tauri/Cargo.toml --lib \
+///        tdx::manager::perf -- --ignored --nocapture --test-threads=1
+///
+/// 测速度（延迟）、连接池并发加速比、批量/K线准确性。盘后跑返回最新收盘价，
+/// 数值仍可校验合理性（>0、OHLC 有序）。
+#[cfg(test)]
+mod perf {
+    use super::*;
+    use crate::domain::shared::InstrumentCategory;
+    use futures_util::StreamExt;
+
+    fn td() -> TradeDate {
+        // 用一个近交易日即可；fetch_quotes 不依赖该值做有效性判断（只用于组装 StockQuote）。
+        TradeDate::parse("20260529").unwrap()
+    }
+
+    fn codes(prefix_sh: bool, range: std::ops::Range<u32>) -> Vec<(TsCode, InstrumentCategory, Option<String>)> {
+        range
+            .filter_map(|i| {
+                let s = if prefix_sh {
+                    format!("60{:04}.SH", i)
+                } else {
+                    format!("00{:04}.SZ", i)
+                };
+                TsCode::parse(&s).ok().map(|ts| (ts, InstrumentCategory::Stock, None))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_single_quote_latency() {
+        let mgr = TdxConnectionManager::new();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 预热（建连接）
+        let _ = mgr.fetch_quote(&ts, InstrumentCategory::Stock, td(), Utc::now(), None).await;
+        let t0 = Instant::now();
+        let q = mgr
+            .fetch_quote(&ts, InstrumentCategory::Stock, td(), Utc::now(), None)
+            .await
+            .expect("fetch 600519");
+        let dt = t0.elapsed();
+        eprintln!("[perf] single quote 600519 latency = {:?}", dt);
+        eprintln!("[perf]   price = {:?} change% = {:?}", q.price, q.change_percent);
+        assert!(q.price.is_some(), "茅台应有报价");
+        assert!(q.price.unwrap().0 > rust_decimal::Decimal::ZERO, "价格应 > 0");
+        assert!(dt < Duration::from_secs(3), "单笔延迟应 < 3s");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_batch_accuracy() {
+        let mgr = TdxConnectionManager::new();
+        // 1 批 80：SH 600000..600060 + SZ 000001..000040
+        let mut list = codes(true, 0..60);
+        list.extend(codes(false, 1..40));
+        let n = list.len();
+        let t0 = Instant::now();
+        let results = mgr.fetch_quotes(list, td(), Utc::now()).await;
+        let dt = t0.elapsed();
+        let ok: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        let with_price = ok.iter().filter(|q| q.price.is_some()).count();
+        eprintln!(
+            "[perf] batch {} codes: {:?}, ok={}, with_price={}",
+            n, dt, ok.len(), with_price
+        );
+        // 准确性：拿到的报价价格都应 > 0
+        for q in &ok {
+            if let Some(p) = q.price {
+                assert!(p.0 > rust_decimal::Decimal::ZERO, "{} 价格应>0", q.ts_code.as_str());
+            }
+        }
+        assert!(with_price > 0, "应至少有部分标的返回有效价格");
+        assert!(dt < Duration::from_secs(5), "单批延迟应 < 5s");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn perf_pool_speedup() {
+        let mgr = TdxConnectionManager::new();
+        // 4 批 × 80 = 320 标的
+        let mut all = codes(true, 0..160);
+        all.extend(codes(false, 1..160));
+        let chunks: Vec<Vec<_>> = all.chunks(80).map(|c| c.to_vec()).collect();
+        let nb = chunks.len();
+        eprintln!("[perf] pool speedup test: {} batches", nb);
+
+        // 顺序
+        let t0 = Instant::now();
+        for c in &chunks {
+            let _ = mgr.fetch_quotes(c.clone(), td(), Utc::now()).await;
+        }
+        let seq = t0.elapsed();
+
+        // 并发（buffer_unordered 4，落在连接池 4 条连接）
+        let t1 = Instant::now();
+        let mut s = futures_util::stream::iter(chunks.clone())
+            .map(|c| {
+                let mgr = &mgr;
+                async move { mgr.fetch_quotes(c, td(), Utc::now()).await }
+            })
+            .buffer_unordered(4);
+        while s.next().await.is_some() {}
+        let conc = t1.elapsed();
+
+        let speedup = seq.as_secs_f64() / conc.as_secs_f64().max(0.001);
+        eprintln!(
+            "[perf] {} batches: sequential={:?} concurrent={:?} speedup={:.2}x",
+            nb, seq, conc, speedup
+        );
+        assert!(conc <= seq, "连接池并发应 ≤ 顺序耗时");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn perf_kline_latency_accuracy() {
+        let mgr = TdxConnectionManager::new();
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let _ = mgr.fetch_kline_at(&ts, crate::domain::quotes::KlinePeriod::Day, 0, 800).await;
+        let t0 = Instant::now();
+        let bars = mgr
+            .fetch_kline_at(&ts, crate::domain::quotes::KlinePeriod::Day, 0, 800)
+            .await
+            .expect("kline 600519");
+        let dt = t0.elapsed();
+        eprintln!("[perf] daily kline 600519 x{} latency = {:?}", bars.len(), dt);
+        assert!(!bars.is_empty(), "应返回 K 线");
+        // 准确性：OHLC 有序 + > 0
+        for b in &bars {
+            assert!(b.high >= b.low, "high>=low");
+            assert!(b.high >= b.open && b.high >= b.close, "high 为最高");
+            assert!(b.low <= b.open && b.low <= b.close, "low 为最低");
+            assert!(b.close > 0.0, "收盘>0");
+        }
+        eprintln!("[perf]   first={} last={}", bars.first().unwrap().datetime(), bars.last().unwrap().datetime());
+        assert!(dt < Duration::from_secs(5), "K线延迟应 < 5s");
+    }
+}
