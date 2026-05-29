@@ -142,8 +142,10 @@ impl ArticleExtractor {
             });
         }
 
-        // 默认按 UTF-8 解析；多数中文站为 UTF-8。
-        let html = String::from_utf8_lossy(&body_bytes).into_owned();
+        // 字符集解码：很多中文站（如早晨报 zaochenbao）是 GBK/GB18030，
+        // 直接 from_utf8_lossy 会整篇乱码。先从 Content-Type charset 取，
+        // 取不到再嗅探 <meta charset=...>，最后用 encoding_rs 解码。
+        let html = decode_html(&body_bytes, &ct);
         let (title, content) = extract_main(&html);
 
         let too_short = content
@@ -230,6 +232,57 @@ fn is_html_like(content_type: &str) -> bool {
     content_type.contains("html")
         || content_type.contains("xhtml")
         || content_type.contains("text/plain")
+}
+
+/// 按字符集把 HTML 字节解码成 String。
+/// 顺序：Content-Type charset → `<meta charset>` / `<meta http-equiv>` 嗅探 → UTF-8 兜底。
+/// 用 encoding_rs，支持 gbk / gb2312 / gb18030 / big5 / utf-8 等。
+fn decode_html(bytes: &[u8], content_type: &str) -> String {
+    let label = charset_from_content_type(content_type)
+        .or_else(|| sniff_meta_charset(bytes))
+        .unwrap_or_else(|| "utf-8".to_string());
+    let enc = encoding_rs::Encoding::for_label(label.as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let (cow, _, _) = enc.decode(bytes);
+    cow.into_owned()
+}
+
+fn charset_from_content_type(ct: &str) -> Option<String> {
+    // e.g. "text/html; charset=gbk"
+    let idx = ct.find("charset=")?;
+    let raw = ct[idx + "charset=".len()..].trim();
+    let val = raw
+        .trim_matches(|c| c == '"' || c == '\'')
+        .split(|c| c == ';' || c == ' ')
+        .next()?
+        .trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+/// 在 HTML 头部前 2KB 内 ascii 嗅探 `<meta charset="...">` 或
+/// `<meta http-equiv="Content-Type" content="...; charset=...">`。
+fn sniff_meta_charset(bytes: &[u8]) -> Option<String> {
+    let head_len = bytes.len().min(2048);
+    // 用 lossy 只为嗅探 ascii 标记，不影响最终解码。
+    let head = String::from_utf8_lossy(&bytes[..head_len]).to_ascii_lowercase();
+    let idx = head.find("charset=")?;
+    let rest = &head[idx + "charset=".len()..];
+    let val: String = rest
+        .trim_start_matches(|c| c == '"' || c == '\'' || c == ' ')
+        .chars()
+        .take_while(|c| {
+            c.is_ascii_alphanumeric() || *c == '-' || *c == '_'
+        })
+        .collect();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
 }
 
 /// 提取标题 + 主正文。简单策略：
@@ -340,6 +393,36 @@ fn clean_whitespace(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charset_from_content_type_parses() {
+        assert_eq!(
+            charset_from_content_type("text/html; charset=gbk").as_deref(),
+            Some("gbk")
+        );
+        assert_eq!(
+            charset_from_content_type("text/html;charset=UTF-8").as_deref(),
+            Some("UTF-8")
+        );
+        assert_eq!(charset_from_content_type("text/html").as_deref(), None);
+    }
+
+    #[test]
+    fn sniff_meta_charset_finds_gbk() {
+        let html = br#"<!DOCTYPE html><html><head><meta charset="gbk"><title>x</title>"#;
+        assert_eq!(sniff_meta_charset(html).as_deref(), Some("gbk"));
+    }
+
+    #[test]
+    fn decode_html_gbk_roundtrip() {
+        // "新闻" GBK 编码字节
+        let (gbk_bytes, _, _) = encoding_rs::GBK.encode("新闻正文");
+        let mut body = b"<html><head><meta charset=\"gbk\"></head><body>".to_vec();
+        body.extend_from_slice(&gbk_bytes);
+        body.extend_from_slice(b"</body></html>");
+        let html = decode_html(&body, "text/html");
+        assert!(html.contains("新闻正文"));
+    }
 
     #[test]
     fn extract_main_basic() {
