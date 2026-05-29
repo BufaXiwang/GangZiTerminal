@@ -1923,48 +1923,25 @@ body {
   border-top: 1px solid var(--border-soft);
 }
 
-/* 正文加载骨架屏 */
-.article-drawer-skeleton {
+/* 快讯无独立正文时的轻量提示（标题即正文） */
+.article-drawer-note {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 6px;
-}
-.article-drawer-skeleton span {
-  height: 13px;
-  border-radius: 4px;
-  background: linear-gradient(
-    90deg,
-    var(--bg-soft) 0%,
-    var(--border-soft) 50%,
-    var(--bg-soft) 100%
-  );
-  background-size: 200% 100%;
-  animation: news-shimmer 1.2s ease-in-out infinite;
-}
-.article-drawer-skeleton span:nth-child(1) { width: 100%; }
-.article-drawer-skeleton span:nth-child(2) { width: 92%; }
-.article-drawer-skeleton span:nth-child(3) { width: 70%; }
-
-@keyframes news-shimmer {
-  from { background-position: 200% 0; }
-  to { background-position: -200% 0; }
-}
-
-/* 无独立正文（快讯）引导 */
-.article-drawer-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 12px;
-  padding: 20px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
   background: var(--bg-soft);
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--fg-muted);
 }
-.article-drawer-empty p { margin: 0; }
-.article-drawer-empty a { text-decoration: none; }
+.article-drawer-note a {
+  display: inline-flex;
+  align-items: center;
+  color: var(--brand);
+  text-decoration: none;
+}
+.article-drawer-note a:hover { text-decoration: underline; }
 
 /* 加载中提示条（已有摘要时叠加在下方） */
 .article-drawer-loading-hint {

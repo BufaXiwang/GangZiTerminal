@@ -214,7 +214,9 @@ export function ArticleDrawer({
             </div>
           )}
 
-          {/* 正文区：article.content > articleExcerpt > summary，按可用度降级。 */}
+          {/* 正文区：article.content > articleExcerpt > summary。
+              快讯标题即全文（h2 已显示），正文区无内容时不闪骨架屏，
+              直接给轻量提示 + 原文链接；后台 warm 成功再补正文。 */}
           {(() => {
             const loading = warm.kind === "warming" || warm.kind === "fetching";
             const body =
@@ -224,22 +226,17 @@ export function ArticleDrawer({
                 <article className="article-drawer-content">{body}</article>
               );
             }
-            if (loading) {
-              return (
-                <div className="article-drawer-skeleton" aria-label="正在加载正文">
-                  <span />
-                  <span />
-                  <span />
-                </div>
-              );
-            }
-            // 无正文且非加载中：快讯类无独立正文，引导看原文。
             return (
-              <div className="article-drawer-empty">
-                <p>这条资讯没有独立正文（多为快讯 / 一句话消息）。</p>
+              <div className="article-drawer-note">
+                {loading ? (
+                  <span className="article-drawer-loading-hint">
+                    <RefreshCcw size={12} className="spin" /> 正在尝试抓取完整正文…
+                  </span>
+                ) : (
+                  <span>快讯 · 标题即正文，更多内容见原文</span>
+                )}
                 {item.url && (
                   <a
-                    className="btn"
                     href={item.url}
                     target="_blank"
                     rel="noreferrer noopener"
@@ -252,27 +249,12 @@ export function ArticleDrawer({
             );
           })()}
 
-          {/* 加载中提示条 */}
+          {/* 已有正文时，后台仍在抓更完整版本的提示 */}
           {(warm.kind === "warming" || warm.kind === "fetching") &&
-            (item.articleExcerpt || item.summary) && (
+            (item.articleExcerpt || item.summary) &&
+            !article && (
               <div className="article-drawer-loading-hint">
                 <RefreshCcw size={11} className="spin" /> 正在抓取完整正文…
-              </div>
-            )}
-
-          {/* 抓取失败 / 重试（次要操作，仅在有 URL 且失败时显示） */}
-          {(warm.kind === "missing" || warm.kind === "error") &&
-            !article &&
-            item.url && (
-              <div className="article-drawer-actions">
-                <button
-                  type="button"
-                  className="btn ghost"
-                  onClick={handleFetchArticle}
-                >
-                  <RefreshCcw size={12} style={{ marginRight: 4 }} />
-                  重试抓取正文
-                </button>
               </div>
             )}
         </div>
