@@ -1905,15 +1905,17 @@ body {
 }
 
 .article-drawer-content {
-  font-size: 14px;
-  color: var(--fg-default);
-  line-height: 1.75;
+  font-size: 15.5px;
+  color: var(--fg-strong);
+  line-height: 1.9;
+  letter-spacing: 0.1px;
   white-space: pre-wrap;
   word-break: break-word;
+  max-width: 40em;
 }
 
 .article-drawer-content p {
-  margin: 0 0 12px;
+  margin: 0 0 14px;
 }
 
 .article-drawer-warning {
