@@ -502,15 +502,24 @@ impl QuotesService {
         intent: FreshnessIntent,
     ) -> (Option<StockQuote>, Freshness) {
         let eligible = eligible_trade_date(ctx);
-        let mut cached = self.cache.get(&inst.ts_code).map(|c| c.quote);
-        if cached.is_none() && !eligible.is_intraday {
-            if let Ok(Some(q)) = self
+        // 用 cache 当且仅当其 tradeDate 命中 eligible；否则回落 close_snapshot(eligible)。
+        //
+        // 关键：不能只在 cache 空时回落。盘中早盘写入的 quote tradeDate=今天，
+        // 午休 / 收盘后 eligible 翻回上一交易日，此时 cache 里的"今天"quote 对
+        // eligible 而言已失效（derive_freshness 会判 Missing）；若仍因 cache 非空
+        // 跳过 close_snapshot 回落，整段午休都显示 "-"。改成：cache quote 的
+        // tradeDate ≠ eligible 时，去取 eligible 当日的 close_snapshot。
+        // 盘中 eligible=今天、close_snapshot 当天为空 → 自然回到 quote_missing，
+        // 不会错误回退到昨日 close（spec §2 交易时段必须用 currentTradeDate）。
+        let cache_quote = self.cache.get(&inst.ts_code).map(|c| c.quote);
+        let cached = match cache_quote {
+            Some(q) if q.trade_date == eligible.trade_date => Some(q),
+            _ => self
                 .repo()
                 .load_close_snapshot(&inst.ts_code, eligible.trade_date)
-            {
-                cached = Some(q);
-            }
-        }
+                .ok()
+                .flatten(),
+        };
         let Some(mut quote) = cached else {
             return (
                 None,

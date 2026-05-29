@@ -31,6 +31,8 @@ export interface NewsTimelineProps {
   registerSectionRef: (dateKey: string, el: HTMLElement | null) => void;
   onActiveDateChange: (dateKey: string) => void;
   query: string;
+  /** sourceId → 友好展示名，row 上的 source chip 用；缺失时回落到 ID。 */
+  sourceNames?: Record<string, string>;
 }
 
 interface DateGroup {
@@ -88,6 +90,7 @@ export function NewsTimeline({
   registerSectionRef,
   onActiveDateChange,
   query,
+  sourceNames = {},
 }: NewsTimelineProps) {
   // === sort + group ===
   const groups: DateGroup[] = useMemo(() => {
@@ -236,7 +239,9 @@ export function NewsTimeline({
                   )}
                 </div>
                 <div className="news-row-meta">
-                  <span className="news-row-source">{it.source}</span>
+                  <span className="news-row-source">
+                    {sourceNames[it.source] ?? it.source}
+                  </span>
                   {(hasArticle || hasWarn) && (
                     <div className="news-row-flags">
                       {hasArticle && (

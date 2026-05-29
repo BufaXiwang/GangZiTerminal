@@ -52,6 +52,18 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 - URL canonicalization 与 RSS 一致。
 - 时间字段必须 normalize 为 ISO-8601；无法解析时为空。
 
+### 时间字段来源（各 channel 不一致）
+
+NewsNow 不同 channel 的发布时间字段位置和格式不同，adapter 按以下顺序探测：
+
+| channel | 字段 | 格式 | 处理 |
+|---|---|---|---|
+| `cls-telegraph` | 顶层 `pubDate` | 数字毫秒 | 直接 `ms_to_dt` |
+| `jin10` | 顶层 `pubDate` | 北京时间裸字符串 `YYYY-MM-DD HH:MM:SS`（无时区） | 按 UTC+8 解释，减 8h 得 UTC |
+| `wallstreetcn-quick` | 嵌套 `extra.date` | 数字毫秒 | 直接 `ms_to_dt` |
+
+探测顺序：先查顶层 `["publishedAt", "time", "pubDate", "published"]`，未命中再查 `extra.{date,time}`。裸字符串一律视为北京时间（NewsNow 聚合的国内财经源默认 Beijing）。新增 channel 若有新的时间字段位置 / 格式，必须扩展 `pick_time` 探测列表并更新此表。
+
 ## Fallback 和失败
 
 - NewsNow 整体不可用不影响 RSS refresh。

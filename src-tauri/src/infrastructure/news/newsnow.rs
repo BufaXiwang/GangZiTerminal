@@ -198,7 +198,12 @@ fn normalize_payload(
             .as_deref()
             .and_then(|u| canonicalize_url(u).ok());
         let summary = pick_string(raw, &["summary", "description", "desc"]).map(|s| s.to_string());
-        let published_at = pick_time(raw, &["publishedAt", "time", "pubDate", "published"]);
+        // 时间字段三种来源（NewsNow channel 各异，见 references/news/newsnow.md）：
+        //   - cls-telegraph: 顶层 pubDate = 数字毫秒
+        //   - jin10:         顶层 pubDate = 北京时间字符串 "YYYY-MM-DD HH:MM:SS"
+        //   - wallstreetcn:  嵌套 extra.date = 数字毫秒
+        let published_at = pick_time(raw, &["publishedAt", "time", "pubDate", "published"])
+            .or_else(|| raw.get("extra").and_then(|e| pick_time(e, &["date", "time"])));
 
         let id_input = IdInput {
             source: source_id,
@@ -297,6 +302,41 @@ mod origin_tests {
     }
 }
 
+#[cfg(test)]
+mod time_tests {
+    use super::{parse_time_str, pick_time};
+
+    #[test]
+    fn parses_beijing_naive_string_as_utc8() {
+        // 2026-05-29 11:31:24 北京 = 2026-05-29 03:31:24 UTC
+        let dt = parse_time_str("2026-05-29 11:31:24").expect("parse");
+        assert_eq!(dt.to_rfc3339(), "2026-05-29T03:31:24+00:00");
+    }
+
+    #[test]
+    fn parses_millis_string() {
+        let dt = parse_time_str("1779953515000").expect("parse");
+        assert_eq!(dt.timestamp_millis(), 1779953515000);
+    }
+
+    #[test]
+    fn parses_rfc3339() {
+        let dt = parse_time_str("2026-05-29T11:31:24+08:00").expect("parse");
+        assert_eq!(dt.to_rfc3339(), "2026-05-29T03:31:24+00:00");
+    }
+
+    #[test]
+    fn picks_nested_extra_date() {
+        // wallstreetcn 形态：extra.date 数字毫秒
+        let raw = serde_json::json!({ "title": "x", "extra": { "date": 1780024789000_i64 } });
+        let dt = raw
+            .get("extra")
+            .and_then(|e| pick_time(e, &["date", "time"]))
+            .expect("extra.date");
+        assert_eq!(dt.timestamp_millis(), 1780024789000);
+    }
+}
+
 fn pick_string<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
     for k in keys {
         if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
@@ -312,12 +352,8 @@ fn pick_time(v: &serde_json::Value, keys: &[&str]) -> Option<DateTime<Utc>> {
     for k in keys {
         if let Some(field) = v.get(*k) {
             if let Some(s) = field.as_str() {
-                if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
-                    return Some(d.with_timezone(&Utc));
-                }
-                // 尝试 millis as string
-                if let Ok(ms) = s.parse::<i64>() {
-                    return Some(ms_to_dt(ms));
+                if let Some(dt) = parse_time_str(s) {
+                    return Some(dt);
                 }
             } else if let Some(num) = field.as_i64() {
                 return Some(ms_to_dt(num));
@@ -325,6 +361,26 @@ fn pick_time(v: &serde_json::Value, keys: &[&str]) -> Option<DateTime<Utc>> {
                 return Some(ms_to_dt(num as i64));
             }
         }
+    }
+    None
+}
+
+/// 解析 NewsNow 各 channel 的字符串时间。支持：
+/// - RFC3339 (`2026-05-29T11:31:24+08:00` / `...Z`)
+/// - 数字毫秒 / 秒字符串
+/// - 北京时间裸字符串 `YYYY-MM-DD HH:MM:SS`（jin10）—— 无时区，按 UTC+8 解释
+fn parse_time_str(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(d.with_timezone(&Utc));
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(ms_to_dt(n));
+    }
+    // 北京时间裸字符串：解析为 NaiveDateTime 再减 8h 得 UTC。
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+        let beijing = naive - chrono::Duration::hours(8);
+        return Some(DateTime::from_naive_utc_and_offset(beijing, Utc));
     }
     None
 }

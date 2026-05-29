@@ -183,6 +183,15 @@ export default function NewsPage() {
     [],
   );
 
+  // === sourceId → displayName map，timeline row 友好显示来源名 ===
+  const sourceNames = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const s of sources) {
+      if (s.displayName) m[s.sourceId] = s.displayName;
+    }
+    return m;
+  }, [sources]);
+
   // === counts by date 给 nav 用 ===
   const countsByDate = useMemo(() => {
     const m: Record<string, number> = {};
@@ -365,6 +374,7 @@ export default function NewsPage() {
               registerSectionRef={handleRegisterSectionRef}
               onActiveDateChange={setActiveDate}
               query={query}
+              sourceNames={sourceNames}
             />
           )}
         </div>
