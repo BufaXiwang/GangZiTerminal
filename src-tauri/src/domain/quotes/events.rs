@@ -95,7 +95,8 @@ pub enum RefreshDataScope {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct MarketQuotesRefreshProgressPayload {
-    /// 总是 [`RefreshScopeKind::Universe`]；spec 用 `scope: "universe"` 字面量约束。
+    /// `Universe` = 全市场 60s batch 中间态；`Subscribed` = 热点档 3s 刷新。
+    /// 消费者不区分 scope，统一触发增量 UI 刷新。
     pub scope: RefreshScopeKind,
     pub purpose: RefreshPurpose,
     #[serde(skip_serializing_if = "Option::is_none")]

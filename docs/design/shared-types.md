@@ -250,11 +250,14 @@ type MarketQuotesRefreshedPayload = {
   capturedAt: OccurredAt;
 };
 
-// market-quotes-refresh-progress：universe scope 中间态进度。
-// emit 节奏由 quotes-module.md "全市场 quote 刷新执行契约" 规定（默认每 200 只）。
-// 消费者只用于增量列表刷新；终态仍以 MarketQuotesRefreshedPayload 为准。
+// market-quotes-refresh-progress：refresh 中间态进度（universe 全市场刷新 +
+// 热点档 hot set 刷新都用它）。emit 节奏见 quotes-module.md §5。
+// 消费者订阅做增量 UI 刷新（列表/指数卡/详情/自选），按 affectedTsCodes 或全量重读；
+// 不区分 scope（universe 全市场 batch / subscribed 热点档都触发同样的 UI 刷新）。
+// 终态仍以 MarketQuotesRefreshedPayload 为准。
 type MarketQuotesRefreshProgressPayload = {
-  scope: "universe";
+  // "universe" = 全市场 60s batch 的中间态；"subscribed" = 热点档 3s 刷新。
+  scope: "universe" | "subscribed";
   purpose: "intraday" | "close";
   tradeDate?: TradeDate;
   completed: number;        // 累计已完成数量（含失败）
