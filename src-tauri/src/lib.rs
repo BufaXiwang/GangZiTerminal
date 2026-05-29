@@ -125,14 +125,18 @@ pub fn run() {
                 // 必须是 append-only：新增 BC migration 时只能加到当前列表末尾，
                 // 否则会把后面 BC 的旧 migration 错位变成"需要重跑"，CREATE TABLE 直接 panic。
                 //
-                // 当前固定顺序（不要重排）：news → agent → account → quotes
-                // quotes 排最后是因为 quotes 是目前唯一有 M002 的 BC（D1 引入 xdxr 表）；
-                // 其他 BC 加 M002 时，自行把那个 BC 移到当前末尾。
+                // 当前固定顺序（不要重排）：news → account → quotes → agent
+                // 规则：新增 migration 的 BC 必须排在拼接末尾，让该 migration 落到全局
+                // 最后一个 index——否则 user_version 之后的 index 会指向其他 BC 已应用的
+                // migration（CREATE TABLE 重跑 → panic）。
+                // 既有 DB(user_version=5: news1+agent1+account1+quotes2)：agent 新增 M002 后
+                // 把 agent 移到末尾，agent-002 落到 index 5 = user_version，恰好只补它一条；
+                // agent-001 移到 index 4(<5) 不重跑。新装 DB 顺序无依赖，全量建表 OK。
                 let mut all = Vec::new();
                 all.extend(news_migrations());
-                all.extend(agent_migrations());
                 all.extend(account_migrations());
                 all.extend(quotes_migrations());
+                all.extend(agent_migrations());
                 run_migrations(conn, all).expect("failed to apply migrations");
             });
 
@@ -427,5 +431,102 @@ mod specta_export_tests {
     fn export_ts_bindings_is_current() {
         let builder = build_specta_builder();
         export_ts_bindings(&builder);
+    }
+
+    /// 用 app 完全一致的 migration 列表 + 顺序在内存库跑一遍，验证迁移序安全
+    /// （reorder 后 agent-002 落到全局末尾，不重跑已应用的 quotes 建表）。
+    #[test]
+    fn full_migration_list_applies_clean() {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| {
+            let mut all = Vec::new();
+            all.extend(news_migrations());
+            all.extend(account_migrations());
+            all.extend(quotes_migrations());
+            all.extend(agent_migrations());
+            run_migrations(conn, all).expect("full migration list must apply clean");
+            // agent M002 列存在
+            let cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(agent_provider_channels)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(cols.iter().any(|c| c == "api_key"));
+            assert!(cols.iter().any(|c| c == "is_active"));
+        });
+    }
+
+    /// 一次性把测试服务商配置写入指定 DB（migration-safe）。`#[ignore]`，凭证 / DB
+    /// 路径全走环境变量（不硬编码 secret）。先对 real DB 的副本跑验证迁移安全，再对
+    /// real DB 跑记录配置。env：SEED_DB_PATH + 各 *_KEY；缺哪个跳哪个。
+    #[test]
+    #[ignore]
+    fn seed_provider_channels() {
+        use crate::domain::agent::{ProviderChannel, WireFormat};
+        use crate::infrastructure::agent::ProviderChannelsRepo;
+
+        let db_path = std::env::var("SEED_DB_PATH").expect("SEED_DB_PATH required");
+        let db = AppDb::open(&std::path::PathBuf::from(&db_path)).unwrap();
+        // 应用全量 migration（与 run() 同序）——既有 DB 只补未应用的尾部。
+        db.with(|conn| {
+            let mut all = Vec::new();
+            all.extend(news_migrations());
+            all.extend(account_migrations());
+            all.extend(quotes_migrations());
+            all.extend(agent_migrations());
+            run_migrations(conn, all).expect("migrations apply clean on seed DB");
+        });
+        let repo = ProviderChannelsRepo::new(db.clone());
+
+        let mk = |id: &str, provider: &str, wf: WireFormat, base: &str, key: String, model: &str| {
+            ProviderChannel {
+                channel_id: id.into(),
+                provider: provider.into(),
+                wire_format: wf,
+                base_url: Some(base.into()),
+                api_key: key,
+                model: model.into(),
+                stream: true,
+                enabled: true,
+                supports_vision: false,
+                supports_thinking: false,
+                max_output_tokens: None,
+                context_window_tokens: None,
+            }
+        };
+
+        let mut seeded: Vec<&str> = Vec::new();
+        if let Ok(k) = std::env::var("SEED_DS_KEY") {
+            let id = "ch_seed_deepseek";
+            let _ = repo.remove(id);
+            repo.add(&mk(id, "DeepSeek", WireFormat::ChatCompletions, "https://api.deepseek.com", k, "deepseek-v4-flash")).unwrap();
+            seeded.push(id);
+        }
+        if let Ok(k) = std::env::var("SEED_ANT_KEY") {
+            let id = "ch_seed_anthropic";
+            let base = std::env::var("SEED_ANT_BASE").unwrap_or_else(|_| "https://api.anthropic.com".into());
+            let _ = repo.remove(id);
+            repo.add(&mk(id, "Anthropic", WireFormat::Messages, &base, k, "claude-haiku-4-5-20251001")).unwrap();
+            seeded.push(id);
+        }
+        if let Ok(k) = std::env::var("SEED_OAI_KEY") {
+            let id = "ch_seed_openai";
+            let base = std::env::var("SEED_OAI_BASE").unwrap_or_else(|_| "https://api.openai.com".into());
+            let _ = repo.remove(id);
+            repo.add(&mk(id, "OpenAI", WireFormat::Responses, &base, k, "gpt-5")).unwrap();
+            seeded.push(id);
+        }
+        // 设一个当前模型：优先 deepseek（快），否则任意已 seed 的。
+        if let Some(active) = seeded.iter().find(|s| **s == "ch_seed_deepseek").or_else(|| seeded.first()) {
+            repo.set_active(active).unwrap();
+        }
+        let all = repo.list().unwrap();
+        println!("seeded {} channels; total in DB = {}", seeded.len(), all.len());
+        for c in &all {
+            println!("  {} ({}) [{:?}] active={} keySet={}", c.model, c.provider, c.wire_format, c.channel_id, !c.api_key.is_empty());
+        }
+        assert!(!seeded.is_empty(), "no SEED_*_KEY env provided");
     }
 }
