@@ -49,6 +49,10 @@ const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
     newsnow_source!("36kr-quick", "36氪快讯"),
     newsnow_source!("gelonghui", "格隆汇"),
     newsnow_source!("cls-depth", "财联社深度"),
+    newsnow_source!("wallstreetcn", "华尔街见闻"),
+    newsnow_source!("fastbull-news", "法布财经"),
+    newsnow_source!("cankaoxiaoxi", "参考消息"),
+    newsnow_source!("sputniknewscn", "卫星通讯社"),
 ];
 
 #[allow(dead_code)] // 留作未来 add-source UI 落地时的 endpoint base 引用

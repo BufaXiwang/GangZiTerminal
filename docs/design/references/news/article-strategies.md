@@ -17,6 +17,7 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 | `NextData` | SSR 页面内 `<script id="__NEXT_DATA__">` JSON 内嵌正文 |
 | `InitialState` | SSR 页面 `window.initialState` JSON（或 `<meta name=description>` 快捷） |
 | `StaticHtml` | 静态页 CSS selector 抽取（注意字符集） |
+| `InlineScript` | 正文藏在内联 JS 变量（DOM 容器是空壳，由 JS 填充） |
 | `Generic` | 未登记源兜底（readability） |
 
 ## 渠道配方（实测 2026-05-29）
@@ -26,8 +27,12 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 | `cls-telegraph` | 财联社电报 | NextData | `www.cls.cn/detail/<id>` → `__NEXT_DATA__` | utf-8 |
 | `cls-depth` | 财联社深度 | NextData | 同上（共用 detail 页） | utf-8 |
 | `wallstreetcn-quick` | 华尔街见闻快讯 | JsonApi | `api-one.wallstcn.com/apiv1/content/lives/<id>` | utf-8(JSON) |
+| `wallstreetcn` | 华尔街见闻 | JsonApi | 按 url 判 lives/articles（见下） | utf-8(JSON) |
 | `36kr-quick` | 36氪快讯 | InitialState | `www.36kr.com/newsflashes/<id>` → `<meta name=description>` | utf-8 |
 | `gelonghui` | 格隆汇 | StaticHtml | `www.gelonghui.com/news/<id>` selector `article.main-news.article-with-html` | utf-8 |
+| `fastbull-news` | 法布财经 | StaticHtml | `item.url`（`fastbull.com/cn/news-detail/<id>_1`）selector `.news-detail-content` | utf-8 |
+| `cankaoxiaoxi` | 参考消息 | InlineScript | `item.url` 内联 JS `var contentTxt="…"` | utf-8 |
+| `sputniknewscn` | 卫星通讯社 | StaticHtml | `item.url`（`sputniknews.cn/YYYYMMDD/<id>.html`）selector `.article__body` | utf-8 |
 | `zaobao` | 联合早报(zaochenbao) | StaticHtml | `item.url` selector `#article-body` | **GBK/gb18030** |
 | `jin10` | 金十数据 | TitleIsContent | 标题即全文，不抓 | — |
 
@@ -43,6 +48,24 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 - 从 item.url `…/livenews/<id>` 取数字 id。请求 `GET https://api-one.wallstcn.com/apiv1/content/lives/<id>`，无需特殊 header。
 - 字段：`data.content_text`（纯文本，首选）/ `data.content`（HTML）。
 - 注意：`wallstreetcn.com/livenews/<id>` 网页本身 404，必须走 api-one。
+
+### wallstreetcn（主站，长文 + 快讯混下发）
+- NewsNow `wallstreetcn` 渠道会同时下发 livenews（快讯）和 articles（长文），用 item.url 区分：
+  - url 含 `/articles/<id>` → `GET https://api-one.wallstcn.com/apiv1/content/articles/<id>?extract=0` → `data.content`（HTML，**无 content_text**，需 strip tags）。
+  - 否则按 livenews 处理 → `…/content/lives/<id>` → `data.content_text`。
+- 与 `wallstreetcn-quick` 共用同一抽取器（`WallstreetcnApi`），仅 endpoint 按 url 切换。
+
+### fastbull-news（法布财经）
+- 请求 item.url（`www.fastbull.com/cn/news-detail/<id>_1`，utf-8，需浏览器 UA）。selector `.news-detail-content`。
+- 无公开 JSON API；静态页正文已完整。
+
+### cankaoxiaoxi（参考消息）
+- 请求 item.url（`ckxxapp.ckxx.net/pages/YYYY/MM/DD/<id>.html`，utf-8）。
+- 正文**不在 DOM**（`#articleContent` 空壳由 JS 填充），而在内联脚本变量 `var contentTxt = "…";`。
+- 取该字符串字面量（找未转义收尾 `"`）→ JS 反转义（`\/`→`/`、`\"`→`"`、`\n`/`\t`）→ strip tags。
+
+### sputniknewscn（卫星通讯社）
+- 请求 item.url（`sputniknews.cn/YYYYMMDD/<id>.html`，utf-8）。selector `.article__body`（正文容器，内含多个 `.article__text` 段落）。
 
 ### 36kr-quick
 - 从 item.url `…/newsflashes/<id>` 取数字 id。请求 `GET https://www.36kr.com/newsflashes/<id>`。

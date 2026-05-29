@@ -73,14 +73,16 @@ pub enum ArticleStrategy {
     TitleIsContent,
     /// 财联社详情页 `__NEXT_DATA__` JSON 内嵌正文（cls-telegraph / cls-depth）。
     ClsNextData,
-    /// 华尔街见闻 api-one JSON（wallstreetcn-quick）。
+    /// 华尔街见闻 api-one JSON（wallstreetcn-quick / wallstreetcn，按 url 判 lives/articles）。
     WallstreetcnApi,
     /// 36 氪快讯页 `<meta name=description>`（36kr-quick）。
     Kr36Meta,
-    /// 格隆汇静态页 CSS selector。
-    GelonghuiStatic,
+    /// 静态页 CSS selector（gelonghui / fastbull-news / sputniknewscn 各自 selector）。
+    StaticSelector(&'static str),
     /// 早晨报静态 GBK 页 CSS selector（zaobao→zaochenbao）。
     ZaochenbaoStatic,
+    /// 参考消息：正文在内联 JS 变量 `var contentTxt="…"`。
+    CankaoInlineScript,
     /// 未登记源：通用 readability 兜底。
     Generic,
 }
@@ -89,9 +91,12 @@ pub enum ArticleStrategy {
 pub fn strategy_for(source: &str) -> ArticleStrategy {
     match source {
         "newsnow:cls-telegraph" | "newsnow:cls-depth" => ArticleStrategy::ClsNextData,
-        "newsnow:wallstreetcn-quick" => ArticleStrategy::WallstreetcnApi,
+        "newsnow:wallstreetcn-quick" | "newsnow:wallstreetcn" => ArticleStrategy::WallstreetcnApi,
         "newsnow:36kr-quick" => ArticleStrategy::Kr36Meta,
-        "newsnow:gelonghui" => ArticleStrategy::GelonghuiStatic,
+        "newsnow:gelonghui" => ArticleStrategy::StaticSelector("article.main-news.article-with-html"),
+        "newsnow:fastbull-news" => ArticleStrategy::StaticSelector(".news-detail-content"),
+        "newsnow:sputniknewscn" => ArticleStrategy::StaticSelector(".article__body"),
+        "newsnow:cankaoxiaoxi" => ArticleStrategy::CankaoInlineScript,
         "newsnow:zaobao" => ArticleStrategy::ZaochenbaoStatic,
         "newsnow:jin10" => ArticleStrategy::TitleIsContent,
         _ => ArticleStrategy::Generic,
@@ -138,12 +143,13 @@ impl ArticleExtractor {
             ArticleStrategy::ClsNextData => self.extract_cls(canonical_url).await,
             ArticleStrategy::WallstreetcnApi => self.extract_wallstreetcn(canonical_url).await,
             ArticleStrategy::Kr36Meta => self.extract_36kr(canonical_url).await,
-            ArticleStrategy::GelonghuiStatic => {
-                self.extract_static(canonical_url, "article.main-news.article-with-html").await
+            ArticleStrategy::StaticSelector(sel) => {
+                self.extract_static(canonical_url, sel).await
             }
             ArticleStrategy::ZaochenbaoStatic => {
                 self.extract_static(canonical_url, "#article-body").await
             }
+            ArticleStrategy::CankaoInlineScript => self.extract_cankao(canonical_url).await,
             ArticleStrategy::TitleIsContent => unreachable!(),
             ArticleStrategy::Generic => {
                 return Some(self.extract(canonical_url, first_news_id).await)
@@ -217,10 +223,16 @@ impl ArticleExtractor {
         Ok((title, text))
     }
 
-    /// 华尔街见闻：api-one lives JSON → data.content_text。
+    /// 华尔街见闻：api-one JSON。按 url 判断 lives（快讯，content_text）还是
+    /// articles（长文，content HTML）—— 主站 `wallstreetcn` 渠道会混下发两类。
     async fn extract_wallstreetcn(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
         let id = last_path_segment(url).ok_or_else(|| parse_err("wscn: no id"))?;
-        let api = format!("https://api-one.wallstcn.com/apiv1/content/lives/{id}");
+        let is_article = url.contains("/articles/");
+        let api = if is_article {
+            format!("https://api-one.wallstcn.com/apiv1/content/articles/{id}?extract=0")
+        } else {
+            format!("https://api-one.wallstcn.com/apiv1/content/lives/{id}")
+        };
         let resp = self.client.get(&api).send().await.map_err(|e| ExtractErr {
             reason: if e.is_timeout() { ArticleExtractReason::Timeout } else { ArticleExtractReason::Network },
             message: e.to_string(),
@@ -230,10 +242,12 @@ impl ArticleExtractor {
             message: e.to_string(),
         })?;
         let data = json.get("data").ok_or_else(|| parse_err("wscn: no data"))?;
+        // articles 仅有 content(HTML)；lives 首选 content_text(纯文本)，回落 content。
         let text = data
             .get("content_text")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .or_else(|| data.get("content").and_then(|v| v.as_str()).map(html_to_text))
             .unwrap_or_default();
         let title = data.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -241,6 +255,25 @@ impl ArticleExtractor {
             return Err(parse_err("wscn: empty content"));
         }
         Ok((title, text))
+    }
+
+    /// 参考消息：正文在内联 JS 变量 `var contentTxt = "…";`（DOM 容器是空壳由 JS 填充）。
+    async fn extract_cankao(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
+        let page = self.fetch_decoded(url).await?;
+        let raw = extract_js_string_var(&page, "contentTxt")
+            .ok_or_else(|| parse_err("cankao: no contentTxt var"))?;
+        // JS 字符串字面量内的转义：\/ → /，\" → "，\n 等先还原再 strip tags。
+        let unescaped = raw
+            .replace("\\/", "/")
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\r", "")
+            .replace("\\t", "\t");
+        let text = html_to_text(&unescaped);
+        if text.is_empty() {
+            return Err(parse_err("cankao: empty content"));
+        }
+        Ok((None, text))
     }
 
     /// 36 氪：快讯页 `<meta name=description>` == 正文。
@@ -413,6 +446,50 @@ fn extract_script_json(html: &str, id: &str) -> Option<serde_json::Value> {
     let sel = Selector::parse(&format!(r#"script#{id}"#)).ok()?;
     let raw = doc.select(&sel).next()?.text().collect::<String>();
     serde_json::from_str(raw.trim()).ok()
+}
+
+/// 从页面内联脚本里取 `<name> = "…";` 的字符串字面量（含转义，未还原）。
+/// `=` 两侧空白可有可无（实测参考消息写法是 `contentTxt ="…`）。
+/// 同名变量可能多次出现（赋值 / 引用），逐个尝试直到命中 `= "`。
+/// 用于正文藏在 JS 变量里、DOM 容器为空壳的源（如参考消息）。
+fn extract_js_string_var(html: &str, name: &str) -> Option<String> {
+    let bytes = html.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = html[from..].find(name) {
+        let after_name = from + rel + name.len();
+        // 跳过 name 后的空白，要求紧跟 `=`，再跳过空白，要求紧跟 `"`。
+        let mut k = after_name;
+        while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+            k += 1;
+        }
+        if k < bytes.len() && bytes[k] == b'=' {
+            k += 1;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'"' {
+                let str_start = k + 1;
+                // 找到未被 `\` 转义的收尾 `"`。
+                let mut i = str_start;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        let mut bs = 0;
+                        let mut j = i;
+                        while j > 0 && bytes[j - 1] == b'\\' {
+                            bs += 1;
+                            j -= 1;
+                        }
+                        if bs % 2 == 0 {
+                            return Some(html[str_start..i].to_string());
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        from = after_name;
+    }
+    None
 }
 
 /// HTML 片段 → 纯文本（strip tags + 规整空白）。
@@ -700,5 +777,87 @@ mod tests {
         );
         assert_eq!(ArticleExtractReason::HttpStatus.as_str(), "http_status");
         assert_eq!(ArticleExtractReason::ParseError.as_str(), "parse_error");
+    }
+
+    #[test]
+    fn extract_js_string_var_stops_at_unescaped_quote() {
+        // 收尾引号前是转义引号 \" 时不应提前结束。
+        let html = r#"<script>var contentTxt = "<p>he said \"hi\"<\/p>"; var x = 1;</script>"#;
+        let raw = extract_js_string_var(html, "contentTxt").expect("should find var");
+        assert_eq!(raw, r#"<p>he said \"hi\"<\/p>"#);
+    }
+
+    #[test]
+    fn strategy_for_maps_new_sources() {
+        assert!(matches!(
+            strategy_for("newsnow:wallstreetcn"),
+            ArticleStrategy::WallstreetcnApi
+        ));
+        assert!(matches!(
+            strategy_for("newsnow:fastbull-news"),
+            ArticleStrategy::StaticSelector(".news-detail-content")
+        ));
+        assert!(matches!(
+            strategy_for("newsnow:cankaoxiaoxi"),
+            ArticleStrategy::CankaoInlineScript
+        ));
+        assert!(matches!(
+            strategy_for("newsnow:sputniknewscn"),
+            ArticleStrategy::StaticSelector(".article__body")
+        ));
+    }
+
+    /// 实网烟测：对 4 个新登记渠道各取 NewsNow 首条 url 跑抽取，打印是否拿到正文。
+    /// 默认 #[ignore]（依赖外网 + 实时数据）。运行：
+    ///   cargo test --manifest-path src-tauri/Cargo.toml \
+    ///     infrastructure::news::article_extractor::tests::live_smoke_new_sources -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_smoke_new_sources() {
+        let ex = ArticleExtractor::new().unwrap();
+        let client = reqwest::Client::builder()
+            .user_agent(BROWSER_UA)
+            .build()
+            .unwrap();
+        for ch in ["wallstreetcn", "fastbull-news", "cankaoxiaoxi", "sputniknewscn"] {
+            let feed = format!("https://newsnow.busiyi.world/api/s?id={ch}&latest");
+            let json: serde_json::Value = client
+                .get(&feed)
+                .header("Origin", "https://newsnow.busiyi.world")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let url = json
+                .pointer("/items/0/url")
+                .and_then(|v| v.as_str())
+                .expect("first item url")
+                .to_string();
+            let out = ex
+                .extract_for_source(&format!("newsnow:{ch}"), &url, None)
+                .await;
+            match out {
+                Some(o) => {
+                    let len = o.article.content.as_ref().map(|c| c.chars().count()).unwrap_or(0);
+                    let preview: String = o
+                        .article
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
+                    println!(
+                        "[{ch}] url={url} ok={} len={len} err={:?} :: {preview}",
+                        o.error.is_none(),
+                        o.error.as_ref().map(|e| &e.reason)
+                    );
+                    assert!(o.error.is_none(), "{ch}: extraction failed: {:?}", o.error);
+                }
+                None => println!("[{ch}] TitleIsContent (skipped)"),
+            }
+        }
     }
 }
