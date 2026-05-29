@@ -1034,6 +1034,10 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - `market-quotes-refreshed` 只表示 snapshot 已更新；payload 使用 [shared-types.md](shared-types.md) 定义的 `MarketQuotesRefreshedPayload`，其中 `purpose = "close"` 表示收盘快照，`purpose = "intraday"` 表示盘中 / 手动常规刷新；下游重建和事件路由由模块外编排处理。
 - `MarketQuotesRefreshedPayload.affectedTsCodes` 在 `subscribed` / `manual` scope 下必须尽量填写成功写入 snapshot 的标的集合；`universe` scope 数据量过大时可以省略。消费者看到 `affectedTsCodes` 缺失时必须按 `scope` 做全量重读 / 重建。
 - `failedBatches > 0` 表示本轮 quote refresh 部分失败；事件仍可 emit，但消费者必须把本次读取视为 partial，不得把缺失标的解释为确定无数据。
+- **universe scope 的两段 `refreshed`**：universe 采用 TDX 主批同步 + fallback 异步（见下「全市场执行契约」）。因此 universe 会 emit **两条** `market-quotes-refreshed`：
+  1. 同步首条：TDX 主批结束即 emit，`success` = TDX 命中数，`failedBatches` = 延后进 fallback 的标的数（BJ + TDX 失败/不完整）。TDX 整体故障时 `failedBatches` ≈ total，消费者据此知道本轮 partial，**禁止**误判为全成功。
+  2. fallback 完成后由后台任务 emit 修正条：`success` / `failedBatches` 含 EM→腾讯→新浪 fallback 结果，作为本轮最终汇总。
+  消费者必须容忍同一轮多条 refreshed（以最后一条为准，或按 progress 增量重读）。`subscribed` / `manual` scope 仍只 emit 一条同步 refreshed。
 
 ### 全市场 quote 刷新执行契约
 

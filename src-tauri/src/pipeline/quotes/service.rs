@@ -1272,6 +1272,12 @@ impl QuotesService {
                 "universe TDX pass complete; spawning async fallback (non-blocking)"
             );
 
+            // 同步 emit 的 payload 反映 TDX 主批：未被 TDX 满足、延后进 fallback 的标的
+            // （BJ + TDX 失败/不完整）计入 failedBatches，让消费者把本轮当 partial（spec §5
+            // line 1036），尤其 TDX 整体故障时不会被误报成"全成功"。fallback 完成后由后台
+            // 任务 emit 一条修正后的 refreshed（success/failedBatches 含 fallback 结果）。
+            failed_batches = fallback_queue.len() as u32;
+
             if !fallback_queue.is_empty() {
                 let this = Arc::clone(self);
                 let purpose = req.purpose;
@@ -1290,9 +1296,6 @@ impl QuotesService {
                     .await;
                 });
             }
-            // 注意：success/failed_batches 此处只反映 TDX 主批；fallback 成功的
-            // 标的由后台任务补写 cache/close_snapshot 并 emit progress，最终由
-            // 后台任务重写 refresh_state（见 run_universe_fallback_bg）。
         } else {
             // Subscribed / Manual scope: per-stock loop (small N, fallback chain has best quality).
             const BATCH: usize = 200;
@@ -1451,6 +1454,18 @@ impl QuotesService {
             total.saturating_sub(success),
             now,
         );
+        // emit 一条修正后的 refreshed：success/failedBatches 含 fallback 结果，
+        // 取代同步那条 TDX-pass-only 的 partial 汇总（spec §5 universe 两段 refreshed）。
+        self.emit_refreshed(MarketQuotesRefreshedPayload {
+            scope: RefreshScopeKind::Universe,
+            purpose,
+            trade_date: Some(trade_date),
+            affected_ts_codes: None,
+            total,
+            success,
+            failed_batches: total.saturating_sub(success),
+            captured_at: now,
+        });
         tracing::info!(
             target: "quotes.refresh.universe",
             pending,

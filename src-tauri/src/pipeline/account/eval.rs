@@ -22,7 +22,7 @@ use crate::domain::shared::{
     resolve_market_time, FreshnessStatus, InstrumentCategory, Money, OccurredAt, Price, Shares,
     TsCode, WarningCode,
 };
-use crate::infrastructure::account::repository::{AccountRepository, FreezeEntry};
+use crate::infrastructure::account::repository::{AccountRepository, FreezeEntry, FrozenLot};
 use crate::infrastructure::db::AppDb;
 use crate::pipeline::account::fills::{simulate_limit, FillDecision, NotEligibleReason};
 use crate::pipeline::account::quote_gateway::AccountQuoteGateway;
@@ -530,6 +530,8 @@ fn commit_limit_fill(
         event_ids.push(pos_ev.event_id);
 
         // Lots
+        // 卖单 FIFO 扣减返回 (lot_id, 消耗量) 明细，供下方按实际消耗收缩 frozen_lots。
+        let mut consumed_lots: Vec<(String, i64)> = Vec::new();
         match order.side {
             OrderSide::Buy => {
                 let ctx = resolve_market_time(now);
@@ -552,7 +554,7 @@ fn commit_limit_fill(
                 AccountRepository::insert_lot(tx, &lot)?;
             }
             OrderSide::Sell => {
-                consume_lots_fifo(tx, &position_id, exec_quantity)?;
+                consumed_lots = consume_lots_fifo(tx, &position_id, exec_quantity)?;
             }
         }
 
@@ -646,9 +648,26 @@ fn commit_limit_fill(
                     if full_fill {
                         AccountRepository::delete_freeze(tx, &order_id)?;
                     } else {
-                        // partially — leave freeze as-is for simplicity; lots已通过 consume_lots_fifo 扣减。
-                        // 实务可以再细化 lot-by-lot释放；保留 freeze 记录但更新 frozen_shares。
+                        // 部分成交：必须把 frozen_lots 按本次实际消耗收缩，否则后续撤单/
+                        // 过期会按"原始冻结量"去扣已被 consume 减过的 lot.frozen_quantity，
+                        // 造成冻结记账与 sellableQuantity 漂移（spec §2 冻结和重建规则）。
                         let new_remaining_qty = updated_order.quantity.0 - updated_order.filled_quantity.0;
+                        let reduced_lots: Vec<FrozenLot> = f
+                            .frozen_lots
+                            .iter()
+                            .map(|fl| {
+                                let taken: i64 = consumed_lots
+                                    .iter()
+                                    .filter(|(id, _)| id == &fl.lot_id)
+                                    .map(|(_, q)| *q)
+                                    .sum();
+                                FrozenLot {
+                                    lot_id: fl.lot_id.clone(),
+                                    quantity: (fl.quantity - taken).max(0),
+                                }
+                            })
+                            .filter(|fl| fl.quantity > 0)
+                            .collect();
                         AccountRepository::upsert_freeze(
                             tx,
                             &FreezeEntry {
@@ -657,7 +676,7 @@ fn commit_limit_fill(
                                 side: OrderSide::Sell,
                                 frozen_cash: Money(Decimal::ZERO),
                                 frozen_shares: Shares(new_remaining_qty),
-                                frozen_lots: f.frozen_lots.clone(),
+                                frozen_lots: reduced_lots,
                             },
                         )?;
                     }

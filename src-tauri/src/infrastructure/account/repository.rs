@@ -1084,6 +1084,38 @@ impl<'a> AccountRepository<'a> {
         .optional()
     }
 
+    /// 列出所有冻结记录（用于重建一致性校验）。
+    pub fn list_freezes(&self) -> rusqlite::Result<Vec<FreezeEntry>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT order_id, ts_code, side, frozen_cash, frozen_shares, frozen_lots_json
+                 FROM account_freezes",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let ts_code = TsCode::parse(&row.get::<_, String>(1)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+                })?;
+                let frozen_lots: Vec<FrozenLot> = row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                Ok(FreezeEntry {
+                    order_id: row.get(0)?,
+                    ts_code,
+                    side: order_side_from_str(&row.get::<_, String>(2)?),
+                    frozen_cash: Money(Self::parse_decimal(&row.get::<_, String>(3)?)),
+                    frozen_shares: Shares(row.get::<_, i64>(4)?),
+                    frozen_lots,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
     /// 计算账户当前总冻结现金 = active orders 的 frozen_cash 之和。
     pub fn total_frozen_cash(&self) -> rusqlite::Result<Money> {
         self.db.with(|c| {

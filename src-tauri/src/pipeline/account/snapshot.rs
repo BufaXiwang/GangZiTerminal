@@ -206,6 +206,69 @@ fn weaken_status(a: FreshnessStatus, b: FreshnessStatus) -> FreshnessStatus {
     }
 }
 
+/// 重建一致性校验。Spec §2「冻结和重建规则」line 543：重建时，冻结事件派生结果
+/// 与 order/lot 派生结果若不一致，必须 **fail closed**（报 db_error 并记日志），
+/// 不允许静默自纠（clamp）。返回 `Some(detail)` 表示检测到不一致。
+///
+/// 校验项：
+/// 1. `available_cash = cash - Σ frozen_cash` 不得为负（过冻结）。
+/// 2. 每个 lot 的 `frozen_quantity` 必须等于"所有冻结记录里指向该 lot 的冻结量之和"
+///    （正是部分卖单成交冻结漂移会破坏的不变量）。
+/// 3. 每个 lot：`0 <= frozen_quantity <= remaining_quantity`。
+/// 4. 不存在指向"已不在任何 open position"的 lot 的残留冻结。
+pub fn check_account_consistency(
+    repo: &AccountRepository<'_>,
+) -> rusqlite::Result<Option<String>> {
+    let Some(meta) = repo.get_meta()? else {
+        return Ok(None);
+    };
+    let frozen_cash = repo.total_frozen_cash()?;
+    if meta.cash.0 < frozen_cash.0 {
+        return Ok(Some(format!(
+            "frozen_cash {} exceeds cash {}",
+            frozen_cash.0, meta.cash.0
+        )));
+    }
+
+    // freeze 记录派生的 per-lot 冻结量。
+    let mut freeze_by_lot: HashMap<String, i64> = HashMap::new();
+    for fz in repo.list_freezes()? {
+        for fl in &fz.frozen_lots {
+            *freeze_by_lot.entry(fl.lot_id.clone()).or_insert(0) += fl.quantity;
+        }
+    }
+
+    let positions = repo.list_positions(Some(PositionStatus::Open), 10_000, 0)?;
+    let mut seen_lots: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &positions {
+        for lot in repo.list_lots_by_position(&p.position_id)? {
+            seen_lots.insert(lot.lot_id.clone());
+            if lot.frozen_quantity.0 < 0 || lot.frozen_quantity.0 > lot.remaining_quantity.0 {
+                return Ok(Some(format!(
+                    "lot {} frozen {} out of range [0,{}]",
+                    lot.lot_id, lot.frozen_quantity.0, lot.remaining_quantity.0
+                )));
+            }
+            let expected = freeze_by_lot.get(&lot.lot_id).copied().unwrap_or(0);
+            if expected != lot.frozen_quantity.0 {
+                return Ok(Some(format!(
+                    "lot {} frozen_quantity {} != freeze-derived {}",
+                    lot.lot_id, lot.frozen_quantity.0, expected
+                )));
+            }
+        }
+    }
+    // 残留冻结：freeze 指向的 lot 不在任何 open position 中。
+    for (lot_id, qty) in &freeze_by_lot {
+        if *qty > 0 && !seen_lots.contains(lot_id) {
+            return Ok(Some(format!(
+                "freeze references lot {lot_id} (qty {qty}) not in any open position"
+            )));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

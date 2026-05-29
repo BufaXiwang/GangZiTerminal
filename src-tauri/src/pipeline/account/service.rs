@@ -773,6 +773,18 @@ impl AccountService {
         let _g = self.write_lock.lock().unwrap();
         let repo = AccountRepository::new(&self.db);
         let now = Utc::now();
+        // Spec §2 冻结和重建规则 line 543：重建必须 fail closed，不静默自纠。
+        // 冻结事件派生与 order/lot 派生不一致 → 报 db_error 并记日志。
+        if let Some(detail) = crate::pipeline::account::snapshot::check_account_consistency(&repo)
+            .map_err(|_| ErrorCode::DbError)?
+        {
+            tracing::error!(
+                target: "account",
+                inconsistency = %detail,
+                "rebuild consistency check failed — fail closed (not self-correcting)"
+            );
+            return Err(ErrorCode::DbError);
+        }
         let r = rebuild_snapshot(SnapshotBuildInput {
             repo: &repo,
             gateway: self.gateway.as_ref(),
@@ -3341,6 +3353,66 @@ mod tests {
         );
         assert!(!resp.accepted);
         assert_eq!(resp.reason, Some(ErrorCode::QuoteStale));
+    }
+
+    #[test]
+    fn consistency_check_detects_inconsistency_and_rebuild_fails_closed() {
+        use crate::infrastructure::account::repository::{FreezeEntry, FrozenLot};
+        use crate::pipeline::account::snapshot::check_account_consistency;
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        // pending 限价买单：初始化账户(meta) + 冻结现金（不依赖 trading-time）。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::new(50, 0))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "limit buy should be accepted, got {:?}", resp);
+
+        let repo = AccountRepository::new(&db);
+        // 干净账户 → 一致。
+        assert!(check_account_consistency(&repo).unwrap().is_none());
+
+        // 注入不一致：一条卖出冻结记录指向不存在的 lot（check #4）。
+        repo.tx(|tx| {
+            AccountRepository::upsert_freeze(
+                tx,
+                &FreezeEntry {
+                    order_id: "bogus-ord".into(),
+                    ts_code: code.clone(),
+                    side: OrderSide::Sell,
+                    frozen_cash: Money(Decimal::ZERO),
+                    frozen_shares: Shares(50),
+                    frozen_lots: vec![FrozenLot { lot_id: "no-such-lot".into(), quantity: 50 }],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let issue = check_account_consistency(&repo).unwrap();
+        assert!(issue.is_some(), "must detect freeze referencing nonexistent lot");
+        // rebuild 必须 fail closed（spec §2 line 543），不静默自纠。
+        assert_eq!(svc.rebuild_account_snapshot().unwrap_err(), ErrorCode::DbError);
     }
 
     #[test]
