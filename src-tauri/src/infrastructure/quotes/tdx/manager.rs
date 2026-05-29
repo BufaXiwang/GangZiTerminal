@@ -983,6 +983,37 @@ mod tests {
     }
 
     #[test]
+    fn new_builds_pool_size_slots() {
+        let mgr = TdxConnectionManager::new();
+        // 构造出 POOL_SIZE 条独立槽，next 计数从 0 起。
+        assert_eq!(mgr.slots.len(), POOL_SIZE);
+        assert_eq!(mgr.next.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn slot_round_robins_through_pool() {
+        let mgr = TdxConnectionManager::new();
+        // 连续取 POOL_SIZE 次应轮转到每一条不同的槽（按 next % POOL_SIZE）。
+        let picked: Vec<Arc<Mutex<State>>> = (0..POOL_SIZE).map(|_| mgr.slot()).collect();
+        for i in 0..POOL_SIZE {
+            // 第 i 次取到的槽应是 slots[i]（next 从 0 起，fetch_add 后 %）。
+            assert!(
+                Arc::ptr_eq(&picked[i], &mgr.slots[i]),
+                "pick {i} should map to slots[{i}]"
+            );
+        }
+        // 取满一圈后所有槽互不相同。
+        for i in 0..POOL_SIZE {
+            for j in (i + 1)..POOL_SIZE {
+                assert!(!Arc::ptr_eq(&picked[i], &picked[j]), "slots {i} and {j} aliased");
+            }
+        }
+        // 再取一次应回绕到 slots[0]。
+        let wrapped = mgr.slot();
+        assert!(Arc::ptr_eq(&wrapped, &mgr.slots[0]), "should wrap to slots[0]");
+    }
+
+    #[test]
     fn map_security_quote_populates_bid_ask_and_change() {
         let raw = sample_raw();
         let code = TsCode::parse("600519.SH").unwrap();

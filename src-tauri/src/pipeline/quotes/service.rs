@@ -3194,6 +3194,47 @@ mod tests {
     }
 
     #[test]
+    fn set_quote_hotset_dedups_and_caps_at_120() {
+        let svc = make_service();
+        // 构造 130 个唯一 code，并在末尾追加若干重复，验证去重 + cap 120 + 首次顺序保留。
+        let mut raw: Vec<TsCode> = (0..130)
+            .map(|i| TsCode::parse(&format!("{:06}.SZ", i)).unwrap())
+            .collect();
+        // 重复前 5 个（这些重复落在 cap 之前，应被去重忽略，不占额外 slot）。
+        for i in 0..5 {
+            raw.push(TsCode::parse(&format!("{:06}.SZ", i)).unwrap());
+        }
+        svc.set_quote_hotset(raw);
+
+        let hot = svc.hot_set.read().unwrap();
+        // cap 120：130 唯一 + 5 重复 → 最多 120。
+        assert_eq!(hot.len(), 120);
+        // 去重：无重复元素。
+        let unique: HashSet<&TsCode> = hot.iter().collect();
+        assert_eq!(unique.len(), hot.len());
+        // 首次出现顺序保留：前 120 个唯一 code（000000..000119）按序。
+        for (i, c) in hot.iter().enumerate() {
+            assert_eq!(c.as_str(), format!("{:06}.SZ", i));
+        }
+    }
+
+    #[test]
+    fn set_quote_hotset_early_dup_does_not_evict_later_unique() {
+        let svc = make_service();
+        // 前置重复应被去重折叠，使后面的唯一 code 仍能在 cap 内入选。
+        // 输入：A, A, B, C —— 去重后 [A, B, C]，全部 ≤ 120。
+        let a = TsCode::parse("600000.SH").unwrap();
+        let b = TsCode::parse("600001.SH").unwrap();
+        let c = TsCode::parse("600002.SH").unwrap();
+        svc.set_quote_hotset(vec![a.clone(), a.clone(), b.clone(), c.clone()]);
+        let hot = svc.hot_set.read().unwrap();
+        assert_eq!(hot.len(), 3);
+        assert_eq!(hot[0].as_str(), "600000.SH");
+        assert_eq!(hot[1].as_str(), "600001.SH");
+        assert_eq!(hot[2].as_str(), "600002.SH");
+    }
+
+    #[test]
     fn fetch_data_empty_ts_codes_is_invalid_input() {
         let svc = make_service();
         let req = FetchDataRequest::default();
@@ -4038,7 +4079,7 @@ mod tests {
 
     #[test]
     fn read_kline_qfq_with_xdxr_applies_factor_and_caches() {
-        use crate::domain::shared::{Amount, Price, Volume};
+        use crate::domain::shared::{Price, Volume};
         use rust_decimal::Decimal;
         let svc = make_service();
         seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);

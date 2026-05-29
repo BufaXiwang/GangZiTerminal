@@ -3441,6 +3441,99 @@ mod tests {
         assert!(r4.accepted);
     }
 
+    /// Spec: account-module.md §4 line 459 — watchlist 是显示读取，走 `get_display_snapshot`
+    /// 显示路径，可以展示 stale quote（不 fail-closed）。
+    #[test]
+    fn watchlist_displays_stale_quote_via_display_path() {
+        let (db, svc, gw) = setup_account(1_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // 给 watchlist 标的设一个 stale 的 quote。display 路径（mock = get_snapshot().ok()）
+        // 应当照样返回它，而不是像交易级 get_snapshot 那样被拒。
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Stale,
+            )),
+        );
+        let add = svc.update_watchlist(
+            UpdateWatchlistRequest {
+                action: UpdateWatchlistAction::Add {
+                    ts_code: code.clone(),
+                    note: None,
+                    reason: None,
+                },
+            },
+            AccountActor::User,
+        );
+        assert!(add.accepted);
+
+        let resp = svc.fetch_account(FetchAccountRequest {
+            include: Some(crate::domain::account::requests::FetchAccountInclude {
+                watchlist: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let wl = resp.watchlist.expect("watchlist present");
+        assert_eq!(wl.len(), 1);
+        let view = &wl[0];
+        let quote = view.quote.as_ref().expect("quote view present");
+        // 走了 display 路径：即便 stale，price 仍然有值（mock_snapshot 用 ask[0]=100.0）。
+        assert_eq!(quote.price, Some(Price(Decimal::new(100, 0))));
+        let freshness = quote.freshness.as_ref().expect("freshness present");
+        assert_eq!(freshness.status, FreshnessStatus::Stale);
+        // stale 不是错误：不应产生 quote_missing 警告。
+        assert!(!resp.warnings.contains(&WarningCode::QuoteMissing));
+    }
+
+    /// Spec: account-module.md §4 line 459 — watchlist 无可用 quote 时优雅降级：
+    /// `get_display_snapshot` 返回 None → quote view 为 missing（price=None +
+    /// missing freshness + quote_missing warning），但 item 仍在列表、整体不报错。
+    #[test]
+    fn watchlist_degrades_gracefully_when_quote_unavailable() {
+        let (db, svc, gw) = setup_account(1_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // mock display 路径 = get_snapshot().ok()；设成 Err → None。
+        gw.set(&code, Err(QuoteFacadeErrorKind::QuoteMissing));
+        let add = svc.update_watchlist(
+            UpdateWatchlistRequest {
+                action: UpdateWatchlistAction::Add {
+                    ts_code: code.clone(),
+                    note: None,
+                    reason: None,
+                },
+            },
+            AccountActor::User,
+        );
+        assert!(add.accepted);
+
+        let resp = svc.fetch_account(FetchAccountRequest {
+            include: Some(crate::domain::account::requests::FetchAccountInclude {
+                watchlist: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let wl = resp.watchlist.expect("watchlist present");
+        // item 仍在列表里 — 没有 quote 不应让标的消失。
+        assert_eq!(wl.len(), 1);
+        assert_eq!(wl[0].item.ts_code, code);
+        let quote = wl[0].quote.as_ref().expect("quote view present");
+        // missing：price 为空，freshness=Missing，warning=quote_missing。
+        assert_eq!(quote.price, None);
+        assert_eq!(quote.change_percent, None);
+        assert_eq!(quote.source, None);
+        let freshness = quote.freshness.as_ref().expect("freshness present");
+        assert_eq!(freshness.status, FreshnessStatus::Missing);
+        assert_eq!(freshness.warning, Some(WarningCode::QuoteMissing));
+        // 整体降级提示，但 fetch_account 本身不报错。
+        assert!(resp.warnings.contains(&WarningCode::QuoteMissing));
+    }
+
     #[test]
     fn watchlist_in_subscribed_codes() {
         let (db, svc, _gw) = setup_account(1_000_000);

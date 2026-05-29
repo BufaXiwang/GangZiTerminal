@@ -302,6 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn display_returns_none_when_instrument_missing() {
+        let (db, cache) = make_setup();
+        let code = TsCode::parse("600519.SH").unwrap();
+        // 无 instrument → display 返回 None；snapshot 返回 Err(NotFound)。
+        assert!(get_quote_for_display(&db, &cache, &code).is_none());
+        let err = get_quote_snapshot(&db, &cache, &code).unwrap_err();
+        assert!(matches!(err.kind, QuoteFacadeErrorKind::NotFound));
+    }
+
+    #[test]
+    fn display_returns_none_when_no_quote() {
+        let (db, cache) = make_setup();
+        let code = seed_inst(&db, "600519.SH");
+        // 有 instrument、无 cache、无 close_snapshot → display 返回 None。
+        // 不依赖当前是否交易时段：盘中 cache 空回落不到 close_snapshot；
+        // 收盘后 close_snapshot 表为空 → 同样 None。
+        assert!(get_quote_for_display(&db, &cache, &code).is_none());
+        // 同等无数据路径下 snapshot 返回 Err(QuoteMissing)（交易/非交易时段均如此）。
+        let err = get_quote_snapshot(&db, &cache, &code).unwrap_err();
+        assert!(matches!(err.kind, QuoteFacadeErrorKind::QuoteMissing));
+    }
+
+    #[test]
     fn facade_cache_hit_returns_snapshot_when_fresh() {
         let (db, cache) = make_setup();
         let code = seed_inst(&db, "600519.SH");
