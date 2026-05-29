@@ -206,8 +206,9 @@ mod minute_diag {
     use super::*;
     use byteorder::ByteOrder;
 
-    /// 联网诊断：dump minute_time 原始 body 前若干字节 + 两种 pos 起点(2/4)下
-    /// 前 6 个点的解码，人工判断哪个对齐。
+    /// 联网诊断（分时下线调查留档）：dump minute_time 原始 body + 逐点解码。
+    /// 结论：当前 TDX 服务器 minute 响应非标准（body 回显 code + per-point 结构
+    /// 与 pytdx/mootdx 不一致），分时已 descoped。详见 quotes-module.md §5。
     /// 运行：cargo test --lib tdx::client::minute_diag -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -224,26 +225,25 @@ mod minute_diag {
         let num = byteorder::LittleEndian::read_u16(&body[0..2]);
         eprintln!("num(u16@0) = {num}");
 
-        // 茅台 600519 当前 ~1400-1500，第一个点价应接近开盘价。
-        // 扫描起点 offset，找哪个让前几个累积价落在合理区间。
-        for start in 2usize..=14 {
+        // 详细 dump：从 offset 11(code 后) 起，逐点打印 3 个 varint 的原始值 + 消耗字节数。
+        for start in [11usize, 13usize] {
+            eprintln!("=== detailed decode from offset {start} (3 varints/point) ===");
             let mut pos = start;
             let mut last = 0i64;
-            let mut prices = Vec::new();
-            let mut ok = true;
-            for _ in 0..5 {
-                let Ok(d) = super::super::helper::get_price(&body, &mut pos) else { ok = false; break; };
-                let _r = super::super::helper::get_price(&body, &mut pos);
-                let _v = super::super::helper::get_price(&body, &mut pos);
+            for i in 0..10 {
+                let p0 = pos;
+                let Ok(d) = super::super::helper::get_price(&body, &mut pos) else { break };
+                let p1 = pos;
+                let Ok(r) = super::super::helper::get_price(&body, &mut pos) else { break };
+                let p2 = pos;
+                let Ok(v) = super::super::helper::get_price(&body, &mut pos) else { break };
                 last += d;
-                prices.push(last as f64 / 100.0);
-            }
-            if ok {
-                eprintln!("start={start:>2}: {prices:?}");
+                eprintln!(
+                    "  pt{i}: d={d}({}B) r={r}({}B) v={v}({}B) | accum={:.2}",
+                    p1 - p0, p2 - p1, pos - p2, last as f64 / 100.0
+                );
             }
         }
-        // 同时打印 code 回显之后的偏移（"600519" 末尾 + 1）
-        eprintln!("(code echo '600519' at offset 5..11, so data likely starts ~11)");
     }
 }
 

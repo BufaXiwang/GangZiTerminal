@@ -1,9 +1,13 @@
-// KlinePeriodTabs — 9 个 K 线周期切换器（分时 / 分钟 K / 日周月）。
+// KlinePeriodTabs — K 线周期切换器（分钟 K / 日周月）。
 //
 // Spec: docs/design/frontend-design.md §5 K 线图
 //
-// 三组分隔：
-//   [分时]  |  [1m 5m 15m 30m 60m]  |  [日K 周K 月K]
+// 两组分隔：
+//   [1m 5m 15m 30m 60m]  |  [日K 周K 月K]
+//
+// 「分时」已下线：当前 TDX 服务器返回的 minute_time 响应为非标准格式
+// （body 回显 code + per-point 结构与 pytdx/mootdx 假设不一致，无法可靠解码）。
+// 分时是 nice-to-have，不影响 K线 / 报价 / 资讯主线。详见 quotes-module.md §5。
 
 import type { ChartPeriod } from "../../lib/useKlineData";
 
@@ -16,8 +20,6 @@ interface PeriodOption {
   value: ChartPeriod;
   label: string;
 }
-
-const GROUP_INTRADAY: PeriodOption[] = [{ value: "intraday", label: "分时" }];
 
 const GROUP_MINUTE: PeriodOption[] = [
   { value: "1m", label: "1m" },
@@ -53,8 +55,6 @@ export function KlinePeriodTabs({ value, onChange }: KlinePeriodTabsProps) {
 
   return (
     <div className="kline-period-tabs">
-      {renderGroup(GROUP_INTRADAY)}
-      <span className="kline-tab-sep" aria-hidden />
       {renderGroup(GROUP_MINUTE)}
       <span className="kline-tab-sep" aria-hidden />
       {renderGroup(GROUP_DAY)}

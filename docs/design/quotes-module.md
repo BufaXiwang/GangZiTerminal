@@ -213,6 +213,8 @@ K 线和分时是 Quotes 的本地读模型，不是 provider 原始数据直出
 - 分时点：`(tsCode, tradeDate, time)` 唯一。
 - 本地读模型必须记录 source / fetchedAt；对外 K 线、分钟 K 和分时都通过 series-level `freshness` 暴露统一 freshness。
 
+> **分时（intraday）当前已下线（descoped）**。原因：实测当前 TDX 服务器池返回的 `minute_time`（`get_minute_time_data` / cmd 0x051d）响应为**非标准格式** —— body 在 `num` 之后回显了请求的 6 位 code，且 per-point 字节结构与 pytdx/mootdx 假设的 `(price, reversed1, vol)×N` 不一致（前 2 个点能解出正确价，第 3 点起 varint 失步）。pytdx/mootdx 在该服务器上同样无法可靠解码。分时是 nice-to-have，不属于研究 / 模拟核心（K 线 / 报价 / 资讯不受影响），故前端移除「分时」tab、不再展示。后端 `refresh_intraday` / `IntradaySeries` 读模型代码保留为 dormant，待将来找到返回标准格式的服务器或完成专项逆向再启用。`ChartPeriod` 仍保留 `"intraday"` 变体但 UI 不可达。
+
 ### 本地复权计算（基于 TDX xdxr）
 
 复权数据真源是 TDX 协议层提供的 xdxr 除权事件（送股、转增、配股、分红）。Quotes 本地存以下两部分：
