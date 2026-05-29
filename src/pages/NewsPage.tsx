@@ -95,7 +95,8 @@ export default function NewsPage() {
       return commands.fetchNews({
         query: query.length > 0 ? query : undefined,
         sources: sourceArr,
-        includeArticle: false,
+        // 带全文：行内展开要显示完整正文，不能只给 500 字的 articleExcerpt。
+        includeArticle: true,
         limit: PAGE_SIZE,
         offset,
       });

@@ -56,7 +56,8 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 
 ### fastbull-news（法布财经）
 - 请求 item.url（`www.fastbull.com/cn/news-detail/<id>_1`，utf-8，需浏览器 UA）。selector `.news-detail-content`。
-- 无公开 JSON API；静态页正文已完整。
+- 无公开 JSON API；静态页正文已完整。url 后缀 `_1`/`_2`/`_N` 是装饰性的，服务端返回相同 HTML——**不要**拼 `_2`/`_3` 当分页。
+- **剔除** `.news-detail-content` 内尾部的 `.risk_tips`（"市场有风险…据此投资，责任自负"免责声明 + 收藏/分享按钮文字），否则正文末尾混入这段 boilerplate。
 
 ### cankaoxiaoxi（参考消息）
 - 请求 item.url（`ckxxapp.ckxx.net/pages/YYYY/MM/DD/<id>.html`，utf-8）。
@@ -77,6 +78,8 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 
 ### zaobao（zaochenbao.com）
 - 请求 item.url（NewsNow 直接给完整 url）。**字符集 GBK(gb18030) 必须显式 decode**。selector `article#article-body`，标题 `h1.article-title`。Cloudflare 前置，普通 UA 可过。
+- **剔除** `#article-body` 内的 `div.warning`（"您查看的内容可能不完整，部分内容和推荐被拦截…"反广告拦截提示）。该提示是**无条件 boilerplate**，对所有 UA 都下发，不代表真截断——正文始终完整在 `#article-body`，其后无隐藏 `<p>`。脚本/广告位（`script` / `div.zaobao-slot`）也应跳过（walk_node 已跳 `script`）。
+- 注意：正文开头有个**被注释掉**的广告 div（`<!--<div id="zaobao-asd1"…-->`）；用 DOM parser（scraper）会自动跳过注释，不要用裸正则 strip tags。
 
 ### jin10
 - `TitleIsContent`：item.title 即完整快讯，不二次抓取。（富文本备选：`flash-api.jin10.com/get_flash_list` 需 `x-app-id` header。）

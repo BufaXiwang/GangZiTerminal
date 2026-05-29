@@ -78,7 +78,11 @@ pub enum ArticleStrategy {
     /// 36 氪快讯页 `<meta name=description>`（36kr-quick）。
     Kr36Meta,
     /// 静态页 CSS selector（gelonghui / fastbull-news / sputniknewscn 各自 selector）。
-    StaticSelector(&'static str),
+    /// `strip` 是要从正文容器里剔除的 noisy 子树 selector（免责声明 / 反广告拦截提示等）。
+    StaticSelector {
+        selector: &'static str,
+        strip: &'static [&'static str],
+    },
     /// 早晨报静态 GBK 页 CSS selector（zaobao→zaochenbao）。
     ZaochenbaoStatic,
     /// 参考消息：正文在内联 JS 变量 `var contentTxt="…"`。
@@ -93,9 +97,19 @@ pub fn strategy_for(source: &str) -> ArticleStrategy {
         "newsnow:cls-telegraph" | "newsnow:cls-depth" => ArticleStrategy::ClsNextData,
         "newsnow:wallstreetcn-quick" | "newsnow:wallstreetcn" => ArticleStrategy::WallstreetcnApi,
         "newsnow:36kr-quick" => ArticleStrategy::Kr36Meta,
-        "newsnow:gelonghui" => ArticleStrategy::StaticSelector("article.main-news.article-with-html"),
-        "newsnow:fastbull-news" => ArticleStrategy::StaticSelector(".news-detail-content"),
-        "newsnow:sputniknewscn" => ArticleStrategy::StaticSelector(".article__body"),
+        "newsnow:gelonghui" => ArticleStrategy::StaticSelector {
+            selector: "article.main-news.article-with-html",
+            strip: &[],
+        },
+        // fastbull 正文容器尾部带 .risk_tips 免责声明 + 收藏/分享按钮文字，剔除。
+        "newsnow:fastbull-news" => ArticleStrategy::StaticSelector {
+            selector: ".news-detail-content",
+            strip: &[".risk_tips"],
+        },
+        "newsnow:sputniknewscn" => ArticleStrategy::StaticSelector {
+            selector: ".article__body",
+            strip: &[],
+        },
         "newsnow:cankaoxiaoxi" => ArticleStrategy::CankaoInlineScript,
         "newsnow:zaobao" => ArticleStrategy::ZaochenbaoStatic,
         "newsnow:jin10" => ArticleStrategy::TitleIsContent,
@@ -143,11 +157,12 @@ impl ArticleExtractor {
             ArticleStrategy::ClsNextData => self.extract_cls(canonical_url).await,
             ArticleStrategy::WallstreetcnApi => self.extract_wallstreetcn(canonical_url).await,
             ArticleStrategy::Kr36Meta => self.extract_36kr(canonical_url).await,
-            ArticleStrategy::StaticSelector(sel) => {
-                self.extract_static(canonical_url, sel).await
+            ArticleStrategy::StaticSelector { selector, strip } => {
+                self.extract_static(canonical_url, selector, strip).await
             }
+            // 联合早报正文末尾恒有 .warning 反广告拦截提示（"内容可能不完整…"），剔除。
             ArticleStrategy::ZaochenbaoStatic => {
-                self.extract_static(canonical_url, "#article-body").await
+                self.extract_static(canonical_url, "#article-body", &[".warning"]).await
             }
             ArticleStrategy::CankaoInlineScript => self.extract_cankao(canonical_url).await,
             ArticleStrategy::TitleIsContent => unreachable!(),
@@ -296,19 +311,30 @@ impl ArticleExtractor {
         Ok((None, text))
     }
 
-    /// 静态页：按 selector 抽正文文本。
+    /// 静态页：按 selector 抽正文文本，剔除 `strip` selector 命中的 noisy 子树
+    /// （免责声明 / 反广告拦截提示等），它们随正文容器一起被 DOM 文本扫描收进来。
     async fn extract_static(
         &self,
         url: &str,
         selector: &str,
+        strip: &[&str],
     ) -> Result<(Option<String>, String), ExtractErr> {
         let page = self.fetch_decoded(url).await?;
         let doc = Html::parse_document(&page);
         let sel = Selector::parse(selector)
             .map_err(|_| parse_err("static: bad selector"))?;
         let el = doc.select(&sel).next().ok_or_else(|| parse_err("static: selector miss"))?;
+        // 收集要跳过的子树 NodeId（strip selector 命中的节点及其后代）。
+        let mut skip: std::collections::HashSet<ego_tree::NodeId> = std::collections::HashSet::new();
+        for s in strip {
+            if let Ok(strip_sel) = Selector::parse(s) {
+                for node in el.select(&strip_sel) {
+                    skip.insert(node.id());
+                }
+            }
+        }
         let mut buf = String::new();
-        collect_text(el, &mut buf);
+        collect_text(el, &mut buf, &skip);
         let text = clean_whitespace(&buf);
         if text.is_empty() {
             return Err(parse_err("static: empty"));
@@ -496,8 +522,9 @@ fn extract_js_string_var(html: &str, name: &str) -> Option<String> {
 fn html_to_text(html: &str) -> String {
     let frag = Html::parse_fragment(html);
     let mut buf = String::new();
+    let no_skip = std::collections::HashSet::new();
     for node in frag.tree.root().children() {
-        walk_node(node, &mut buf);
+        walk_node(node, &mut buf, &no_skip);
     }
     clean_whitespace(&buf)
 }
@@ -630,7 +657,7 @@ fn pick_main_text(doc: &Html) -> Option<String> {
         };
         if let Some(el) = doc.select(&sel).next() {
             let mut buf = String::new();
-            collect_text(el, &mut buf);
+            collect_text(el, &mut buf, &std::collections::HashSet::new());
             let trimmed = buf.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
@@ -640,14 +667,25 @@ fn pick_main_text(doc: &Html) -> Option<String> {
     None
 }
 
-fn collect_text(el: scraper::ElementRef<'_>, buf: &mut String) {
-    // 递归收集 text nodes，跳过 noisy 子树。
-    walk_node(*el, buf);
+fn collect_text(
+    el: scraper::ElementRef<'_>,
+    buf: &mut String,
+    skip: &std::collections::HashSet<ego_tree::NodeId>,
+) {
+    // 递归收集 text nodes，跳过 noisy 子树（tag 黑名单 + skip NodeId 集）。
+    walk_node(*el, buf, skip);
 }
 
-fn walk_node(node: ego_tree::NodeRef<'_, scraper::Node>, buf: &mut String) {
+fn walk_node(
+    node: ego_tree::NodeRef<'_, scraper::Node>,
+    buf: &mut String,
+    skip: &std::collections::HashSet<ego_tree::NodeId>,
+) {
     use scraper::Node;
     for child in node.children() {
+        if skip.contains(&child.id()) {
+            continue; // strip selector 命中的子树整体跳过
+        }
         match child.value() {
             Node::Element(elem) => {
                 let name = elem.name();
@@ -664,7 +702,7 @@ fn walk_node(node: ego_tree::NodeRef<'_, scraper::Node>, buf: &mut String) {
                 ) {
                     continue;
                 }
-                walk_node(child, buf);
+                walk_node(child, buf, skip);
             }
             Node::Text(t) => {
                 buf.push_str(t);
@@ -795,7 +833,7 @@ mod tests {
         ));
         assert!(matches!(
             strategy_for("newsnow:fastbull-news"),
-            ArticleStrategy::StaticSelector(".news-detail-content")
+            ArticleStrategy::StaticSelector { selector: ".news-detail-content", .. }
         ));
         assert!(matches!(
             strategy_for("newsnow:cankaoxiaoxi"),
@@ -803,7 +841,7 @@ mod tests {
         ));
         assert!(matches!(
             strategy_for("newsnow:sputniknewscn"),
-            ArticleStrategy::StaticSelector(".article__body")
+            ArticleStrategy::StaticSelector { selector: ".article__body", .. }
         ));
     }
 
@@ -819,7 +857,12 @@ mod tests {
             .user_agent(BROWSER_UA)
             .build()
             .unwrap();
-        for ch in ["wallstreetcn", "fastbull-news", "cankaoxiaoxi", "sputniknewscn"] {
+        // 每个源映射其正文末尾**不应**出现的 boilerplate noise（剥离验证）。
+        let noise: &[(&str, &str)] = &[
+            ("fastbull-news", "责任自负"),
+            ("zaobao", "内容可能不完整"),
+        ];
+        for ch in ["wallstreetcn", "fastbull-news", "cankaoxiaoxi", "sputniknewscn", "zaobao"] {
             let feed = format!("https://newsnow.busiyi.world/api/s?id={ch}&latest");
             let json: serde_json::Value = client
                 .get(&feed)
@@ -849,12 +892,17 @@ mod tests {
                         .chars()
                         .take(60)
                         .collect();
+                    let content = o.article.content.as_deref().unwrap_or("");
+                    let tail: String = content.chars().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect();
                     println!(
-                        "[{ch}] url={url} ok={} len={len} err={:?} :: {preview}",
+                        "[{ch}] url={url} ok={} len={len} err={:?}\n    head: {preview}\n    tail: …{tail}",
                         o.error.is_none(),
                         o.error.as_ref().map(|e| &e.reason)
                     );
                     assert!(o.error.is_none(), "{ch}: extraction failed: {:?}", o.error);
+                    if let Some((_, n)) = noise.iter().find(|(c, _)| *c == ch) {
+                        assert!(!content.contains(n), "{ch}: content still contains noise {n:?}");
+                    }
                 }
                 None => println!("[{ch}] TitleIsContent (skipped)"),
             }

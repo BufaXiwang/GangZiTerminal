@@ -97,7 +97,8 @@ function NewsRow({
   const acc = sourceAccent(it.source);
   const warnings = it.warnings ?? [];
   const hasWarn = warnings.length > 0;
-  const body = it.articleExcerpt ?? it.summary ?? "";
+  // 优先全文（展开要看完整正文）；无全文回落 excerpt / summary。
+  const body = it.article?.content ?? it.articleExcerpt ?? it.summary ?? "";
   const bodyRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [overflow, setOverflow] = useState(false);
