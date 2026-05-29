@@ -14,11 +14,23 @@ use crate::domain::quotes::{
     apply_band_helper, compute_limit_band, derive_freshness, eligible_trade_date, FreshnessIntent,
     MarketInstrument, MarketQuoteSnapshot, QuoteFacadeError, QuoteFacadeErrorKind,
 };
-use crate::domain::shared::{resolve_market_time, FreshnessStatus, TsCode};
+use crate::domain::shared::{FreshnessStatus, TsCode};
 use crate::infrastructure::db::AppDb;
-use crate::infrastructure::quotes::{QuotesRepository, SnapshotCache};
+use crate::infrastructure::quotes::{
+    QuotesRepository, SnapshotCache, TradeCalendar, TradeCalendarRepo,
+};
+use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
 use chrono::Utc;
 use std::sync::Arc;
+
+/// 用本地交易日历修正 shared 近似日历后解析市场时刻（节假日 / 半日市）。
+/// 与 `QuotesService::market_time_now` 同口径，保证 Account 跨 BC 读路径与
+/// Quotes 自身对"交易日 / 是否盘中"的判定一致（spec §2 / shared-types §3）。
+fn market_ctx(db: &AppDb, now: chrono::DateTime<Utc>) -> crate::domain::shared::MarketTimeContext {
+    let cal_repo = TradeCalendarRepo::new(db.clone());
+    let cal: &dyn TradeCalendar = &cal_repo;
+    resolve_market_time_with_calendar(now, cal)
+}
 
 /// 同步读取一个标的的可用 quote snapshot。
 ///
@@ -34,7 +46,7 @@ pub fn get_quote_snapshot(
     ts_code: &TsCode,
 ) -> Result<MarketQuoteSnapshot, QuoteFacadeError> {
     let now = Utc::now();
-    let ctx = resolve_market_time(now);
+    let ctx = market_ctx(db, now);
     let eligible = eligible_trade_date(&ctx);
     let repo = QuotesRepository::new(db);
 
@@ -117,7 +129,7 @@ pub fn get_quote_for_display(
     ts_code: &TsCode,
 ) -> Option<MarketQuoteSnapshot> {
     let now = Utc::now();
-    let ctx = resolve_market_time(now);
+    let ctx = market_ctx(db, now);
     let eligible = eligible_trade_date(&ctx);
     let repo = QuotesRepository::new(db);
     let inst = repo.get_instrument(ts_code).ok().flatten()?;

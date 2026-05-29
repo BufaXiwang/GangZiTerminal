@@ -800,12 +800,14 @@ ensure_chart_data(ts_code: TsCode, period: ChartPeriod): Promise<void>
 ```
 
 行为：
-- `period ∈ {day, week, month}` → 走 `refresh_klines_full(scope=Subscribed[ts_code], periods=[period])`，**TDX 分页全量历史**：循环 `security_bars(start=0, 800, 1600, ...)` 直到 TDX 返回空 / 不足 800 / 命中硬上限（50 000 根）。覆盖该 ts_code + period 的全部可获取历史。
-- `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`。
-- `period == intraday` → `refresh_intraday(...)`。
-- 已有数据时也会重新拉（upsert 幂等，PK = `(ts_code, period, adjust, trade_date)`）；UI 调用方决定何时触发。
-- 设计目的：用户进入标的详情时一次性把全量历史拉好，不依赖 K 线左拉 callback 触发；后续访问从 DB 命中即可，不再重复 TDX 调用。
-- 耗时提示：老股可能触发 10+ 次 TDX 调用（每次 80ms 间隔 + 100-500ms 协议延迟），总耗时 3-10s。前端应在 UI 显示 loading；中间 batch 失败由底层整体 abort（partial 落库无意义）。
+- `period ∈ {day, week, month}` → **只同步拉首屏一页**（`fetch_kline_page(scope=Subscribed[ts_code], period, start=0)`，TDX `security_bars(start=0)` 的最新 ~800 根），落 DB 后立即返回，让 UI 第一时间出图。**更早的历史不由本命令拉**：前端 `KlineCanvas` 在首屏渲染后用 background loop 调 `fetch_kline_page(start=800, 1600, ...)` 渐进 prepend 补到 DB（upsert 幂等）。
+  - 设计目的：首屏感知速度优先。老股全量历史需 10+ 次 TDX 调用（每次 80ms 间隔 + 100-500ms 协议延迟，总 3-10s），若同步全量拉会让用户进详情页干等数秒；改为"首屏即出 + 后台补全"。
+  - 代价 / 边界：若用户在后台分页跑完前离开详情页，DB 不保证有该 ts_code 的全量历史。需要全量历史的场景（盘后扫描 / agent 长周期分析）由调度路径 `refresh_klines` / `refresh_klines_extended(history_days > 800)` 保证，不依赖 `ensure_chart_data` 这一次前台触发。
+  - `refresh_klines_full`（一次性分页全量）仍保留实现（`service.rs::refresh_klines_full`），供需要"同步落全量"的调用方（如显式补段）使用，但**不是** `ensure_chart_data` 的默认路径。
+- `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`（同步全量当日 catch-up）。
+- `period == intraday` → `refresh_intraday(...)`（分时已 descope，dormant）。
+- 已有数据时也会重新拉首屏（upsert 幂等，PK = `(ts_code, period, adjust, trade_date)`）；UI 调用方决定何时触发。
+- 首屏页失败由底层 abort 并返回 `Err`（partial 落库无意义）；前端后台分页的单页失败不影响首屏。
 
 #### `extend_chart_history`
 
@@ -908,8 +910,9 @@ TDX > Eastmoney > 腾讯 > 新浪
 - **可用性判定与候选选取**（实现锚：`domain/quotes/quote.rs::StockQuote::{is_display_complete, is_quote_complete}`、`pipeline/quotes/service.rs::pick_fallback_quote`）：
   1. 按 `TDX > Eastmoney > Tencent > Sina` 顺序逐个尝试 provider，每个调用返回一条 normalized quote 候选。
   2. 遇到**首个** `is_quote_complete = true`（display 必备字段全有 + 五档盘口可用：bid[0]/ask[0] 含 price+volume）立即采纳并 short-circuit。
-  3. 全程未命中 quote-complete 时，回退到**首个** `is_display_complete = true`（必备：`tsCode/category/tradeDate/price/previousClose/changePercent`）的候选；该候选缺盘口，写入 snapshot 时附 `depth_missing` warning。
+  3. 全程未命中 quote-complete 时，回退到**首个** `is_display_complete = true` 的候选；该候选缺盘口，写入 snapshot 时附 `depth_missing` warning。
   4. 全部 provider 都未达到 display-complete → 视为无可用 quote，不写 snapshot。
+- **`is_display_complete` 的硬门槛 = `price` 非空**（`tsCode/category/tradeDate/capturedAt` 在 `StockQuote` 类型上非空，恒满足）。`previousClose` / `changePercent` 是**首选但非必备**字段：指数 / 基金在 TDX / EM / Tencent / Sina 多源下经常缺 `previousClose`，若强求会把它们全推进 fallback chain（每只多花 ~600ms）且最终仍无更优候选。缺这两个字段时 UI 涨跌幅显示 `—`，可接受。这与 universe batch 接受门槛（§5 line 接受门槛：price 非空）一致——全局只有一个 price-only 谓词。
 - `is_display_complete` 是 UI 展示和扫描的最低准入；`is_quote_complete` 仅在 Account 写路径成交模拟时作为可成交前提，**不**是 fallback 选取的硬条件——缺盘口的 display-complete quote 仍然可用于展示。
 - `StockQuote.source` 与 `StockQuote.freshness.source` 必须一致；缺盘口的 fallback quote 可以用于展示，但必须带 `depth_missing` warning。
 - Account 成交模拟需要 fresh quote 和盘口；fallback 源缺盘口时必须返回 `depth_missing`，是否可成交由 Account 交易规则判断。
@@ -926,7 +929,8 @@ TDX > Eastmoney > 腾讯 > 新浪
 日 / 周 / 月 K：
 
 - **TDX 是主源**：日 / 周 / 月 K 全部从 TDX 拉取 unadjusted bar；单次拉取根数受 TDX 协议限制（默认 ~800 根），SH / SZ 全覆盖，BJ 不支持。
-- **全量历史（`refresh_klines_full`）**：`ensure_chart_data` 触发时走分页 loop —— TDX `security_bars(start=0, 800, 1600, ...)` 直到返回空 / 不足 800 根 / 命中硬上限 50 000 根。`start` 是从最新往回跳过的根数，更早的 batch prepend 到累计 Vec 前，最终升序。这是首次访问标的的默认路径，一次性把全量历史落 DB，后续从 DB 命中。
+- **首屏单页（`fetch_kline_page`）**：`ensure_chart_data` 的默认路径只同步拉 `start=0` 的最新 ~800 根（首屏），落 DB 立即返回；更早历史由前端 background loop 调 `fetch_kline_page(start=800, 1600, ...)` 渐进 prepend 补全（见 §4 `ensure_chart_data`）。`start` 是从最新往回跳过的根数，更早 batch prepend 到累计 Vec 前，最终升序。
+- **全量历史（`refresh_klines_full`）**：保留实现，走分页 loop —— TDX `security_bars(start=0, 800, 1600, ...)` 直到返回空 / 不足 800 根 / 命中硬上限 50 000 根，一次性同步把全量历史落 DB。供需要"同步落全量"的显式补段调用方使用；**不是** `ensure_chart_data` 的默认路径（首屏速度优先，见上）。
 - **增量回溯（`refresh_klines` / `refresh_klines_extended`）**：每只 (ts_code, period) 先查 `max(trade_date) FROM quote_klines_daily WHERE adjust='none'`：
   - DB 空 → 初始拉过去 ~365 天（受 TDX 单次根数限制约束，超出部分留给 TuShare 长历史扩展）。
   - 有数据 → 从 `max+1` 拉到 today，幂等 upsert。

@@ -18,6 +18,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
 import { NewsRowMenu } from "./NewsRowMenu";
+import { beijingHHmm, beijingTodayKey, dateKeyWeekday } from "../../lib/beijingTime";
 
 const WEEKDAY_LABEL = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -44,24 +45,19 @@ const UNKNOWN_KEY = "__unknown__";
 
 function formatDateLabel(dateKey: string): string {
   if (dateKey === UNKNOWN_KEY) return "未知日期";
-  // dateKey 是 YYYY-MM-DD
-  const [y, m, d] = dateKey.split("-").map((s) => Number.parseInt(s, 10));
+  // dateKey 是北京日历日 YYYY-MM-DD
+  const [y] = dateKey.split("-").map((s) => Number.parseInt(s, 10));
   if (Number.isNaN(y)) return dateKey;
-  const date = new Date(y, m - 1, d);
-  const wd = WEEKDAY_LABEL[date.getDay()];
-  const today = new Date();
-  const isToday =
-    date.getFullYear() === today.getFullYear() &&
-    date.getMonth() === today.getMonth() &&
-    date.getDate() === today.getDate();
-  return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")} ${wd}${isToday ? " · 今天" : ""}`;
+  const wd = WEEKDAY_LABEL[dateKeyWeekday(dateKey)];
+  const isToday = dateKey === beijingTodayKey();
+  return `${dateKey} ${wd}${isToday ? " · 今天" : ""}`;
 }
 
 function formatHHmm(iso?: string): string {
   if (!iso) return "--:--";
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "--:--";
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  return beijingHHmm(d);
 }
 
 // 按 source 字符串散列到 0..4，给每条 row 一条稳定的左侧色条 + source tag 配色，

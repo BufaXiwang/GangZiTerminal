@@ -687,6 +687,8 @@ Account 中的 `actor` 表示账户写动作或事件的发起者，不表示行
 
 - 人工 UI 不允许发起交易写动作；`user` actor 不得用于订单、仓位、保护条件或成交事件。
 - `system` 不代表投资判断，不能主动创建新的开仓 / 加仓 / 减仓 / 平仓意图；它只用于初始化、订单过期、挂单成交评估、冻结释放和 snapshot 重建等维护事实。
+- **`operate_account` 即时市价成交**（同步路径）产生的 `order_placed` / `order_filled` / `order_partially_filled` / `position_*` 事件 `actor = agent`——它们是 agent 调用的直接同步结果，审计链溯源到本次 `operate_account`。唯一例外：市价单未成交剩余量的 `order_cancelled`（reason=`market_remainder_auto_cancel`）是系统机械撤单（市价单不挂单留存），`actor = system`。
+  - 对比：**限价单挂单后由调度评估成交**的终态事件（`order_filled` / `order_partially_filled` / `order_cancelled` / `order_expired`）`actor = system`——成交发生在 agent 调用之外、由后台撮合评估触发。
 - 自选维护是非交易能力，允许 `user` / `agent` / `system` 发起。
 - `actor` 必须进入 `AccountEvent`，用于审计链追踪。
 

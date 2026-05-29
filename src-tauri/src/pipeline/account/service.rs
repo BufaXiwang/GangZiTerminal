@@ -1361,7 +1361,8 @@ impl AccountService {
                     position_id: Some(position_id.clone()),
                     ts_code: Some(ts_code.clone()),
                     reason: Some(reason.clone()),
-                    actor: AccountActor::System.as_str().into(),
+                    // agent 市价单直接导致的成交 → 归 agent（审计链溯源到 operate_account）。
+                    actor: AccountActor::Agent.as_str().into(),
                     payload: json!({
                         "price": fill.price.0.to_string(),
                         "filledQuantity": fill.quantity.0,
@@ -1400,7 +1401,8 @@ impl AccountService {
                     position_id: Some(position_id.clone()),
                     ts_code: Some(ts_code.clone()),
                     reason: Some(reason.clone()),
-                    actor: AccountActor::System.as_str().into(),
+                    // agent 市价单直接导致的成交 → 归 agent（审计链溯源到 operate_account）。
+                    actor: AccountActor::Agent.as_str().into(),
                     payload: json!({
                         "fillId": fill.fill_id,
                         "price": fill.price.0.to_string(),

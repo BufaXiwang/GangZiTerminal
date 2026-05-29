@@ -14,6 +14,12 @@
 // 不发请求，纯展示组件。
 
 import { useEffect, useMemo, useRef } from "react";
+import {
+  beijingDateKey,
+  beijingTodayKey,
+  dateKeyWeekday,
+  shiftDateKey,
+} from "../../lib/beijingTime";
 
 const WEEKDAY_LABEL = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -27,17 +33,13 @@ export interface NewsDateNavProps {
   onSelect: (dateKey: string) => void;
 }
 
+// 资讯归日统一用北京日历日（与后端 dateCounts 同口径）。
 function formatDateKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+  return beijingDateKey(d);
 }
 
-function formatMonthDay(d: Date): string {
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${m}-${day}`;
+function monthDayOfKey(key: string): string {
+  return key.slice(5); // "YYYY-MM-DD" → "MM-DD"
 }
 
 export function NewsDateNav({
@@ -47,16 +49,14 @@ export function NewsDateNav({
   onSelect,
 }: NewsDateNavProps) {
   const days = useMemo(() => {
-    const now = new Date();
-    const out: { key: string; date: Date; label: string; weekday: string; isToday: boolean }[] = [];
+    const today = beijingTodayKey();
+    const out: { key: string; label: string; weekday: string; isToday: boolean }[] = [];
     for (let i = 0; i < daysBack; i++) {
-      const d = new Date(now);
-      d.setDate(now.getDate() - i);
+      const key = shiftDateKey(today, -i);
       out.push({
-        key: formatDateKey(d),
-        date: d,
-        label: formatMonthDay(d),
-        weekday: WEEKDAY_LABEL[d.getDay()],
+        key,
+        label: monthDayOfKey(key),
+        weekday: WEEKDAY_LABEL[dateKeyWeekday(key)],
         isToday: i === 0,
       });
     }
