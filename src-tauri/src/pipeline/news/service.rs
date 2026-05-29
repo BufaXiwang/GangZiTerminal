@@ -314,6 +314,8 @@ impl NewsService {
         let mut failures: Vec<NewsFailure> = Vec::new();
         let mut new_ids: Vec<String> = Vec::new();
         let mut updated_ids: Vec<String> = Vec::new();
+        // 新入库且有 URL 的 item，刷新时同步抓正文（按 source 策略）：(source, news_id, url)。
+        let mut to_fetch_body: Vec<(String, String, String)> = Vec::new();
 
         // First-phase: 顺序拉取，避免并发对同一 provider 叠加速率压力；spec §5 允许后续改并行。
         for src in targets {
@@ -367,7 +369,17 @@ impl NewsService {
                 Ok(outcomes) => {
                     for (id, oc) in outcomes {
                         match oc {
-                            RepoItemUpsertOutcome::Inserted => new_ids.push(id),
+                            RepoItemUpsertOutcome::Inserted => {
+                                // 新 item 有 URL → 排队抓正文（按 source 策略，刷新时同步抓）。
+                                if let Some(u) = news_items
+                                    .iter()
+                                    .find(|it| it.id == id)
+                                    .and_then(|it| it.url.clone())
+                                {
+                                    to_fetch_body.push((src.source_id.clone(), id.clone(), u));
+                                }
+                                new_ids.push(id);
+                            }
                             RepoItemUpsertOutcome::Updated => updated_ids.push(id),
                             RepoItemUpsertOutcome::Unchanged => {}
                         }
@@ -390,6 +402,45 @@ impl NewsService {
             }
         }
 
+        // 刷新时同步抓正文（按 source 策略，并发≤6）。抓到 → 存 ArticleContent；
+        // 快讯(TitleIsContent) 跳过；抓不到 → 记 debug log，不入正文、不算 item 失败。
+        let mut article_updated_news_ids: Vec<String> = Vec::new();
+        if !to_fetch_body.is_empty() {
+            use futures_util::StreamExt;
+            let mut stream = futures_util::stream::iter(to_fetch_body)
+                .map(|(source, news_id, url)| {
+                    let extractor = &self.article;
+                    async move {
+                        let out = extractor.extract_for_source(&source, &url, Some(&news_id)).await;
+                        (source, news_id, url, out)
+                    }
+                })
+                .buffer_unordered(6);
+            while let Some((source, news_id, url, out)) = stream.next().await {
+                match out {
+                    None => {} // TitleIsContent：标题即全文，跳过
+                    Some(o) => {
+                        if o.error.is_none() && o.article.content.is_some() {
+                            if self.repo().upsert_article_content(&o.article).is_ok() {
+                                article_updated_news_ids.push(news_id);
+                            }
+                        } else {
+                            let reason = o
+                                .error
+                                .as_ref()
+                                .map(|e| e.reason.as_str())
+                                .unwrap_or("empty");
+                            tracing::debug!(
+                                target: "news.article",
+                                source = %source, url = %url, reason,
+                                "article body fetch missed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let saved_count = (new_ids.len() + updated_ids.len()) as u32;
         let first_failure = failures.first().cloned();
         let failed_count = failures.len() as u32;
@@ -399,10 +450,10 @@ impl NewsService {
             fetched_count,
             skipped_count,
             saved_count,
-            article_updated_count: 0,
+            article_updated_count: article_updated_news_ids.len() as u32,
             new_ids,
             updated_ids,
-            article_updated_news_ids: vec![],
+            article_updated_news_ids,
             failed_count,
             first_failure,
             failures,

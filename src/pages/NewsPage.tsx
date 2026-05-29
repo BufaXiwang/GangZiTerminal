@@ -6,13 +6,13 @@
 //   PageShell
 //     control strip：source 多选 chip + FTS 搜索 + 刷新
 //   ─ 顶部 横向 日期 nav（最近 14 天）
-//   ─ workspace：纵向时间线（按日分组，倒序，滚动加载更多）+ 右侧 ArticleDrawer
+//   ─ workspace：纵向时间线（按日分组，倒序，滚动加载更多）；正文行内展示、>3 行可展开
 //
 // 数据流：
 //   - mount: listNewsSources() + fetchNews({ limit, offset: 0 })
 //   - query / sources / refresh 变化 → 清空 items + 重拉
 //   - 滚动到底 → fetchNews({ offset: prev + limit }) 拼接
-//   - 点条目 → 打开 ArticleDrawer，drawer 内决定是否 warm + 重读 includeArticle
+//   - 正文在刷新时按 source 策略同步抓取（无侧边 drawer）；行内点击展开/收起
 
 import { RefreshCcw, Search, X } from "lucide-react";
 import {
@@ -31,7 +31,6 @@ import {
 } from "../bindings";
 import { NewsDateNav } from "./news/NewsDateNav";
 import { NewsTimeline } from "./news/NewsTimeline";
-import { ArticleDrawer } from "./news/ArticleDrawer";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -59,9 +58,6 @@ export default function NewsPage() {
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-
-  // === drawer state ===
-  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // === date nav 当前激活日期（由 timeline 上报当前 viewport 顶部那一天） ===
   const [activeDate, setActiveDate] = useState<string | null>(null);
@@ -251,11 +247,6 @@ export default function NewsPage() {
     </span>
   );
 
-  const selectedItem = useMemo(
-    () => items.find((it) => it.id === selectedId) ?? null,
-    [items, selectedId],
-  );
-
   const controls = (
     <>
       <div className="search-input" style={{ minWidth: 280 }}>
@@ -367,8 +358,6 @@ export default function NewsPage() {
               loadingMore={loadingMore}
               hasMore={page?.hasMore ?? false}
               onLoadMore={handleLoadMore}
-              onSelectItem={setSelectedId}
-              selectedId={selectedId}
               registerSectionRef={handleRegisterSectionRef}
               onActiveDateChange={setActiveDate}
               query={query}
@@ -377,18 +366,6 @@ export default function NewsPage() {
           )}
         </div>
       </div>
-
-      <ArticleDrawer
-        item={selectedItem}
-        open={selectedId !== null}
-        onClose={() => setSelectedId(null)}
-        sourceNames={sourceNames}
-        onItemUpdated={(updated) => {
-          setItems((prev) =>
-            prev.map((it) => (it.id === updated.id ? updated : it)),
-          );
-        }}
-      />
     </PageShell>
   );
 }

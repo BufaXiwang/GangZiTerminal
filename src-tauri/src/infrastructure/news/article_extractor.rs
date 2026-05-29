@@ -63,6 +63,41 @@ impl ArticleExtractReason {
     }
 }
 
+const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+
+/// 按 source（NewsNow channel）选正文抽取策略。详见 references/news/article-strategies.md。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleStrategy {
+    /// 快讯：标题即全文，不抓取。
+    TitleIsContent,
+    /// 财联社详情页 `__NEXT_DATA__` JSON 内嵌正文（cls-telegraph / cls-depth）。
+    ClsNextData,
+    /// 华尔街见闻 api-one JSON（wallstreetcn-quick）。
+    WallstreetcnApi,
+    /// 36 氪快讯页 `<meta name=description>`（36kr-quick）。
+    Kr36Meta,
+    /// 格隆汇静态页 CSS selector。
+    GelonghuiStatic,
+    /// 早晨报静态 GBK 页 CSS selector（zaobao→zaochenbao）。
+    ZaochenbaoStatic,
+    /// 未登记源：通用 readability 兜底。
+    Generic,
+}
+
+/// source 前缀 → 策略。新增渠道在此登记 + reference 文档同步。
+pub fn strategy_for(source: &str) -> ArticleStrategy {
+    match source {
+        "newsnow:cls-telegraph" | "newsnow:cls-depth" => ArticleStrategy::ClsNextData,
+        "newsnow:wallstreetcn-quick" => ArticleStrategy::WallstreetcnApi,
+        "newsnow:36kr-quick" => ArticleStrategy::Kr36Meta,
+        "newsnow:gelonghui" => ArticleStrategy::GelonghuiStatic,
+        "newsnow:zaobao" => ArticleStrategy::ZaochenbaoStatic,
+        "newsnow:jin10" => ArticleStrategy::TitleIsContent,
+        _ => ArticleStrategy::Generic,
+    }
+}
+
 pub struct ArticleExtractor {
     client: Client,
 }
@@ -70,9 +105,7 @@ pub struct ArticleExtractor {
 impl ArticleExtractor {
     pub fn new() -> reqwest::Result<Self> {
         let client = Client::builder()
-            .user_agent(
-                "Mozilla/5.0 (compatible; GangZi-Terminal/0.1; +news/article-extractor)",
-            )
+            .user_agent(BROWSER_UA)
             .timeout(Duration::from_secs(ARTICLE_TIMEOUT_SECS))
             .build()?;
         Ok(Self { client })
@@ -85,6 +118,169 @@ impl ArticleExtractor {
             Ok(out) => out,
             Err(e) => failure(canonical_url, first_news_id, now, e.reason, &e.message),
         }
+    }
+
+    /// 按 source 策略抽取正文（spec references/news/article-strategies.md）。
+    /// 返回 `None` 表示该源 `TitleIsContent`（快讯，标题即全文，无需抓取、不存正文）。
+    /// 其余策略返回 `ArticleExtractOutput`（成功有 content；失败 error 填充供调用方记 log）。
+    pub async fn extract_for_source(
+        &self,
+        source: &str,
+        canonical_url: &str,
+        first_news_id: Option<&str>,
+    ) -> Option<ArticleExtractOutput> {
+        let now = Utc::now();
+        let strategy = strategy_for(source);
+        if strategy == ArticleStrategy::TitleIsContent {
+            return None;
+        }
+        let res = match strategy {
+            ArticleStrategy::ClsNextData => self.extract_cls(canonical_url).await,
+            ArticleStrategy::WallstreetcnApi => self.extract_wallstreetcn(canonical_url).await,
+            ArticleStrategy::Kr36Meta => self.extract_36kr(canonical_url).await,
+            ArticleStrategy::GelonghuiStatic => {
+                self.extract_static(canonical_url, "article.main-news.article-with-html").await
+            }
+            ArticleStrategy::ZaochenbaoStatic => {
+                self.extract_static(canonical_url, "#article-body").await
+            }
+            ArticleStrategy::TitleIsContent => unreachable!(),
+            ArticleStrategy::Generic => {
+                return Some(self.extract(canonical_url, first_news_id).await)
+            }
+        };
+        Some(match res {
+            Ok((title, content)) => {
+                if content.chars().count() < ARTICLE_MIN_CONTENT_CHARS {
+                    failure(canonical_url, first_news_id, now, ArticleExtractReason::TooShort, "content too short")
+                } else {
+                    ArticleExtractOutput {
+                        article: ArticleContent {
+                            url: canonical_url.to_string(),
+                            first_news_id: first_news_id.map(|s| s.to_string()),
+                            title,
+                            content: Some(content),
+                            payload: serde_json::json!({"provider": "article_extractor", "strategy": format!("{strategy:?}")}),
+                            fetched_at: now,
+                            warning: None,
+                        },
+                        error: None,
+                    }
+                }
+            }
+            Err(e) => failure(canonical_url, first_news_id, now, e.reason, &e.message),
+        })
+    }
+
+    /// GET 并按字符集 decode 成 HTML 文本。
+    async fn fetch_decoded(&self, url: &str) -> Result<String, ExtractErr> {
+        let resp = self.client.get(url).send().await.map_err(|e| ExtractErr {
+            reason: if e.is_timeout() { ArticleExtractReason::Timeout } else { ArticleExtractReason::Network },
+            message: e.to_string(),
+        })?;
+        if !resp.status().is_success() {
+            return Err(ExtractErr {
+                reason: ArticleExtractReason::HttpStatus,
+                message: format!("http status {}", resp.status()),
+            });
+        }
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let bytes = resp.bytes().await.map_err(|e| ExtractErr {
+            reason: ArticleExtractReason::Network,
+            message: e.to_string(),
+        })?;
+        Ok(decode_html(&bytes, &ct))
+    }
+
+    /// 财联社：detail 页 `__NEXT_DATA__` JSON → articleDetail.{title,content}。
+    async fn extract_cls(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
+        let id = last_path_segment(url).ok_or_else(|| parse_err("cls: no id in url"))?;
+        let page = self
+            .fetch_decoded(&format!("https://www.cls.cn/detail/{id}"))
+            .await?;
+        let json = extract_script_json(&page, "__NEXT_DATA__")
+            .ok_or_else(|| parse_err("cls: no __NEXT_DATA__"))?;
+        let detail = json
+            .pointer("/props/pageProps/articleDetail")
+            .ok_or_else(|| parse_err("cls: no articleDetail"))?;
+        let content_html = detail.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let title = detail.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let text = html_to_text(content_html);
+        if text.is_empty() {
+            return Err(parse_err("cls: empty content"));
+        }
+        Ok((title, text))
+    }
+
+    /// 华尔街见闻：api-one lives JSON → data.content_text。
+    async fn extract_wallstreetcn(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
+        let id = last_path_segment(url).ok_or_else(|| parse_err("wscn: no id"))?;
+        let api = format!("https://api-one.wallstcn.com/apiv1/content/lives/{id}");
+        let resp = self.client.get(&api).send().await.map_err(|e| ExtractErr {
+            reason: if e.is_timeout() { ArticleExtractReason::Timeout } else { ArticleExtractReason::Network },
+            message: e.to_string(),
+        })?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| ExtractErr {
+            reason: ArticleExtractReason::ParseError,
+            message: e.to_string(),
+        })?;
+        let data = json.get("data").ok_or_else(|| parse_err("wscn: no data"))?;
+        let text = data
+            .get("content_text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .or_else(|| data.get("content").and_then(|v| v.as_str()).map(html_to_text))
+            .unwrap_or_default();
+        let title = data.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+        if text.is_empty() {
+            return Err(parse_err("wscn: empty content"));
+        }
+        Ok((title, text))
+    }
+
+    /// 36 氪：快讯页 `<meta name=description>` == 正文。
+    async fn extract_36kr(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
+        let id = last_path_segment(url).ok_or_else(|| parse_err("36kr: no id"))?;
+        let page = self
+            .fetch_decoded(&format!("https://www.36kr.com/newsflashes/{id}"))
+            .await?;
+        let doc = Html::parse_document(&page);
+        let sel = Selector::parse(r#"meta[name="description"]"#).unwrap();
+        let text = doc
+            .select(&sel)
+            .next()
+            .and_then(|el| el.value().attr("content"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Err(parse_err("36kr: no description"));
+        }
+        Ok((None, text))
+    }
+
+    /// 静态页：按 selector 抽正文文本。
+    async fn extract_static(
+        &self,
+        url: &str,
+        selector: &str,
+    ) -> Result<(Option<String>, String), ExtractErr> {
+        let page = self.fetch_decoded(url).await?;
+        let doc = Html::parse_document(&page);
+        let sel = Selector::parse(selector)
+            .map_err(|_| parse_err("static: bad selector"))?;
+        let el = doc.select(&sel).next().ok_or_else(|| parse_err("static: selector miss"))?;
+        let mut buf = String::new();
+        collect_text(el, &mut buf);
+        let text = clean_whitespace(&buf);
+        if text.is_empty() {
+            return Err(parse_err("static: empty"));
+        }
+        Ok((None, text))
     }
 
     async fn do_extract(
@@ -195,6 +391,38 @@ impl ArticleExtractor {
 struct ExtractErr {
     reason: ArticleExtractReason,
     message: String,
+}
+
+fn parse_err(msg: &str) -> ExtractErr {
+    ExtractErr { reason: ArticleExtractReason::ParseError, message: msg.to_string() }
+}
+
+/// 取 URL 最后一个路径段（去 query/fragment），用于从 detail url 提 id。
+fn last_path_segment(url: &str) -> Option<String> {
+    let no_q = url.split(['?', '#']).next().unwrap_or(url);
+    no_q.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// 从 HTML 里取 `<script id="<id>" ...>...</script>` 内的 JSON。
+fn extract_script_json(html: &str, id: &str) -> Option<serde_json::Value> {
+    let doc = Html::parse_document(html);
+    let sel = Selector::parse(&format!(r#"script#{id}"#)).ok()?;
+    let raw = doc.select(&sel).next()?.text().collect::<String>();
+    serde_json::from_str(raw.trim()).ok()
+}
+
+/// HTML 片段 → 纯文本（strip tags + 规整空白）。
+fn html_to_text(html: &str) -> String {
+    let frag = Html::parse_fragment(html);
+    let mut buf = String::new();
+    for node in frag.tree.root().children() {
+        walk_node(node, &mut buf);
+    }
+    clean_whitespace(&buf)
 }
 
 fn failure(

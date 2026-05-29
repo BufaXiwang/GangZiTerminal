@@ -14,7 +14,7 @@
 // 红涨绿跌不适用资讯；只有 has-article 用绿色调，warning 用 state-warn 暖色。
 
 import { AlertTriangle, BookOpen } from "lucide-react";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
 
@@ -26,8 +26,6 @@ export interface NewsTimelineProps {
   loadingMore: boolean;
   hasMore: boolean;
   onLoadMore: () => void;
-  onSelectItem: (id: string) => void;
-  selectedId: string | null;
   registerSectionRef: (dateKey: string, el: HTMLElement | null) => void;
   onActiveDateChange: (dateKey: string) => void;
   query: string;
@@ -93,13 +91,21 @@ export function NewsTimeline({
   loadingMore,
   hasMore,
   onLoadMore,
-  onSelectItem,
-  selectedId,
   registerSectionRef,
   onActiveDateChange,
   query,
   sourceNames = {},
 }: NewsTimelineProps) {
+  // 行内正文展开状态（>3 行折叠，点"展开"看全文）。无侧边 drawer。
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   // === sort + group ===
   const groups: DateGroup[] = useMemo(() => {
     const sorted = [...items].sort((a, b) => {
@@ -219,20 +225,24 @@ export function NewsTimeline({
             <span className="news-day-count">{g.items.length} 条</span>
           </header>
           {g.items.map((it) => {
-            const hasArticle = Boolean(it.articleExcerpt) || Boolean(it.article);
             const hasWarn = it.warnings.length > 0;
             const acc = sourceAccent(it.source);
+            // 正文：有抽取正文用之；否则用 summary（快讯多为空）。
+            const body = it.articleExcerpt ?? it.summary ?? "";
+            const isOpen = expanded.has(it.id);
+            // 够长才给"展开"（约 >3 行）。
+            const expandable = body.length > 100;
             return (
               <div
                 key={it.id}
-                className={`news-row acc-${acc} ${selectedId === it.id ? "selected" : ""}`}
-                onClick={() => onSelectItem(it.id)}
-                role="button"
-                tabIndex={0}
+                className={`news-row acc-${acc}${isOpen ? " expanded" : ""}`}
+                onClick={() => expandable && toggle(it.id)}
+                role={expandable ? "button" : undefined}
+                tabIndex={expandable ? 0 : undefined}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
+                  if (expandable && (e.key === "Enter" || e.key === " ")) {
                     e.preventDefault();
-                    onSelectItem(it.id);
+                    toggle(it.id);
                   }
                 }}
               >
@@ -243,11 +253,11 @@ export function NewsTimeline({
                 <div className="news-row-body">
                   <h3 className="news-row-title">
                     {highlight(it.title, query)}
-                    {hasArticle && (
+                    {it.article && (
                       <BookOpen
                         size={12}
                         className="news-row-article-icon"
-                        aria-label="本地已抽取正文"
+                        aria-label="已抽取正文"
                       />
                     )}
                     {hasWarn && (
@@ -258,11 +268,24 @@ export function NewsTimeline({
                       />
                     )}
                   </h3>
-                  {/* 快讯无独立 summary（标题即全文）；有抽取正文时显示一段摘录。 */}
-                  {(it.summary || it.articleExcerpt) && (
-                    <div className="news-row-summary">
-                      {highlight(it.summary ?? it.articleExcerpt ?? "", query)}
+                  {body && (
+                    <div
+                      className={`news-row-body-text${isOpen ? " open" : ""}`}
+                    >
+                      {highlight(body, query)}
                     </div>
+                  )}
+                  {expandable && (
+                    <button
+                      type="button"
+                      className="news-row-expand"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggle(it.id);
+                      }}
+                    >
+                      {isOpen ? "收起" : "展开"}
+                    </button>
                   )}
                 </div>
                 <span className={`news-src-tag acc-${acc}`}>
