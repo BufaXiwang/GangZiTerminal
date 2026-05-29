@@ -201,6 +201,52 @@ impl Drop for TdxHqClient {
     }
 }
 
+#[cfg(test)]
+mod minute_diag {
+    use super::*;
+    use byteorder::ByteOrder;
+
+    /// 联网诊断：dump minute_time 原始 body 前若干字节 + 两种 pos 起点(2/4)下
+    /// 前 6 个点的解码，人工判断哪个对齐。
+    /// 运行：cargo test --lib tdx::client::minute_diag -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_minute_raw() {
+        let (mut cli, ip) =
+            TdxHqClient::connect_bestip(Duration::from_secs(5)).expect("connect");
+        eprintln!("connected via {ip}");
+        // 600519 贵州茅台 (SH)，收盘价 ~1500+，分时第一个点应接近开盘价。
+        let pkg = cmd::security_minute::build(Market::SH.as_u8(), "600519").unwrap();
+        let body = frame::request(&mut cli.sock, &pkg).expect("request");
+        eprintln!("body.len = {}", body.len());
+        let hex: Vec<String> = body.iter().take(48).map(|b| format!("{b:02x}")).collect();
+        eprintln!("first 48 bytes: {}", hex.join(" "));
+        let num = byteorder::LittleEndian::read_u16(&body[0..2]);
+        eprintln!("num(u16@0) = {num}");
+
+        // 茅台 600519 当前 ~1400-1500，第一个点价应接近开盘价。
+        // 扫描起点 offset，找哪个让前几个累积价落在合理区间。
+        for start in 2usize..=14 {
+            let mut pos = start;
+            let mut last = 0i64;
+            let mut prices = Vec::new();
+            let mut ok = true;
+            for _ in 0..5 {
+                let Ok(d) = super::super::helper::get_price(&body, &mut pos) else { ok = false; break; };
+                let _r = super::super::helper::get_price(&body, &mut pos);
+                let _v = super::super::helper::get_price(&body, &mut pos);
+                last += d;
+                prices.push(last as f64 / 100.0);
+            }
+            if ok {
+                eprintln!("start={start:>2}: {prices:?}");
+            }
+        }
+        // 同时打印 code 回显之后的偏移（"600519" 末尾 + 1）
+        eprintln!("(code echo '600519' at offset 5..11, so data likely starts ~11)");
+    }
+}
+
 /// Connect + handshake against one host. Used by [`TdxHqClient::connect_bestip`].
 fn race_one(host: &str, port: u16, timeout: Duration) -> Result<(TcpStream, SocketAddr)> {
     let addr = (host, port)

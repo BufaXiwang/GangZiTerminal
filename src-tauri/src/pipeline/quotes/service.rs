@@ -1023,7 +1023,7 @@ impl QuotesService {
 
     /// 刷新指定 scope 的 quotes 到 `MARKET_SNAPSHOT`。
     pub async fn refresh_market_quotes(
-        &self,
+        self: &Arc<Self>,
         req: RefreshMarketQuotesRequest,
     ) -> Result<MarketQuotesRefreshedPayload, ResponseError> {
         let ctx = self.market_time_now();
@@ -1117,8 +1117,6 @@ impl QuotesService {
         let mut success: u32 = 0;
         let mut failed_batches: u32 = 0;
         let mut affected: Vec<TsCode> = Vec::new();
-        // Spec §5 全市场刷新执行契约 — 每 N 只 emit progress event。
-        const PROGRESS_BATCH: usize = 200;
 
         if matches!(scope_kind, RefreshScopeKind::Universe) {
             // ============================================================
@@ -1215,14 +1213,11 @@ impl QuotesService {
                 "universe TDX streaming pass returned"
             );
 
-            tracing::info!(
-                target: "quotes.refresh.universe",
-                success_after_tdx = success,
-                fallback_pending = fallback_queue.len() + bj_codes.len(),
-                "universe TDX batch pass complete; entering fallback chain"
-            );
-
-            // BJ + TDX 失败 → per-stock fallback chain。
+            // BJ + TDX 失败 → fallback。**不阻塞主流程**：主批已入库 + 即将 emit
+            // refreshed，剩下的 fallback_queue 丢到后台 spawn 并发跑（EM→腾讯→新浪），
+            // 完成一个补一个 cache/close_snapshot + emit progress。
+            // 这样 universe 一轮的同步耗时 = TDX 主批（~20s），不再被 ~37s 串行
+            // fallback 拖到吃满 60s 周期。subscribed/manual scope 仍同步等（见 else）。
             let bj_inputs: Vec<(TsCode, InstrumentCategory, Option<String>)> = bj_codes
                 .into_iter()
                 .map(|ts| {
@@ -1235,84 +1230,35 @@ impl QuotesService {
                 .collect();
             fallback_queue.extend(bj_inputs);
 
-            let t_fb_start = std::time::Instant::now();
-            for (ts, cat, name) in fallback_queue {
-                completed += 1;
-                let outcome = self
-                    .refresh_one_quote(&ts, cat, name, trade_date, now)
-                    .await;
-                match outcome {
-                    Some(q) => {
-                        let captured_at = q.captured_at;
-                        let source_str = q.source.as_str().to_string();
-                        self.cache.put(CachedSnapshot {
-                            quote: q.clone(),
-                            captured_at,
-                            trade_date,
-                            source: source_str,
-                        });
-                        if matches!(req.purpose, RefreshPurpose::Close) {
-                            let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
-                        }
-                        success += 1;
-                        affected.push(ts.clone());
-                        affected_in_batch.push(ts.clone());
-                    }
-                    None => {
-                        failed_batches += 1;
-                    }
-                }
-                if affected_in_batch.len() >= PROGRESS_BATCH {
-                    tracing::info!(
-                        target: "quotes.refresh.universe",
-                        completed,
-                        success,
-                        total,
-                        batch_size = affected_in_batch.len(),
-                        "emit progress (fallback path)"
-                    );
-                    self.emit_progress(MarketQuotesRefreshProgressPayload {
-                        scope: RefreshScopeKind::Universe,
-                        purpose: req.purpose,
-                        trade_date: Some(trade_date),
-                        completed,
-                        success,
-                        total,
-                        affected_ts_codes: std::mem::take(&mut affected_in_batch),
-                        captured_at: now,
-                    });
-                }
-            }
-            if !affected_in_batch.is_empty() {
-                tracing::info!(
-                    target: "quotes.refresh.universe",
-                    completed,
-                    success,
-                    total,
-                    batch_size = affected_in_batch.len(),
-                    "emit progress (final flush)"
-                );
-                self.emit_progress(MarketQuotesRefreshProgressPayload {
-                    scope: RefreshScopeKind::Universe,
-                    purpose: req.purpose,
-                    trade_date: Some(trade_date),
-                    completed,
-                    success,
-                    total,
-                    affected_ts_codes: std::mem::take(&mut affected_in_batch),
-                    captured_at: now,
-                });
-            }
-
             tracing::info!(
                 target: "quotes.refresh.universe",
-                total,
-                success,
-                failed = failed_batches,
-                fallback_elapsed_ms = t_fb_start.elapsed().as_millis() as u64,
-                total_elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
-                "universe refresh complete"
+                success_after_tdx = success,
+                fallback_pending = fallback_queue.len(),
+                tdx_elapsed_ms = t_tdx_start.elapsed().as_millis() as u64,
+                "universe TDX pass complete; spawning async fallback (non-blocking)"
             );
+
+            if !fallback_queue.is_empty() {
+                let this = Arc::clone(self);
+                let purpose = req.purpose;
+                let base_completed = completed;
+                let base_success = success;
+                tokio::spawn(async move {
+                    this.run_universe_fallback_bg(
+                        fallback_queue,
+                        trade_date,
+                        now,
+                        purpose,
+                        base_completed,
+                        base_success,
+                        total,
+                    )
+                    .await;
+                });
+            }
+            // 注意：success/failed_batches 此处只反映 TDX 主批；fallback 成功的
+            // 标的由后台任务补写 cache/close_snapshot 并 emit progress，最终由
+            // 后台任务重写 refresh_state（见 run_universe_fallback_bg）。
         } else {
             // Subscribed / Manual scope: per-stock loop (small N, fallback chain has best quality).
             const BATCH: usize = 200;
@@ -1380,6 +1326,126 @@ impl QuotesService {
         };
         self.emit_refreshed(payload.clone());
         Ok(payload)
+    }
+
+    /// 后台异步处理 universe 的 fallback 队列（TDX 失败 / BJ 标的）。
+    ///
+    /// Spec: quotes-module.md §5 "全市场 quote 刷新执行契约" — universe fallback 非阻塞。
+    /// 并发跑 EM→腾讯→新浪（buffer_unordered 上限 8），完成一个补一个 cache/
+    /// close_snapshot + emit progress；结束后重写 refresh_state 反映最终成功数。
+    /// 不走 TDX（队列里的标的 TDX 已失败或不支持）。
+    async fn run_universe_fallback_bg(
+        self: Arc<Self>,
+        queue: Vec<(TsCode, InstrumentCategory, Option<String>)>,
+        trade_date: TradeDate,
+        now: chrono::DateTime<Utc>,
+        purpose: RefreshPurpose,
+        base_completed: u32,
+        base_success: u32,
+        total: u32,
+    ) {
+        use futures_util::StreamExt;
+        const FB_CONCURRENCY: usize = 8;
+        const PROGRESS_BATCH: usize = 80;
+        let t0 = std::time::Instant::now();
+        let pending = queue.len();
+        let close = matches!(purpose, RefreshPurpose::Close);
+
+        let stream = futures_util::stream::iter(queue.into_iter().map(|(ts, cat, _name)| {
+            let this = Arc::clone(&self);
+            async move {
+                let q = this.fallback_http_quote(&ts, cat, trade_date, now).await;
+                (ts, q)
+            }
+        }))
+        .buffer_unordered(FB_CONCURRENCY);
+        tokio::pin!(stream);
+
+        let mut completed = base_completed;
+        let mut success = base_success;
+        let mut batch: Vec<TsCode> = Vec::new();
+        while let Some((ts, q)) = stream.next().await {
+            completed += 1;
+            if let Some(q) = q {
+                let captured_at = q.captured_at;
+                let source_str = q.source.as_str().to_string();
+                self.cache.put(CachedSnapshot {
+                    quote: q.clone(),
+                    captured_at,
+                    trade_date,
+                    source: source_str,
+                });
+                if close {
+                    let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
+                }
+                success += 1;
+                batch.push(ts);
+            }
+            if batch.len() >= PROGRESS_BATCH {
+                self.emit_progress(MarketQuotesRefreshProgressPayload {
+                    scope: RefreshScopeKind::Universe,
+                    purpose,
+                    trade_date: Some(trade_date),
+                    completed,
+                    success,
+                    total,
+                    affected_ts_codes: std::mem::take(&mut batch),
+                    captured_at: now,
+                });
+            }
+        }
+        if !batch.is_empty() {
+            self.emit_progress(MarketQuotesRefreshProgressPayload {
+                scope: RefreshScopeKind::Universe,
+                purpose,
+                trade_date: Some(trade_date),
+                completed,
+                success,
+                total,
+                affected_ts_codes: std::mem::take(&mut batch),
+                captured_at: now,
+            });
+        }
+
+        // 重写 refresh_state 反映含 fallback 的最终成功数（catch-up / diagnostics 用）。
+        let kind = if close { "close" } else { "intraday" };
+        let _ = self.repo().record_refresh_state(
+            kind,
+            trade_date,
+            total,
+            success,
+            total.saturating_sub(success),
+            now,
+        );
+        tracing::info!(
+            target: "quotes.refresh.universe",
+            pending,
+            final_success = success,
+            fallback_elapsed_ms = t0.elapsed().as_millis() as u64,
+            "async fallback complete"
+        );
+    }
+
+    /// HTTP-only fallback（EM→腾讯→新浪），不走 TDX。用于 universe 后台 fallback。
+    /// 选取规则同 [`pick_fallback_quote`]：首个 quote_complete，否则首个 display_complete。
+    async fn fallback_http_quote(
+        &self,
+        ts: &TsCode,
+        category: InstrumentCategory,
+        trade_date: TradeDate,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<StockQuote> {
+        let mut candidates: Vec<StockQuote> = Vec::with_capacity(3);
+        if let Ok(q) = self.eastmoney.fetch_quote(ts, category, trade_date, now).await {
+            candidates.push(q);
+        }
+        if let Ok(q) = self.tencent.fetch_quote(ts, category, trade_date, now).await {
+            candidates.push(q);
+        }
+        if let Ok(q) = self.sina.fetch_quote(ts, category, trade_date, now).await {
+            candidates.push(q);
+        }
+        Self::pick_fallback_quote(candidates)
     }
 
     fn resolve_categories(
@@ -3089,7 +3155,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_market_quotes_manual_empty_is_invalid_input() {
-        let svc = make_service();
+        let svc = Arc::new(make_service());
         let req = RefreshMarketQuotesRequest {
             scope: RefreshMarketQuotesScope::Manual { ts_codes: vec![] },
             purpose: RefreshPurpose::Intraday,
@@ -3101,7 +3167,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_market_quotes_subscribed_empty_is_noop() {
-        let svc = make_service();
+        let svc = Arc::new(make_service());
         let req = RefreshMarketQuotesRequest {
             scope: RefreshMarketQuotesScope::Subscribed { ts_codes: vec![] },
             purpose: RefreshPurpose::Intraday,

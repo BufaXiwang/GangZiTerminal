@@ -1026,10 +1026,13 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 1. **批量 RPC 强制**：universe scope 实现必须用 TDX `get_security_quotes` 批量调用（每批 ≤ 80 标的），不允许逐只串行；其他 provider fallback 沿用原逐只路径。理由：TDX 协议层已经支持批量并自带 ≥80 ms/批节流，串行方案在节流下吞吐 ~6 只/秒，批量 ~80×80ms/秒 ≈ 1000 只/秒。
    - **接受门槛**：universe batch 路径用 `is_display_complete`（只要 `price` 非空就接受为最终值），**不**用 `is_quote_complete`。理由：指数 / 基金 TDX 不返回 bid/ask 五档，且 EM / Tencent / Sina 也无；用 `is_quote_complete` 会把所有指数 / 基金错误地推进 fallback chain，每只浪费 ~600ms。`is_quote_complete` 是 fallback chain 多 provider 之间挑选的"字段完整度优先"裁判，不是 universe batch 主源的接受门槛。
    - **fallback 触发面**：只在 TDX `Err` 或 `Ok` 但 `price` 为空时，把该标的推入 fallback queue（EM → Tencent → Sina）。
-2. **吞吐目标**：在 TDX 健康、网络正常的前提下，universe scope close / intraday 一轮完成时间 **≤ 1 分钟**（universe ~7500）。超出视为 provider 或 IO 异常，写入 `quote_refresh_state.failed`。
-3. **执行顺序**：universe scope 标的按 `InstrumentCategory` 排序进入批次队列 —— **`Stock` → `Index` → `Fund`**；同 category 内顺序不约束。理由：用户首屏感知优先级是 A 股票，索引和基金次之；按类别交付让"看得见的部分"先就绪。
-4. **进度事件**：universe scope 必须 emit `market-quotes-refresh-progress`，payload 见 [shared-types.md](shared-types.md) `MarketQuotesRefreshProgressPayload`。emit 触发节奏由实现决定，最低粒度 **N = 80**（TDX transport batch size），上限 `N = 200`；推荐实现用 streaming 模式 —— pipeline 按 80 一批驱动 TDX，每批完成后 write DB + emit progress，让首次安装 25s 期间 UI 持续流式填充。前端订阅该事件做增量列表刷新，**不要靠 polling 撞数据**。终态仍以 `market-quotes-refreshed` 为准；progress 是中间态，消费者不得用其覆盖 `quote_refresh_state` 最终行。
-5. **resume 语义**：catch-up（`purpose = "close"`）必须先查 `list_close_snapshot_ts_codes(tradeDate)` 过滤已有标的，重启后从断点接续，不重跑已成功条目。`skip_existing` 行为只对 `purpose = "close"` 生效；`intraday` 仍刷全 universe（覆盖盘中变化）。
+2. **fallback 非阻塞（async）**：universe scope 的 fallback queue **不得阻塞主流程**。TDX 主批跑完即视为本轮"主体完成" —— 立即写 `quote_refresh_state`（TDX 主批成功数）+ emit `market-quotes-refreshed`，然后把 fallback queue 丢到后台任务并发处理（EM→腾讯→新浪，建议并发上限 8），完成一个补一个 cache / `close_snapshot` 并 emit progress，结束后**重写** `quote_refresh_state` 反映含 fallback 的最终成功数。
+   - 理由：universe 里 TDX 失败的多是退市 / 停牌 / 北交所，少量但每只串行跑 3 个 HTTP provider（~440ms）会把一轮拖到 ~58s 吃满 60s 周期，导致刷新近乎连续、与交互请求抢 TDX 连接。异步化后一轮同步耗时 = TDX 主批（~20s）。
+   - **例外**：`subscribed` / `manual` scope（用户显式关注 / 点击的具体标的）的 fallback 仍**同步**等待——这些场景调用方需要拿到确定结果。"非阻塞"只对 universe scope 生效。
+3. **吞吐目标**：在 TDX 健康、网络正常的前提下，universe scope 一轮**主体完成**（TDX 主批 + emit refreshed）时间 **≤ 30s**（universe ~7500）；后台 fallback 不计入主体完成时间。超出视为 provider 或 IO 异常，写入 `quote_refresh_state.failed`。
+4. **执行顺序**：universe scope 标的按 `InstrumentCategory` 排序进入批次队列 —— **`Stock` → `Index` → `Fund`**；同 category 内顺序不约束。理由：用户首屏感知优先级是 A 股票，索引和基金次之；按类别交付让"看得见的部分"先就绪。
+5. **进度事件**：universe scope 必须 emit `market-quotes-refresh-progress`，payload 见 [shared-types.md](shared-types.md) `MarketQuotesRefreshProgressPayload`。emit 触发节奏由实现决定，最低粒度 **N = 80**（TDX transport batch size），上限 `N = 200`；推荐实现用 streaming 模式 —— pipeline 按 80 一批驱动 TDX，每批完成后 write DB + emit progress，让首次安装期间 UI 持续流式填充。后台 fallback 也复用同一事件按完成进度补发。前端订阅该事件做增量列表刷新，**不要靠 polling 撞数据**。终态仍以 `market-quotes-refreshed` 为准（注意：universe scope 下 refreshed 在 TDX 主批后即发，后台 fallback 的增量只通过 progress + cache 体现）；progress 是中间态，消费者不得用其覆盖 `quote_refresh_state` 最终行。
+6. **resume 语义**：catch-up（`purpose = "close"`）必须先查 `list_close_snapshot_ts_codes(tradeDate)` 过滤已有标的，重启后从断点接续，不重跑已成功条目。`skip_existing` 行为只对 `purpose = "close"` 生效；`intraday` 仍刷全 universe（覆盖盘中变化）。
 
 ### 核心指数集合
 
