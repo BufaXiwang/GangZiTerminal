@@ -285,7 +285,12 @@ export type FetchNewsError = { field?: string | null; code: ErrorCode; message?:
 export type FetchNewsItem = { id: string; source: string; title: string; summary?: string | null; url?: string | null; publishedAt?: string | null; articleExcerpt?: string | null; article?: ArticleSnippet | null; freshness?: NewsItemFreshness | null; warnings?: WarningCode[]; errors?: ErrorCode[] }
 export type FetchNewsPage = { limit: number; offset: number; hasMore: boolean }
 export type FetchNewsRequest = { query?: string | null; sources?: string[] | null; publishedFrom?: string | null; publishedTo?: string | null; includeArticle?: boolean | null; limit?: number | null; offset?: number | null }
-export type FetchNewsResponse = { items: FetchNewsItem[]; errors: FetchNewsError[]; page: FetchNewsPage }
+export type FetchNewsResponse = { items: FetchNewsItem[]; errors: FetchNewsError[]; page: FetchNewsPage; 
+/**
+ * 按北京日期(YYYY-MM-DD)的每日真实总条数（同 filter，不受分页限制）。
+ * 资讯页日期导航用它显示每天真实数量，而非分页累积。
+ */
+dateCounts?: NewsDateCount[] }
 /**
  * Spec: shared-types.md §4
  * - `missing` 表示本地读模型没有可用数据，或数据已超过模块定义的硬过期阈值而不可再作为可用事实返回。
@@ -415,6 +420,7 @@ export type MinutePoint = { tradeDate: string; time: string; price: Price; avera
  * CNY，保留到分；内部计算可使用更高精度。
  */
 export type Money = string
+export type NewsDateCount = { date: string; count: number }
 /**
  * 单 provider / source 失败（shared-types.md §6 NewsFailure）。
  */

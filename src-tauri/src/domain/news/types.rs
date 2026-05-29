@@ -154,6 +154,17 @@ pub struct FetchNewsResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<FetchNewsError>,
     pub page: FetchNewsPage,
+    /// 按北京日期(YYYY-MM-DD)的每日真实总条数（同 filter，不受分页限制）。
+    /// 资讯页日期导航用它显示每天真实数量，而非分页累积。
+    #[serde(default)]
+    pub date_counts: Vec<NewsDateCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NewsDateCount {
+    pub date: String,
+    pub count: u32,
 }
 
 // ============================================================================

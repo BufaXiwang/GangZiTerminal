@@ -29,7 +29,7 @@ import {
   type FetchNewsPage,
   type NewsSource,
 } from "../bindings";
-import { NewsDateNav, formatDateKey } from "./news/NewsDateNav";
+import { NewsDateNav } from "./news/NewsDateNav";
 import { NewsTimeline } from "./news/NewsTimeline";
 import { ArticleDrawer } from "./news/ArticleDrawer";
 
@@ -52,6 +52,8 @@ export default function NewsPage() {
   // === list state ===
   const [items, setItems] = useState<FetchNewsItem[]>([]);
   const [page, setPage] = useState<FetchNewsPage | null>(null);
+  // 每日真实总数（后端 GROUP BY，不受分页限制）—— 给日期导航显示真实条数。
+  const [dateCounts, setDateCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -118,6 +120,12 @@ export default function NewsPage() {
       }
       setItems(res.data.items);
       setPage(res.data.page);
+      // 日期导航用后端按日聚合的真实总数（不随分页累积）。
+      {
+        const m: Record<string, number> = {};
+        for (const dc of res.data.dateCounts ?? []) m[dc.date] = dc.count;
+        setDateCounts(m);
+      }
       if (res.data.errors && res.data.errors.length > 0) {
         setWarnings(
           res.data.errors.map((e) =>
@@ -192,18 +200,7 @@ export default function NewsPage() {
     return m;
   }, [sources]);
 
-  // === counts by date 给 nav 用 ===
-  const countsByDate = useMemo(() => {
-    const m: Record<string, number> = {};
-    for (const it of items) {
-      if (!it.publishedAt) continue;
-      const d = new Date(it.publishedAt);
-      if (Number.isNaN(d.getTime())) continue;
-      const key = formatDateKey(d);
-      m[key] = (m[key] ?? 0) + 1;
-    }
-    return m;
-  }, [items]);
+  // 日期导航计数直接用后端 dateCounts（真实每日总数，不随分页累积）。
 
   // === status line ===
   const enabledCount = sources.filter((s) => s.enabled).length;
@@ -348,7 +345,7 @@ export default function NewsPage() {
       controls={controls}
     >
       <NewsDateNav
-        countsByDate={countsByDate}
+        countsByDate={dateCounts}
         activeDate={activeDate}
         onSelect={handleSelectDate}
       />

@@ -15,8 +15,8 @@ use crate::domain::news::events::{
 use crate::domain::news::source::NewsSource;
 use crate::domain::news::types::{
     ArticleSnippet, FetchNewsError, FetchNewsItem, FetchNewsPage, FetchNewsRequest,
-    FetchNewsResponse, ListNewsSourcesResponse, NewsItem, NewsItemFreshness, ProviderNewsItem,
-    WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
+    FetchNewsResponse, ListNewsSourcesResponse, NewsDateCount, NewsItem, NewsItemFreshness,
+    ProviderNewsItem, WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
 };
 use crate::domain::shared::{ErrorCode, WarningCode};
 use crate::infrastructure::db::AppDb;
@@ -145,6 +145,7 @@ impl NewsService {
                         offset,
                         has_more: false,
                     },
+                    date_counts: vec![],
                 };
             }
         }
@@ -173,6 +174,7 @@ impl NewsService {
                         offset,
                         has_more: false,
                     },
+                    date_counts: vec![],
                 };
             }
         };
@@ -185,6 +187,20 @@ impl NewsService {
             .collect::<Vec<_>>();
 
         let has_more = (offset as u64 + items.len() as u64) < result.total as u64;
+
+        // 每日真实条数（同 filter，不分页）给日期导航。失败不致命，空表退化。
+        let date_counts = repo
+            .count_news_by_date(
+                req.sources.as_deref(),
+                req.published_from.as_ref(),
+                req.published_to.as_ref(),
+                req.query.as_deref(),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(date, count)| NewsDateCount { date, count })
+            .collect();
+
         FetchNewsResponse {
             items,
             errors: response_errors,
@@ -193,6 +209,7 @@ impl NewsService {
                 offset,
                 has_more,
             },
+            date_counts,
         }
     }
 

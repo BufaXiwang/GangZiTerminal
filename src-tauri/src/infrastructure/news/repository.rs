@@ -168,6 +168,18 @@ impl<'a> NewsRepository<'a> {
         })
     }
 
+    /// 按北京日期统计每日条数（同 filter，不分页），供日期导航显示真实总数。
+    pub fn count_news_by_date(
+        &self,
+        sources: Option<&[String]>,
+        published_from: Option<&DateTime<Utc>>,
+        published_to: Option<&DateTime<Utc>>,
+        query: Option<&str>,
+    ) -> rusqlite::Result<Vec<(String, u32)>> {
+        self.db
+            .with(|conn| count_news_by_date_impl(conn, sources, published_from, published_to, query))
+    }
+
     // -- NewsSource ----------------------------------------------------------
 
     pub fn list_sources(&self) -> rusqlite::Result<Vec<NewsSource>> {
@@ -498,49 +510,44 @@ pub struct ListResult {
     pub total: u32,
 }
 
-fn list_news_items_impl(
-    conn: &Connection,
+struct NewsFilter {
+    from_table_sql: String,
+    where_sql: String,
+    binds: Vec<rusqlite::types::Value>,
+    has_query: bool,
+}
+
+/// 构建 news 查询的 FROM + WHERE + binds（严格 lockstep，保证 placeholder 顺序）。
+/// Spec: news-module.md §4 fetch_news（query / sources / 时间范围按 AND 组合）。
+///
+/// 历史 bug（B1）：FTS `MATCH ?` 必须在 WHERE 第一位且 bind 第一个；sources/from/to
+/// 顺序无关但 clause 与 bind 必须同步 push。返回 None 表示 empty-sources（不命中）。
+fn build_news_filter(
     sources: Option<&[String]>,
     published_from: Option<&DateTime<Utc>>,
     published_to: Option<&DateTime<Utc>>,
     query: Option<&str>,
-    limit: u32,
-    offset: u32,
-) -> rusqlite::Result<ListResult> {
-    // 每个 (clause, binds) 一起 push，保证 SQL placeholder 顺序与 binds 顺序严格对齐。
-    // Spec: news-module.md §4 fetch_news（query / sources / 时间范围按 AND 组合）。
-    //
-    // 历史 bug 修复（B1）：原实现把 query bind push 在 binds 末尾，但 SQL 把 `fts MATCH ?`
-    // 放在 WHERE 第一个，导致 sources / from / to 与 query 同时使用时绑定顺序错位。
+) -> Option<NewsFilter> {
     type ClauseBinds = (String, Vec<rusqlite::types::Value>);
     let mut where_parts: Vec<ClauseBinds> = Vec::new();
 
-    // -- FTS MATCH 必须在 SQL 中第一位（FROM ... INNER JOIN fts WHERE fts MATCH ?）
     let has_query = query
         .map(|q| !normalize_query_text(q).is_empty())
         .unwrap_or(false);
 
-    let (from_table_sql, order_sql) = if has_query {
+    let from_table_sql = if has_query {
         let q_norm = normalize_query_text(query.unwrap());
         where_parts.push((
             "fts.news_search_fts MATCH ?".to_string(),
             vec![rusqlite::types::Value::Text(q_norm)],
         ));
-        (
-            "FROM news_items ni
-             INNER JOIN news_search_fts fts ON fts.news_id = ni.id"
-                .to_string(),
-            "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string(),
-        )
+        "FROM news_items ni
+         INNER JOIN news_search_fts fts ON fts.news_id = ni.id"
+            .to_string()
     } else {
-        (
-            "FROM news_items ni".to_string(),
-            "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
-                .to_string(),
-        )
+        "FROM news_items ni".to_string()
     };
 
-    // -- sources / from / to —— 顺序无关，按 AND 组合
     if let Some(srcs) = sources {
         if !srcs.is_empty() {
             let marks: Vec<String> = (0..srcs.len()).map(|_| "?".to_string()).collect();
@@ -550,14 +557,9 @@ fn list_news_items_impl(
                 .collect();
             where_parts.push((format!("ni.source IN ({})", marks.join(",")), binds));
         } else {
-            // empty sources list 过滤等价于不命中
-            return Ok(ListResult {
-                items: vec![],
-                total: 0,
-            });
+            return None;
         }
     }
-
     if let Some(from) = published_from {
         where_parts.push((
             "(ni.published_at IS NOT NULL AND ni.published_at >= ?)".to_string(),
@@ -571,7 +573,6 @@ fn list_news_items_impl(
         ));
     }
 
-    // -- 组装 WHERE 子句 + binds，严格 lockstep
     let mut where_sql = String::new();
     let mut binds: Vec<rusqlite::types::Value> = Vec::new();
     for (i, (clause, part_binds)) in where_parts.iter().enumerate() {
@@ -582,8 +583,71 @@ fn list_news_items_impl(
     if where_sql.is_empty() {
         where_sql = " WHERE 1=1".to_string();
     }
+    Some(NewsFilter {
+        from_table_sql,
+        where_sql,
+        binds,
+        has_query,
+    })
+}
 
-    let from_with_where = format!("{}{}", from_table_sql, where_sql);
+/// 按北京日期（UTC+8）分组统计条数，用于资讯页日期导航的每日真实总数。
+/// 同 filter（sources / query / 时间范围），但不分页。
+/// 返回 `(YYYY-MM-DD, count)`，只统计 `published_at` 非空的条目。
+fn count_news_by_date_impl(
+    conn: &Connection,
+    sources: Option<&[String]>,
+    published_from: Option<&DateTime<Utc>>,
+    published_to: Option<&DateTime<Utc>>,
+    query: Option<&str>,
+) -> rusqlite::Result<Vec<(String, u32)>> {
+    let Some(filter) = build_news_filter(sources, published_from, published_to, query) else {
+        return Ok(vec![]);
+    };
+    // where_sql 永不为空（至少 "WHERE 1=1"），可安全追加 AND。
+    let sql = format!(
+        "SELECT date(ni.published_at, '+8 hours') AS d, COUNT(*) AS c
+         {}{} AND ni.published_at IS NOT NULL
+         GROUP BY d ORDER BY d DESC",
+        filter.from_table_sql, filter.where_sql
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(filter.binds.iter()), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u32))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+fn list_news_items_impl(
+    conn: &Connection,
+    sources: Option<&[String]>,
+    published_from: Option<&DateTime<Utc>>,
+    published_to: Option<&DateTime<Utc>>,
+    query: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> rusqlite::Result<ListResult> {
+    // filter 构建（FROM/WHERE/binds）抽到 build_news_filter 共享给 count-by-date。
+    let Some(filter) = build_news_filter(sources, published_from, published_to, query) else {
+        // empty sources list 过滤等价于不命中
+        return Ok(ListResult {
+            items: vec![],
+            total: 0,
+        });
+    };
+    let order_sql = if filter.has_query {
+        "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string()
+    } else {
+        "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
+            .to_string()
+    };
+    let binds = filter.binds;
+
+    let from_with_where = format!("{}{}", filter.from_table_sql, filter.where_sql);
     let count_sql = format!("SELECT COUNT(*) {}", from_with_where);
     let select_sql = format!(
         "SELECT ni.id, ni.source, ni.title, ni.summary, ni.url, ni.published_at,

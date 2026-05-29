@@ -255,12 +255,16 @@ type FetchNewsResponse = {
     offset: number;
     hasMore: boolean;
   };
+  // 按北京日期(YYYY-MM-DD)的每日真实总条数；同 filter(query/sources/时间范围)、
+  // 不受分页限制。供资讯页日期导航显示真实数量，避免用分页累积的 items 计数。
+  dateCounts?: Array<{ date: string; count: number }>;
 };
 ```
 
 规则：
 
 - `fetch_news` **不提供按 ID 列表查询**：调用方无法预知具体 `NewsItem.id`，按 ID 检索不是产品需求。需要定位特定新闻，按 `query` / `sources` / `publishedFrom-publishedTo` 组合检索。
+- `dateCounts` 与 `items` 共享同一 filter（`query` / `sources` / 时间范围）但**不分页**：按 `published_at` 转北京时区(UTC+8)后的日期 `GROUP BY` 统计，只计 `publishedAt` 非空的条目。前端日期导航直接用它显示每日真实总数，不得用分页累积的 `items` 重新计数（会随滚动逐步增长，误导用户）。
 - `query` 是唯一文本查询条件，使用全文搜索读模型做相关性搜索；无正文时仍可命中 title / summary。
 - `query` 匹配前必须 trim、折叠连续空白；英文大小写不敏感，中文按全文搜索 tokenizer 规则处理。多词 query 的 AND / OR / phrase 行为由 News FTS 读模型统一定义，不能由调用方或不同 adapter 各自解释。
 - `query`、`sources`、时间范围同时出现时按 AND 组合。

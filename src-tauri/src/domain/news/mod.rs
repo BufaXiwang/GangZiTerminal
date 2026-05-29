@@ -20,6 +20,6 @@ pub use ids::{compute_stable_id, IdInput};
 pub use source::{NewsSource, NewsSourceLastError, NewsSourceRef};
 pub use types::{
     ArticleContent, ArticleSnippet, FetchNewsItem, FetchNewsRequest, FetchNewsResponse,
-    ListNewsSourcesResponse, NewsItem, NewsItemFreshness, ProviderNewsItem, WarmArticlesRequest,
-    WarmArticlesResponse, WarmArticlesResult,
+    ListNewsSourcesResponse, NewsDateCount, NewsItem, NewsItemFreshness, ProviderNewsItem,
+    WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
 };
