@@ -121,9 +121,11 @@ pub struct FetchNewsItem {
     pub article: Option<ArticleSnippet>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<NewsItemFreshness>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // Spec / binding 把 warnings & errors 标为必填 (`WarningCode[]` / `ErrorCode[]`)；
+    // 不能 skip-if-empty，否则前端拿到 undefined.length 直接崩。空时必须送 `[]`。
+    #[serde(default)]
     pub warnings: Vec<WarningCode>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub errors: Vec<crate::domain::shared::ErrorCode>,
 }
 
