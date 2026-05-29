@@ -92,17 +92,16 @@ pub fn spawn_full_scheduler(
                         if !ctx.is_trading_time {
                             continue;
                         }
-                        let mut codes = core_indexes();
-                        // 把当前 cache 中已有的 ts_code 也合并进来作为 hot list。
-                        let mut seen: std::collections::HashSet<_> =
-                            codes.iter().cloned().collect();
-                        for snap in svc.cache().snapshot_all() {
-                            if seen.insert(snap.quote.ts_code.clone()) {
-                                codes.push(snap.quote.ts_code);
-                            }
-                        }
+                        // Spec §2 line 992：关注标的 + 核心指数 15s，全市场 universe 60s。
+                        // 这里只刷**核心指数**（4 个，subscribed 走逐只 fallback 路径但 N 小很快）。
+                        // 不再合并 cache.snapshot_all() —— 那会在首轮 universe 后变成 7497 只串行
+                        // 刷新（~18min/轮），和 universe 60s batch 抢 TDX 单连接、纯浪费。全市场由
+                        // universe tick 负责。关注标的（watchlist/positions）需调用方传入，scheduler
+                        // 暂不持有，故此处只保证核心指数 15s 新鲜。
                         let req = RefreshMarketQuotesRequest {
-                            scope: RefreshMarketQuotesScope::Subscribed { ts_codes: codes },
+                            scope: RefreshMarketQuotesScope::Subscribed {
+                                ts_codes: core_indexes(),
+                            },
                             purpose: RefreshPurpose::Intraday,
                             trade_date: None,
                         };
