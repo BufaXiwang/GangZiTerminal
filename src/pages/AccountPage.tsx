@@ -17,7 +17,8 @@
 //   AddWatchlistModal（条件渲染）
 
 import { RefreshCcw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { PageShell } from "../components/PageShell";
 import {
   commands,
@@ -52,9 +53,11 @@ export default function AccountPage() {
   const setStoreItems = useWatchlistStore((s) => s.setItems);
   const watchlistItems = useWatchlistStore((s) => s.items);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  const refresh = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+      setError(null);
+    }
     const res = await commands.fetchAccount({
       include: {
         snapshot: true,
@@ -66,10 +69,12 @@ export default function AccountPage() {
       triggerHandled: false,
     });
     if (res.status === "error") {
-      setError(
-        `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-      );
-      setLoading(false);
+      if (!silent) {
+        setError(
+          `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+        );
+        setLoading(false);
+      }
       return;
     }
     setSnapshot(res.data.snapshot ?? null);
@@ -80,7 +85,7 @@ export default function AccountPage() {
     if (res.data.watchlist) {
       setStoreItems(res.data.watchlist as WatchlistItemView[]);
     }
-    setLoading(false);
+    if (!silent) setLoading(false);
     setLastUpdated(new Date());
     // 默认选中第一只持仓
     setSelectedPosition((prev) => {
@@ -91,6 +96,38 @@ export default function AccountPage() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  // 订阅 universe 行情进度事件，节流后静默重取账户 —— 让自选 / 持仓估值
+  // 随行情实时更新（否则只有 mount + 手动刷新两次取数，cache 后填的报价看不到）。
+  const lastBgRefetchRef = useRef(0);
+  const pendingBgTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    const THROTTLE_MS = 3000;
+    let unlisten: (() => void) | null = null;
+    const doBg = () => {
+      lastBgRefetchRef.current = Date.now();
+      void refresh(true);
+    };
+    void listen("market-quotes-refresh-progress", () => {
+      const elapsed = Date.now() - lastBgRefetchRef.current;
+      if (elapsed >= THROTTLE_MS) {
+        doBg();
+      } else if (pendingBgTimerRef.current == null) {
+        pendingBgTimerRef.current = window.setTimeout(() => {
+          pendingBgTimerRef.current = null;
+          doBg();
+        }, THROTTLE_MS - elapsed);
+      }
+    }).then((un) => {
+      unlisten = un;
+    });
+    return () => {
+      if (pendingBgTimerRef.current != null) {
+        window.clearTimeout(pendingBgTimerRef.current);
+      }
+      unlisten?.();
+    };
   }, [refresh]);
 
   const status = error
