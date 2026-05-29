@@ -253,6 +253,31 @@ impl<'a> NewsRepository<'a> {
         })
     }
 
+    /// 删除一条 news_item 及其 FTS 索引行（保持 FTS 与 news_items 一致）。
+    /// news_articles 按 url 存、可被同 url 的其他 item 复用，故不在此删除。
+    pub fn delete_news_item(&self, news_id: &str) -> rusqlite::Result<()> {
+        self.db.with(|conn| {
+            conn.execute("DELETE FROM news_search_fts WHERE news_id = ?1", params![news_id])?;
+            conn.execute("DELETE FROM news_items WHERE id = ?1", params![news_id])?;
+            Ok(())
+        })
+    }
+
+    /// 启动自愈：清掉 FTS 中指向已不存在 news_item 的幽灵行。
+    /// `news_search_fts` 是独立 FTS5 表（article 列来自 news_articles join，无法做
+    /// external-content + 触发器），靠本对账保证不随历史删除累积幽灵行。返回清理条数。
+    /// Spec: news-module.md §2 全文搜索（FTS 与 news_items 一致性）。
+    pub fn prune_fts_orphans(&self) -> rusqlite::Result<usize> {
+        self.db.with(|conn| {
+            let n = conn.execute(
+                "DELETE FROM news_search_fts
+                 WHERE news_id NOT IN (SELECT id FROM news_items)",
+                [],
+            )?;
+            Ok(n)
+        })
+    }
+
     pub fn record_source_refresh_ok(&self, source_id: &str, when: DateTime<Utc>) -> rusqlite::Result<()> {
         let when_s = format_dt(&when);
         self.db.with(|conn| {
@@ -887,6 +912,51 @@ mod tests {
             .unwrap();
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].id, "id-a");
+    }
+
+    #[test]
+    fn delete_news_item_and_prune_fts_keep_search_consistent() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+        let mut a = sample_item("id-a", "rss:x", None);
+        a.title = "GangZi quant alpha".to_string();
+        let mut b = sample_item("id-b", "rss:x", None);
+        b.title = "GangZi quant beta".to_string();
+        repo.upsert_news_item(&a).unwrap();
+        repo.upsert_news_item(&b).unwrap();
+
+        // delete_news_item 同步清 FTS：搜索不再命中已删条目。
+        repo.delete_news_item("id-a").unwrap();
+        let r = repo.list_news_items(None, None, None, Some("alpha"), 50, 0).unwrap();
+        assert_eq!(r.items.len(), 0, "deleted item must not be searchable");
+        let r2 = repo.list_news_items(None, None, None, Some("beta"), 50, 0).unwrap();
+        assert_eq!(r2.items.len(), 1);
+
+        // 制造幽灵：绕过 delete_news_item 直接删 news_items 行，留下孤儿 FTS 行。
+        db.with(|c| {
+            c.execute("DELETE FROM news_items WHERE id = ?1", params!["id-b"]).unwrap();
+        });
+        // prune 前：FTS 仍有 id-b 的孤儿行。
+        let ghosts: i64 = db.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM news_search_fts WHERE news_id NOT IN (SELECT id FROM news_items)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(ghosts, 1);
+        // prune 清掉孤儿。
+        assert_eq!(repo.prune_fts_orphans().unwrap(), 1);
+        let ghosts_after: i64 = db.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM news_search_fts WHERE news_id NOT IN (SELECT id FROM news_items)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(ghosts_after, 0);
     }
 
     /// Spec §4 line 265：query 英文大小写不敏感。

@@ -86,6 +86,12 @@ impl SourceRegistry {
         for (sid, provider, display, feed_url, enabled) in DEFAULT_SOURCES {
             repo.upsert_source(sid, provider, Some(display), *enabled, *feed_url, now)?;
         }
+        // 启动自愈：清掉 FTS 幽灵行（指向已删除 news_item 的索引），防止历史累积。
+        match repo.prune_fts_orphans() {
+            Ok(n) if n > 0 => tracing::info!(target: "news", pruned_fts_orphans = n, "cleaned FTS ghost rows"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "news", error = %e, "prune_fts_orphans failed"),
+        }
         let mut map = self.by_id.write().expect("registry poisoned");
         map.clear();
         for s in repo.list_sources()? {

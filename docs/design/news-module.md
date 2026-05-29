@@ -169,6 +169,8 @@ type NewsSource = {
 - `query` 同时检索 title / summary / article。
 - `article` 缺失时只索引 title / summary。
 - 更新 `ArticleContent` 后必须同步更新所有 `NewsItem.url == ArticleContent.url` 的搜索读模型。
+- 搜索读模型必须与 `NewsItem` 保持一致：删除 `NewsItem` 时同步删除其搜索行；删除 `ArticleContent` 不连带删除（按 url 存、可被同 url 其他 item 复用）。
+- 实现自愈：启动时对账，清掉搜索读模型中指向已不存在 `NewsItem` 的孤儿行（防历史删除累积）。当前 FTS 实现是独立 FTS5 表（`article` 列来自 `news_articles` join，不便做 external-content + 触发器），故靠"删除路径 + 启动对账"双重保证一致性。
 
 ---
 
