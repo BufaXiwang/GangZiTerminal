@@ -32,6 +32,10 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 | `newsnow:cls-telegraph` | 财联社电报 | `cls-telegraph` |
 | `newsnow:wallstreetcn-quick` | 华尔街见闻快讯 | `wallstreetcn-quick` |
 | `newsnow:jin10` | 金十数据 | `jin10` |
+| `newsnow:zaobao` | 联合早报 | `zaobao` |
+| `newsnow:36kr-quick` | 36氪快讯 | `36kr-quick` |
+| `newsnow:gelonghui` | 格隆汇 | `gelonghui` |
+| `newsnow:cls-depth` | 财联社深度 | `cls-depth` |
 
 支持的全量 channel 见 NewsNow upstream `getters.ts`，覆盖财联社 / 华尔街见闻 / 金十 / 36 氪快讯 / 格隆汇 / 知乎 / V2EX / 微博 / 抖音 等。新增默认 source 须改 `infrastructure/news/registry.rs::DEFAULT_SOURCES` 并同步更新这张表。
 

@@ -80,16 +80,24 @@ export function NewsDateNav({
       {days.map((d) => {
         const count = countsByDate[d.key] ?? 0;
         const isActive = activeDate === d.key;
+        const empty = count === 0;
         return (
           <button
             key={d.key}
             type="button"
             role="tab"
             ref={isActive ? activeStopRef : null}
-            className={`news-date-timeline-stop${isActive ? " active" : ""}${d.isToday ? " today" : ""}`}
-            onClick={() => onSelect(d.key)}
+            className={`news-date-timeline-stop${isActive ? " active" : ""}${d.isToday ? " today" : ""}${empty ? " empty" : ""}`}
+            onClick={() => {
+              if (!empty) onSelect(d.key);
+            }}
+            disabled={empty}
             aria-pressed={isActive}
-            title={`${d.key}${count > 0 ? ` · ${count} 条` : ""}`}
+            title={
+              empty
+                ? `${d.key} · 暂无资讯`
+                : `${d.key} · ${count} 条`
+            }
           >
             <span className="news-date-timeline-label tabular">
               {d.isToday ? "今天" : d.label}

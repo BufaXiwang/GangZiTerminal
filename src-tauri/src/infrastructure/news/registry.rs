@@ -22,29 +22,33 @@ use std::sync::RwLock;
 /// 自部署后可改环境变量替换，但 spec §2 source 是 compile-time。
 const NEWSNOW_BASE: &str = "https://newsnow.busiyi.world/api/s";
 
+/// 默认 NewsNow channel。channel id 经 newsnow.busiyi.world 实测有数据返回。
+/// 新增只需在此追加 (source_id, "newsnow", 显示名, endpoint, enabled)。
+macro_rules! newsnow_source {
+    ($channel:literal, $name:literal) => {
+        (
+            concat!("newsnow:", $channel),
+            "newsnow",
+            $name,
+            Some(concat!(
+                "https://newsnow.busiyi.world/api/s?id=",
+                $channel,
+                "&latest"
+            )),
+            true,
+        )
+    };
+}
+
 const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
     // (source_id, provider, display_name, feed_url, enabled)
-    (
-        "newsnow:cls-telegraph",
-        "newsnow",
-        "财联社电报",
-        Some("https://newsnow.busiyi.world/api/s?id=cls-telegraph&latest"),
-        true,
-    ),
-    (
-        "newsnow:wallstreetcn-quick",
-        "newsnow",
-        "华尔街见闻快讯",
-        Some("https://newsnow.busiyi.world/api/s?id=wallstreetcn-quick&latest"),
-        true,
-    ),
-    (
-        "newsnow:jin10",
-        "newsnow",
-        "金十数据",
-        Some("https://newsnow.busiyi.world/api/s?id=jin10&latest"),
-        true,
-    ),
+    newsnow_source!("cls-telegraph", "财联社电报"),
+    newsnow_source!("wallstreetcn-quick", "华尔街见闻快讯"),
+    newsnow_source!("jin10", "金十数据"),
+    newsnow_source!("zaobao", "联合早报"),
+    newsnow_source!("36kr-quick", "36氪快讯"),
+    newsnow_source!("gelonghui", "格隆汇"),
+    newsnow_source!("cls-depth", "财联社深度"),
 ];
 
 #[allow(dead_code)] // 留作未来 add-source UI 落地时的 endpoint base 引用
