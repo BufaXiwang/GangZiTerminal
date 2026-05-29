@@ -218,6 +218,29 @@ Agent tabbar
 - 工具调用使用 timeline row：工具名、输入摘要、输出摘要、耗时、错误状态。
 - Agent 产生账户动作时，必须有醒目的 episode / intent / account result 链接。
 
+### 设置页
+
+目标：管理 Agent 模型渠道（服务商连接 + 模型）。契约见 [agent-infra-module.md §2](agent-infra-module.md) `ProviderChannel`。
+
+推荐结构：
+
+```text
+模型渠道
+  -> 添加渠道：[快速预设 | 自定义] 两种
+       快速预设：选 DeepSeek/OpenAI/Anthropic 官方 → 只填 API Key
+       自定义：渠道名 + 消息格式(Messages/Chat Completions/Responses) + Host + API Key
+  -> 保存后自动发现模型 → 勾选确认保留（发现失败则手动输入一个/多个模型名确认）
+  -> 渠道/模型列表（每个保留模型一行，`{model} ({渠道名})`）
+  -> 当前模型选择器（单选，run 走选中渠道）
+```
+
+规则：
+
+- 渠道按**消息格式**抽象，不按厂商写死；「渠道名」即展示用 provider name，列表与当前模型选择器都用 `{model} ({渠道名})` 文案。
+- API Key **只提交不回显**：保存后列表只显示"已配置"状态，不回传明文（走 specta 强类型 command，不裸调 invoke，不在前端持有 token）。
+- 模型发现失败时降级为手动输入模型名（允许多个），不阻塞配置。
+- 新建渠道默认 enabled；首次配置完成后自动设为当前模型（若此前没有当前模型）。
+
 ---
 
 ## 5. 数据展示组件

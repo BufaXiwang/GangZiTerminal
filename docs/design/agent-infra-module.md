@@ -314,11 +314,14 @@ Channel reference：
 ```ts
 type ProviderChannel = {
   channelId: string;
-  provider: string;
+  provider: string;               // 用户添加渠道时输入的「渠道名」，也是展示用 provider name；
+                                   // 前端按 `{model} ({provider})` 展示。无单独 provider-id 字段。
   wireFormat: "messages" | "responses" | "chat_completions";
-  baseUrl?: string;
+  baseUrl?: string;               // host；快速预设自动填，自定义由用户输入
+  apiKey: string;                 // 鉴权 token；持久化但**只写不读**（见下）
   model: string;
   stream: true;
+  enabled: boolean;               // 渠道开关，默认 true
   supportsVision: boolean;
   supportsThinking: boolean;
   maxOutputTokens?: number;       // 模型生成上限，写入 provider request
@@ -328,12 +331,20 @@ type ProviderChannel = {
 
 规则：
 
+- **抽象轴是 wire format（消息格式），不是厂商**。新增兼容厂商=加一条渠道配置：`chat_completions` 覆盖 OpenAI / DeepSeek / GLM / Moonshot / 本地 OpenAI 兼容服务（改 baseUrl + model 即可），`messages` 覆盖 Anthropic，`responses` 覆盖 OpenAI Responses。不为每家厂商写 provider-specific 代码。
+- `provider` 是**用户输入的渠道名**（展示语义），不是受控的厂商枚举；同一 wireFormat 可以有多条不同 `provider` 名的渠道（如 "DeepSeek"、"我的本地 Qwen"）。
+- `apiKey` 持久化在渠道行；但**只写不读**：list / get 等返回给前端的 DTO 必须屏蔽 apiKey（只回 `apiKeySet: boolean` 之类），不回传明文。
+- **渠道添加有两种方式**：
+  1. **快速预设**：内置已知厂商（DeepSeek 官方 / OpenAI 官方 / Anthropic 官方），`provider` 名 + `wireFormat` + `baseUrl` 预置，用户只填 `apiKey`。
+  2. **自定义**：用户填 `provider`(渠道名) + 选 `wireFormat` + `baseUrl` + `apiKey`。
+- **模型发现 + 确认**：填完连接信息后，调对应 wireFormat 的 `/models` 接口发现可用模型（`chat_completions` / `responses` → `GET {baseUrl}/v1/models` + `Authorization: Bearer`；`messages` → `GET {baseUrl}/v1/models` + `x-api-key` + `anthropic-version`）。发现成功 → 列出让用户**勾选确认**保留；发现失败（接口不存在 / 网络错）→ 提示用户**手动输入模型名**（允许输入多个）确认。每个确认保留的模型各成一条 `ProviderChannel`（共享同一连接的 provider/wireFormat/baseUrl/apiKey，仅 model 不同）。
+- **当前模型**：维护一个「当前渠道」（active channelId）；Agent run 默认走它。切换当前模型即切换底层渠道。
 - Agent 内部使用 canonical request / event。
 - Provider adapter 只负责 canonical chat request 和厂商 wire format 的互转；**不传 tools / functions 字段、不解析 tool_use / function_call block**。
 - 主 Agent 渠道必须支持 streaming；不支持 streaming 的 provider 不能作为主渠道。
-- `supportsVision = false` 时，含 `image` block 的 AgentMessage 必须被 Infra 在 build wire 前拒绝（返回 `InvalidInput`）。
+- `supportsVision = false` 时，含 `image` block 的 AgentMessage 必须被 Infra 在 build wire 前拒绝（返回 `InvalidInput`）。新加渠道默认 `supportsVision = false` / `supportsThinking = false`，可后续按模型细化。
 - `supportsThinking = false` 时，含 `thinking` block 的 AgentMessage 在 build wire 时由 adapter 丢弃，不报错（thinking 只对支持模型有意义）。
-- `agent_provider_channels` 表持久化 channel 配置；Infra 暴露 `ProviderChannelsRepo` 的 CRUD（add / update / remove / list / get_by_id），Runtime 调用。
+- `agent_provider_channels` 表持久化 channel 配置（含 `api_key` / `enabled` / active 标记）；Infra 暴露 `ProviderChannelsRepo` 的 CRUD（add / update / remove / list / get_by_id）+ 模型发现 + active 渠道读写，Runtime / 设置页调用。
 - 不再有 `supportsTools` / `supportsServerSideTools` 字段：所有 chat-completable provider 都通过 Skill 文本协议提供工具能力，没有 provider 差异。
 - 具体 stream event、thinking、错误码映射写在 channel reference。
 
@@ -598,9 +609,29 @@ ProviderChannelsRepo::update(channel: ProviderChannel) -> Result<()>;
 ProviderChannelsRepo::remove(channel_id: &str) -> Result<()>;
 ProviderChannelsRepo::get(channel_id: &str) -> Option<ProviderChannel>;
 ProviderChannelsRepo::list() -> Vec<ProviderChannel>;
+ProviderChannelsRepo::set_active(channel_id: &str) -> Result<()>;
+ProviderChannelsRepo::active() -> Option<ProviderChannel>;
 ```
 
-Runtime 通过这个 repo 管理 `agent_provider_channels` 表。
+Runtime / 设置页通过这个 repo 管理 `agent_provider_channels` 表 + 当前渠道。
+
+### 模型发现 API
+
+```rust
+// 用给定连接信息调对应 wireFormat 的 /models 接口，返回可用 model id 列表。
+// 发现失败（接口缺失 / 网络错）→ Err，调用方据此引导用户手填模型名。
+discover_models(wire_format: WireFormat, base_url: &str, api_key: &str)
+    -> Result<Vec<DiscoveredModel>>;   // DiscoveredModel { id, displayName? }
+```
+
+- `chat_completions` / `responses`：`GET {base_url}/v1/models`，`Authorization: Bearer <api_key>`，解 `{data:[{id}]}`。
+- `messages`：`GET {base_url}/v1/models`，header `x-api-key` + `anthropic-version`，解 `{data:[{id, display_name}]}`。
+- 这是普通 GET（非 streaming），属于渠道连通性能力，可在 Infra/adapter 实现；与「streaming `ProviderStream` 实现归 Runtime/Phase 3」不冲突。
+- 调用方（设置页）拿到列表后让用户勾选确认；发现失败时允许手动输入一个或多个模型名确认。每个确认的模型物化成一条渠道。
+
+### 前端命令（设置页）
+
+设置页通过 specta 强类型 command 操作（不裸调 invoke、apiKey 只提交不回读）：`agent_list_channels`（屏蔽 apiKey）/ `agent_add_channel` / `agent_remove_channel` / `agent_set_active_channel` / `agent_discover_models` / `agent_channel_presets`（返回内置快速预设）。
 
 ### 前端消息入口
 
@@ -611,6 +642,7 @@ Runtime 通过这个 repo 管理 `agent_provider_channels` 表。
 ## 6. 验收标准 / 例子
 
 - 同一套 Infra loop 支持 `/messages`、`/responses`、`/chat/completions` 三类 wire format，**全部走纯 chat**——provider request 中不传 `tools` 字段、不解析 `tool_use` / `function_call` block。
+- 渠道按 wireFormat 添加：快速预设（DeepSeek/OpenAI/Anthropic 官方，仅填 key）或自定义（渠道名 + 格式 + host + key）；保存后调对应格式 `/models` 发现模型让用户确认，发现失败可手填多个模型名；每个确认模型成一条渠道，前端按 `{model} ({渠道名})` 展示，apiKey 不回显。
 - 主渠道支持 streaming；前端能看到 `run_start`、`text_delta`、`thinking_delta`（如有）、`skill_start` / `skill_end`、`usage`、`done` / `error`。
 - 未注册 skill 被拒绝（parser 检测后返回 `<skill_error code="invalid_input">`），不会因 LLM 任意输出字符串触发 dispatch。
 - Runtime 限制本次 run 不允许 `operate_account` skill 时，Infra 不会把它编译进 SystemPromptBuilder 的 skill 清单，模型在 system prompt 中看不到该 skill 存在。
