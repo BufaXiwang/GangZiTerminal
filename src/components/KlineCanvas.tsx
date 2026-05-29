@@ -72,6 +72,20 @@ function readCssVar(name: string, fallback: string): string {
   return v || fallback;
 }
 
+/** 北京时间是否处于 A 股连续竞价时段（09:30-11:30 / 13:00-15:00，工作日）。
+ *  仅用于盘中 K 线轮询的门控；忽略节假日（最坏情况节假日多轮询几次，后端返回同数据无害）。 */
+function isTradingSessionNow(): boolean {
+  // 用 Asia/Shanghai 偏移：本地若非北京时区，按 UTC+8 推算。
+  const now = new Date();
+  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const bjMin = (utcMin + 8 * 60) % (24 * 60);
+  const bjDay = (now.getUTCDay() + (utcMin + 8 * 60 >= 24 * 60 ? 1 : 0)) % 7;
+  if (bjDay === 0 || bjDay === 6) return false; // 周末
+  const am = bjMin >= 9 * 60 + 30 && bjMin <= 11 * 60 + 30;
+  const pm = bjMin >= 13 * 60 && bjMin <= 15 * 60;
+  return am || pm;
+}
+
 async function fetchKlineData(
   tsCode: string,
   period: ChartPeriod,
@@ -231,6 +245,9 @@ export function KlineCanvas({
 }: KlineCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<Chart | null>(null);
+  // 当前已显示数据的最大时间戳；盘中轮询只用 updateData 喂 >= 它的尾部 bar，
+  // 避免覆盖错位（progressive 历史 loop 只 prepend 更早 bar，不动这个最大值）。
+  const lastTsRef = useRef<number>(0);
   const [status, setStatus] = useState<"loading" | "empty" | "error" | "ok">(
     "loading",
   );
@@ -348,6 +365,10 @@ export function KlineCanvas({
         }
         const shownTs = new Set<number>();
         initialData.forEach((b) => shownTs.add(b.timestamp));
+        lastTsRef.current = initialData.reduce(
+          (mx, b) => Math.max(mx, b.timestamp),
+          0,
+        );
         chart.applyNewData(initialData, true); // more=true: 表示可能还有更早数据
         setStatus("ok");
 
@@ -405,6 +426,44 @@ export function KlineCanvas({
         `KlineCanvas dispose tsCode=${tsCode} period=${period} took ${(performance.now() - tBeforeDispose).toFixed(1)}ms; lived ${(performance.now() - mountedAt).toFixed(1)}ms`,
       );
       chartRef.current = null;
+    };
+  }, [tsCode, period, pricePrecision]);
+
+  // 盘中近实时轮询：每 15s 触发后端重拉最新 bar（minute → refresh_minute_klines
+  // 增量；day → fetch_kline_page(0) 拉今日），再读尾部用 updateData merge
+  // （时间戳 == 末根 → 更新当前 bar；> 末根 → append 新 bar）。
+  // 只在交易时段轮询；分时(intraday)已下线不轮询。
+  useEffect(() => {
+    if (period === "intraday") return;
+    let cancelled = false;
+    const POLL_MS = 15_000;
+    const tick = async () => {
+      if (cancelled || !chartRef.current || !isTradingSessionNow()) return;
+      try {
+        // 强制后端重拉最新（绕过 ensuredKeys —— 那只防首次重复触发）
+        const ensureRes = await commands.ensureChartData(tsCode, period);
+        if (cancelled || !chartRef.current) return;
+        if (ensureRes.status === "error") return;
+        // 读最近 ~16 根，只 merge >= 当前最大时间戳的尾部
+        const latest = await fetchKlineData(tsCode, period, 16);
+        if (cancelled || !chartRef.current) return;
+        const tail = latest
+          .filter((b) => b.timestamp >= lastTsRef.current)
+          .sort((a, b) => a.timestamp - b.timestamp);
+        for (const bar of tail) {
+          chartRef.current.updateData(bar);
+        }
+        if (tail.length > 0) {
+          lastTsRef.current = tail[tail.length - 1].timestamp;
+        }
+      } catch {
+        // 轮询失败静默忽略，下一 tick 再试
+      }
+    };
+    const timer = window.setInterval(() => void tick(), POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, [tsCode, period, pricePrecision]);
 
