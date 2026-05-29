@@ -6,8 +6,8 @@
 use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::context::ContextContent;
 use crate::domain::agent::{
-    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, WireFormat,
+    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentStopReason, ContextBundle,
+    ProviderChannel, WireFormat,
 };
 use crate::infrastructure::agent::payload_store::PayloadStore;
 use base64::Engine;
@@ -98,12 +98,12 @@ impl ProviderAdapter for OpenAIResponsesAdapter {
 
     fn build_request_body(
         &self,
-        request: &AgentRunRequest,
+        msgs: &[AgentMessage],
         context: &ContextBundle,
         payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
         let mut input: Vec<Value> = Vec::new();
-        for m in &request.seed_messages {
+        for m in msgs {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
             input.extend(self.message_to_input_items(m, payload_store)?);
@@ -157,13 +157,13 @@ mod tests {
         }
     }
 
-    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
-        AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel,
-            max_turns: 1,
-            seed_messages: msgs,
+    fn msg(role: AgentMessageRole, blocks: Vec<AgentMessageBlock>) -> AgentMessage {
+        AgentMessage {
+            message_id: "m1".into(),
+            run_id: Some("r1".into()),
+            role,
+            blocks,
+            created_at: Utc::now(),
         }
     }
 
@@ -171,17 +171,11 @@ mod tests {
     fn maps_user_message_to_input_text() {
         let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Text { text: "hello".into() }],
-                created_at: Utc::now(),
-            }],
-        );
-        let body = ad.build_request_body(&r, &ctx, None).unwrap();
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text { text: "hello".into() }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
@@ -190,22 +184,47 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_reflects_multi_message_conversation() {
+        // Regression for the seed_messages bug.
+        let ad = OpenAIResponsesAdapter::new(ch(false));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text { text: "查行情".into() }],
+            ),
+            msg(
+                AgentMessageRole::Assistant,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<use_skill name="x">{}</use_skill>"#.into(),
+                }],
+            ),
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<skill_result name="x" call_id="sc_1">{"ok":true}</skill_result>"#.into(),
+                }],
+            ),
+        ];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        let arr = body["input"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[2]["role"], "user");
+        let last = arr[2]["content"][0]["text"].as_str().unwrap();
+        assert!(last.contains("<skill_result"));
+    }
+
+    #[test]
     fn skill_xml_in_assistant_text_passes_through() {
         let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Text {
+                text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
             }],
-        );
-        let body = ad.build_request_body(&r, &ctx, None).unwrap();
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let item = &body["input"][0];
         assert_eq!(item["role"], "assistant");
         let t = item["content"][0]["text"].as_str().unwrap();
@@ -216,20 +235,14 @@ mod tests {
     fn vision_rejected_when_unsupported() {
         let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Image {
-                    mime_type: "image/png".into(),
-                    data_ref: "payload://pl_x".into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Image {
+                mime_type: "image/png".into(),
+                data_ref: "payload://pl_x".into(),
             }],
-        );
-        let err = ad.build_request_body(&r, &ctx, None).unwrap_err();
+        )];
+        let err = ad.build_request_body(&msgs, &ctx, None).unwrap_err();
         assert!(matches!(err, WireMappingError::VisionNotSupported));
     }
 

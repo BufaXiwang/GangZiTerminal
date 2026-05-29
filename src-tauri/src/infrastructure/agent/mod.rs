@@ -17,6 +17,7 @@
 pub mod channels_repo;
 pub mod context_compaction;
 pub mod discovery;
+pub mod http_provider;
 pub mod loop_executor;
 pub mod messages_repo;
 pub mod migrations;
@@ -29,6 +30,7 @@ pub mod system_prompt;
 
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
+pub use http_provider::HttpProvider;
 pub use presets::{channel_presets, ChannelPreset};
 pub use context_compaction::{
     compact_context, decide_tier, estimate_context_tokens, CompactPolicy,

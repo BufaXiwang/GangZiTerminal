@@ -11,8 +11,8 @@
 
 use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::{
-    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, WireFormat,
+    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentStopReason, ContextBundle,
+    ProviderChannel, WireFormat,
 };
 use crate::domain::agent::context::ContextContent;
 use crate::infrastructure::agent::payload_store::PayloadStore;
@@ -123,13 +123,13 @@ impl ProviderAdapter for AnthropicAdapter {
 
     fn build_request_body(
         &self,
-        request: &AgentRunRequest,
+        msgs: &[AgentMessage],
         context: &ContextBundle,
         payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
         let system_text = Self::extract_system(context);
-        let mut messages = Vec::with_capacity(request.seed_messages.len());
-        for m in &request.seed_messages {
+        let mut messages = Vec::with_capacity(msgs.len());
+        for m in msgs {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
             if let Some(v) = self.message_to_anthropic(m, payload_store)? {
@@ -165,6 +165,16 @@ mod tests {
     use crate::domain::agent::{AgentMessage, AgentMessageBlock, AgentMessageRole, WireFormat};
     use chrono::Utc;
 
+    fn msg(role: AgentMessageRole, blocks: Vec<AgentMessageBlock>) -> AgentMessage {
+        AgentMessage {
+            message_id: "m1".into(),
+            run_id: Some("r1".into()),
+            role,
+            blocks,
+            created_at: Utc::now(),
+        }
+    }
+
     fn make_channel(vision: bool, thinking: bool) -> ProviderChannel {
         ProviderChannel {
             channel_id: "anthropic".into(),
@@ -182,16 +192,6 @@ mod tests {
         }
     }
 
-    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
-        AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "user".into(),
-            channel,
-            max_turns: 8,
-            seed_messages: msgs,
-        }
-    }
-
     #[test]
     fn build_request_body_basic_chat_no_tools_field() {
         let ad = AnthropicAdapter::new(make_channel(false, false));
@@ -203,19 +203,13 @@ mod tests {
             token_estimate: None,
             droppable: false,
         });
-        let request = req(
-            make_channel(false, false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: "plan trade".into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text {
+                text: "plan trade".into(),
             }],
-        );
-        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["system"], "You are Gangzi.");
         assert_eq!(body["messages"][0]["role"], "user");
@@ -226,24 +220,50 @@ mod tests {
     }
 
     #[test]
-    fn skill_call_xml_round_trips_as_text_block() {
-        // <use_skill> in assistant text — should be a normal text block to Anthropic.
+    fn build_request_body_reflects_multi_message_conversation() {
+        // Regression for the seed_messages bug: body must reflect the *live* growing
+        // messages incl <skill_result> user messages, not the run-start snapshot.
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
-        let request = req(
-            make_channel(false, false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#
-                        .into(),
+        let msgs = vec![
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text { text: "查行情".into() }],
+            ),
+            msg(
+                AgentMessageRole::Assistant,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
                 }],
-                created_at: Utc::now(),
+            ),
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<skill_result name="fetch_quote" call_id="sc_1">{"price":"1820"}</skill_result>"#.into(),
+                }],
+            ),
+        ];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        let arr = body["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[1]["role"], "assistant");
+        assert_eq!(arr[2]["role"], "user");
+        let last = arr[2]["content"][0]["text"].as_str().unwrap();
+        assert!(last.contains("<skill_result"));
+    }
+
+    #[test]
+    fn skill_call_xml_round_trips_as_text_block() {
+        let ad = AnthropicAdapter::new(make_channel(false, false));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Text {
+                text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
             }],
-        );
-        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         let s = body["messages"][0]["content"][0]["text"].as_str().unwrap();
@@ -254,20 +274,14 @@ mod tests {
     fn image_block_rejected_when_vision_unsupported() {
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
-        let request = req(
-            make_channel(false, false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Image {
-                    mime_type: "image/png".into(),
-                    data_ref: "payload://pl_x".into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Image {
+                mime_type: "image/png".into(),
+                data_ref: "payload://pl_x".into(),
             }],
-        );
-        let err = ad.build_request_body(&request, &ctx, None).unwrap_err();
+        )];
+        let err = ad.build_request_body(&msgs, &ctx, None).unwrap_err();
         assert!(matches!(err, WireMappingError::VisionNotSupported));
     }
 
@@ -275,24 +289,18 @@ mod tests {
     fn thinking_silently_dropped_when_unsupported() {
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
-        let request = req(
-            make_channel(false, false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![
-                    AgentMessageBlock::Thinking {
-                        text: "reasoning".into(),
-                        provider: None,
-                        metadata: None,
-                    },
-                    AgentMessageBlock::Text { text: "ok".into() },
-                ],
-                created_at: Utc::now(),
-            }],
-        );
-        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![
+                AgentMessageBlock::Thinking {
+                    text: "reasoning".into(),
+                    provider: None,
+                    metadata: None,
+                },
+                AgentMessageBlock::Text { text: "ok".into() },
+            ],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
@@ -302,21 +310,15 @@ mod tests {
     fn thinking_with_signature_preserved_when_supported() {
         let ad = AnthropicAdapter::new(make_channel(false, true));
         let ctx = ContextBundle::new("r1");
-        let request = req(
-            make_channel(false, true),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Thinking {
-                    text: "reasoning".into(),
-                    provider: Some("anthropic".into()),
-                    metadata: Some(json!({"signature":"sig-xyz"})),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Thinking {
+                text: "reasoning".into(),
+                provider: Some("anthropic".into()),
+                metadata: Some(json!({"signature":"sig-xyz"})),
             }],
-        );
-        let body = ad.build_request_body(&request, &ctx, None).unwrap();
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let block = &body["messages"][0]["content"][0];
         assert_eq!(block["type"], "thinking");
         assert_eq!(block["thinking"], "reasoning");

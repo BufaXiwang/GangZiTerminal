@@ -8,8 +8,8 @@
 use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::context::ContextContent;
 use crate::domain::agent::{
-    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    ContextBundle, ProviderChannel, WireFormat,
+    AgentMessage, AgentMessageBlock, AgentMessageRole, AgentStopReason, ContextBundle,
+    ProviderChannel, WireFormat,
 };
 use crate::infrastructure::agent::payload_store::PayloadStore;
 use base64::Engine;
@@ -125,7 +125,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
 
     fn build_request_body(
         &self,
-        request: &AgentRunRequest,
+        msgs: &[AgentMessage],
         context: &ContextBundle,
         payload_store: Option<&PayloadStore>,
     ) -> Result<Value, WireMappingError> {
@@ -134,7 +134,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
         if !system_text.is_empty() {
             messages.push(json!({"role":"system","content": system_text}));
         }
-        for m in &request.seed_messages {
+        for m in msgs {
             m.validate_role_blocks()
                 .map_err(|e| WireMappingError::InvalidMessage(format!("{:?}", e)))?;
             if let Some(v) = self.message_to_chat(m, payload_store)? {
@@ -149,6 +149,10 @@ impl ProviderAdapter for OpenAIChatAdapter {
         if let Some(m) = self.channel.max_output_tokens {
             body["max_tokens"] = Value::from(m);
         }
+        // Spec §3 / reference openai-chat-completions: stream 时请求 usage chunk。
+        if self.channel.stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
         // Spec §2: 不传 tools 字段。
         Ok(body)
     }
@@ -157,6 +161,8 @@ impl ProviderAdapter for OpenAIChatAdapter {
         match raw {
             "stop" => AgentStopReason::Completed,
             "length" => AgentStopReason::MaxTurns,
+            "content_filter" => AgentStopReason::ProviderStop,
+            "insufficient_system_resource" => AgentStopReason::Error,
             _ => AgentStopReason::Completed,
         }
     }
@@ -185,13 +191,13 @@ mod tests {
         }
     }
 
-    fn req(channel: ProviderChannel, msgs: Vec<AgentMessage>) -> AgentRunRequest {
-        AgentRunRequest {
-            run_id: "r1".into(),
-            trigger: "u".into(),
-            channel,
-            max_turns: 1,
-            seed_messages: msgs,
+    fn msg(role: AgentMessageRole, blocks: Vec<AgentMessageBlock>) -> AgentMessage {
+        AgentMessage {
+            message_id: "m1".into(),
+            run_id: Some("r1".into()),
+            role,
+            blocks,
+            created_at: Utc::now(),
         }
     }
 
@@ -199,40 +205,60 @@ mod tests {
     fn user_message_becomes_string_content() {
         let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Text { text: "hello".into() }],
-                created_at: Utc::now(),
-            }],
-        );
-        let body = ad.build_request_body(&r, &ctx, None).unwrap();
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text { text: "hello".into() }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["max_tokens"], 4096);
         assert!(body.get("tools").is_none());
+        // Spec §3 / reference: stream 时带 stream_options.include_usage。
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn build_request_body_reflects_multi_message_conversation() {
+        // Regression for the seed_messages bug.
+        let ad = OpenAIChatAdapter::new(ch(false));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text { text: "查行情".into() }],
+            ),
+            msg(
+                AgentMessageRole::Assistant,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<use_skill name="x">{}</use_skill>"#.into(),
+                }],
+            ),
+            msg(
+                AgentMessageRole::User,
+                vec![AgentMessageBlock::Text {
+                    text: r#"<skill_result name="x" call_id="sc_1">{"ok":true}</skill_result>"#.into(),
+                }],
+            ),
+        ];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        let arr = body["messages"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[2]["role"], "user");
+        assert!(arr[2]["content"].as_str().unwrap().contains("<skill_result"));
     }
 
     #[test]
     fn assistant_skill_xml_passes_through_as_text() {
         let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: r#"thinking <use_skill name="x">{}</use_skill>"#.into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Text {
+                text: r#"thinking <use_skill name="x">{}</use_skill>"#.into(),
             }],
-        );
-        let body = ad.build_request_body(&r, &ctx, None).unwrap();
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let m = &body["messages"][0];
         assert_eq!(m["role"], "assistant");
         let s = m["content"].as_str().unwrap();
@@ -243,20 +269,14 @@ mod tests {
     fn vision_rejected_when_unsupported() {
         let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
-        let r = req(
-            ch(false),
-            vec![AgentMessage {
-                message_id: "m1".into(),
-                run_id: Some("r1".into()),
-                role: AgentMessageRole::User,
-                blocks: vec![AgentMessageBlock::Image {
-                    mime_type: "image/png".into(),
-                    data_ref: "payload://pl_x".into(),
-                }],
-                created_at: Utc::now(),
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Image {
+                mime_type: "image/png".into(),
+                data_ref: "payload://pl_x".into(),
             }],
-        );
-        let err = ad.build_request_body(&r, &ctx, None).unwrap_err();
+        )];
+        let err = ad.build_request_body(&msgs, &ctx, None).unwrap_err();
         assert!(matches!(err, WireMappingError::VisionNotSupported));
     }
 
@@ -265,5 +285,14 @@ mod tests {
         let ad = OpenAIChatAdapter::new(ch(false));
         assert_eq!(ad.map_stop_reason("stop"), AgentStopReason::Completed);
         assert_eq!(ad.map_stop_reason("length"), AgentStopReason::MaxTurns);
+        assert_eq!(
+            ad.map_stop_reason("content_filter"),
+            AgentStopReason::ProviderStop
+        );
+        assert_eq!(
+            ad.map_stop_reason("insufficient_system_resource"),
+            AgentStopReason::Error
+        );
+        assert_eq!(ad.map_stop_reason("anything"), AgentStopReason::Completed);
     }
 }
