@@ -914,6 +914,15 @@ TDX > Eastmoney > 腾讯 > 新浪
 - `StockQuote.source` 与 `StockQuote.freshness.source` 必须一致；缺盘口的 fallback quote 可以用于展示，但必须带 `depth_missing` warning。
 - Account 成交模拟需要 fresh quote 和盘口；fallback 源缺盘口时必须返回 `depth_missing`，是否可成交由 Account 交易规则判断。
 
+#### TDX 连接池与并发（实现锚：`infrastructure/quotes/tdx/manager.rs`）
+
+为压榨 TDX 吞吐并解耦"后台批量刷新"与"前台交互请求"（K 线 / 详情），TDX 连接层用**连接池**而非单连接：
+
+- **连接池**：维护 N 条独立 TDX 连接（默认 **N = 4**），各自持有 socket + 独立的 per-call 节流（`MIN_CALL_INTERVAL` 80ms 是 per-connection，不是全局）。每次调用取一条空闲连接执行；失败丢弃该连接、下次该槽自动重连。N 取 3-5 保守值，避免单 IP 并发过高触发服务端限频；可连不同 HQ host 分摊。
+- **交互解耦**：前台请求（`ensure_chart_data` / `fetch_data` / K 线分页）和后台批量（universe 60s / 热点档 3s）共享连接池。即使后台批量占用若干连接，前台请求也能拿到空闲连接立即执行，不再排在整轮 universe 刷新（~15-20s）之后。
+- **并发批次**：universe 全市场刷新和热点档刷新必须把 80-batch **并发**发起（并发度 ≤ 池大小 N），而非逐批 `await` 串行。universe ~94 批并发跑在 N 条连接上，目标完成时间从单连接 ~15-20s 压到 **~3-5s**。每批完成即写 cache（盘中只写 in-memory cache，线程安全；`purpose=close` 的 EOD 才写 `quote_close_snapshot`，DB 写经单连接串行化）+ emit progress。
+- **顺序无关**：并发后批次完成顺序不保证，但 progress 是中间态、前端读 cache/DB 重排，故 Stock→Index→Fund 仅影响入队顺序、不要求完成顺序。
+
 日 / 周 / 月 K：
 
 - **TDX 是主源**：日 / 周 / 月 K 全部从 TDX 拉取 unadjusted bar；单次拉取根数受 TDX 协议限制（默认 ~800 根），SH / SZ 全覆盖，BJ 不支持。

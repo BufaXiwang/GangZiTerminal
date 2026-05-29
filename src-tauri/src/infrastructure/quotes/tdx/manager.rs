@@ -1,13 +1,14 @@
-//! TDX 连接管理器 — 连接池 + 失败重连 + per-call 调用串行化。
+//! TDX 连接管理器 — 连接池 + 失败重连 + per-connection 调用串行化。
 //!
-//! Spec: docs/design/quotes-module.md §5；docs/design/references/quotes/tdx.md
+//! Spec: docs/design/quotes-module.md §5「TDX 连接池与并发」；references/quotes/tdx.md
 //!
 //! 设计：
-//! - 单一连接，外加 `Mutex` 串行化（TDX 协议本身串行，单连接 + Mutex 足够并满足 spec §5
-//!   "复用连接 / 失败重连"）。
-//! - 每次调用都通过 spawn_blocking 跑同步 TCP；失败后丢弃连接，下次自动重连。
+//! - **连接池**：N 条独立连接（`POOL_SIZE`），各自一把 `Mutex<State>`（含 socket +
+//!   独立 last_call 节流）。每次调用 round-robin 取一条槽执行 → 最多 N 个调用并发。
+//!   后台批量（universe/热点档）和前台交互（K线/详情）共享池，前台能拿空闲槽不排队。
+//! - 每次调用通过 spawn_blocking 跑同步 TCP；失败后丢弃该槽连接，下次自动重连。
 //! - 最大重试次数：1 次 reconnect + 1 次 retry，避免线程卡死。
-//! - per-IP 速率限制：调用之间最小间隔 `MIN_CALL_INTERVAL`。
+//! - per-connection 速率限制：同一连接调用间最小间隔 `MIN_CALL_INTERVAL`。
 
 use super::{
     Bar, BarCategory, MinuteTimePoint, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket,
@@ -19,6 +20,7 @@ use crate::domain::shared::{
     Volume,
 };
 use chrono::Utc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -28,6 +30,8 @@ const MIN_CALL_INTERVAL: Duration = Duration::from_millis(80);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const QUOTE_BATCH_MAX: usize = 80;
 const BARS_MAX: u16 = 800;
+/// TDX 连接池大小（spec §5）。3-5 保守值，避免单 IP 并发过高触发服务端限频。
+const POOL_SIZE: usize = 4;
 
 #[derive(Debug, Error)]
 pub enum TdxManagerError {
@@ -46,7 +50,9 @@ struct State {
 
 #[derive(Clone)]
 pub struct TdxConnectionManager {
-    inner: Arc<Mutex<State>>,
+    /// N 条独立连接槽；round-robin 取用，最多 N 个调用并发。
+    slots: Arc<Vec<Arc<Mutex<State>>>>,
+    next: Arc<AtomicUsize>,
 }
 
 impl Default for TdxConnectionManager {
@@ -57,12 +63,24 @@ impl Default for TdxConnectionManager {
 
 impl TdxConnectionManager {
     pub fn new() -> Self {
+        let slots = (0..POOL_SIZE)
+            .map(|_| {
+                Arc::new(Mutex::new(State {
+                    client: None,
+                    last_call: None,
+                }))
+            })
+            .collect();
         Self {
-            inner: Arc::new(Mutex::new(State {
-                client: None,
-                last_call: None,
-            })),
+            slots: Arc::new(slots),
+            next: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// round-robin 取一条连接槽。并发调用各拿不同槽 → 真并行。
+    fn slot(&self) -> Arc<Mutex<State>> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        Arc::clone(&self.slots[i])
     }
 
     /// 拉单只标的实时报价。失败后丢弃连接。
@@ -80,7 +98,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         let result = task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             // 速率：保持最小间隔。
@@ -151,7 +169,7 @@ impl TdxConnectionManager {
             if pairs.is_empty() {
                 continue;
             }
-            let inner = Arc::clone(&self.inner);
+            let inner = self.slot();
             let pairs_for_call: Vec<(TdxMarket, String)> = pairs
                 .iter()
                 .map(|(m, c, _, _, _)| (*m, c.clone()))
@@ -239,7 +257,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
@@ -310,7 +328,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         let cat = kline_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -382,7 +400,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let cat = kline_period_to_tdx(period);
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         task::spawn_blocking(move || {
             const HARD_CAP: u32 = 50_000;
             let mut all: Vec<Bar> = Vec::new();
@@ -472,7 +490,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         let cat = minute_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -525,7 +543,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -579,7 +597,7 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -628,7 +646,7 @@ impl TdxConnectionManager {
         &self,
         market: TdxMarket,
     ) -> Result<Vec<SecurityListEntry>, TdxManagerError> {
-        let inner = Arc::clone(&self.inner);
+        let inner = self.slot();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {

@@ -1171,19 +1171,32 @@ impl QuotesService {
                 "universe TDX streaming pass starting"
             );
 
-            // **Streaming chunks**：pipeline 主动按 80 一批驱动 TDX，每批 ~200ms。
-            // 每批完成后立即 write DB + emit progress，让 UI 在 25s 期间持续填充而不是
-            // 干等 15s。`fetch_quotes` 接受 ≤ 80 即触发单次 TDX RPC（manager 内部
-            // QUOTE_BATCH_MAX = 80），刚好对齐。
+            // **并发 streaming chunks**（spec §5 TDX 连接池与并发）：把 tdx_input 切成
+            // 80-batch，buffer_unordered 并发跑（≤ 连接池大小），各批落在不同 TDX 连接 →
+            // 全市场 ~94 批从单连接 ~15-20s 压到 ~3-5s。fetch 并发、处理在 consumer 串行
+            // （cache.put RwLock 线程安全；purpose=close 的 DB 写经单连接串行）。
+            // 完成一批即 write + emit progress，UI 持续流式填充。
+            use futures_util::StreamExt;
             const TDX_CHUNK: usize = 80;
+            const FETCH_CONCURRENCY: usize = 4; // = TDX 连接池 POOL_SIZE
             let mut completed: u32 = 0;
             let mut affected_in_batch: Vec<TsCode> = Vec::new();
             let mut fallback_queue: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
 
-            for chunk in tdx_input.chunks(TDX_CHUNK) {
-                let chunk_vec: Vec<_> = chunk.to_vec();
-                let results = self.tdx.fetch_quotes(chunk_vec, trade_date, now).await;
-                for ((ts, cat, name), res) in chunk.iter().zip(results.into_iter()) {
+            let chunks: Vec<Vec<(TsCode, InstrumentCategory, Option<String>)>> =
+                tdx_input.chunks(TDX_CHUNK).map(|c| c.to_vec()).collect();
+            let mut fetch_stream = futures_util::stream::iter(chunks)
+                .map(|chunk| {
+                    let tdx = &self.tdx;
+                    async move {
+                        let results = tdx.fetch_quotes(chunk.clone(), trade_date, now).await;
+                        (chunk, results)
+                    }
+                })
+                .buffer_unordered(FETCH_CONCURRENCY);
+
+            while let Some((chunk, results)) = fetch_stream.next().await {
+                for ((ts, cat, name), res) in chunk.into_iter().zip(results.into_iter()) {
                     completed += 1;
                     // `is_display_complete` 而不是 `is_quote_complete` —— 指数 / 基金 TDX
                     // 不返回 bid/ask 五档（其他 provider 同样不返回），不该因此把它们丢去
@@ -1199,19 +1212,18 @@ impl QuotesService {
                                 source: source_str,
                             });
                             if matches!(req.purpose, RefreshPurpose::Close) {
-                                let _ = self.repo().upsert_close_snapshot(ts, trade_date, &q);
+                                let _ = self.repo().upsert_close_snapshot(&ts, trade_date, &q);
                             }
                             success += 1;
                             affected.push(ts.clone());
-                            affected_in_batch.push(ts.clone());
+                            affected_in_batch.push(ts);
                         }
                         _ => {
                             // TDX 失败或字段不全 — 推入 fallback chain (EM → Tencent → Sina)。
-                            fallback_queue.push((ts.clone(), *cat, name.clone()));
+                            fallback_queue.push((ts, cat, name));
                         }
                     }
                 }
-                // 每 TDX chunk 一次 emit；spec §5 N=80 (transport batch size) 是流式底线。
                 if !affected_in_batch.is_empty() {
                     self.emit_progress(MarketQuotesRefreshProgressPayload {
                         scope: RefreshScopeKind::Universe,
@@ -1225,6 +1237,7 @@ impl QuotesService {
                     });
                 }
             }
+            drop(fetch_stream);
 
             tracing::info!(
                 target: "quotes.refresh.universe",
