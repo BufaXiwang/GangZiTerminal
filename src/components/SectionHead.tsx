@@ -18,6 +18,8 @@ interface SectionHeadProps {
   meta?: ReactNode;
   /** 主操作区，如刷新按钮、筛选切换 */
   actions?: ReactNode;
+  /** 紧凑模式：隐藏大标题，状态/meta/操作压成单行，给下方内容腾空间。 */
+  compact?: boolean;
 }
 
 export function SectionHead({
@@ -26,10 +28,14 @@ export function SectionHead({
   statusTone = "ok",
   meta,
   actions,
+  compact = false,
 }: SectionHeadProps) {
   return (
-    <header className="page-shell-section-head">
+    <header
+      className={`page-shell-section-head${compact ? " compact" : ""}`}
+    >
       <div className="section-head-title-block">
+        {/* compact 下隐藏 h1，仅保留状态行（视觉去标题、可访问性保留） */}
         <h1 className="section-head-title">{title}</h1>
         {(status || meta) && (
           <div className="section-head-meta">

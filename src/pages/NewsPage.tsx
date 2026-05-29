@@ -343,6 +343,7 @@ export default function NewsPage() {
       statusTone={statusTone}
       meta={meta}
       controls={controls}
+      compact
     >
       <NewsDateNav
         countsByDate={dateCounts}

@@ -18,6 +18,8 @@ interface PageShellProps {
   actions?: ReactNode;
   /** 可选 control strip：filter / search / segment / refresh */
   controls?: ReactNode;
+  /** 紧凑头部：隐藏大标题、压成单行状态条，给内容腾空间。 */
+  compact?: boolean;
   children: ReactNode;
 }
 
@@ -28,6 +30,7 @@ export function PageShell({
   meta,
   actions,
   controls,
+  compact,
   children,
 }: PageShellProps) {
   return (
@@ -38,6 +41,7 @@ export function PageShell({
         statusTone={statusTone}
         meta={meta}
         actions={actions}
+        compact={compact}
       />
       {controls && <div className="page-shell-control-strip">{controls}</div>}
       <div className="page-shell-workspace">{children}</div>

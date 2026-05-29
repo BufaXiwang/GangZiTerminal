@@ -223,6 +223,19 @@ body {
   border-bottom: 1px solid var(--border-soft);
 }
 
+/* 紧凑头部：隐藏大标题，状态行压成一行，给下方内容腾出 ~30px。 */
+.page-shell-section-head.compact {
+  padding-bottom: 8px;
+}
+.page-shell-section-head.compact .section-head-title {
+  display: none;
+}
+.page-shell-section-head.compact .section-head-title-block {
+  flex-direction: row;
+  align-items: center;
+  flex: 1 1 auto;
+}
+
 .page-shell-control-strip {
   display: flex;
   flex-wrap: wrap;

@@ -258,9 +258,10 @@ export function NewsTimeline({
                       />
                     )}
                   </h3>
-                  {it.summary && (
+                  {/* 快讯无独立 summary（标题即全文）；有抽取正文时显示一段摘录。 */}
+                  {(it.summary || it.articleExcerpt) && (
                     <div className="news-row-summary">
-                      {highlight(it.summary, query)}
+                      {highlight(it.summary ?? it.articleExcerpt ?? "", query)}
                     </div>
                   )}
                 </div>
