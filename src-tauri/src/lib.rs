@@ -70,6 +70,13 @@ pub fn run() {
         adapters::quotes::cmd::set_quote_hotset,
         adapters::quotes::cmd::forward_log,
         adapters::agent::cmd::agent_list_skills,
+        adapters::agent::cmd::agent_channel_presets,
+        adapters::agent::cmd::agent_discover_models,
+        adapters::agent::cmd::agent_add_channel,
+        adapters::agent::cmd::agent_list_channels,
+        adapters::agent::cmd::agent_remove_channel,
+        adapters::agent::cmd::agent_set_active_channel,
+        adapters::agent::cmd::agent_get_active_channel,
         adapters::account::cmd::fetch_account,
         // Spec: account-module.md §4 — operate_account 写入口只对 Agent tool /
         // 外部自动化决策运行时暴露，不能注册为 Tauri command 供前端直接 invoke。

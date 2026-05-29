@@ -13,8 +13,13 @@
 use rusqlite_migration::M;
 
 /// 返回 Agent Infra BC 的所有迁移，按版本顺序排列。
+///
+/// **append-only**：新增 migration 只能加到末尾（rusqlite_migration 按全局位置判定 user_version）。
 pub fn migrations() -> Vec<M<'static>> {
-    vec![M::up(MIGRATION_001_INITIAL)]
+    vec![
+        M::up(MIGRATION_001_INITIAL),
+        M::up(MIGRATION_002_CHANNEL_AUTH_ACTIVE),
+    ]
 }
 
 // Spec: agent-infra-module.md §2
@@ -80,6 +85,13 @@ CREATE TABLE agent_payloads (
 );
 "#;
 
+// Spec: agent-infra-module.md §2 `ProviderChannel`（apiKey / enabled / active 标记）
+const MIGRATION_002_CHANNEL_AUTH_ACTIVE: &str = r#"
+ALTER TABLE agent_provider_channels ADD COLUMN api_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE agent_provider_channels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE agent_provider_channels ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +130,30 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn migration_002_adds_auth_active_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn, migrations()).unwrap();
+        conn.execute(
+            "INSERT INTO agent_provider_channels
+              (channel_id, provider, wire_format, model, stream, enabled, is_active,
+               supports_vision, supports_thinking, api_key, created_at, updated_at)
+             VALUES ('ch1', 'DeepSeek', 'chat_completions', 'deepseek-chat', 1, 1, 1, 0, 0,
+                     'sk-secret', '2026-05-27T01:00:00Z', '2026-05-27T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (api_key, enabled, is_active): (String, i64, i64) = conn
+            .query_row(
+                "SELECT api_key, enabled, is_active FROM agent_provider_channels WHERE channel_id = 'ch1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(api_key, "sk-secret");
+        assert_eq!(enabled, 1);
+        assert_eq!(is_active, 1);
     }
 }

@@ -10,6 +10,11 @@
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
+/// serde default helper：`enabled` 默认 true。
+fn default_true() -> bool {
+    true
+}
+
 /// Wire format 标识 — channel adapter 选择哪个 provider 实现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -29,13 +34,21 @@ pub enum WireFormat {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderChannel {
     pub channel_id: String,
+    /// 用户添加渠道时输入的「渠道名」，也是展示用 provider name；
+    /// 前端按 `{model} ({provider})` 展示。无单独 provider-id 字段。
     pub provider: String,
     pub wire_format: WireFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// 鉴权 token；持久化但**只写不读**（list / get DTO 屏蔽明文，只回 apiKeySet）。
+    #[serde(default)]
+    pub api_key: String,
     pub model: String,
     /// Streaming 是主渠道硬要求；保留布尔字段对外明示。
     pub stream: bool,
+    /// 渠道开关，默认 true。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub supports_vision: bool,
     pub supports_thinking: bool,
     /// 模型生成上限，写入 provider request。
@@ -65,8 +78,10 @@ mod tests {
             provider: "anthropic".into(),
             wire_format: WireFormat::Messages,
             base_url: None,
+            api_key: String::new(),
             model: "claude-sonnet-4-5".into(),
             stream: true,
+            enabled: true,
             supports_vision: true,
             supports_thinking: true,
             max_output_tokens: Some(8192),
@@ -87,8 +102,10 @@ mod tests {
             provider: "p".into(),
             wire_format: WireFormat::ChatCompletions,
             base_url: None,
+            api_key: String::new(),
             model: "m".into(),
             stream: true,
+            enabled: true,
             supports_vision: false,
             supports_thinking: false,
             max_output_tokens: None,

@@ -16,16 +16,20 @@
 
 pub mod channels_repo;
 pub mod context_compaction;
+pub mod discovery;
 pub mod loop_executor;
 pub mod messages_repo;
 pub mod migrations;
 pub mod payload_store;
+pub mod presets;
 pub mod providers;
 pub mod skill_parser;
 pub mod skill_registry;
 pub mod system_prompt;
 
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
+pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
+pub use presets::{channel_presets, ChannelPreset};
 pub use context_compaction::{
     compact_context, decide_tier, estimate_context_tokens, CompactPolicy,
 };

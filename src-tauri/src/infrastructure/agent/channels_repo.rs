@@ -34,18 +34,20 @@ impl ProviderChannelsRepo {
         self.db.with(|c| {
             c.execute(
                 "INSERT INTO agent_provider_channels (
-                    channel_id, provider, wire_format, base_url, model,
-                    stream, supports_vision, supports_thinking,
+                    channel_id, provider, wire_format, base_url, api_key, model,
+                    stream, enabled, supports_vision, supports_thinking,
                     max_output_tokens, context_window_tokens,
                     created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     channel.channel_id,
                     channel.provider,
                     wf,
                     channel.base_url,
+                    channel.api_key,
                     channel.model,
                     channel.stream as i32,
+                    channel.enabled as i32,
                     channel.supports_vision as i32,
                     channel.supports_thinking as i32,
                     channel.max_output_tokens.map(|v| v as i64),
@@ -68,21 +70,25 @@ impl ProviderChannelsRepo {
                     provider = ?2,
                     wire_format = ?3,
                     base_url = ?4,
-                    model = ?5,
-                    stream = ?6,
-                    supports_vision = ?7,
-                    supports_thinking = ?8,
-                    max_output_tokens = ?9,
-                    context_window_tokens = ?10,
-                    updated_at = ?11
+                    api_key = ?5,
+                    model = ?6,
+                    stream = ?7,
+                    enabled = ?8,
+                    supports_vision = ?9,
+                    supports_thinking = ?10,
+                    max_output_tokens = ?11,
+                    context_window_tokens = ?12,
+                    updated_at = ?13
                  WHERE channel_id = ?1",
                 params![
                     channel.channel_id,
                     channel.provider,
                     wf,
                     channel.base_url,
+                    channel.api_key,
                     channel.model,
                     channel.stream as i32,
+                    channel.enabled as i32,
                     channel.supports_vision as i32,
                     channel.supports_thinking as i32,
                     channel.max_output_tokens.map(|v| v as i64),
@@ -107,8 +113,8 @@ impl ProviderChannelsRepo {
     pub fn get(&self, channel_id: &str) -> Result<Option<ProviderChannel>, ChannelsRepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT channel_id, provider, wire_format, base_url, model,
-                        stream, supports_vision, supports_thinking,
+                "SELECT channel_id, provider, wire_format, base_url, api_key, model,
+                        stream, enabled, supports_vision, supports_thinking,
                         max_output_tokens, context_window_tokens
                  FROM agent_provider_channels WHERE channel_id = ?1",
             )?;
@@ -122,8 +128,8 @@ impl ProviderChannelsRepo {
     pub fn list(&self) -> Result<Vec<ProviderChannel>, ChannelsRepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT channel_id, provider, wire_format, base_url, model,
-                        stream, supports_vision, supports_thinking,
+                "SELECT channel_id, provider, wire_format, base_url, api_key, model,
+                        stream, enabled, supports_vision, supports_thinking,
                         max_output_tokens, context_window_tokens
                  FROM agent_provider_channels ORDER BY channel_id ASC",
             )?;
@@ -131,6 +137,35 @@ impl ProviderChannelsRepo {
                 .query_map([], row_to_channel)?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+    }
+
+    /// 设置当前 active 渠道：清空所有 is_active，再把目标 id 置 1。
+    /// Spec §2 「当前渠道」：维护一个 active channelId，Agent run 默认走它。
+    pub fn set_active(&self, channel_id: &str) -> Result<(), ChannelsRepoError> {
+        self.db.with(|c| {
+            let tx = c.transaction()?;
+            tx.execute("UPDATE agent_provider_channels SET is_active = 0", [])?;
+            tx.execute(
+                "UPDATE agent_provider_channels SET is_active = 1 WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.commit()?;
+            Ok::<_, ChannelsRepoError>(())
+        })
+    }
+
+    /// 当前 active 渠道（is_active = 1）；无则 None。
+    pub fn active(&self) -> Result<Option<ProviderChannel>, ChannelsRepoError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT channel_id, provider, wire_format, base_url, api_key, model,
+                        stream, enabled, supports_vision, supports_thinking,
+                        max_output_tokens, context_window_tokens
+                 FROM agent_provider_channels WHERE is_active = 1 LIMIT 1",
+            )?;
+            let row = stmt.query_row([], row_to_channel).optional()?;
+            Ok(row)
         })
     }
 }
@@ -157,12 +192,14 @@ fn row_to_channel(row: &Row) -> rusqlite::Result<ProviderChannel> {
     let provider: String = row.get(1)?;
     let wire_format_s: String = row.get(2)?;
     let base_url: Option<String> = row.get(3)?;
-    let model: String = row.get(4)?;
-    let stream_i: i64 = row.get(5)?;
-    let supports_vision_i: i64 = row.get(6)?;
-    let supports_thinking_i: i64 = row.get(7)?;
-    let max_output_tokens_i: Option<i64> = row.get(8)?;
-    let context_window_tokens_i: Option<i64> = row.get(9)?;
+    let api_key: String = row.get(4)?;
+    let model: String = row.get(5)?;
+    let stream_i: i64 = row.get(6)?;
+    let enabled_i: i64 = row.get(7)?;
+    let supports_vision_i: i64 = row.get(8)?;
+    let supports_thinking_i: i64 = row.get(9)?;
+    let max_output_tokens_i: Option<i64> = row.get(10)?;
+    let context_window_tokens_i: Option<i64> = row.get(11)?;
 
     let wire_format = wire_format_parse(&wire_format_s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -177,8 +214,10 @@ fn row_to_channel(row: &Row) -> rusqlite::Result<ProviderChannel> {
         provider,
         wire_format,
         base_url,
+        api_key,
         model,
         stream: stream_i != 0,
+        enabled: enabled_i != 0,
         supports_vision: supports_vision_i != 0,
         supports_thinking: supports_thinking_i != 0,
         max_output_tokens: max_output_tokens_i.map(|v| v as u32),
@@ -204,8 +243,10 @@ mod tests {
             provider: "anthropic".into(),
             wire_format: WireFormat::Messages,
             base_url: Some("https://api.anthropic.com".into()),
+            api_key: "sk-test".into(),
             model: "claude-sonnet-4-5".into(),
             stream: true,
+            enabled: true,
             supports_vision: true,
             supports_thinking: true,
             max_output_tokens: Some(8192),
@@ -240,6 +281,40 @@ mod tests {
         r.add(&c).unwrap();
         r.remove("ch1").unwrap();
         assert!(r.get("ch1").unwrap().is_none());
+    }
+
+    #[test]
+    fn add_get_round_trip_preserves_api_key_and_enabled() {
+        let r = fresh_repo();
+        let mut c = sample("ch1");
+        c.api_key = "sk-secret".into();
+        c.enabled = false;
+        r.add(&c).unwrap();
+        let got = r.get("ch1").unwrap().unwrap();
+        assert_eq!(got.api_key, "sk-secret");
+        assert!(!got.enabled);
+    }
+
+    #[test]
+    fn set_active_and_active_round_trip() {
+        let r = fresh_repo();
+        let mut a = sample("a");
+        a.channel_id = "a".into();
+        let mut b = sample("b");
+        b.channel_id = "b".into();
+        r.add(&a).unwrap();
+        r.add(&b).unwrap();
+
+        // no active yet
+        assert!(r.active().unwrap().is_none());
+
+        r.set_active("a").unwrap();
+        assert_eq!(r.active().unwrap().unwrap().channel_id, "a");
+
+        // switching active clears the previous one (only one active at a time)
+        r.set_active("b").unwrap();
+        let act = r.active().unwrap().unwrap();
+        assert_eq!(act.channel_id, "b");
     }
 
     #[test]
