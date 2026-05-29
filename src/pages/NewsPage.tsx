@@ -51,9 +51,11 @@ export default function NewsPage() {
   // === list state ===
   const [items, setItems] = useState<FetchNewsItem[]>([]);
   const [page, setPage] = useState<FetchNewsPage | null>(null);
-  // 跳日期时在 async 循环里读最新 page，避免闭包拿到旧值。
+  // 跳日期时在 async 循环里读最新 page / items，避免闭包拿到旧值。
   const pageRef = useRef<FetchNewsPage | null>(null);
   pageRef.current = page;
+  const itemsRef = useRef<FetchNewsItem[]>([]);
+  itemsRef.current = items;
   // 每日真实总数（后端 GROUP BY，不受分页限制）—— 给日期导航显示真实条数。
   const [dateCounts, setDateCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
@@ -184,38 +186,50 @@ export default function NewsPage() {
     return false;
   }, []);
 
-  // 点日期导航跳转：若该日 section 已加载直接滚动；否则持续 load more
-  // 直到该日出现（或加载到比它更早的日期 / 到底），再滚动过去。
+  // 点日期导航跳转：把目标日「最新一条」顶到列表顶部。
+  // 关键：必须一直加载到**比目标日更早**的日期，目标日下方才有内容垫着，
+  // 否则目标日成了列表末尾，scrollIntoView 无法把它顶到顶部（只能停在底部，
+  // 看起来"只滚到当日最早一条"）。
+  const localDateKey = (it: FetchNewsItem): string | null =>
+    it.publishedAt ? formatDateKey(new Date(it.publishedAt)) : null;
+
   const handleSelectDate = useCallback(
     async (dateKey: string) => {
-      if (scrollToDate(dateKey)) return;
-      setLoadingMore(true);
-      let cur = pageRef.current;
-      let guard = 0;
-      while (cur?.hasMore && guard < 60) {
-        guard++;
-        const res = await fetchPage(cur.offset + cur.limit);
-        if (res.status !== "ok") break;
-        const batch = res.data.items;
-        setItems((prev) => {
-          const seen = new Set(prev.map((x) => x.id));
-          return [...prev, ...batch.filter((x) => !seen.has(x.id))];
+      // 已经加载到比目标日更早的内容？没有就继续 load more。
+      const hasLoadedPast = () =>
+        itemsRef.current.some((it) => {
+          const k = localDateKey(it);
+          return k !== null && k < dateKey;
         });
-        cur = res.data.page;
-        setPage(cur);
-        pageRef.current = cur;
-        const hit = batch.some(
-          (it) => it.publishedAt && formatDateKey(new Date(it.publishedAt)) === dateKey,
-        );
-        const oldest = batch[batch.length - 1];
-        const passed =
-          !!oldest?.publishedAt &&
-          formatDateKey(new Date(oldest.publishedAt)) < dateKey;
-        if (hit || passed) break;
+      if (!hasLoadedPast()) {
+        setLoadingMore(true);
+        let cur = pageRef.current;
+        let guard = 0;
+        while (cur?.hasMore && guard < 60) {
+          guard++;
+          const res = await fetchPage(cur.offset + cur.limit);
+          if (res.status !== "ok") break;
+          const batch = res.data.items;
+          setItems((prev) => {
+            const seen = new Set(prev.map((x) => x.id));
+            return [...prev, ...batch.filter((x) => !seen.has(x.id))];
+          });
+          cur = res.data.page;
+          setPage(cur);
+          pageRef.current = cur;
+          const oldest = batch[batch.length - 1];
+          const oldestKey = oldest ? localDateKey(oldest) : null;
+          if (oldestKey !== null && oldestKey < dateKey) break; // 已越过目标日
+        }
+        setLoadingMore(false);
       }
-      setLoadingMore(false);
-      // 等新 section 渲染出来再滚动
-      window.setTimeout(() => scrollToDate(dateKey), 80);
+      // 等新 section 渲染 + ref 注册后再滚动；跨帧重试直到命中。
+      let tries = 30;
+      const tick = () => {
+        if (scrollToDate(dateKey)) return;
+        if (--tries > 0) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
     },
     [fetchPage, scrollToDate],
   );
