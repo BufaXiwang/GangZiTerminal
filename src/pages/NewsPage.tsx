@@ -177,13 +177,23 @@ export default function NewsPage() {
   }, []);
 
   const scrollToDate = useCallback((dateKey: string) => {
-    const el = sectionRefs.current.get(dateKey);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-      setActiveDate(dateKey);
-      return true;
+    const header = sectionRefs.current.get(dateKey);
+    if (!header) return false;
+    // 不能用 header.scrollIntoView：header 是 sticky(top:0)，scrollIntoView 会按它
+    // "已粘住"的位置算，短小节会把唯一一条挤出视口。改用非粘性的 section 手动算偏移。
+    const section = (header.closest(".news-day-section") as HTMLElement | null) ?? header;
+    const container = header.closest(".news-timeline") as HTMLElement | null;
+    if (container) {
+      const top =
+        section.getBoundingClientRect().top -
+        container.getBoundingClientRect().top +
+        container.scrollTop;
+      container.scrollTo({ top, behavior: "smooth" });
+    } else {
+      section.scrollIntoView({ behavior: "smooth", block: "start" });
     }
-    return false;
+    setActiveDate(dateKey);
+    return true;
   }, []);
 
   // 点日期导航跳转：把目标日「最新一条」顶到列表顶部。
