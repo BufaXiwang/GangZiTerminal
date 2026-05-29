@@ -365,8 +365,11 @@ impl AccountService {
                             item.name = Some(inst.name);
                         }
                     }
-                    let quote = match self.gateway.get_snapshot(&item.ts_code) {
-                        Ok(snap) => Some(WatchlistQuoteView {
+                    // 自选是**显示读取**：用 display 路径（Universe 90s + 跨日回落 +
+                    // 返回 stale），不用交易级 fail-closed 的 get_snapshot，避免
+                    // cache quote >30s 就被判 stale 显示空。Spec account §4 line 459。
+                    let quote = match self.gateway.get_display_snapshot(&item.ts_code) {
+                        Some(snap) => Some(WatchlistQuoteView {
                             price: snap.quote.price,
                             change_percent: snap.quote.change_percent,
                             volume: snap.quote.volume,
@@ -374,8 +377,8 @@ impl AccountService {
                             source: snap.quote.freshness.source.clone(),
                             freshness: Some(snap.quote.freshness.clone()),
                         }),
-                        Err(e) => {
-                            let warn = quote_err_to_warning(e.kind);
+                        None => {
+                            let warn = WarningCode::QuoteMissing;
                             if !response.warnings.contains(&warn) {
                                 response.warnings.push(warn);
                             }

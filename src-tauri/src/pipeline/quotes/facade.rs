@@ -101,6 +101,74 @@ pub fn get_quote_snapshot(
     })
 }
 
+/// 显示专用：返回可展示的 quote snapshot（含 stale），仅在**完全无可用 quote**
+/// 时返回 None。与 [`get_quote_snapshot`] 的区别：
+/// - 用 `Universe`(90s) intent（与 list_market 一致），不是 `Detail`(30s)。
+/// - **不**因 stale 报错——stale quote 照常返回，由 `freshness.status` 标记，
+///   调用方（如 watchlist / 持仓估值显示）自行决定如何展示。
+/// - cache quote 的 tradeDate 不匹配 eligible 时回落 close_snapshot(eligible)，
+///   与 list_market 的 build_full_quote 一致（避免午休 / 跨日显示空）。
+///
+/// Spec: account-module.md §4 line 459「Account 读取接口可以返回 stale quote 参与
+/// 展示，但交易写路径必须 fail closed」。交易写路径仍用 [`get_quote_snapshot`]。
+pub fn get_quote_for_display(
+    db: &AppDb,
+    cache: &Arc<SnapshotCache>,
+    ts_code: &TsCode,
+) -> Option<MarketQuoteSnapshot> {
+    let now = Utc::now();
+    let ctx = resolve_market_time(now);
+    let eligible = eligible_trade_date(&ctx);
+    let repo = QuotesRepository::new(db);
+    let inst = repo.get_instrument(ts_code).ok().flatten()?;
+
+    // cache 命中 eligible 交易日才用；否则回落 close_snapshot(eligible)。
+    let cache_q = cache.get(ts_code).map(|c| c.quote);
+    let mut quote = match cache_q {
+        Some(q) if q.trade_date == eligible.trade_date => q,
+        _ => repo
+            .load_close_snapshot(ts_code, eligible.trade_date)
+            .ok()
+            .flatten()?,
+    };
+
+    let source = quote.source.as_str().to_string();
+    let (freshness, eligibility) = derive_freshness(
+        &ctx,
+        FreshnessIntent::Universe,
+        quote.trade_date,
+        quote.captured_at,
+        &source,
+    );
+    // tradeDate 不匹配 / 硬过期 → 无可展示 quote。
+    if eligibility.is_some() {
+        return None;
+    }
+    // stale 不拒绝：照常返回，freshness 标记交给调用方。
+    if let (Some(pc), Some(band)) = (
+        quote.previous_close,
+        compute_limit_band(
+            &inst.ts_code,
+            inst.category,
+            inst.board.as_deref(),
+            inst.is_st.unwrap_or(false),
+        ),
+    ) {
+        if let Some((u, d)) = apply_band_helper(pc, band) {
+            quote.limit_up = u;
+            quote.limit_down = d;
+        }
+    }
+    quote.freshness = freshness;
+    let updated_at = quote.captured_at;
+    Some(MarketQuoteSnapshot {
+        ts_code: ts_code.clone(),
+        category: inst.category,
+        quote,
+        updated_at,
+    })
+}
+
 /// 批量版本（per-item Result）。
 pub fn get_quote_snapshots(
     db: &AppDb,

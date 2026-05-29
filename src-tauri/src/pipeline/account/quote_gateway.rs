@@ -23,6 +23,11 @@ pub trait AccountQuoteGateway: Send + Sync {
         &self,
         ts_codes: &[TsCode],
     ) -> Vec<Result<MarketQuoteSnapshot, QuoteFacadeError>>;
+
+    /// 显示专用：返回可展示 quote（含 stale），无可用时 None。
+    /// 仅用于读取展示（watchlist / 估值显示），**不**用于交易写路径。
+    /// Spec: account-module.md §4 line 459。
+    fn get_display_snapshot(&self, ts_code: &TsCode) -> Option<MarketQuoteSnapshot>;
 }
 
 /// 生产路径：调用 `pipeline::quotes::facade`。
@@ -46,6 +51,9 @@ impl AccountQuoteGateway for QuotesFacadeGateway {
         ts_codes: &[TsCode],
     ) -> Vec<Result<MarketQuoteSnapshot, QuoteFacadeError>> {
         quotes_facade::get_quote_snapshots(&self.db, &self.cache, ts_codes)
+    }
+    fn get_display_snapshot(&self, ts_code: &TsCode) -> Option<MarketQuoteSnapshot> {
+        quotes_facade::get_quote_for_display(&self.db, &self.cache, ts_code)
     }
 }
 
@@ -86,5 +94,9 @@ impl AccountQuoteGateway for MockQuoteGateway {
         ts_codes: &[TsCode],
     ) -> Vec<Result<MarketQuoteSnapshot, QuoteFacadeError>> {
         ts_codes.iter().map(|c| self.get_snapshot(c)).collect()
+    }
+    fn get_display_snapshot(&self, ts_code: &TsCode) -> Option<MarketQuoteSnapshot> {
+        // mock：复用 get_snapshot 的 Ok 分支作为可展示 quote。
+        self.get_snapshot(ts_code).ok()
     }
 }
