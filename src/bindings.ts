@@ -13,6 +13,14 @@ async ping() : Promise<Result<PingResult, CommandError>> {
     else return { status: "error", error: e  as any };
 }
 },
+async openExternal(url: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_external", { url }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * 同步读取 News 本地读模型。
  * 

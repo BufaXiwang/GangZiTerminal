@@ -17,6 +17,7 @@ import { AlertTriangle, BookOpen } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
+import { NewsRowMenu } from "./NewsRowMenu";
 
 const WEEKDAY_LABEL = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -90,10 +91,12 @@ function NewsRow({
   it,
   query,
   sourceName,
+  onContextMenu,
 }: {
   it: FetchNewsItem;
   query: string;
   sourceName: string;
+  onContextMenu: (it: FetchNewsItem, x: number, y: number) => void;
 }) {
   const acc = sourceAccent(it.source);
   const warnings = it.warnings ?? [];
@@ -113,6 +116,10 @@ function NewsRow({
     <div
       className={`news-row acc-${acc}${open ? " expanded" : ""}${overflow ? " clickable" : ""}`}
       onClick={() => overflow && setOpen((v) => !v)}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(it, e.clientX, e.clientY);
+      }}
       role={overflow ? "button" : undefined}
       tabIndex={overflow ? 0 : undefined}
       onKeyDown={(e) => {
@@ -160,6 +167,9 @@ export function NewsTimeline({
   query,
   sourceNames = {},
 }: NewsTimelineProps) {
+  // === 右键菜单（打开原文 / 复制链接） ===
+  const [menu, setMenu] = useState<{ url: string | null; x: number; y: number } | null>(null);
+
   // === sort + group ===
   const groups: DateGroup[] = useMemo(() => {
     const sorted = [...items].sort((a, b) => {
@@ -284,6 +294,9 @@ export function NewsTimeline({
               it={it}
               query={query}
               sourceName={sourceNames[it.source] ?? it.source}
+              onContextMenu={(item, x, y) =>
+                setMenu({ url: item.url ?? null, x, y })
+              }
             />
           ))}
         </section>
@@ -308,6 +321,15 @@ export function NewsTimeline({
           </span>
         )}
       </div>
+
+      {menu && (
+        <NewsRowMenu
+          x={menu.x}
+          y={menu.y}
+          url={menu.url}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }

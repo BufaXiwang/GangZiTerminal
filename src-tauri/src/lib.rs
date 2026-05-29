@@ -55,6 +55,7 @@ pub fn run() {
 
     let specta_builder = Builder::<tauri::Wry>::new().commands(collect_commands![
         adapters::ping::ping,
+        adapters::system::open_external,
         adapters::news::cmd::fetch_news,
         adapters::news::cmd::list_news_sources,
         adapters::news::cmd::warm_articles,

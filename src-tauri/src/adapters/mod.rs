@@ -8,3 +8,4 @@ pub mod error;
 pub mod news;
 pub mod ping;
 pub mod quotes;
+pub mod system;
