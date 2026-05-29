@@ -384,6 +384,7 @@ export default function NewsPage() {
         item={selectedItem}
         open={selectedId !== null}
         onClose={() => setSelectedId(null)}
+        sourceNames={sourceNames}
         onItemUpdated={(updated) => {
           setItems((prev) =>
             prev.map((it) => (it.id === updated.id ? updated : it)),

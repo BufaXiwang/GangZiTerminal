@@ -65,6 +65,14 @@ function formatHHmm(iso?: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+// 按 source 字符串散列到 0..4，给每条 row 一条稳定的左侧色条 + source tag 配色，
+// 视觉上把同源资讯归簇。5 个色相都取自暖纸面 palette，不破坏整体调性。
+function sourceAccent(source: string): number {
+  let h = 0;
+  for (let i = 0; i < source.length; i++) h = (h * 31 + source.charCodeAt(i)) >>> 0;
+  return h % 5;
+}
+
 function highlight(text: string, query: string): React.ReactNode {
   const q = query.trim();
   if (!q) return text;
@@ -213,10 +221,11 @@ export function NewsTimeline({
           {g.items.map((it) => {
             const hasArticle = Boolean(it.articleExcerpt) || Boolean(it.article);
             const hasWarn = it.warnings.length > 0;
+            const acc = sourceAccent(it.source);
             return (
               <div
                 key={it.id}
-                className={`news-row ${selectedId === it.id ? "selected" : ""}`}
+                className={`news-row acc-${acc} ${selectedId === it.id ? "selected" : ""}`}
                 onClick={() => onSelectItem(it.id)}
                 role="button"
                 tabIndex={0}
@@ -228,38 +237,36 @@ export function NewsTimeline({
                 }}
               >
                 <div className="news-row-time tabular">
+                  <span className="news-row-dot" />
                   {formatHHmm(it.publishedAt)}
                 </div>
                 <div className="news-row-body">
-                  <h3 className="news-row-title">{highlight(it.title, query)}</h3>
+                  <h3 className="news-row-title">
+                    {highlight(it.title, query)}
+                    {hasArticle && (
+                      <BookOpen
+                        size={12}
+                        className="news-row-article-icon"
+                        aria-label="本地已抽取正文"
+                      />
+                    )}
+                    {hasWarn && (
+                      <AlertTriangle
+                        size={12}
+                        className="news-row-warn-icon"
+                        aria-label={it.warnings.join(", ")}
+                      />
+                    )}
+                  </h3>
                   {it.summary && (
                     <div className="news-row-summary">
                       {highlight(it.summary, query)}
                     </div>
                   )}
                 </div>
-                <div className="news-row-meta">
-                  <span className="news-row-source">
-                    {sourceNames[it.source] ?? it.source}
-                  </span>
-                  {(hasArticle || hasWarn) && (
-                    <div className="news-row-flags">
-                      {hasArticle && (
-                        <span className="news-row-flag has-article" title="本地已抽取正文">
-                          <BookOpen size={10} /> 正文
-                        </span>
-                      )}
-                      {hasWarn && (
-                        <span
-                          className="news-row-flag warn"
-                          title={it.warnings.join(", ")}
-                        >
-                          <AlertTriangle size={10} /> {it.warnings.length}
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <span className={`news-src-tag acc-${acc}`}>
+                  {sourceNames[it.source] ?? it.source}
+                </span>
               </div>
             );
           })}

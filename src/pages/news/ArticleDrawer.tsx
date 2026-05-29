@@ -17,7 +17,7 @@
 // 不修改业务真源，所有错误来自后端 code（spec §5 封闭集合）。
 
 import { ExternalLink, RefreshCcw, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   commands,
   type ArticleSnippet,
@@ -31,6 +31,8 @@ export interface ArticleDrawerProps {
   onClose: () => void;
   /** drawer 内部触发 warm + 重读 includeArticle=true 时，把更新后的 item 回写到列表。 */
   onItemUpdated: (item: FetchNewsItem) => void;
+  /** sourceId → 友好展示名。 */
+  sourceNames?: Record<string, string>;
 }
 
 type WarmState =
@@ -68,6 +70,7 @@ export function ArticleDrawer({
   open,
   onClose,
   onItemUpdated,
+  sourceNames = {},
 }: ArticleDrawerProps) {
   const [warm, setWarm] = useState<WarmState>({ kind: "idle" });
 
@@ -75,6 +78,10 @@ export function ArticleDrawer({
   useEffect(() => {
     setWarm({ kind: "idle" });
   }, [item?.id]);
+
+  // 打开即自动拉正文（spec §4 warm_articles 按需触发）：有 URL 且本地还没正文时，
+  // 不让用户再点一次按钮。快讯类（无独立正文）会回 article_missing，优雅降级显示摘要。
+  const autoWarmedRef = useRef<string | null>(null);
 
   // ESC 关闭
   useEffect(() => {
@@ -142,6 +149,16 @@ export function ArticleDrawer({
     if (hit) onItemUpdated(hit);
   }, [item, onItemUpdated]);
 
+  // 打开自动 warm：每个 item 只触发一次；已有 article / 无 URL 时跳过。
+  useEffect(() => {
+    if (!open || !item) return;
+    if (item.article || item.articleExcerpt) return; // 本地已有正文/摘录
+    if (!item.url) return; // 无 URL 无法抽取
+    if (autoWarmedRef.current === item.id) return; // 本 item 已自动拉过
+    autoWarmedRef.current = item.id;
+    void handleFetchArticle();
+  }, [open, item, handleFetchArticle]);
+
   if (!open || !item) return null;
 
   const showWarnings = item.warnings.length > 0;
@@ -158,7 +175,9 @@ export function ArticleDrawer({
       >
         <header className="article-drawer-head">
           <div className="article-drawer-head-meta">
-            <span className="news-row-source">{item.source}</span>
+            <span className="news-row-source">
+              {sourceNames[item.source] ?? item.source}
+            </span>
             <span>{formatDateTime(item.publishedAt)}</span>
             {item.url && (
               <a href={item.url} target="_blank" rel="noreferrer noopener">
@@ -195,55 +214,67 @@ export function ArticleDrawer({
             </div>
           )}
 
-          {item.summary && !article && (
-            <div className="article-drawer-summary">{item.summary}</div>
-          )}
-
-          {/* 正文：优先 article.content，否则 articleExcerpt */}
-          {article ? (
-            <div className="article-drawer-content">{article.content}</div>
-          ) : item.articleExcerpt ? (
-            <>
-              <div className="article-drawer-content">{item.articleExcerpt}</div>
-              <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-                — 以上为正文摘录（约 500 字符）；点下方按钮拉取完整正文 —
+          {/* 正文区：article.content > articleExcerpt > summary，按可用度降级。 */}
+          {(() => {
+            const loading = warm.kind === "warming" || warm.kind === "fetching";
+            const body =
+              article?.content ?? item.articleExcerpt ?? item.summary ?? null;
+            if (body) {
+              return (
+                <article className="article-drawer-content">{body}</article>
+              );
+            }
+            if (loading) {
+              return (
+                <div className="article-drawer-skeleton" aria-label="正在加载正文">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              );
+            }
+            // 无正文且非加载中：快讯类无独立正文，引导看原文。
+            return (
+              <div className="article-drawer-empty">
+                <p>这条资讯没有独立正文（多为快讯 / 一句话消息）。</p>
+                {item.url && (
+                  <a
+                    className="btn"
+                    href={item.url}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                  >
+                    <ExternalLink size={13} style={{ marginRight: 4 }} />
+                    打开原文
+                  </a>
+                )}
               </div>
-            </>
-          ) : (
-            <div className="muted" style={{ fontSize: 13 }}>
-              (本地暂无正文 / 摘录)
-            </div>
-          )}
+            );
+          })()}
 
-          <div className="article-drawer-actions">
-            {!article && (
-              <button
-                type="button"
-                className="btn primary"
-                onClick={handleFetchArticle}
-                disabled={warm.kind === "warming" || warm.kind === "fetching"}
-              >
-                <RefreshCcw size={12} style={{ marginRight: 4 }} />
-                {warm.kind === "warming"
-                  ? "正在抽取正文…"
-                  : warm.kind === "fetching"
-                    ? "读取中…"
-                    : "查看完整正文"}
-              </button>
+          {/* 加载中提示条 */}
+          {(warm.kind === "warming" || warm.kind === "fetching") &&
+            (item.articleExcerpt || item.summary) && (
+              <div className="article-drawer-loading-hint">
+                <RefreshCcw size={11} className="spin" /> 正在抓取完整正文…
+              </div>
             )}
-            {warm.kind === "missing" && (
-              <span className="article-drawer-warning" style={{ margin: 0 }}>
-                ⚠ {warm.warnings.includes("article_missing")
-                  ? "远端抽取未返回正文（article_missing），稍后可重试"
-                  : `warning: ${warm.warnings.join(", ") || "未知"}`}
-              </span>
+
+          {/* 抓取失败 / 重试（次要操作，仅在有 URL 且失败时显示） */}
+          {(warm.kind === "missing" || warm.kind === "error") &&
+            !article &&
+            item.url && (
+              <div className="article-drawer-actions">
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={handleFetchArticle}
+                >
+                  <RefreshCcw size={12} style={{ marginRight: 4 }} />
+                  重试抓取正文
+                </button>
+              </div>
             )}
-            {warm.kind === "error" && (
-              <span className="article-drawer-warning" style={{ margin: 0 }}>
-                ✕ {warm.message}
-              </span>
-            )}
-          </div>
         </div>
       </aside>
     </div>
