@@ -1683,26 +1683,26 @@ body {
 .news-row {
   position: relative;
   display: grid;
-  grid-template-columns: 60px 1fr auto;
-  gap: 14px;
+  grid-template-columns: 56px 1fr auto;
+  gap: 12px;
   align-items: baseline;
-  padding: 9px 16px 9px 14px;
+  padding: 9px 16px 9px 12px;
   cursor: pointer;
   transition: background 80ms ease;
 }
 
-/* 时间轨道竖线：贯穿 time 列内的 dot 中心。 */
+/* 时间轨道竖线：贯穿最左侧 dot 中心（dot 在 time 列最左、padding 内）。 */
 .news-row::before {
   content: "";
   position: absolute;
-  left: 67px;
+  left: 14px;
   top: 0;
   bottom: 0;
   width: 1px;
   background: var(--border-soft);
 }
-.news-row:first-child::before { top: 10px; }
-.news-row:last-child::before { bottom: auto; height: 14px; }
+.news-row:first-child::before { top: 16px; }
+.news-row:last-child::before { bottom: auto; height: 18px; }
 
 .news-row.clickable {
   cursor: pointer;
@@ -1720,7 +1720,7 @@ body {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
@@ -1728,14 +1728,14 @@ body {
   white-space: nowrap;
 }
 
-/* 轨道圆点：统一小实心点（不再按来源彩色），来源色只留右侧 tag。 */
+/* 轨道圆点：time 列最左的统一小实心点，落在竖线上（不再按来源彩色），
+   来源色只留右侧 tag。 */
 .news-row-dot {
   flex: 0 0 auto;
   width: 5px;
   height: 5px;
   border-radius: 50%;
   background: var(--fg-faint);
-  margin-left: auto;
   position: relative;
   z-index: 1;
   transition: transform 80ms ease, background 80ms ease;

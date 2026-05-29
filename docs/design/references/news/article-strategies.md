@@ -26,7 +26,6 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 |---|---|---|---|---|
 | `cls-telegraph` | 财联社电报 | NextData | `www.cls.cn/detail/<id>` → `__NEXT_DATA__` | utf-8 |
 | `cls-depth` | 财联社深度 | NextData | 同上（共用 detail 页） | utf-8 |
-| `wallstreetcn-quick` | 华尔街见闻快讯 | JsonApi | `api-one.wallstcn.com/apiv1/content/lives/<id>` | utf-8(JSON) |
 | `wallstreetcn` | 华尔街见闻 | JsonApi | 按 url 判 lives/articles（见下） | utf-8(JSON) |
 | `36kr-quick` | 36氪快讯 | InitialState | `www.36kr.com/newsflashes/<id>` → `<meta name=description>` | utf-8 |
 | `gelonghui` | 格隆汇 | StaticHtml | `www.gelonghui.com/news/<id>` selector `article.main-news.article-with-html` | utf-8 |

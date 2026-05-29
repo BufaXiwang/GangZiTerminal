@@ -43,7 +43,6 @@ macro_rules! newsnow_source {
 const DEFAULT_SOURCES: &[(&str, &str, &str, Option<&str>, bool)] = &[
     // (source_id, provider, display_name, feed_url, enabled)
     newsnow_source!("cls-telegraph", "财联社电报"),
-    newsnow_source!("wallstreetcn-quick", "华尔街见闻快讯"),
     newsnow_source!("jin10", "金十数据"),
     newsnow_source!("zaobao", "联合早报"),
     newsnow_source!("36kr-quick", "36氪快讯"),

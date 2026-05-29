@@ -320,7 +320,7 @@ export default function NewsPage() {
         className="btn"
         onClick={handleRefresh}
         disabled={loading}
-        title="重新拉取"
+        title="重新从本地库读取最新资讯（后台每隔几分钟自动抓取，通常无需手动）"
       >
         <RefreshCcw size={14} />
       </button>
