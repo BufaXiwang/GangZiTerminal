@@ -7,6 +7,7 @@
 import { useCoreIndexes, CORE_INDEXES } from "../../lib/useCoreIndexes";
 import { useMarketBreadth } from "../../lib/useMarketBreadth";
 import { useIndustryHeatmap } from "../../lib/useIndustryHeatmap";
+import { useMarketSession } from "../../lib/tradingSession";
 import { IndexCard } from "./IndexCard";
 import { BreadthCard } from "./BreadthCard";
 import { HeatmapCard } from "./HeatmapCard";
@@ -26,12 +27,19 @@ export function MarketMetricsRow({
   const indexes = useCoreIndexes();
   const breadth = useMarketBreadth();
   const heatmap = useIndustryHeatmap({ topN: 5 });
+  const session = useMarketSession();
 
   return (
     <div className="market-metrics-row">
       {statusText && (
         <div className="market-metrics-status">
-          <span className="status-dot ok" aria-hidden />
+          <span
+            className={`market-session-chip ${session.active ? "live" : "idle"}`}
+            title="A 股交易时段"
+          >
+            <span className="status-dot" aria-hidden />
+            {session.label}
+          </span>
           {statusText}
         </div>
       )}

@@ -22,6 +22,7 @@ import {
   type MinuteKlinePeriod,
 } from "../bindings";
 import { perf } from "../lib/perfLog";
+import { isContinuousAuction } from "../lib/tradingSession";
 
 export type ChartPeriod =
   | "intraday"
@@ -70,20 +71,6 @@ function readCssVar(name: string, fallback: string): string {
     .getPropertyValue(name)
     .trim();
   return v || fallback;
-}
-
-/** 北京时间是否处于 A 股连续竞价时段（09:30-11:30 / 13:00-15:00，工作日）。
- *  仅用于盘中 K 线轮询的门控；忽略节假日（最坏情况节假日多轮询几次，后端返回同数据无害）。 */
-function isTradingSessionNow(): boolean {
-  // 用 Asia/Shanghai 偏移：本地若非北京时区，按 UTC+8 推算。
-  const now = new Date();
-  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
-  const bjMin = (utcMin + 8 * 60) % (24 * 60);
-  const bjDay = (now.getUTCDay() + (utcMin + 8 * 60 >= 24 * 60 ? 1 : 0)) % 7;
-  if (bjDay === 0 || bjDay === 6) return false; // 周末
-  const am = bjMin >= 9 * 60 + 30 && bjMin <= 11 * 60 + 30;
-  const pm = bjMin >= 13 * 60 && bjMin <= 15 * 60;
-  return am || pm;
 }
 
 async function fetchKlineData(
@@ -438,7 +425,7 @@ export function KlineCanvas({
     let cancelled = false;
     const POLL_MS = 15_000;
     const tick = async () => {
-      if (cancelled || !chartRef.current || !isTradingSessionNow()) return;
+      if (cancelled || !chartRef.current || !isContinuousAuction()) return;
       try {
         // 强制后端重拉最新（绕过 ensuredKeys —— 那只防首次重复触发）
         const ensureRes = await commands.ensureChartData(tsCode, period);

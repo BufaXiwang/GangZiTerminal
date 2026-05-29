@@ -532,10 +532,46 @@ body {
   grid-column: 1 / -1;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 12px;
   color: var(--fg-muted);
   margin-bottom: -4px;
+}
+
+/* 交易时段 chip：active(交易中/集合竞价) 绿点脉动，idle(休市/午休/盘前) 灰点 */
+.market-session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border-default);
+}
+.market-session-chip .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.market-session-chip.live {
+  color: var(--chart-down);
+  background: color-mix(in srgb, var(--chart-down) 8%, transparent);
+  border-color: color-mix(in srgb, var(--chart-down) 25%, transparent);
+}
+.market-session-chip.live .status-dot {
+  background: var(--chart-down);
+  animation: session-pulse 1.6s ease-in-out infinite;
+}
+.market-session-chip.idle {
+  color: var(--fg-muted);
+  background: var(--bg-soft);
+}
+.market-session-chip.idle .status-dot {
+  background: var(--fg-faint);
+}
+@keyframes session-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 /* category filter chips */
