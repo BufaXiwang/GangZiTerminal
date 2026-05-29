@@ -991,7 +991,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | Cold-start seed | 进程启动时把 `BUILTIN_INSTRUMENTS` upsert 入 `quote_instruments`，保证 UI 第一帧非空 |
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；`TushareHealthState.isAvailable = true` 时 enrich |
 | TuShare 健康探针 | 进程启动时首次 ping；`isAvailable = false` 时每 1 小时重试 |
-| 实时行情 | 连续竞价时段：关注标的 + 核心指数 15s，全市场 universe 60s；读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
+| 实时行情 | 连续竞价时段三档：**热点档 ~3s**（核心指数 ∪ 前端热点集 = 自选 + 可见列表 top-N，TDX batch，总量 ≤ ~120）；核心指数兜底 15s；**全市场 universe 60s**（TDX batch）。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
+| 热点集（hot set） | 前端通过 `set_quote_hotset(tsCodes)` 声明高频刷新标的（自选 + 可见列表 top-N + 关注）；**全覆盖语义**（每次替换，单一推送方发完整集，自动淘汰）；服务端去重 + cap 120；热点档 tick 刷 `core_indexes ∪ hot_set`，走 TDX batch；emit `market-quotes-refresh-progress`(scope=subscribed) 驱动前端各视图刷新 |
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
 | xdxr 事件 | 启动后预热关注标的；盘后随 K 线刷新一同补拉，按 `tsCode` 幂等 |

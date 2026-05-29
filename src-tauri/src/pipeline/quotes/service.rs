@@ -59,6 +59,9 @@ pub struct QuotesService {
     pub(crate) config: QuotesConfig,
     pub(crate) event_sink: std::sync::RwLock<Option<RefreshEventSink>>,
     pub(crate) progress_sink: std::sync::RwLock<Option<RefreshProgressSink>>,
+    /// 热点集（spec §5 热点档）：前端声明的高频刷新标的（自选 + 可见列表 top-N 等）。
+    /// scheduler 的 3s tick 刷 core_indexes ∪ hot_set。cap 见 set_quote_hotset。
+    pub(crate) hot_set: std::sync::RwLock<Vec<TsCode>>,
 }
 
 pub type RefreshEventSink = Arc<dyn Fn(MarketQuotesRefreshedPayload) + Send + Sync + 'static>;
@@ -94,7 +97,25 @@ impl QuotesService {
             config,
             event_sink: std::sync::RwLock::new(None),
             progress_sink: std::sync::RwLock::new(None),
+            hot_set: std::sync::RwLock::new(Vec::new()),
         })
+    }
+
+    /// 前端声明热点集（spec §5 热点档）：自选 + 可见列表 top-N 等。去重、cap 120。
+    pub fn set_quote_hotset(&self, codes: Vec<TsCode>) {
+        let mut seen = HashSet::new();
+        let mut out = Vec::with_capacity(codes.len().min(120));
+        for c in codes {
+            if out.len() >= 120 {
+                break;
+            }
+            if seen.insert(c.clone()) {
+                out.push(c);
+            }
+        }
+        if let Ok(mut g) = self.hot_set.write() {
+            *g = out;
+        }
     }
 
     /// 暴露 health check 给 lib / scheduler 调用。
@@ -1488,6 +1509,96 @@ impl QuotesService {
             }
         }
         display_fallback
+    }
+
+    /// 热点档高频刷新（spec §5 热点档 ~3s）：刷 `core_indexes ∪ hot_set`。
+    /// 走 TDX **batch**（fetch_quotes，N≤~120 = 2 批，~数百 ms），失败的小集合
+    /// 逐只 HTTP fallback；写 cache（intraday，不写 close_snapshot），emit progress
+    /// (scope=subscribed) 让前端各视图刷新。盘外直接返回。
+    pub async fn refresh_hot_quotes(&self) {
+        let ctx = self.market_time_now();
+        if !ctx.is_trading_time {
+            return;
+        }
+        let now = ctx.now;
+        let trade_date = eligible_trade_date(&ctx).trade_date;
+
+        // core_indexes ∪ hot_set
+        let mut codes: Vec<TsCode> = core_indexes();
+        let mut seen: HashSet<TsCode> = codes.iter().cloned().collect();
+        if let Ok(hs) = self.hot_set.read() {
+            for c in hs.iter() {
+                if seen.insert(c.clone()) {
+                    codes.push(c.clone());
+                }
+            }
+        }
+        let (codes, cats) = self.resolve_categories(codes);
+        if codes.is_empty() {
+            return;
+        }
+
+        let mut tdx_input: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+        let mut bj: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+        for ts in &codes {
+            let (cat, name) = cats.get(ts).cloned().unwrap_or((InstrumentCategory::Stock, None));
+            if matches!(ts.market(), crate::domain::shared::Market::BJ) {
+                bj.push((ts.clone(), cat, name));
+            } else {
+                tdx_input.push((ts.clone(), cat, name));
+            }
+        }
+
+        let mut affected: Vec<TsCode> = Vec::new();
+        let put = |this: &Self, q: StockQuote| {
+            let captured_at = q.captured_at;
+            let source = q.source.as_str().to_string();
+            this.cache.put(CachedSnapshot {
+                quote: q,
+                captured_at,
+                trade_date,
+                source,
+            });
+        };
+
+        // TDX batch（display_complete 即采纳）；失败 → HTTP fallback。
+        let results = self.tdx.fetch_quotes(tdx_input.clone(), trade_date, now).await;
+        for ((ts, cat, name), res) in tdx_input.into_iter().zip(results.into_iter()) {
+            match res {
+                Ok(q) if q.is_display_complete() => {
+                    put(self, q);
+                    affected.push(ts);
+                }
+                _ => {
+                    let _ = name;
+                    if let Some(q) = self.fallback_http_quote(&ts, cat, trade_date, now).await {
+                        put(self, q);
+                        affected.push(ts);
+                    }
+                }
+            }
+        }
+        // BJ 不支持 TDX batch → 直接 HTTP fallback。
+        for (ts, cat, _name) in bj {
+            if let Some(q) = self.fallback_http_quote(&ts, cat, trade_date, now).await {
+                put(self, q);
+                affected.push(ts);
+            }
+        }
+
+        if !affected.is_empty() {
+            let n = affected.len() as u32;
+            self.emit_progress(MarketQuotesRefreshProgressPayload {
+                scope: RefreshScopeKind::Subscribed,
+                purpose: RefreshPurpose::Intraday,
+                trade_date: Some(trade_date),
+                completed: n,
+                success: n,
+                total: n,
+                affected_ts_codes: affected,
+                captured_at: now,
+            });
+        }
     }
 
     /// Refresh 单只标的：尝试 TDX → EM → Tencent → Sina；按 spec §5 line 742 选取。

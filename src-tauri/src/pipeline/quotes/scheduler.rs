@@ -26,6 +26,8 @@ use tracing::warn;
 
 pub const QUOTES_REFRESH_INTERVAL_SECS: u64 = 60;
 pub const QUOTES_SUBSCRIBED_INTERVAL_SECS: u64 = 15;
+/// 热点档刷新间隔（spec §5 热点档）：核心指数 ∪ 前端热点集（自选/可见列表），3s。
+pub const QUOTES_HOT_INTERVAL_SECS: u64 = 3;
 
 pub struct QuotesSchedulerHandle {
     _joins: Vec<JoinHandle<()>>,
@@ -43,6 +45,7 @@ pub fn spawn_quotes_scheduler(
             universe_interval: interval,
             subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
             daily_tick_interval: Duration::from_secs(60),
+            hot_interval: Duration::from_secs(QUOTES_HOT_INTERVAL_SECS),
         },
     )
 }
@@ -52,6 +55,7 @@ pub struct QuotesSchedulerIntervals {
     pub universe_interval: Duration,
     pub subscribed_interval: Duration,
     pub daily_tick_interval: Duration,
+    pub hot_interval: Duration,
 }
 
 impl Default for QuotesSchedulerIntervals {
@@ -60,6 +64,7 @@ impl Default for QuotesSchedulerIntervals {
             universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
             subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
             daily_tick_interval: Duration::from_secs(60),
+            hot_interval: Duration::from_secs(QUOTES_HOT_INTERVAL_SECS),
         }
     }
 }
@@ -108,6 +113,28 @@ pub fn spawn_full_scheduler(
                         if let Err(e) = svc.refresh_market_quotes(req).await {
                             warn!(target: "quotes.scheduler.subscribed", error = ?e, "subscribed quote tick failed");
                         }
+                    }
+                }
+            }
+        });
+        joins.push(h);
+        stops.push(stop_tx);
+    }
+
+    // ----- 热点档 3s tick（spec §5 热点档）：核心指数 ∪ 前端热点集（自选/可见列表）
+    {
+        let svc = Arc::clone(&service);
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let interval = intervals.hot_interval;
+        let h = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop_rx.recv() => break,
+                    _ = ticker.tick() => {
+                        // 内部已 gate is_trading_time + 走 TDX batch（≤120），盘外直接返回。
+                        svc.refresh_hot_quotes().await;
                     }
                 }
             }
@@ -307,6 +334,7 @@ mod tests {
                 universe_interval: Duration::from_secs(3600),
                 subscribed_interval: Duration::from_secs(3600),
                 daily_tick_interval: Duration::from_secs(3600),
+                hot_interval: Duration::from_secs(3600),
             },
         );
         drop(handle);

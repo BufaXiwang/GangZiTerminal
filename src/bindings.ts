@@ -161,6 +161,18 @@ async fetchKlinePage(tsCode: string, period: string, startOffset: number) : Prom
 }
 },
 /**
+ * 声明热点集（spec §5 热点档）：前端把自选 + 可见列表 top-N + 关注标的传入，
+ * scheduler 的 3s tick 会高频刷这批（≤120）。非法 ts_code 跳过。
+ */
+async setQuoteHotset(tsCodes: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_quote_hotset", { tsCodes }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Frontend log forwarder：前端调 commands.forwardLog(msg) → 后端 tracing
  * → tauri dev stdout，可以从开发者那里直接读 log 文件分析性能问题。
  * 仅供 dev / 调试用，生产 build 可去掉。

@@ -197,6 +197,31 @@ export default function MarketPage() {
     };
   }, [category, query, refreshTick]);
 
+  // 声明热点集（spec §5 热点档）：核心指数 + 自选 + 成交额 top-80（可见列表头）。
+  // 后端 3s tick 高频刷这批（≤120）。debounce 800ms；items 每次 progress 重拉会变，
+  // 故约每 2.5s 推一次（命令很轻，只覆盖一个 Vec）。MarketPage keep-alive 常驻，
+  // 切到别的 tab 也持续维护热点集，自选/指数始终高频。
+  useEffect(() => {
+    const top = [...items]
+      .filter((it) => it.quote?.amount != null)
+      .sort(
+        (a, b) => (Number(b.quote?.amount) || 0) - (Number(a.quote?.amount) || 0),
+      )
+      .slice(0, 80)
+      .map((it) => it.tsCode);
+    const codes = Array.from(
+      new Set([
+        ...CORE_INDEXES.map((c) => c.tsCode),
+        ...Array.from(starred),
+        ...top,
+      ]),
+    ).slice(0, 120);
+    const t = window.setTimeout(() => {
+      void commands.setQuoteHotset(codes);
+    }, 800);
+    return () => window.clearTimeout(t);
+  }, [items, starred]);
+
   // 选中核心指数时加载并**持续刷新**其 quote（externalItem 形式）。
   // 依赖 [selected, refreshTick]：refreshTick 在 universe progress 事件时 +1
   //（2.5s 节流），让指数详情头报价与顶部指数卡同源、同节奏刷新，避免详情头

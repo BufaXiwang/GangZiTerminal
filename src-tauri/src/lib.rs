@@ -66,6 +66,7 @@ pub fn run() {
         adapters::quotes::cmd::ensure_chart_data,
         adapters::quotes::cmd::extend_chart_history,
         adapters::quotes::cmd::fetch_kline_page,
+        adapters::quotes::cmd::set_quote_hotset,
         adapters::quotes::cmd::forward_log,
         adapters::agent::cmd::agent_list_skills,
         adapters::account::cmd::fetch_account,
@@ -376,6 +377,9 @@ pub fn run() {
                                 QUOTES_SUBSCRIBED_INTERVAL_SECS,
                             ),
                             daily_tick_interval: Duration::from_secs(60),
+                            hot_interval: Duration::from_secs(
+                                crate::pipeline::quotes::scheduler::QUOTES_HOT_INTERVAL_SECS,
+                            ),
                         },
                     )
                 });
