@@ -14,7 +14,7 @@
 //   - 滚动到底 → fetchNews({ offset: prev + limit }) 拼接
 //   - 正文在刷新时按 source 策略同步抓取（无侧边 drawer）；行内点击展开/收起
 
-import { RefreshCcw, Search, X } from "lucide-react";
+import { Search, X } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -29,7 +29,7 @@ import {
   type FetchNewsPage,
   type NewsSource,
 } from "../bindings";
-import { NewsDateNav } from "./news/NewsDateNav";
+import { NewsDateNav, formatDateKey } from "./news/NewsDateNav";
 import { NewsTimeline } from "./news/NewsTimeline";
 
 const PAGE_SIZE = 50;
@@ -51,6 +51,9 @@ export default function NewsPage() {
   // === list state ===
   const [items, setItems] = useState<FetchNewsItem[]>([]);
   const [page, setPage] = useState<FetchNewsPage | null>(null);
+  // 跳日期时在 async 循环里读最新 page，避免闭包拿到旧值。
+  const pageRef = useRef<FetchNewsPage | null>(null);
+  pageRef.current = page;
   // 每日真实总数（后端 GROUP BY，不受分页限制）—— 给日期导航显示真实条数。
   const [dateCounts, setDateCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
@@ -171,13 +174,51 @@ export default function NewsPage() {
     });
   }, []);
 
-  const handleSelectDate = useCallback((dateKey: string) => {
+  const scrollToDate = useCallback((dateKey: string) => {
     const el = sectionRefs.current.get(dateKey);
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "start" });
       setActiveDate(dateKey);
+      return true;
     }
+    return false;
   }, []);
+
+  // 点日期导航跳转：若该日 section 已加载直接滚动；否则持续 load more
+  // 直到该日出现（或加载到比它更早的日期 / 到底），再滚动过去。
+  const handleSelectDate = useCallback(
+    async (dateKey: string) => {
+      if (scrollToDate(dateKey)) return;
+      setLoadingMore(true);
+      let cur = pageRef.current;
+      let guard = 0;
+      while (cur?.hasMore && guard < 60) {
+        guard++;
+        const res = await fetchPage(cur.offset + cur.limit);
+        if (res.status !== "ok") break;
+        const batch = res.data.items;
+        setItems((prev) => {
+          const seen = new Set(prev.map((x) => x.id));
+          return [...prev, ...batch.filter((x) => !seen.has(x.id))];
+        });
+        cur = res.data.page;
+        setPage(cur);
+        pageRef.current = cur;
+        const hit = batch.some(
+          (it) => it.publishedAt && formatDateKey(new Date(it.publishedAt)) === dateKey,
+        );
+        const oldest = batch[batch.length - 1];
+        const passed =
+          !!oldest?.publishedAt &&
+          formatDateKey(new Date(oldest.publishedAt)) < dateKey;
+        if (hit || passed) break;
+      }
+      setLoadingMore(false);
+      // 等新 section 渲染出来再滚动
+      window.setTimeout(() => scrollToDate(dateKey), 80);
+    },
+    [fetchPage, scrollToDate],
+  );
 
   const handleRegisterSectionRef = useCallback(
     (dateKey: string, el: HTMLElement | null) => {
@@ -313,17 +354,6 @@ export default function NewsPage() {
         )}
       </div>
 
-      <div className="control-spacer" />
-
-      <button
-        type="button"
-        className="btn"
-        onClick={handleRefresh}
-        disabled={loading}
-        title="重新从本地库读取最新资讯（后台每隔几分钟自动抓取，通常无需手动）"
-      >
-        <RefreshCcw size={14} />
-      </button>
     </>
   );
 
