@@ -917,7 +917,7 @@ send_agent_message
   -> select AgentRunProfile(user_chat)
   -> build RealtimeDecisionPacket as needed
   -> register allowed tools
-  -> Agent Infra run_agent_loop
+  -> Agent Infra run_agent_turn
   -> persist assistant message / tool calls / optional episode / trade intent
 ```
 
@@ -939,7 +939,7 @@ Agent Runtime tick
   -> Agent Runtime buffers pending changed newsIds
   -> trigger when pending count >= M or oldest pending age >= N
   -> create AgentRun(trigger=news_batch, profile=news_analysis)
-  -> Agent Infra run_agent_loop
+  -> Agent Infra run_agent_turn
 ```
 
 ```ts
@@ -978,7 +978,7 @@ Account emits account-triggered
   -> Agent Runtime reads trigger_id
   -> Agent Runtime dedupe(trigger_id)
   -> create AgentRun(trigger=account_trigger, profile=account_trigger_response)
-  -> Agent Infra run_agent_loop
+  -> Agent Infra run_agent_turn
   -> mark Account trigger handled only after terminal runtime outcome
 ```
 
@@ -1057,7 +1057,7 @@ Quotes emits market-quotes-refreshed
 ```text
 Agent Runtime scheduled tick
   -> create AgentRun(trigger=scheduled_review, profile=scheduled_review)
-  -> Agent Infra run_agent_loop
+  -> Agent Infra run_agent_turn
 ```
 
 规则：
@@ -1358,7 +1358,7 @@ recover_news_buffer(now) -> RecoverySummary;
 
 规则：
 
-- Runtime API 可以调用 Infra `run_agent_loop`，但 Infra 不反向调用 Runtime。
+- Runtime API 可以调用 Infra `run_agent_turn`，但 Infra 不反向调用 Runtime。
 - `build_realtime_decision_packet` 只读 Quotes / News / Account facade，不读取内部表。
 - `register_tools_for_profile` 必须按 profile 裁剪工具，不得默认全量暴露。
 - `record_decision_episode` / `record_decision_review` 持久化的是已 hydrate 的 `EvidenceRef[]`；Agent 工具 handler 必须先调用 `hydrate_evidence_selectors`。

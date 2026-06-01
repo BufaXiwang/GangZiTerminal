@@ -4,7 +4,7 @@
 //!       §3 (Agent Loop) / §4 (上下文管理 / Summarize / compaction) / §5 (Infra Loop API).
 //!
 //! These tests are NOT deterministic script assertions. Each one drives a *real* agent-infra
-//! capability live (run_agent_loop / run_agent_turn over a real HttpProvider), then asks a
+//! capability live (run_agent_turn over a real HttpProvider), then asks a
 //! separate JUDGE LLM to evaluate the produced output against a rubric, returning a structured
 //! `{pass, score, reason}` verdict. The judge semantically validates the agent's core behaviors:
 //! answer relevance, tool/skill faithfulness, multi-turn memory, summary faithfulness, and
@@ -40,7 +40,7 @@ use crate::domain::agent::{
 };
 use crate::infrastructure::agent::http_provider::HttpProvider;
 use crate::infrastructure::agent::loop_executor::{
-    run_agent_loop, run_agent_loop_with_deps, run_agent_turn, ProviderStream, RunAgentDeps,
+    run_agent_turn, ProviderStream, RunAgentDeps,
 };
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
 use crate::infrastructure::agent::skill_registry::{
@@ -320,7 +320,7 @@ fn assert_verdict(test: &str, label: &str, v: &Verdict) {
 }
 
 // ---------------------------------------------------------------------------
-// Run-loop helper: drive run_agent_loop and collect the streamed answer + skills
+// Run-loop helper: drive run_agent_turn and collect the streamed answer + skills
 // ---------------------------------------------------------------------------
 
 struct LoopRun {
@@ -360,7 +360,7 @@ async fn run_loop_collect(
         }
         (text, skills)
     });
-    let summary = run_agent_loop(request, registry, ContextBundle::new("judge-run"), provider, tx)
+    let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), provider, tx, RunAgentDeps::default())
         .await
         .expect("loop run");
     let (answer, skills) = pump.await.unwrap();
@@ -391,7 +391,7 @@ fn fresh_repo() -> AgentMessagesRepo {
 
 // ===========================================================================
 // 1. answer_relevance — for each wire format present, ask a concrete A股 question,
-//    run run_agent_loop, judge on-topic / plausible / Chinese / addresses the question.
+//    run run_agent_turn, judge on-topic / plausible / Chinese / addresses the question.
 // ===========================================================================
 #[tokio::test]
 #[ignore]
@@ -678,7 +678,7 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     // 用带持久化的入口，Summarize 产出的 kind=Summary 检查点才会落到 repo（供下方读回判定）。
-    let _ = run_agent_loop_with_deps(
+    let _ = run_agent_turn(
         req,
         registry,
         ContextBundle::new("sum-run2"),
@@ -807,7 +807,7 @@ async fn judge_memory_through_compaction() {
         }
         (text, saw_summarize)
     });
-    let _ = run_agent_loop(req, registry, ContextBundle::new("cmp-2"), provider, tx)
+    let _ = run_agent_turn(req, registry, ContextBundle::new("cmp-2"), provider, tx, RunAgentDeps::default())
         .await
         .expect("compaction run");
     let (answer, saw_summarize) = pump.await.unwrap();
@@ -1078,7 +1078,7 @@ async fn judge_rolling_summary_folds_prior() {
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let _ = run_agent_loop_with_deps(
+    let _ = run_agent_turn(
         req,
         registry,
         ContextBundle::new("roll"),

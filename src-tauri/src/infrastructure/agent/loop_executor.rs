@@ -147,41 +147,26 @@ pub enum LoopError {
     EventChannelClosed,
 }
 
-/// 执行一次 Agent loop（spec §5 便捷入口，无持久化）。
+/// 唯一 Agent loop 入口：推进一个会话 turn（一次 user→assistant，内部可多次 provider / skill 往返）。
 ///
-/// Spec §5：`run_agent_loop(request, registry, context, provider, event_tx) -> RunSummary`。
-/// 无 DB / conversation 续接需求时使用；持久化版本走 `run_agent_loop_with_deps`。
-pub async fn run_agent_loop(
-    request: AgentRunRequest,
-    registry: Arc<SkillRegistry>,
-    context: ContextBundle,
-    provider: Box<dyn ProviderStream>,
-    event_tx: Sender<AgentEvent>,
-) -> Result<RunSummary, LoopError> {
-    run_agent_loop_with_deps(
-        request,
-        registry,
-        context,
-        provider,
-        event_tx,
-        RunAgentDeps::default(),
-    )
-    .await
-}
-
-/// 带会话续接 + 持久化的便捷入口（spec §4 / §5 `run_agent_turn`）。
+/// 行为完全由 `deps` + `request.seed_messages` 决定，不再有「持久化 / 无状态」「续接 / 一次性」
+/// 的分裂入口：
+/// - `deps.repo = None` → 不持久化、不读会话视图（无状态一次性运行；测试 / 不关心落库时用）。
+/// - `seed_messages` 为空 且 有 `conversation_id` 且 `deps.repo` 存在 → 先 `load_conversation_view`
+///   （最近 summary 检查点 + 其后最近若干轮）当 seed，实现跨 run 续接。
+/// - `seed_messages` 非空 → 直接用调用方给的 seed（忽略自动加载）。
+/// 主动压缩（每轮）+ Summarize 模型调用 + 多轮会话持久化都在此函数内完成。
 ///
-/// 行为：若 `request.conversation_id` 有值且 `seed_messages` 为空 → 通过 `deps.repo`
-/// `load_conversation_view`（最近 summary 检查点 + 其后最近若干轮）作为 seed；再跑
-/// `run_agent_loop_with_deps`（loop 内部按 conversation_id + next_seq 落库）。
+/// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
 pub async fn run_agent_turn(
     mut request: AgentRunRequest,
     registry: Arc<SkillRegistry>,
-    context: ContextBundle,
-    provider: Box<dyn ProviderStream>,
+    mut context: ContextBundle,
+    mut provider: Box<dyn ProviderStream>,
     event_tx: Sender<AgentEvent>,
     deps: RunAgentDeps,
 ) -> Result<RunSummary, LoopError> {
+    // 续接：调用方没给 seed 但指定了会话且提供了 repo → 自动 load 压缩视图当 seed。
     if request.seed_messages.is_empty() {
         if let (Some(conv), Some(repo)) = (request.conversation_id.clone(), deps.repo.as_ref()) {
             let view = repo
@@ -190,20 +175,6 @@ pub async fn run_agent_turn(
             request.seed_messages = view;
         }
     }
-    run_agent_loop_with_deps(request, registry, context, provider, event_tx, deps).await
-}
-
-/// 全功能 Agent loop：主动压缩（每轮）+ Summarize 模型调用 + 多轮会话持久化。
-///
-/// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
-pub async fn run_agent_loop_with_deps(
-    request: AgentRunRequest,
-    registry: Arc<SkillRegistry>,
-    mut context: ContextBundle,
-    mut provider: Box<dyn ProviderStream>,
-    event_tx: Sender<AgentEvent>,
-    deps: RunAgentDeps,
-) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
     let plan = CompactionPlan::derive(request.compaction.as_ref(), &request.channel);
     let conversation_id = request.conversation_id.clone();
@@ -1057,7 +1028,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.turns, 1);
@@ -1091,7 +1062,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1150,7 +1121,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.skill_call_ids.len(), 2);
@@ -1175,7 +1146,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1202,7 +1173,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::ContextLimit);
@@ -1252,7 +1223,7 @@ mod tests {
             captured: Arc::clone(&captured),
         });
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
-        let _ = run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
             .await
             .unwrap();
         let parts = captured.lock().unwrap().clone();
@@ -1275,7 +1246,7 @@ mod tests {
             index: 0,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
-        let _ = run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
             .await
             .unwrap();
         // First event should be RunStart with the channel's model.
@@ -1304,7 +1275,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_loop(req(), registry, ContextBundle::new("r1"), provider, tx)
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1458,7 +1429,7 @@ mod tests {
             droppable: true,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let _ = run_agent_loop(request, registry, ctx, provider, tx)
+        let _ = run_agent_turn(request, registry, ctx, provider, tx, RunAgentDeps::default())
             .await
             .unwrap();
         let mut saw_micro = false;
@@ -1500,7 +1471,7 @@ mod tests {
         }
         request.seed_messages = seed;
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let _ = run_agent_loop(request, registry, ContextBundle::new("r1"), provider, tx)
+        let _ = run_agent_turn(request, registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
             .await
             .unwrap();
         let mut saw_drop = false;
@@ -1558,7 +1529,7 @@ mod tests {
         assert_eq!(msgs[1].message_id, "a2", "recent message kept");
     }
 
-    /// 端到端实网 chat：跑完整 `run_agent_loop`（loop + HttpProvider + 真 SSE）对三个真实
+    /// 端到端实网 chat：跑完整 `run_agent_turn`（loop + HttpProvider + 真 SSE）对三个真实
     /// relay，用真实问题，打印流式答案。`#[ignore]`，凭证全走 env（无硬编码 secret）。
     ///   TEST_OAI_BASE/KEY/MODEL（responses）, TEST_ANT_BASE/KEY/MODEL（messages）,
     ///   TEST_DS_BASE/KEY/MODEL（chat_completions） → cargo test loop_chat_live -- --ignored --nocapture
@@ -1609,7 +1580,7 @@ mod tests {
                 text
             });
             let summary =
-                run_agent_loop(request, registry, ContextBundle::new("live"), provider, tx)
+                run_agent_turn(request, registry, ContextBundle::new("live"), provider, tx, RunAgentDeps::default())
                     .await
                     .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
             let streamed = pump.await.unwrap();
@@ -1708,7 +1679,7 @@ mod tests {
                 (text, skills)
             });
             let summary =
-                run_agent_loop(request, registry, ContextBundle::new("skill"), provider, tx)
+                run_agent_turn(request, registry, ContextBundle::new("skill"), provider, tx, RunAgentDeps::default())
                     .await
                     .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
             let (text, skills) = pump.await.unwrap();
@@ -1827,7 +1798,7 @@ mod tests {
         req1.compaction = None;
         let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
         let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
-        let s1 = run_agent_loop_with_deps(
+        let s1 = run_agent_turn(
             req1,
             registry.clone(),
             ContextBundle::new("run-1"),
@@ -1882,7 +1853,7 @@ mod tests {
             }
             tiers
         });
-        let s2 = run_agent_loop_with_deps(
+        let s2 = run_agent_turn(
             req2,
             registry,
             ContextBundle::new("run-2"),
