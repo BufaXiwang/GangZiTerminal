@@ -6,7 +6,7 @@
 
 ## 一句话定位
 
-**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，Eastmoney / 腾讯 / 新浪 作为 TDX fallback；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（长历史 K 线、`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
+**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，**腾讯**作为 TDX 实时行情 fallback（兼 BJ 实时主路径），**Eastmoney** 作 BJ universe 枚举 + K 线 / 分时 / 日线兜底（不参与实时报价）；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（长历史 K 线、`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
 
 远端 provider 是 Quotes 内部实现细节，不暴露给对外读取 API。
 
@@ -144,7 +144,7 @@ freshness 定义：
 - `MarketTimeContext.isTradingTime = false` 时，读取优先使用 `tradeDate = latestCompletedTradeDate` 的 quote；只要 trade date 匹配最新已完成交易日，就视为收盘事实，不因 `capturedAt > 1h` 过期。
 - 非交易时段如果缺少最新已完成交易日的 close snapshot，则 quote 为空并返回 `snapshot_expired` 或 `quote_missing`；不能退回更早交易日的旧 quote。
 - 启动冷加载或 cache hydrate 未完成时，读取接口按无可用 snapshot 处理：quote 为空，并在 response 或 item warning 返回 `snapshot_expired` / `quote_missing`。
-- stale threshold 和硬过期阈值不因 TDX / Eastmoney / 腾讯 / 新浪 source 改变；如配置 source-specific threshold，响应必须保留 source 以便审计。
+- stale threshold 和硬过期阈值不因 TDX / 腾讯 source 改变；如配置 source-specific threshold，响应必须保留 source 以便审计。
 
 行情 DTO：
 
@@ -154,6 +154,8 @@ type QuoteDepthLevel = {
   volume?: Volume;
 };
 
+// 实时报价当前只会产出 "tdx" / "tencent"（/ 未来 "mixed"）。"eastmoney" / "sina" 变体
+// 保留仅为向后兼容旧 quote_close_snapshot 行的反序列化；新数据不再产出这两个 source。
 type QuoteSource = "tdx" | "eastmoney" | "tencent" | "sina" | "mixed";
 
 type StockQuote = {
@@ -196,7 +198,7 @@ type StockQuote = {
 - `QuoteDepthLevel.volume` 使用 shared `Volume` 规范化单位；价格或数量缺失的档位不得伪造为 0。
 - 缺盘口、盘口为空、买一 / 卖一价格缺失时必须返回 `depth_missing` warning。
 - 少于 5 档但买一 / 卖一可用时仍返回已有档位，并返回 `data_partial` warning；Quotes 不在本模块判断某笔订单需要消耗几档盘口。
-- TDX 是五档盘口主路径；Eastmoney / Tencent 可补充可用盘口；Sina 不保证盘口，通常只可作为基础展示 fallback。
+- TDX 是五档盘口主路径；腾讯可补充可用盘口（实测含五档）。EM 不参与实时报价路径，不提供报价盘口。
 - `limitUp` / `limitDown` 优先由 Quotes 基于 `previousClose`、`MarketInstrument.board`、`MarketInstrument.isSt`、上市日期 / 公司事件和 A 股涨跌幅规则计算；provider 返回值只能作为校验或补充。
 - 计算涨跌停价必须使用纯规则：确定适用涨跌幅、处理新股 / 无涨跌幅限制场景、按最小价格 tick 舍入；缺少必要输入时可为空，并必须返回 `quote_price_missing` warning。
 - Account 不得自行推导涨跌停价；`limitUp` / `limitDown` 缺失时不得执行涨跌停相关判断。
@@ -516,7 +518,7 @@ type TushareHealthState = {
 
 - 所有 TuShare 路径（universe enrich、长历史 K 线、`daily_basic`、公司事件、交易日历校准）调用前必须 check `isAvailable`；为 `false` 时跳过 TuShare 调用，走本地 / TDX 路径并在对应 series / item 返回适用 warning。
 - 健康状态变更（`true ↔ false`）应该向外 emit 事件，便于运维 / UI 提示（事件名 / payload 由 [agent-runtime-module.md](agent-runtime-module.md) 协调）；本 spec 不强制 event 名称。
-- 健康检查失败不得影响 TDX / Eastmoney / 腾讯 / 新浪 任何路径的可用性。
+- 健康检查失败不得影响 TDX / 腾讯 / Eastmoney（universe + K线/分时）任何路径的可用性。
 
 ---
 
@@ -871,10 +873,9 @@ core_indexes() -> Vec<TsCode>;
 Provider reference：
 
 - [TDX](references/quotes/tdx.md)
-- [Eastmoney](references/quotes/eastmoney.md)
+- [Eastmoney](references/quotes/eastmoney.md) — 仅 BJ universe + K 线 / 分时 / 日线兜底，不参与实时报价
 - [TuShare](references/quotes/tushare.md)
-- [Tencent](references/quotes/tencent.md)
-- [Sina](references/quotes/sina.md)
+- [Tencent](references/quotes/tencent.md) — 实时行情唯一 HTTP fallback + BJ 实时主路径
 
 规则：
 
@@ -882,7 +883,7 @@ Provider reference：
 - 具体连接方式、字段映射、单位转换、timeout、retry 写在 provider reference。
 - 所有 provider 输出必须 normalize 到 `MarketInstrument`、`StockQuote`、K 线 / 分钟 K / 分时读模型行、`DailyBasic` 或 `CompanyEvent`，对外由对应 series DTO 暴露。
 - Provider 失败默认是 item / batch 级 partial failure，不改变对外读取契约。
-- 当前 provider 集合保留 TDX / Eastmoney / 腾讯 / 新浪 / TuShare；后续可以继续扩展 provider，但新增 provider 必须先补 reference 文档，并 normalize 到本 spec 的 canonical model。
+- 当前 provider 集合：TDX / 腾讯 / Eastmoney / TuShare（**Sina 已于 2026-06-01 移除**）。后续可以继续扩展 provider，但新增 provider 必须先补 reference 文档，并 normalize 到本 spec 的 canonical model。
 
 全市场列表：
 
@@ -899,20 +900,21 @@ Provider reference：
 实时行情：
 
 ```text
-TDX > Eastmoney > 腾讯 > 新浪
+TDX > 腾讯
 ```
 
 - TDX 是 SH / SZ 实时报价主路径。
-- Eastmoney 是 BJ 主路径，也是 TDX 失败或缺字段时的第一 fallback。
-- Tencent / Sina 只作为基础展示 fallback，不能覆盖更新鲜且字段更完整的 snapshot。
+- **腾讯是唯一的 HTTP 实时行情 fallback**（TDX 失败 / 缺字段时），也是 **BJ 实时报价主路径**（BJ 不走 TDX，直接腾讯）。腾讯实测覆盖股票 / 指数 / 场内基金 / BJ，含五档盘口 + 换手率 + 成交额，价格为真值（无缩放问题）。
+- **Eastmoney 不参与实时报价**：EM 的 push2 `stock/get` 价格按 `10^f59` 缩放（实现曾硬编码 `/100`，对 3 位小数 ETF 产生 10× 错价），且其五档字段映射 / BJ secid 前缀无法在受限环境实测确认。为「避免数据源错误」，EM 退出实时报价路径，仅保留它不可替代 / 低风险的角色：**BJ universe 枚举** + **K 线 / 分时 / 日线兜底**（这些走 CSV 真值解析，不受 f59 缩放影响）。
+- **Sina 已移除**（2026-06-01）：字段严格弱于腾讯（无盘口、无换手、exchange_time 解析依赖末位字段而实际 date/time 在固定索引、status 字段尾随导致恒失败），且只在腾讯也失败时才轮到的末位冗余，价值不足以维护。
 - fallback 选择以单个 provider 的完整 normalized quote 为单位；默认不做跨 provider 字段拼接。若未来引入 field-level merge，必须显式标记 `source = "mixed"` 并提供字段来源审计。
-- quote 写入 snapshot 前先判断该 provider 输出是否满足当前用途的必需字段：展示至少需要 `price/tradeDate/capturedAt`，成交模拟还需要可用买一 / 卖一盘口。多个 provider 同时可用时，先比较 eligible trade date 和 freshness，再比较字段完整度，最后按 `TDX > Eastmoney > Tencent > Sina` tie-breaker。
+- quote 写入 snapshot 前先判断该 provider 输出是否满足当前用途的必需字段：展示至少需要 `price/tradeDate/capturedAt`，成交模拟还需要可用买一 / 卖一盘口。多个 provider 同时可用时，先比较 eligible trade date 和 freshness，再比较字段完整度，最后按 `TDX > 腾讯` tie-breaker。
 - **可用性判定与候选选取**（实现锚：`domain/quotes/quote.rs::StockQuote::{is_display_complete, is_quote_complete}`、`pipeline/quotes/service.rs::pick_fallback_quote`）：
-  1. 按 `TDX > Eastmoney > Tencent > Sina` 顺序逐个尝试 provider，每个调用返回一条 normalized quote 候选。
+  1. 按 `TDX > 腾讯` 顺序逐个尝试 provider（BJ 跳过 TDX 直接腾讯），每个调用返回一条 normalized quote 候选。
   2. 遇到**首个** `is_quote_complete = true`（display 必备字段全有 + 五档盘口可用：bid[0]/ask[0] 含 price+volume）立即采纳并 short-circuit。
   3. 全程未命中 quote-complete 时，回退到**首个** `is_display_complete = true` 的候选；该候选缺盘口，写入 snapshot 时附 `depth_missing` warning。
   4. 全部 provider 都未达到 display-complete → 视为无可用 quote，不写 snapshot。
-- **`is_display_complete` 的硬门槛 = `price` 非空**（`tsCode/category/tradeDate/capturedAt` 在 `StockQuote` 类型上非空，恒满足）。`previousClose` / `changePercent` 是**首选但非必备**字段：指数 / 基金在 TDX / EM / Tencent / Sina 多源下经常缺 `previousClose`，若强求会把它们全推进 fallback chain（每只多花 ~600ms）且最终仍无更优候选。缺这两个字段时 UI 涨跌幅显示 `—`，可接受。这与 universe batch 接受门槛（§5 line 接受门槛：price 非空）一致——全局只有一个 price-only 谓词。
+- **`is_display_complete` 的硬门槛 = `price` 非空**（`tsCode/category/tradeDate/capturedAt` 在 `StockQuote` 类型上非空，恒满足）。`previousClose` / `changePercent` 是**首选但非必备**字段：指数 / 基金在 TDX / 腾讯 多源下经常缺 `previousClose`，若强求会把它们全推进 fallback chain 且最终仍无更优候选。缺这两个字段时 UI 涨跌幅显示 `—`，可接受。这与 universe batch 接受门槛（§5 接受门槛：price 非空）一致——全局只有一个 price-only 谓词。
 - `is_display_complete` 是 UI 展示和扫描的最低准入；`is_quote_complete` 仅在 Account 写路径成交模拟时作为可成交前提，**不**是 fallback 选取的硬条件——缺盘口的 display-complete quote 仍然可用于展示。
 - `StockQuote.source` 与 `StockQuote.freshness.source` 必须一致；缺盘口的 fallback quote 可以用于展示，但必须带 `depth_missing` warning。
 - Account 成交模拟需要 fresh quote 和盘口；fallback 源缺盘口时必须返回 `depth_missing`，是否可成交由 Account 交易规则判断。
@@ -1036,7 +1038,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - `failedBatches > 0` 表示本轮 quote refresh 部分失败；事件仍可 emit，但消费者必须把本次读取视为 partial，不得把缺失标的解释为确定无数据。
 - **universe scope 的两段 `refreshed`**：universe 采用 TDX 主批同步 + fallback 异步（见下「全市场执行契约」）。因此 universe 会 emit **两条** `market-quotes-refreshed`：
   1. 同步首条：TDX 主批结束即 emit，`success` = TDX 命中数，`failedBatches` = 延后进 fallback 的标的数（BJ + TDX 失败/不完整）。TDX 整体故障时 `failedBatches` ≈ total，消费者据此知道本轮 partial，**禁止**误判为全成功。
-  2. fallback 完成后由后台任务 emit 修正条：`success` / `failedBatches` 含 EM→腾讯→新浪 fallback 结果，作为本轮最终汇总。
+  2. fallback 完成后由后台任务 emit 修正条：`success` / `failedBatches` 含 腾讯（EM 退出报价、新浪已移除） fallback 结果，作为本轮最终汇总。
   消费者必须容忍同一轮多条 refreshed（以最后一条为准，或按 progress 增量重读）。`subscribed` / `manual` scope 仍只 emit 一条同步 refreshed。
 
 ### 全市场 quote 刷新执行契约
@@ -1044,9 +1046,9 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 `refresh_market_quotes(scope = "universe")` 一次需要扫 ~7500 标的，是吞吐敏感路径。Quotes 对该路径**强制契约**如下：
 
 1. **批量 RPC 强制**：universe scope 实现必须用 TDX `get_security_quotes` 批量调用（每批 ≤ 80 标的），不允许逐只串行；其他 provider fallback 沿用原逐只路径。理由：TDX 协议层已经支持批量并自带 ≥80 ms/批节流，串行方案在节流下吞吐 ~6 只/秒，批量 ~80×80ms/秒 ≈ 1000 只/秒。
-   - **接受门槛**：universe batch 路径用 `is_display_complete`（只要 `price` 非空就接受为最终值），**不**用 `is_quote_complete`。理由：指数 / 基金 TDX 不返回 bid/ask 五档，且 EM / Tencent / Sina 也无；用 `is_quote_complete` 会把所有指数 / 基金错误地推进 fallback chain，每只浪费 ~600ms。`is_quote_complete` 是 fallback chain 多 provider 之间挑选的"字段完整度优先"裁判，不是 universe batch 主源的接受门槛。
-   - **fallback 触发面**：只在 TDX `Err` 或 `Ok` 但 `price` 为空时，把该标的推入 fallback queue（EM → Tencent → Sina）。
-2. **fallback 非阻塞（async）**：universe scope 的 fallback queue **不得阻塞主流程**。TDX 主批跑完即视为本轮"主体完成" —— 立即写 `quote_refresh_state`（TDX 主批成功数）+ emit `market-quotes-refreshed`，然后把 fallback queue 丢到后台任务并发处理（EM→腾讯→新浪，建议并发上限 8），完成一个补一个 cache / `close_snapshot` 并 emit progress，结束后**重写** `quote_refresh_state` 反映含 fallback 的最终成功数。
+   - **接受门槛**：universe batch 路径用 `is_display_complete`（只要 `price` 非空就接受为最终值），**不**用 `is_quote_complete`。理由：指数 / 基金 TDX 不返回 bid/ask 五档，且 腾讯也无；用 `is_quote_complete` 会把所有指数 / 基金错误地推进 fallback chain，每只浪费 ~600ms。`is_quote_complete` 是 fallback chain 多 provider 之间挑选的"字段完整度优先"裁判，不是 universe batch 主源的接受门槛。
+   - **fallback 触发面**：只在 TDX `Err` 或 `Ok` 但 `price` 为空时，把该标的推入 fallback queue（腾讯（EM 退出报价、Sina 已移除））。
+2. **fallback 非阻塞（async）**：universe scope 的 fallback queue **不得阻塞主流程**。TDX 主批跑完即视为本轮"主体完成" —— 立即写 `quote_refresh_state`（TDX 主批成功数）+ emit `market-quotes-refreshed`，然后把 fallback queue 丢到后台任务并发处理（腾讯（EM 退出报价、新浪已移除），建议并发上限 8），完成一个补一个 cache / `close_snapshot` 并 emit progress，结束后**重写** `quote_refresh_state` 反映含 fallback 的最终成功数。
    - 理由：universe 里 TDX 失败的多是退市 / 停牌 / 北交所，少量但每只串行跑 3 个 HTTP provider（~440ms）会把一轮拖到 ~58s 吃满 60s 周期，导致刷新近乎连续、与交互请求抢 TDX 连接。异步化后一轮同步耗时 = TDX 主批（~20s）。
    - **例外**：`subscribed` / `manual` scope（用户显式关注 / 点击的具体标的）的 fallback 仍**同步**等待——这些场景调用方需要拿到确定结果。"非阻塞"只对 universe scope 生效。
 3. **吞吐目标**：在 TDX 健康、网络正常的前提下，universe scope 一轮**主体完成**（TDX 主批 + emit refreshed）时间 **≤ 30s**（universe ~7500）；后台 fallback 不计入主体完成时间。超出视为 provider 或 IO 异常，写入 `quote_refresh_state.failed`。
@@ -1089,8 +1091,8 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 
 - 股票 / 指数 / 基金 universe 统一建模为 `MarketInstrument`；实现中不新增互不兼容的平行主模型。
 - `list_market`、`fetch_data` 和 `scan_market` 是读取 quotes 的统一入口。
-- 对外读取路径默认不直接请求 TDX / EM / TuShare / 腾讯 / 新浪。
-- TDX 是 Quotes 数据主源；Eastmoney / Tencent / Sina 是 TDX fallback；TuShare 仅在 `TushareHealthState.isAvailable = true` 时作为 enrich 调用。
+- 对外读取路径默认不直接请求 TDX / EM / TuShare / 腾讯。
+- TDX 是 Quotes 数据主源；腾讯是 TDX 实时行情 fallback；Eastmoney 作 BJ universe + K线/分时/日线兜底；TuShare 仅在 `TushareHealthState.isAvailable = true` 时作为 enrich 调用。
 - TuShare token 缺失 / 健康检查失败时，Quotes 仍能基于 TDX 提供 universe、实时行情、K 线、xdxr、复权、分时、分钟 K 的完整能力；只是 `daily_basic` / 公司事件 / TuShare-only 字段为空。
 - `qfq` / `hfq` K 线在本地基于 TDX xdxr 现算，不依赖 TuShare `adj_factor`。
 - 进程启动时执行 cold-start seed（`BUILTIN_INSTRUMENTS`），保证 UI 第一帧非空。

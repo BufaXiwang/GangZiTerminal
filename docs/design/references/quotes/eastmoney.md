@@ -4,7 +4,9 @@
 
 ## 定位
 
-Eastmoney 是 Quotes 的重要 fallback：覆盖 BJ 标的、TDX 缺失行情、分钟 K、分时和部分互联网行情字段。
+Eastmoney 在 Quotes 里承担两类**不可替代 / 低风险**的角色：**BJ universe 枚举**（列出北交所标的，其他源做不到）+ **K 线 / 分时 / 日线兜底**（CSV 真值解析）。
+
+**Eastmoney 不参与实时报价**（2026-06-01 起）：其 push2 `stock/get` 价格按 `10^f59` 缩放（曾硬编码 `/100`，对 3 位小数 ETF 产生 10× 错价），且五档字段映射 / BJ secid 前缀无法在受限环境实测确认。为避免数据源错误，实时报价收敛到 TDX → 腾讯，EM 退出报价路径。
 
 Eastmoney 不是对外 API；所有输出必须 normalize 到 Quotes canonical model。
 
@@ -12,11 +14,11 @@ Eastmoney 不是对外 API；所有输出必须 normalize 到 Quotes canonical m
 
 | 数据 | 角色 | 输出 |
 |---|---|---|
-| SH / SZ / BJ 实时行情 | TDX fallback / BJ 主源 | `StockQuote` |
-| 指数 / 场内基金行情 | fallback | `StockQuote` |
+| BJ universe 枚举 | **主源（独有）** | `(code6, name)` → `MarketInstrument` |
 | 分钟 K | fallback / 补充源 | 分钟 K 读模型行 |
 | 分时 | fallback / 补充源 | 分时读模型行 |
-| 估值 / 市值字段 | 可补充 | `DailyBasic` 子集 |
+| 日线 K | fallback（TuShare 不可用时） | 日 K 读模型行 |
+| ~~SH / SZ / BJ 实时行情~~ | ~~已移除~~ | 改由 TDX → 腾讯 |
 
 ## 获取方式
 

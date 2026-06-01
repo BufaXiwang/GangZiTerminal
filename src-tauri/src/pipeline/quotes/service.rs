@@ -20,7 +20,7 @@ use crate::domain::shared::{
 use crate::infrastructure::db::AppDb;
 use crate::infrastructure::quotes::{
     AdjustCache, AdjustCacheKey, CachedSnapshot, EastmoneyProvider, QuotesConfig, QuotesRepository,
-    SinaProvider, SnapshotCache, TdxConnectionManager, TencentProvider, TradeCalendar,
+    SnapshotCache, TdxConnectionManager, TencentProvider, TradeCalendar,
     TradeCalendarRepo, TushareClient, TushareHealthCheck,
 };
 use crate::pipeline::quotes::market_time::resolve_market_time_with_calendar;
@@ -46,7 +46,6 @@ pub struct QuotesService {
     pub(crate) cache: Arc<SnapshotCache>,
     pub(crate) tdx: TdxConnectionManager,
     pub(crate) eastmoney: EastmoneyProvider,
-    pub(crate) sina: SinaProvider,
     pub(crate) tencent: TencentProvider,
     pub(crate) tushare: TushareClient,
     /// TuShare 健康 gate（spec quotes-module.md §2 "TuShare 健康状态"）。
@@ -73,7 +72,6 @@ impl QuotesService {
         let cache = Arc::new(SnapshotCache::new());
         let tdx = TdxConnectionManager::new();
         let eastmoney = EastmoneyProvider::new()?;
-        let sina = SinaProvider::new()?;
         let tencent = TencentProvider::new()?;
         let tushare = TushareClient::new(config.tushare_token.clone())?;
         // 共享 client 给 health probe；TushareClient 是 Clone（reqwest::Client + Option<String>）。
@@ -88,7 +86,6 @@ impl QuotesService {
             cache,
             tdx,
             eastmoney,
-            sina,
             tencent,
             tushare,
             health,
@@ -1146,7 +1143,7 @@ impl QuotesService {
             //   1. 批量 RPC 强制 — 用 tdx.fetch_quotes (manager 内部按 80/批 节流)。
             //   2. BJ 不走 TDX (UnsupportedMarket) — 进入 per-stock fallback。
             //   3. 每 PROGRESS_BATCH (200) 只 emit market-quotes-refresh-progress。
-            //   4. TDX 失败 / 不完整的标的延后进 fallback chain (EM → Tencent → Sina)。
+            //   4. TDX 失败 / 不完整的标的延后进 fallback chain (腾讯)。
             // ============================================================
             let mut tdx_input: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
             let mut bj_codes: Vec<TsCode> = Vec::new();
@@ -1200,7 +1197,7 @@ impl QuotesService {
                     completed += 1;
                     // `is_display_complete` 而不是 `is_quote_complete` —— 指数 / 基金 TDX
                     // 不返回 bid/ask 五档（其他 provider 同样不返回），不该因此把它们丢去
-                    // 跑 ~600ms/只的 EM→Tencent→Sina fallback。list 视图只需要 price。
+                    // 跑 ~600ms/只的腾讯 fallback。list 视图只需要 price。
                     match res {
                         Ok(q) if q.is_display_complete() => {
                             let captured_at = q.captured_at;
@@ -1219,7 +1216,7 @@ impl QuotesService {
                             affected_in_batch.push(ts);
                         }
                         _ => {
-                            // TDX 失败或字段不全 — 推入 fallback chain (EM → Tencent → Sina)。
+                            // TDX 失败或字段不全 — 推入 fallback chain (腾讯)。
                             fallback_queue.push((ts, cat, name));
                         }
                     }
@@ -1475,7 +1472,7 @@ impl QuotesService {
         );
     }
 
-    /// HTTP-only fallback（EM→腾讯→新浪），不走 TDX。用于 universe 后台 fallback。
+    /// HTTP-only fallback（腾讯，唯一 HTTP 报价 fallback），不走 TDX。用于 universe 后台 fallback。
     /// 选取规则同 [`pick_fallback_quote`]：首个 quote_complete，否则首个 display_complete。
     async fn fallback_http_quote(
         &self,
@@ -1484,14 +1481,8 @@ impl QuotesService {
         trade_date: TradeDate,
         now: chrono::DateTime<Utc>,
     ) -> Option<StockQuote> {
-        let mut candidates: Vec<StockQuote> = Vec::with_capacity(3);
-        if let Ok(q) = self.eastmoney.fetch_quote(ts, category, trade_date, now).await {
-            candidates.push(q);
-        }
+        let mut candidates: Vec<StockQuote> = Vec::with_capacity(1);
         if let Ok(q) = self.tencent.fetch_quote(ts, category, trade_date, now).await {
-            candidates.push(q);
-        }
-        if let Ok(q) = self.sina.fetch_quote(ts, category, trade_date, now).await {
             candidates.push(q);
         }
         Self::pick_fallback_quote(candidates)
@@ -1522,7 +1513,7 @@ impl QuotesService {
 
     /// 按 spec §5 line 742 从多个 provider 候选中选取一条 quote。
     ///
-    /// `candidates` 必须按 spec tie-breaker 顺序（TDX > EM > Tencent > Sina）传入；
+    /// `candidates` 必须按 spec tie-breaker 顺序（TDX > 腾讯）传入；
     /// 函数选首个 `is_quote_complete = true`，否则首个 `is_display_complete = true`，否则 None。
     /// 暴露为关联函数便于纯函数单测；和 `refresh_one_quote` 的命中-即-return 等价。
     #[doc(hidden)]
@@ -1629,14 +1620,14 @@ impl QuotesService {
         }
     }
 
-    /// Refresh 单只标的：尝试 TDX → EM → Tencent → Sina；按 spec §5 line 742 选取。
+    /// Refresh 单只标的：尝试 TDX → 腾讯；按 spec §5 line 742 选取。
     ///
     /// 选取规则：
     /// 1. 顺序尝试 provider，遇到首个 `is_quote_complete = true` 立即采纳（带盘口）。
     /// 2. 都不完整时，保留首个 `is_display_complete = true` 的 quote 作为 fallback。
     /// 3. 全部失败返回 None。
     ///
-    /// 顺序本身就是 spec 要求的 tie-breaker `TDX > Eastmoney > Tencent > Sina`，因此先 hit 即满足
+    /// 顺序本身就是 spec 要求的 tie-breaker `TDX > 腾讯`，因此先 hit 即满足
     /// "字段完整度优先 + tie-break 顺序"。eligible trade date 由调用方 (`refresh_market_quotes`)
     /// 统一指定，本函数内一致。BJ 跳过 TDX。
     ///
@@ -1677,9 +1668,7 @@ impl QuotesService {
                 "tdx"
             );
         }
-        consider!(self.eastmoney.fetch_quote(ts, category, trade_date, now).await, "em");
         consider!(self.tencent.fetch_quote(ts, category, trade_date, now).await, "tencent");
-        consider!(self.sina.fetch_quote(ts, category, trade_date, now).await, "sina");
 
         fallback_display
     }
