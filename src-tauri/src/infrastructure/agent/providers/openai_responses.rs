@@ -37,11 +37,19 @@ impl OpenAIResponsesAdapter {
     fn block_to_input_content(
         &self,
         b: &AgentMessageBlock,
+        role: AgentMessageRole,
         payload_store: Option<&PayloadStore>,
     ) -> Result<Option<Value>, WireMappingError> {
+        // Responses API: assistant-role message items carry `output_text`; user/system carry
+        // `input_text`. Emitting `input_text` for an assistant turn makes the multi-turn `input`
+        // array malformed and the upstream rejects the whole request (HTTP 502 upstream_error).
+        let text_type = match role {
+            AgentMessageRole::Assistant => "output_text",
+            _ => "input_text",
+        };
         Ok(match b {
             AgentMessageBlock::Text { text } => {
-                Some(json!({"type":"input_text","text": text}))
+                Some(json!({"type": text_type, "text": text}))
             }
             AgentMessageBlock::Image { mime_type, .. } => {
                 if !self.channel.supports_vision {
@@ -75,7 +83,7 @@ impl OpenAIResponsesAdapter {
         };
         let mut content = Vec::new();
         for b in &msg.blocks {
-            if let Some(c) = self.block_to_input_content(b, payload_store)? {
+            if let Some(c) = self.block_to_input_content(b, msg.role, payload_store)? {
                 content.push(c);
             }
         }
@@ -213,7 +221,14 @@ mod tests {
         let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let arr = body["input"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
+        // User turns → input_text; assistant turn → output_text (Responses API requirement;
+        // assistant input_text makes the upstream reject the whole multi-turn request).
+        assert_eq!(arr[0]["role"], "user");
+        assert_eq!(arr[0]["content"][0]["type"], "input_text");
+        assert_eq!(arr[1]["role"], "assistant");
+        assert_eq!(arr[1]["content"][0]["type"], "output_text");
         assert_eq!(arr[2]["role"], "user");
+        assert_eq!(arr[2]["content"][0]["type"], "input_text");
         let last = arr[2]["content"][0]["text"].as_str().unwrap();
         assert!(last.contains("<skill_result"));
     }
@@ -231,6 +246,7 @@ mod tests {
         let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let item = &body["input"][0];
         assert_eq!(item["role"], "assistant");
+        assert_eq!(item["content"][0]["type"], "output_text");
         let t = item["content"][0]["text"].as_str().unwrap();
         assert!(t.contains("<use_skill"));
     }
