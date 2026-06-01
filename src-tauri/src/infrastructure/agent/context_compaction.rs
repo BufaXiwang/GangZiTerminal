@@ -610,6 +610,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: Some(9000), // soft = 9000/3 = 3000
+            thinking_budget_tokens: None,
         };
         let est = estimate_context_tokens(&b, &channel);
         assert!(est.total_tokens >= 10_000);
@@ -633,6 +634,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: Some(200_000),
+            thinking_budget_tokens: None,
         };
         let est = estimate_context_tokens(&b, &channel);
         assert_eq!(est.total_tokens, 0);
@@ -656,6 +658,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: None,
+            thinking_budget_tokens: None,
         };
         let est = estimate_context_tokens(&b, &channel);
         // No window: default soft_limit_tokens is 60_000; empty bundle is 0 → under.

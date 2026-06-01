@@ -222,6 +222,10 @@ fn row_to_channel(row: &Row) -> rusqlite::Result<ProviderChannel> {
         supports_thinking: supports_thinking_i != 0,
         max_output_tokens: max_output_tokens_i.map(|v| v as u32),
         context_window_tokens: context_window_tokens_i.map(|v| v as u32),
+        // FIX 4: extended-thinking budget is not yet persisted to a DB column (would
+        // require a schema migration). Default None = no request-level thinking config,
+        // which preserves existing behavior. Runtime-built channels can set it directly.
+        thinking_budget_tokens: None,
     })
 }
 
@@ -251,6 +255,7 @@ mod tests {
             supports_thinking: true,
             max_output_tokens: Some(8192),
             context_window_tokens: Some(200_000),
+            thinking_budget_tokens: None,
         }
     }
 

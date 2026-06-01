@@ -124,6 +124,7 @@ mod factory_smoke {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: None,
+            thinking_budget_tokens: None,
         }
     }
 

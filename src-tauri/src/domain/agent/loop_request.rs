@@ -98,6 +98,7 @@ mod tests {
                 supports_thinking: false,
                 max_output_tokens: None,
                 context_window_tokens: None,
+                thinking_budget_tokens: None,
             },
             max_turns: 12,
             seed_messages: vec![],

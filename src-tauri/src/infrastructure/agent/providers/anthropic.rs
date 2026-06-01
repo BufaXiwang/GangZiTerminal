@@ -73,18 +73,50 @@ impl AnthropicAdapter {
                 if !self.channel.supports_thinking {
                     return Ok(None);
                 }
-                let mut obj = serde_json::Map::new();
-                obj.insert("type".into(), json!("thinking"));
-                obj.insert("thinking".into(), json!(text));
-                if let Some(m) = metadata {
-                    if let Some(sig) = m.get("signature") {
-                        obj.insert("signature".into(), sig.clone());
+                // FIX 3: redacted thinking is its own block shape.
+                // Per anthropic-messages.md:
+                //   normal   = {type:"thinking", thinking, signature}
+                //   redacted = {type:"redacted_thinking", data}
+                // Treat the block as redacted when metadata carries `redacted` (the encrypted
+                // `data` payload) or an explicit `data` field, or `type=="redacted_thinking"`.
+                let redacted_data = metadata.as_ref().and_then(|m| {
+                    // explicit type marker
+                    let is_redacted_type = m
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "redacted_thinking")
+                        .unwrap_or(false);
+                    // the encrypted blob can live under `data` or `redacted`
+                    let data = m
+                        .get("data")
+                        .or_else(|| m.get("redacted"))
+                        .and_then(|d| d.as_str());
+                    match (is_redacted_type, data) {
+                        // redacted_thinking type → use data (fall back to text if absent)
+                        (true, Some(d)) => Some(d.to_string()),
+                        (true, None) => Some(text.clone()),
+                        // no explicit type but a string `data`/`redacted` blob present
+                        (false, Some(d)) => Some(d.to_string()),
+                        (false, None) => None,
                     }
-                    if let Some(red) = m.get("redacted") {
-                        obj.insert("redacted".into(), red.clone());
+                });
+
+                if let Some(data) = redacted_data {
+                    Some(json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    }))
+                } else {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("type".into(), json!("thinking"));
+                    obj.insert("thinking".into(), json!(text));
+                    if let Some(m) = metadata {
+                        if let Some(sig) = m.get("signature") {
+                            obj.insert("signature".into(), sig.clone());
+                        }
                     }
+                    Some(Value::Object(obj))
                 }
-                Some(Value::Object(obj))
             }
         })
     }
@@ -146,6 +178,32 @@ impl ProviderAdapter for AnthropicAdapter {
         if !system_text.is_empty() {
             body["system"] = Value::String(system_text);
         }
+        // FIX 4: request-level extended-thinking config. Only emit when the channel both
+        // supports thinking and has an explicit budget. Default (no budget) = no thinking,
+        // preserving prior behavior. Per anthropic-messages.md: budget_tokens must be
+        // ≥ 1024 and < max_tokens.
+        if self.channel.supports_thinking {
+            if let Some(budget) = self.channel.thinking_budget_tokens {
+                if budget < 1024 {
+                    return Err(WireMappingError::Unsupported(
+                        WireFormat::Messages,
+                        format!("thinking budget_tokens {budget} must be >= 1024"),
+                    ));
+                }
+                if budget >= max_tokens {
+                    return Err(WireMappingError::Unsupported(
+                        WireFormat::Messages,
+                        format!(
+                            "thinking budget_tokens {budget} must be < max_tokens {max_tokens}"
+                        ),
+                    ));
+                }
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            }
+        }
         Ok(body)
     }
 
@@ -189,6 +247,7 @@ mod tests {
             supports_thinking: thinking,
             max_output_tokens: Some(4096),
             context_window_tokens: Some(200_000),
+            thinking_budget_tokens: None,
         }
     }
 
@@ -334,5 +393,92 @@ mod tests {
             ad.map_stop_reason("stop_sequence"),
             AgentStopReason::ProviderStop
         );
+    }
+
+    // FIX 3: redacted thinking serializes as {type:"redacted_thinking", data}, NOT a
+    // `redacted` field inside a `thinking` block.
+    #[test]
+    fn redacted_thinking_uses_redacted_thinking_block() {
+        let ad = AnthropicAdapter::new(make_channel(false, true));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Thinking {
+                text: "ignored".into(),
+                provider: Some("anthropic".into()),
+                metadata: Some(json!({"type":"redacted_thinking","data":"enc-blob-123"})),
+            }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["data"], "enc-blob-123");
+        assert!(block.get("thinking").is_none());
+        assert!(block.get("redacted").is_none());
+    }
+
+    // FIX 3: a bare `redacted` blob (legacy metadata) also maps to redacted_thinking.
+    #[test]
+    fn redacted_metadata_blob_maps_to_redacted_thinking() {
+        let ad = AnthropicAdapter::new(make_channel(false, true));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::Assistant,
+            vec![AgentMessageBlock::Thinking {
+                text: "ignored".into(),
+                provider: None,
+                metadata: Some(json!({"redacted":"enc-xyz"})),
+            }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["data"], "enc-xyz");
+    }
+
+    // FIX 4: default (no budget) → no request-level thinking config.
+    #[test]
+    fn no_request_thinking_config_by_default() {
+        let ad = AnthropicAdapter::new(make_channel(false, true));
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text { text: "hi".into() }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        assert!(body.get("thinking").is_none());
+    }
+
+    // FIX 4: budget + supports_thinking → top-level thinking:{type:enabled,budget_tokens}.
+    #[test]
+    fn request_thinking_config_emitted_with_budget() {
+        let mut ch = make_channel(false, true);
+        ch.max_output_tokens = Some(4096);
+        ch.thinking_budget_tokens = Some(2048);
+        let ad = AnthropicAdapter::new(ch);
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text { text: "hi".into() }],
+        )];
+        let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+    }
+
+    // FIX 4: budget >= max_tokens → error (must be < max_tokens).
+    #[test]
+    fn request_thinking_budget_must_be_less_than_max_tokens() {
+        let mut ch = make_channel(false, true);
+        ch.max_output_tokens = Some(2048);
+        ch.thinking_budget_tokens = Some(4096);
+        let ad = AnthropicAdapter::new(ch);
+        let ctx = ContextBundle::new("r1");
+        let msgs = vec![msg(
+            AgentMessageRole::User,
+            vec![AgentMessageBlock::Text { text: "hi".into() }],
+        )];
+        let err = ad.build_request_body(&msgs, &ctx, None).unwrap_err();
+        assert!(matches!(err, WireMappingError::Unsupported(..)));
     }
 }

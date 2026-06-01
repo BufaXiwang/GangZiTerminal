@@ -57,6 +57,13 @@ pub struct ProviderChannel {
     /// 上下文窗口大小，驱动 soft / hard limit 计算。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u32>,
+    /// FIX 4（agent provider wire audit）：Anthropic extended-thinking budget。
+    /// `None`（默认）= 不发 request-level `thinking` 配置（行为不变）。
+    /// `Some(n)` 且 `supports_thinking = true` 时，Anthropic adapter 发
+    /// top-level `thinking: {type:"enabled", budget_tokens:n}`，并校验 `n < max_tokens`。
+    /// 参考 anthropic-messages.md §thinking：budget_tokens ≥ 1024 且 < max_tokens。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl ProviderChannel {
@@ -86,6 +93,7 @@ mod tests {
             supports_thinking: true,
             max_output_tokens: Some(8192),
             context_window_tokens: Some(200_000),
+            thinking_budget_tokens: None,
         };
         let j = serde_json::to_value(&c).unwrap();
         assert_eq!(j["channelId"], "anthropic-main");
@@ -110,6 +118,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: None,
+            thinking_budget_tokens: None,
         };
         assert!(c.is_primary_capable());
         c.stream = false;

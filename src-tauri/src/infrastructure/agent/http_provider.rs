@@ -8,8 +8,10 @@
 //!
 //! - SSE 解析器手写（不引入新 crate）：buffer bytes → split on `\n`；`data: {json}` /
 //!   `event: <type>`；空行 = event 边界；`:`-comment / ping 忽略。
-//! - skill 调用走 §2 文本协议；本层只产 chat text，不传 tools、不解析 tool_use。
-//! - Image dataRef 在 chat smoke 场景不需要（payload_store=None）。
+//! - skill 调用走 §2 文本协议。FIX 1：`SkillCallParser` 跑在本层内部——每段 chat 文本
+//!   fragment 喂 parser，clean（XML 抑制）`TextDelta` 实时 emit 一次；`UseSkill` /
+//!   `ParseError` 收集进 `ProviderTurnOutcome.skill_events` 交给 loop dispatch。
+//! - FIX 2：Image dataRef 用注入的 `PayloadStore` deref 成 base64（`None` = chat-only）。
 //!
 //! Error mapping（spec §4）：
 //! - 非 2xx：anthropic 400 含 "prompt is too long" 或 openai/deepseek error.code ==
@@ -21,7 +23,9 @@ use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentStopReason, ContextBundle, ProviderChannel, WireFormat,
 };
 use crate::infrastructure::agent::loop_executor::{LoopError, ProviderStream, ProviderTurnOutcome};
+use crate::infrastructure::agent::payload_store::PayloadStore;
 use crate::infrastructure::agent::providers::{ProviderAdapter, WireMappingError};
+use crate::infrastructure::agent::skill_parser::{ParserEvent, SkillCallParser};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
@@ -34,11 +38,22 @@ pub struct HttpProvider {
     channel: ProviderChannel,
     client: reqwest::Client,
     adapter: Box<dyn ProviderAdapter>,
+    /// FIX 2：image `payload://` dataRef 需要 PayloadStore 才能 dereference 成 base64。
+    /// `None` = chat-only 场景（不含 image）。
+    payload_store: Option<PayloadStore>,
 }
 
 impl HttpProvider {
-    /// 根据 channel 的 wire_format 选择 adapter，构造一个生产 provider。
+    /// 根据 channel 的 wire_format 选择 adapter，构造一个生产 provider（无 PayloadStore）。
     pub fn new(channel: ProviderChannel) -> Result<Self, LoopError> {
+        Self::with_payload_store(channel, None)
+    }
+
+    /// FIX 2：构造一个带 PayloadStore 的 provider，使 `payload://` image 可 deref。
+    pub fn with_payload_store(
+        channel: ProviderChannel,
+        payload_store: Option<PayloadStore>,
+    ) -> Result<Self, LoopError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(180))
             .build()
@@ -48,6 +63,7 @@ impl HttpProvider {
             channel,
             client,
             adapter,
+            payload_store,
         })
     }
 
@@ -110,9 +126,10 @@ impl ProviderStream for HttpProvider {
         run_id: &str,
     ) -> Result<ProviderTurnOutcome, LoopError> {
         // 1. body —— 用 live messages slice（修复 seed_messages bug）。
+        // FIX 2: 注入 PayloadStore，使 image `payload://` dataRef 可 deref 成 base64。
         let body = self
             .adapter
-            .build_request_body(messages, context, None)
+            .build_request_body(messages, context, self.payload_store.as_ref())
             .map_err(map_wire_error)?;
 
         // 2. URL + auth by wire_format。
@@ -178,19 +195,26 @@ impl ProviderStream for HttpProvider {
 impl HttpProvider {
     async fn finalize(
         &self,
-        state: StreamState,
+        mut state: StreamState,
         event_tx: &Sender<AgentEvent>,
         run_id: &str,
     ) -> Result<ProviderTurnOutcome, LoopError> {
-        // emit usage (spec §2 AgentEvent::Usage)。
+        // FIX 1: flush any text the parser was still buffering (clean TextDelta, XML
+        // suppressed). UseSkill/ParseError go to state.skill_events.
+        let tail = state.parser.finalize();
+        drain_parser_events(&mut state, tail, event_tx, run_id).await?;
+
+        // emit per-turn usage (spec §2 AgentEvent::Usage)。
+        // FIX 5: include Anthropic cache read/write token details when present.
+        // FIX 6: this is the *per-turn* usage; loop_executor emits the cumulative run total.
         send_event(
             event_tx,
             AgentEvent::Usage {
                 run_id: run_id.to_string(),
                 input_tokens: state.usage_input,
                 output_tokens: state.usage_output,
-                cache_read_tokens: None,
-                cache_write_tokens: None,
+                cache_read_tokens: state.cache_read_tokens,
+                cache_write_tokens: state.cache_write_tokens,
             },
         )
         .await?;
@@ -201,10 +225,11 @@ impl HttpProvider {
         };
 
         Ok(ProviderTurnOutcome {
-            text: state.text,
+            text: state.raw_text,
             usage_input: state.usage_input,
             usage_output: state.usage_output,
             stop_reason,
+            skill_events: state.skill_events,
         })
     }
 }
@@ -218,12 +243,79 @@ async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopEr
 }
 
 /// 跨 SSE event 累积的解码状态。
-#[derive(Default)]
+///
+/// FIX 1：`SkillCallParser` 在 provider 内部跑——每段 chat 文本 fragment 喂 `parser`，
+/// 对 `ParserEvent::TextDelta` emit clean（XML 抑制）`AgentEvent::TextDelta`，把
+/// `UseSkill` / `ParseError` 收集到 `skill_events`。`raw_text` 单独累积（含 `<use_skill>`
+/// XML）供消息历史回写。
 struct StreamState {
-    text: String,
+    /// raw chat text，含 `<use_skill>` XML（用于消息历史）。
+    raw_text: String,
     usage_input: u32,
     usage_output: u32,
+    /// FIX 5: Anthropic cache_read_input_tokens。
+    cache_read_tokens: Option<u32>,
+    /// FIX 5: Anthropic cache_creation_input_tokens。
+    cache_write_tokens: Option<u32>,
     raw_stop_reason: Option<String>,
+    /// FIX 1: provider 内部的 skill 调用文本协议解析器。
+    parser: SkillCallParser,
+    /// FIX 1: 解析出的 `UseSkill` / `ParseError`（按出现顺序；不含 TextDelta）。
+    skill_events: Vec<ParserEvent>,
+}
+
+impl Default for StreamState {
+    fn default() -> Self {
+        Self {
+            raw_text: String::new(),
+            usage_input: 0,
+            usage_output: 0,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            raw_stop_reason: None,
+            parser: SkillCallParser::new(),
+            skill_events: Vec::new(),
+        }
+    }
+}
+
+/// FIX 1：把一段 chat 文本 fragment 喂 parser；clean `TextDelta` 实时 emit（XML 抑制），
+/// `UseSkill` / `ParseError` 收集到 `state.skill_events`。raw fragment 累积到 `raw_text`。
+async fn feed_chat_text(
+    state: &mut StreamState,
+    fragment: &str,
+    event_tx: &Sender<AgentEvent>,
+    run_id: &str,
+) -> Result<(), LoopError> {
+    state.raw_text.push_str(fragment);
+    let events = state.parser.feed(fragment);
+    drain_parser_events(state, events, event_tx, run_id).await
+}
+
+async fn drain_parser_events(
+    state: &mut StreamState,
+    events: Vec<ParserEvent>,
+    event_tx: &Sender<AgentEvent>,
+    run_id: &str,
+) -> Result<(), LoopError> {
+    for ev in events {
+        match ev {
+            ParserEvent::TextDelta(s) => {
+                if !s.is_empty() {
+                    send_event(
+                        event_tx,
+                        AgentEvent::TextDelta {
+                            run_id: run_id.to_string(),
+                            delta: s,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            other => state.skill_events.push(other),
+        }
+    }
+    Ok(())
 }
 
 /// 一个完整的 SSE event（`event:` 行 + 连接好的 `data:` 行）。
@@ -375,21 +467,28 @@ async fn handle_messages_event(
             if let Some(u) = v.pointer("/message/usage/output_tokens").and_then(|x| x.as_u64()) {
                 state.usage_output = u as u32;
             }
+            // FIX 5: Anthropic usage cache details. cache_read_input_tokens →
+            // cache_read_tokens; cache_creation_input_tokens → cache_write_tokens.
+            if let Some(u) = v
+                .pointer("/message/usage/cache_read_input_tokens")
+                .and_then(|x| x.as_u64())
+            {
+                state.cache_read_tokens = Some(u as u32);
+            }
+            if let Some(u) = v
+                .pointer("/message/usage/cache_creation_input_tokens")
+                .and_then(|x| x.as_u64())
+            {
+                state.cache_write_tokens = Some(u as u32);
+            }
         }
         "content_block_delta" => {
             let delta_type = v.pointer("/delta/type").and_then(|t| t.as_str()).unwrap_or("");
             match delta_type {
                 "text_delta" => {
                     if let Some(t) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
-                        state.text.push_str(t);
-                        send_event(
-                            event_tx,
-                            AgentEvent::TextDelta {
-                                run_id: run_id.to_string(),
-                                delta: t.to_string(),
-                            },
-                        )
-                        .await?;
+                        // FIX 1: feed through SkillCallParser (suppresses <use_skill> XML).
+                        feed_chat_text(state, t, event_tx, run_id).await?;
                     }
                 }
                 "thinking_delta" => {
@@ -414,6 +513,19 @@ async fn handle_messages_event(
             if let Some(u) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
                 // message_delta usage.output_tokens 是累计值。
                 state.usage_output = u as u32;
+            }
+            // FIX 5: cache details can also appear on message_delta usage.
+            if let Some(u) = v
+                .pointer("/usage/cache_read_input_tokens")
+                .and_then(|x| x.as_u64())
+            {
+                state.cache_read_tokens = Some(u as u32);
+            }
+            if let Some(u) = v
+                .pointer("/usage/cache_creation_input_tokens")
+                .and_then(|x| x.as_u64())
+            {
+                state.cache_write_tokens = Some(u as u32);
             }
         }
         "message_stop" => return Ok(true),
@@ -468,15 +580,8 @@ async fn handle_chat_event(
         .and_then(|t| t.as_str())
     {
         if !t.is_empty() {
-            state.text.push_str(t);
-            send_event(
-                event_tx,
-                AgentEvent::TextDelta {
-                    run_id: run_id.to_string(),
-                    delta: t.to_string(),
-                },
-            )
-            .await?;
+            // FIX 1: feed through SkillCallParser (suppresses <use_skill> XML).
+            feed_chat_text(state, t, event_tx, run_id).await?;
         }
     }
     // choices[0].finish_reason → stop_reason（忽略 reasoning_content）。
@@ -519,15 +624,8 @@ async fn handle_responses_event(
     match typ {
         "response.output_text.delta" => {
             if let Some(t) = v.get("delta").and_then(|t| t.as_str()) {
-                state.text.push_str(t);
-                send_event(
-                    event_tx,
-                    AgentEvent::TextDelta {
-                        run_id: run_id.to_string(),
-                        delta: t.to_string(),
-                    },
-                )
-                .await?;
+                // FIX 1: feed through SkillCallParser (suppresses <use_skill> XML).
+                feed_chat_text(state, t, event_tx, run_id).await?;
             }
         }
         "response.reasoning_summary_text.delta" => {
@@ -542,24 +640,24 @@ async fn handle_responses_event(
                 .await?;
             }
         }
+        // FIX 8: response.completed → terminal with usage + status.
         "response.completed" => {
-            if let Some(u) = v
-                .pointer("/response/usage/input_tokens")
-                .and_then(|x| x.as_u64())
-            {
-                state.usage_input = u as u32;
-            }
-            if let Some(u) = v
-                .pointer("/response/usage/output_tokens")
-                .and_then(|x| x.as_u64())
-            {
-                state.usage_output = u as u32;
-            }
-            if let Some(s) = v
-                .pointer("/response/status")
+            read_responses_completion(&v, state);
+            return Ok(true);
+        }
+        // FIX 8: response.incomplete → terminal. Map incomplete_details.reason
+        // (e.g. max_output_tokens) to a stop_reason; "length"/max_output_tokens → MaxTurns.
+        "response.incomplete" => {
+            read_responses_completion(&v, state);
+            // Prefer the explicit incomplete reason if present.
+            if let Some(reason) = v
+                .pointer("/response/incomplete_details/reason")
                 .and_then(|t| t.as_str())
             {
-                state.raw_stop_reason = Some(s.to_string());
+                // adapter.map_stop_reason maps "max_output_tokens"/"length" → MaxTurns.
+                state.raw_stop_reason = Some(reason.to_string());
+            } else {
+                state.raw_stop_reason = Some("incomplete".to_string());
             }
             return Ok(true);
         }
@@ -575,9 +673,31 @@ async fn handle_responses_event(
             }
             return Err(LoopError::Provider(msg.to_string()));
         }
+        // FIX 8: item-lifecycle events carry no visible delta we need; ignore gracefully.
+        // (response.output_item.added/done, response.content_part.added/done,
+        //  response.output_text.done, response.created, response.in_progress, etc.)
         _ => {}
     }
     Ok(false)
+}
+
+/// FIX 8 helper：从 `response.completed` / `response.incomplete` envelope 读 usage + status。
+fn read_responses_completion(v: &Value, state: &mut StreamState) {
+    if let Some(u) = v
+        .pointer("/response/usage/input_tokens")
+        .and_then(|x| x.as_u64())
+    {
+        state.usage_input = u as u32;
+    }
+    if let Some(u) = v
+        .pointer("/response/usage/output_tokens")
+        .and_then(|x| x.as_u64())
+    {
+        state.usage_output = u as u32;
+    }
+    if let Some(s) = v.pointer("/response/status").and_then(|t| t.as_str()) {
+        state.raw_stop_reason = Some(s.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +719,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: Some(64),
             context_window_tokens: Some(32_000),
+            thinking_budget_tokens: None,
         }
     }
 
@@ -721,6 +842,67 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { delta, .. } if delta == "你好")));
     }
 
+    // FIX 5: Anthropic usage cache details parsed into AgentEvent::Usage.
+    #[tokio::test]
+    async fn parse_messages_stream_usage_cache_details() {
+        let canned = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1,\"cache_read_input_tokens\":2051,\"cache_creation_input_tokens\":2048}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_outcome, events) = run_canned(WireFormat::Messages, canned.as_bytes()).await;
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::Usage {
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    ..
+                } => Some((*cache_read_tokens, *cache_write_tokens)),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.0, Some(2051));
+        assert_eq!(usage.1, Some(2048));
+    }
+
+    // FIX 1: a <use_skill> turn emits clean TextDelta (no raw XML) exactly once and the
+    // skill is parsed into outcome.skill_events for the loop to dispatch.
+    #[tokio::test]
+    async fn parse_messages_stream_suppresses_use_skill_xml() {
+        let canned = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"check: <use_skill name=\\\"echo\\\">{\\\"a\\\":1}</use_skill> done\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (outcome, events) = run_canned(WireFormat::Messages, canned.as_bytes()).await;
+        // raw text retains the XML for message history.
+        assert!(outcome.text.contains("<use_skill"));
+        // skill_events carries exactly one UseSkill, no TextDelta.
+        assert_eq!(outcome.skill_events.len(), 1);
+        assert!(matches!(
+            &outcome.skill_events[0],
+            ParserEvent::UseSkill { name, .. } if name == "echo"
+        ));
+        // Emitted TextDelta must be clean (no raw XML) and "check: " appears once.
+        let joined: String = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!joined.contains("<use_skill"), "leaked XML: {joined:?}");
+        assert_eq!(joined.matches("check: ").count(), 1);
+        assert!(joined.contains("done"));
+    }
+
     #[tokio::test]
     async fn parse_chat_completions_stream() {
         let canned = concat!(
@@ -764,6 +946,34 @@ mod tests {
         assert_eq!(outcome.usage_output, 4);
         assert_eq!(outcome.stop_reason, AgentStopReason::Completed);
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ThinkingDelta { .. })));
+    }
+
+    // FIX 8: response.incomplete (max_output_tokens) → MaxTurns; item-lifecycle events
+    // are ignored gracefully without crashing.
+    #[tokio::test]
+    async fn parse_responses_incomplete_maps_to_max_turns() {
+        let canned = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}\n\n",
+            "event: response.content_part.added\n",
+            "data: {\"type\":\"response.content_part.added\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\"}\n\n",
+            "event: response.content_part.done\n",
+            "data: {\"type\":\"response.content_part.done\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\"}\n\n",
+            "event: response.incomplete\n",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":3,\"output_tokens\":64}}}\n\n",
+        );
+        let (outcome, _events) = run_canned(WireFormat::Responses, canned.as_bytes()).await;
+        assert_eq!(outcome.text, "hi");
+        assert_eq!(outcome.usage_output, 64);
+        assert_eq!(outcome.stop_reason, AgentStopReason::MaxTurns);
     }
 
     #[tokio::test]
@@ -813,6 +1023,57 @@ mod tests {
         assert!(hs.iter().any(|(k, v)| *k == "Authorization" && v == "Bearer secret"));
     }
 
+    // FIX 2: HttpProvider with an in-memory PayloadStore builds image wire (base64) for a
+    // payload:// dataRef — the production image request path.
+    #[tokio::test]
+    async fn http_provider_image_request_derefs_payload_store() {
+        use crate::domain::agent::{AgentMessageBlock, AgentMessageRole};
+        use crate::infrastructure::agent::migrations::migrations as agent_migrations;
+        use crate::infrastructure::agent::payload_store::PayloadStore;
+        use crate::infrastructure::db::{run_migrations, AppDb};
+        use chrono::Utc;
+
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, agent_migrations()).unwrap());
+        let store = PayloadStore::new(db);
+        // store a tiny PNG-ish byte payload
+        let bytes = vec![0x89u8, 0x50, 0x4e, 0x47];
+        let payload_id = store
+            .put_image(bytes.clone(), "image/png".to_string())
+            .unwrap();
+        let uri = PayloadStore::make_uri(&payload_id);
+
+        let mut ch = channel(WireFormat::Messages, "https://h", "m", "k");
+        ch.supports_vision = true;
+        let hp = HttpProvider::with_payload_store(ch, Some(store)).unwrap();
+
+        let msgs = vec![AgentMessage {
+            message_id: "m1".into(),
+            run_id: Some("r1".into()),
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Image {
+                mime_type: "image/png".into(),
+                data_ref: uri,
+            }],
+            created_at: Utc::now(),
+        }];
+        let ctx = ContextBundle::new("r1");
+        // Build the body the way next_turn does (FIX 2: pass Some(&store)).
+        let body = hp
+            .adapter
+            .build_request_body(&msgs, &ctx, hp.payload_store.as_ref())
+            .expect("image wire build with payload store");
+        let src = &body["messages"][0]["content"][0]["source"];
+        assert_eq!(src["type"], "base64");
+        assert_eq!(src["media_type"], "image/png");
+        let b64 = src["data"].as_str().unwrap();
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert_eq!(decoded, bytes);
+    }
+
     // ---------- Live chat smoke (env-driven, #[ignore], NO hardcoded secrets) ----------
     //
     // Run with (env inline; never commit secrets):
@@ -850,25 +1111,49 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
             let pump = tokio::spawn(async move {
                 let mut collected = String::new();
+                let mut text_delta_count = 0usize;
+                let mut saw_raw_xml = false;
+                let mut usage_seen: Vec<(u32, u32, Option<u32>, Option<u32>)> = Vec::new();
                 while let Some(e) = rx.recv().await {
-                    if let AgentEvent::TextDelta { delta, .. } = e {
-                        collected.push_str(&delta);
+                    match e {
+                        AgentEvent::TextDelta { delta, .. } => {
+                            if delta.contains("<use_skill") {
+                                saw_raw_xml = true;
+                            }
+                            collected.push_str(&delta);
+                            text_delta_count += 1;
+                        }
+                        AgentEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                            ..
+                        } => usage_seen.push((
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens,
+                            cache_write_tokens,
+                        )),
+                        _ => {}
                     }
                 }
-                collected
+                (collected, text_delta_count, saw_raw_xml, usage_seen)
             });
             let outcome = hp
                 .next_turn(&msgs, &ctx, &tx, "r1")
                 .await
                 .unwrap_or_else(|e| panic!("[{label}] next_turn failed: {e}"));
             drop(tx);
-            let streamed = pump.await.unwrap();
+            let (streamed, n_deltas, saw_raw_xml, usage_seen) = pump.await.unwrap();
             println!(
-                "[live][{label}] text={:?} streamed={:?} usage_in={} usage_out={} stop={:?}",
-                outcome.text, streamed, outcome.usage_input, outcome.usage_output, outcome.stop_reason
+                "[live][{label}] text={:?} streamed={:?} n_text_deltas={} raw_xml_in_delta={} usage(per-turn)={:?} stop={:?}",
+                outcome.text, streamed, n_deltas, saw_raw_xml, usage_seen, outcome.stop_reason
             );
             assert!(!outcome.text.is_empty(), "[{label}] returned empty text");
             assert!(outcome.usage_output > 0, "[{label}] usage_output == 0");
+            // FIX 1: no raw <use_skill XML in emitted TextDelta.
+            assert!(!saw_raw_xml, "[{label}] raw <use_skill XML leaked into TextDelta");
         }
 
         let mut ran = 0;

@@ -5,11 +5,13 @@
 //! 行为：
 //! 1. emit `run_start`
 //! 2. 调 provider stream（trait `ProviderStream`，便于注入 fake provider 测试）
-//! 3. 把 provider 输出的 chat text 喂 `SkillCallParser`：
-//!    - `TextDelta` → emit `text_delta`
+//! 3. FIX 1（spec §2/§3）：`SkillCallParser` 现在跑在 **provider 内部**，clean `TextDelta`
+//!    由 provider 实时 emit（XML 抑制）。loop 只消费 `outcome.skill_events`：
 //!    - `UseSkill` → emit `skill_start` → `SkillRegistry::dispatch_skill_call` →
 //!      emit `skill_end` → 缓存 `<skill_result>` 文本
 //!    - `ParseError` → 把 `<skill_error code="parse_error">` 加到本轮回写文本
+//!    loop **不再** 自己跑 parser、**不再** re-emit `TextDelta`（避免重复）。
+//!    消息历史用 `outcome.text`（raw，含 `<use_skill>` XML）回写。
 //! 4. turn 结束：
 //!    - 若本 turn 触发了 ≥ 1 次 dispatch：构造新一轮 user message（按出现顺序串联
 //!      `<skill_result>` / `<skill_error>`），继续 loop。
@@ -23,7 +25,7 @@ use crate::domain::agent::{
 };
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::agent::context_compaction::{compact_context, CompactPolicy};
-use crate::infrastructure::agent::skill_parser::{ParserEvent, SkillCallParser};
+use crate::infrastructure::agent::skill_parser::ParserEvent;
 use crate::infrastructure::agent::skill_registry::{DispatchError, SkillRegistry};
 use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
@@ -34,14 +36,22 @@ use uuid::Uuid;
 /// 一次 provider stream 的拉取结果。
 ///
 /// 本 trait 抽象掉具体 SSE 解码细节，让 loop 测试可以注入 mock。
+///
+/// FIX 1（spec §2/§3）：`SkillCallParser` 现在跑在 **streaming provider 内部**，
+/// 所以 provider 在流式过程中已经 emit 过 clean（XML-suppressed）的 `TextDelta`。
+/// `skill_events` 携带本 turn 解析出的 `UseSkill` / `ParseError`（按出现顺序），供
+/// loop dispatch；其中**不包含** `TextDelta`（已由 provider emit，loop 不再 re-emit）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderTurnOutcome {
-    /// provider 输出的纯 chat text（可能含 `<use_skill>` XML 标签）。
+    /// provider 输出的 **raw** chat text（含 `<use_skill>` XML 标签），用于回写消息历史。
     pub text: String,
     pub usage_input: u32,
     pub usage_output: u32,
     /// provider 原始 stop reason（adapter 归一化后值）。
     pub stop_reason: AgentStopReason,
+    /// 本 turn 解析出的 skill 事件（`UseSkill` / `ParseError`，按出现顺序）。
+    /// TextDelta 已由 provider emit，**不**出现在此 vec。
+    pub skill_events: Vec<ParserEvent>,
 }
 
 /// Provider stream 抽象。Loop executor 在每个 turn 调用一次 `next_turn`。
@@ -157,38 +167,20 @@ pub async fn run_agent_loop(
         usage_input = usage_input.saturating_add(outcome.usage_input);
         usage_output = usage_output.saturating_add(outcome.usage_output);
 
-        // ---- feed provider text through SkillCallParser ----
-        let mut parser = SkillCallParser::new();
-        let mut events = parser.feed(&outcome.text);
-        events.extend(parser.finalize());
-
-        let mut assistant_text_parts: Vec<String> = Vec::new();
+        // ---- FIX 1: provider already ran SkillCallParser and emitted clean TextDelta.
+        // Loop consumes only the parsed skill events; it does NOT re-feed text and does
+        // NOT re-emit TextDelta. Assistant message history uses outcome.text (raw XML).
         let mut skill_results_for_next_turn: Vec<String> = Vec::new();
         let mut any_dispatch = false;
 
-        for ev in events {
+        for ev in outcome.skill_events.iter().cloned() {
             match ev {
-                ParserEvent::TextDelta(s) => {
-                    send_event(
-                        &event_tx,
-                        AgentEvent::TextDelta {
-                            run_id: run_id.clone(),
-                            delta: s.clone(),
-                        },
-                    )
-                    .await?;
-                    assistant_text_parts.push(s);
+                ParserEvent::TextDelta(_) => {
+                    // Provider already emitted clean TextDelta; loop ignores any here.
                 }
                 ParserEvent::UseSkill { name, input } => {
                     any_dispatch = true;
                     let call_id = SkillRegistry::new_skill_call_id();
-                    // Persist <use_skill> raw XML in assistant text history for the LLM.
-                    let raw_use = format!(
-                        r#"<use_skill name="{}">{}</use_skill>"#,
-                        name,
-                        serde_json::to_string(&input).unwrap_or_else(|_| "{}".into())
-                    );
-                    assistant_text_parts.push(raw_use);
 
                     send_event(
                         &event_tx,
@@ -261,10 +253,9 @@ pub async fn run_agent_loop(
                         ));
                     }
                 }
-                ParserEvent::ParseError { reason, partial } => {
+                ParserEvent::ParseError { reason, partial: _ } => {
                     // Spec §2: 标签嵌套不合法 / JSON parse 错 → 返回 <skill_error code="parse_error">。
-                    let raw_partial = partial.clone();
-                    assistant_text_parts.push(raw_partial);
+                    // raw partial 已包含在 outcome.text 中（assistant 历史从 outcome.text 回写）。
                     any_dispatch = true;
                     let call_id = SkillRegistry::new_skill_call_id();
                     skill_call_ids.push(call_id.clone());
@@ -279,14 +270,15 @@ pub async fn run_agent_loop(
             }
         }
 
-        // Persist assistant message (text-only).
-        if !assistant_text_parts.is_empty() {
-            let joined = assistant_text_parts.join("");
+        // Persist assistant message (raw text, incl <use_skill> XML) for LLM history.
+        if !outcome.text.is_empty() {
             messages.push(AgentMessage {
                 message_id: format!("am-{}", Uuid::new_v4()),
                 run_id: Some(run_id.clone()),
                 role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Text { text: joined }],
+                blocks: vec![AgentMessageBlock::Text {
+                    text: outcome.text.clone(),
+                }],
                 created_at: Utc::now(),
             });
         }
@@ -313,7 +305,13 @@ pub async fn run_agent_loop(
         // Continue to next turn.
     }
 
-    // emit usage + done
+    // FIX 6: usage event semantics.
+    // The provider emits a *per-turn* `AgentEvent::Usage` inside `next_turn` (one per
+    // provider round-trip). Here the loop emits the *cumulative run total* exactly ONCE,
+    // just before `Done`. Same variant, but disambiguated by position: the final Usage
+    // immediately preceding Done is always the run total; any earlier Usage is per-turn.
+    // (We keep the public AgentEvent shape unchanged; consumers that need the run total
+    // can read the last Usage before Done, which also matches RunSummary.)
     send_event(
         &event_tx,
         AgentEvent::Usage {
@@ -409,6 +407,7 @@ mod tests {
     use crate::domain::agent::{
         ProviderChannel, SideEffect, SkillSpec, WireFormat,
     };
+    use crate::infrastructure::agent::skill_parser::SkillCallParser;
     use crate::infrastructure::agent::skill_registry::{
         FnSkillHandler, SkillHandler, SkillHandlerFuture, SkillHandlerOutput, SkillInvocation,
     };
@@ -429,10 +428,38 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: None,
             context_window_tokens: None,
+            thinking_budget_tokens: None,
+        }
+    }
+
+    /// Build a scripted outcome the way a real provider does: run SkillCallParser over the
+    /// scripted raw text, populate `skill_events` (TextDelta excluded). TextDelta would be
+    /// emitted by the provider during streaming; here we simply build the outcome.
+    fn scripted_outcome(
+        text: &str,
+        usage_input: u32,
+        usage_output: u32,
+        stop_reason: AgentStopReason,
+    ) -> ProviderTurnOutcome {
+        let mut parser = SkillCallParser::new();
+        let mut events = parser.feed(text);
+        events.extend(parser.finalize());
+        let skill_events: Vec<ParserEvent> = events
+            .into_iter()
+            .filter(|e| !matches!(e, ParserEvent::TextDelta(_)))
+            .collect();
+        ProviderTurnOutcome {
+            text: text.to_string(),
+            usage_input,
+            usage_output,
+            stop_reason,
+            skill_events,
         }
     }
 
     /// Fake provider — 按预设脚本输出 turns.
+    /// FIX 1: emit clean TextDelta from the SkillCallParser over the scripted text (mirrors
+    /// HttpProvider), and carry parsed skill_events in the outcome.
     struct ScriptedProvider {
         script: Vec<Result<ProviderTurnOutcome, LoopError>>,
         index: usize,
@@ -443,8 +470,8 @@ mod tests {
             &mut self,
             _messages: &[AgentMessage],
             _context: &ContextBundle,
-            _event_tx: &Sender<AgentEvent>,
-            _run_id: &str,
+            event_tx: &Sender<AgentEvent>,
+            run_id: &str,
         ) -> Result<ProviderTurnOutcome, LoopError> {
             // Move element out without cloning LoopError (LoopError: !Clone).
             if self.index >= self.script.len() {
@@ -455,6 +482,24 @@ mod tests {
                 Err(LoopError::Provider("consumed".into())),
             );
             self.index += 1;
+            // Emit clean TextDelta in real time, as a streaming provider would.
+            if let Ok(out) = &item {
+                let mut parser = SkillCallParser::new();
+                let mut events = parser.feed(&out.text);
+                events.extend(parser.finalize());
+                for ev in events {
+                    if let ParserEvent::TextDelta(s) = ev {
+                        send_event(
+                            event_tx,
+                            AgentEvent::TextDelta {
+                                run_id: run_id.to_string(),
+                                delta: s,
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             item
         }
     }
@@ -492,12 +537,12 @@ mod tests {
     async fn loop_completes_on_text_only_turn() {
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
-            script: vec![Ok(ProviderTurnOutcome {
-                text: "hello".into(),
-                usage_input: 5,
-                usage_output: 7,
-                stop_reason: AgentStopReason::Completed,
-            })],
+            script: vec![Ok(scripted_outcome(
+                "hello",
+                5,
+                7,
+                AgentStopReason::Completed,
+            ))],
             index: 0,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -524,18 +569,13 @@ mod tests {
         registry.register_skill(spec("echo"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
-                Ok(ProviderTurnOutcome {
-                    text: r#"check: <use_skill name="echo">{"a":1}</use_skill>"#.into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::ProviderStop,
-                }),
-                Ok(ProviderTurnOutcome {
-                    text: "done".into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::Completed,
-                }),
+                Ok(scripted_outcome(
+                    r#"check: <use_skill name="echo">{"a":1}</use_skill>"#,
+                    1,
+                    1,
+                    AgentStopReason::ProviderStop,
+                )),
+                Ok(scripted_outcome("done", 1, 1, AgentStopReason::Completed)),
             ],
             index: 0,
         });
@@ -548,16 +588,36 @@ mod tests {
         assert_eq!(summary.turns, 2);
         assert_eq!(summary.skill_call_ids.len(), 1);
 
-        let mut starts = 0;
-        let mut ends = 0;
+        // FIX 1: a `<use_skill>` turn emits clean TextDelta (raw XML suppressed) exactly
+        // once, and the skill still dispatches.
+        let mut text_deltas: Vec<String> = Vec::new();
+        let mut starts2 = 0;
+        let mut rx_events = Vec::new();
         while let Some(e) = rx.recv().await {
+            rx_events.push(e);
+        }
+        for e in &rx_events {
             match e {
-                AgentEvent::SkillStart { .. } => starts += 1,
-                AgentEvent::SkillEnd { .. } => ends += 1,
+                AgentEvent::TextDelta { delta, .. } => text_deltas.push(delta.clone()),
+                AgentEvent::SkillStart { .. } => starts2 += 1,
                 _ => {}
             }
         }
-        assert_eq!(starts, 1);
+        let joined: String = text_deltas.concat();
+        assert!(
+            !joined.contains("<use_skill"),
+            "raw <use_skill> XML leaked into TextDelta: {joined:?}"
+        );
+        assert!(joined.contains("check: "));
+        // "check: " appears exactly once (no double-emit).
+        assert_eq!(joined.matches("check: ").count(), 1, "TextDelta double-emitted");
+        assert_eq!(starts2, 1);
+
+        let ends = rx_events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::SkillEnd { .. }))
+            .count();
+        assert_eq!(starts2, 1);
         assert_eq!(ends, 1);
     }
 
@@ -568,19 +628,13 @@ mod tests {
         registry.register_skill(spec("b"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
-                Ok(ProviderTurnOutcome {
-                    text: r#"<use_skill name="a">{"i":1}</use_skill><use_skill name="b">{"i":2}</use_skill>"#
-                        .into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::ProviderStop,
-                }),
-                Ok(ProviderTurnOutcome {
-                    text: "done".into(),
-                    usage_input: 0,
-                    usage_output: 0,
-                    stop_reason: AgentStopReason::Completed,
-                }),
+                Ok(scripted_outcome(
+                    r#"<use_skill name="a">{"i":1}</use_skill><use_skill name="b">{"i":2}</use_skill>"#,
+                    1,
+                    1,
+                    AgentStopReason::ProviderStop,
+                )),
+                Ok(scripted_outcome("done", 0, 0, AgentStopReason::Completed)),
             ],
             index: 0,
         });
@@ -605,12 +659,7 @@ mod tests {
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Err(LoopError::ProviderContextTooLong),
-                Ok(ProviderTurnOutcome {
-                    text: "ok".into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::Completed,
-                }),
+                Ok(scripted_outcome("ok", 1, 1, AgentStopReason::Completed)),
             ],
             index: 0,
         });
@@ -684,6 +733,7 @@ mod tests {
                     usage_input: 1,
                     usage_output: 1,
                     stop_reason: AgentStopReason::Completed,
+                    skill_events: Vec::new(),
                 })
             }
         }
@@ -711,12 +761,7 @@ mod tests {
     async fn loop_emits_run_start_with_model_from_channel() {
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
-            script: vec![Ok(ProviderTurnOutcome {
-                text: "x".into(),
-                usage_input: 0,
-                usage_output: 0,
-                stop_reason: AgentStopReason::Completed,
-            })],
+            script: vec![Ok(scripted_outcome("x", 0, 0, AgentStopReason::Completed))],
             index: 0,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
@@ -737,18 +782,13 @@ mod tests {
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![
-                Ok(ProviderTurnOutcome {
-                    text: r#"<use_skill name="missing">{}</use_skill>"#.into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::ProviderStop,
-                }),
-                Ok(ProviderTurnOutcome {
-                    text: "bye".into(),
-                    usage_input: 1,
-                    usage_output: 1,
-                    stop_reason: AgentStopReason::Completed,
-                }),
+                Ok(scripted_outcome(
+                    r#"<use_skill name="missing">{}</use_skill>"#,
+                    1,
+                    1,
+                    AgentStopReason::ProviderStop,
+                )),
+                Ok(scripted_outcome("bye", 1, 1, AgentStopReason::Completed)),
             ],
             index: 0,
         });

@@ -154,6 +154,7 @@ mod tests {
             supports_thinking: false,
             max_output_tokens: Some(2048),
             context_window_tokens: Some(128_000),
+            thinking_budget_tokens: None,
         }
     }
 

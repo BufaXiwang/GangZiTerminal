@@ -143,6 +143,8 @@ pub fn agent_add_channel(
         supports_thinking: input.supports_thinking.unwrap_or(false),
         max_output_tokens: input.max_output_tokens,
         context_window_tokens: input.context_window_tokens,
+        // FIX 4: thinking budget not exposed via add-channel DTO yet; default off.
+        thinking_budget_tokens: None,
     };
 
     let was_empty = infra.channels_repo.list().map_err(map_repo_err)?.is_empty();
