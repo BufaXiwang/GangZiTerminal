@@ -75,6 +75,17 @@ Quotes 不负责：
 
 股票、指数、基金统一建模为 `MarketInstrument`。实现可以使用任意持久化结构，但对外和跨模块只认这个模型。
 
+> **当前 universe 只覆盖股票 / 指数 / 场内基金（三类），债券 / 逆回购等一律不纳入。** TDX `security_list`
+> 原始全量含交易所所有证券（实测 ~5 万：股 ~5200、指 ~560、基 ~1700，**其余 ~4.3 万是国债/可转债/
+> 企业债/逆回购等**）。`universe::classify` 白名单只放行三类（SH 股 600/601/603/605/688/689、基 51/56/58、
+> 指 000/999；SZ 股 000-004/300/301、基 159、指 399；BJ 股），其余 `None` 丢弃。
+> 注意分层：**底层 TDX provider 方法（`fetch_quote`/`fetch_kline_*` 等）是 category-无关的**——`TsCode` 只校验
+> 「6 位数字 + 市场后缀」，传入债券代码（如 `110059.SH`）TDX 同样会返回数据。所以「不取债券」是 universe
+> 策展层（`classify` + 读路径只遍历 curated universe）的约束，**不是 provider 方法的硬限制**。
+> **债券作为一等公民（可转债等）暂不支持，延后**——见 [issues/quotes-bond-support-todo.md](../../issues/quotes-bond-support-todo.md)。
+> 真要支持需：新增 `InstrumentCategory::Bond` + 债券 3 位小数缩放（否则报价 10× 错，同 ETF 那个 bug 类）+
+> 放开 `classify` 债券前缀 + universe 纳入 + 本 spec 落点。
+
 ```ts
 type MarketInstrument = {
   tsCode: TsCode;
