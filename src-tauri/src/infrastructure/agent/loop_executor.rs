@@ -5,11 +5,12 @@
 //! 行为：
 //! 1. emit `run_start`
 //! 2. 调 provider stream（trait `ProviderStream`，便于注入 fake provider 测试）
-//! 3. FIX 1（spec §2/§3）：`SkillCallParser` 现在跑在 **provider 内部**，clean `TextDelta`
+//! 3. （spec §2/§3）：`SkillCallParser` 现在跑在 **provider 内部**，clean `TextDelta`
 //!    由 provider 实时 emit（XML 抑制）。loop 只消费 `outcome.skill_events`：
 //!    - `UseSkill` → emit `skill_start` → `SkillRegistry::dispatch_skill_call` →
 //!      emit `skill_end` → 缓存 `<skill_result>` 文本
 //!    - `ParseError` → 把 `<skill_error code="parse_error">` 加到本轮回写文本
+//!
 //!    loop **不再** 自己跑 parser、**不再** re-emit `TextDelta`（避免重复）。
 //!    消息历史用 `outcome.text`（raw，含 `<use_skill>` XML）回写。
 //! 4. turn 结束：
@@ -94,7 +95,7 @@ impl CompactionPlan {
 ///
 /// 本 trait 抽象掉具体 SSE 解码细节，让 loop 测试可以注入 mock。
 ///
-/// FIX 1（spec §2/§3）：`SkillCallParser` 现在跑在 **streaming provider 内部**，
+/// （spec §2/§3）：`SkillCallParser` 现在跑在 **streaming provider 内部**，
 /// 所以 provider 在流式过程中已经 emit 过 clean（XML-suppressed）的 `TextDelta`。
 /// `skill_events` 携带本 turn 解析出的 `UseSkill` / `ParseError`（按出现顺序），供
 /// loop dispatch；其中**不包含** `TextDelta`（已由 provider emit，loop 不再 re-emit）。
@@ -141,6 +142,7 @@ pub enum LoopError {
 /// - `repo=Some` 且有 `conversation_id` → Infra 先把 `input` 落库（分配 seq + 打 conversationId），
 ///   再 `load_conversation_view`（含刚落库的 input）作为本轮上下文，跑完把产出也落库。
 /// - 无 `conversation_id` 或 `repo=None` → 不 load 不持久化，`input` 即本轮全部上下文（无状态运行）。
+///
 /// 调用方**永不**自己 upsert / 分配 seq / load 历史。主动压缩 + Summarize 也都在此函数内完成。
 ///
 /// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
@@ -278,7 +280,7 @@ pub async fn run_agent_turn(
         usage_input = usage_input.saturating_add(outcome.usage_input);
         usage_output = usage_output.saturating_add(outcome.usage_output);
 
-        // ---- FIX 1: provider already ran SkillCallParser and emitted clean TextDelta.
+        // ---- provider already ran SkillCallParser and emitted clean TextDelta.
         // Loop consumes only the parsed skill events; it does NOT re-feed text and does
         // NOT re-emit TextDelta. Assistant message history uses outcome.text (raw XML).
         let mut skill_results_for_next_turn: Vec<String> = Vec::new();
@@ -428,7 +430,7 @@ pub async fn run_agent_turn(
         // Continue to next turn.
     }
 
-    // FIX 6: usage event semantics.
+    // usage event semantics.
     // The provider emits a *per-turn* `AgentEvent::Usage` inside `next_turn` (one per
     // provider round-trip). Here the loop emits the *cumulative run total* exactly ONCE,
     // just before `Done`. Same variant, but disambiguated by position: the final Usage
@@ -863,7 +865,7 @@ fn prepend_skill_list_to_system_parts(context: &mut ContextBundle, registry: &Sk
     if prompt.is_empty() {
         return;
     }
-    let token_estimate = ((prompt.chars().count() + 3) / 4) as u32;
+    let token_estimate = prompt.chars().count().div_ceil(4) as u32;
     let part = ContextPart {
         kind: ContextPartKind::System,
         content: ContextContent::Text(prompt),
@@ -931,7 +933,7 @@ mod tests {
     }
 
     /// Fake provider — 按预设脚本输出 turns.
-    /// FIX 1: emit clean TextDelta from the SkillCallParser over the scripted text (mirrors
+    /// emit clean TextDelta from the SkillCallParser over the scripted text (mirrors
     /// HttpProvider), and carry parsed skill_events in the outcome.
     struct ScriptedProvider {
         script: Vec<Result<ProviderTurnOutcome, LoopError>>,
@@ -1063,7 +1065,7 @@ mod tests {
         assert_eq!(summary.turns, 2);
         assert_eq!(summary.skill_call_ids.len(), 1);
 
-        // FIX 1: a `<use_skill>` turn emits clean TextDelta (raw XML suppressed) exactly
+        // a `<use_skill>` turn emits clean TextDelta (raw XML suppressed) exactly
         // once, and the skill still dispatches.
         let mut text_deltas: Vec<String> = Vec::new();
         let mut starts2 = 0;

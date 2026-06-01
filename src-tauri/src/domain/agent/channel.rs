@@ -57,7 +57,7 @@ pub struct ProviderChannel {
     /// 上下文窗口大小，驱动 soft / hard limit 计算。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u32>,
-    /// FIX 4（agent provider wire audit）：Anthropic extended-thinking budget。
+    /// Anthropic extended-thinking budget。
     /// `None`（默认）= 不发 request-level `thinking` 配置（行为不变）。
     /// `Some(n)` 且 `supports_thinking = true` 时，Anthropic adapter 发
     /// top-level `thinking: {type:"enabled", budget_tokens:n}`，并校验 `n < max_tokens`。

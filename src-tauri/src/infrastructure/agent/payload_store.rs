@@ -36,6 +36,9 @@ impl PayloadKind {
         }
     }
 
+    // Intentionally an inherent `Option`-returning parser, not the std `FromStr` trait
+    // (no Err type needed — unknown kinds are simply None).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "skill_input" => Some(PayloadKind::SkillInput),

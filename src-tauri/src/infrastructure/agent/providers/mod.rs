@@ -45,7 +45,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// 把**当前 live messages** + context 转成 provider 可接受的 JSON body。
     ///
     /// Spec §3 Agent Loop：body 必须反映 loop 累积的每一轮消息（含 `<skill_result>` user
-    /// 消息），而不是 run 启动时的 seed_messages 快照。loop_executor 维护 growing
+    /// 消息），而不是启动时的消息快照。loop_executor 维护 growing
     /// `messages: Vec<AgentMessage>` 并在每个 turn 把整个 slice 传进来。
     ///
     /// Spec §2 ProviderChannel:

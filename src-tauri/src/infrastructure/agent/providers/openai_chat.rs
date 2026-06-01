@@ -24,7 +24,7 @@ impl OpenAIChatAdapter {
         Self { channel }
     }
 
-    /// FIX 7（agent provider wire audit）：official OpenAI 新模型（o1/o3/o4/gpt-5）经
+    /// official OpenAI 新模型（o1/o3/o4/gpt-5）经
     /// `/v1/chat/completions` 时要求 `max_completion_tokens`（`max_tokens` 已弃用且与
     /// o-series 不兼容），且用 `developer` 替代 `system` 角色。
     ///
@@ -52,9 +52,9 @@ impl OpenAIChatAdapter {
         context
             .system_parts
             .iter()
-            .filter_map(|p| match &p.content {
-                ContextContent::Text(s) => Some(s.clone()),
-                ContextContent::Json(v) => Some(v.to_string()),
+            .map(|p| match &p.content {
+                ContextContent::Text(s) => s.clone(),
+                ContextContent::Json(v) => v.to_string(),
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -79,7 +79,7 @@ impl OpenAIChatAdapter {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                // FIX 7: developer role for official OpenAI new models; system otherwise.
+                // developer role for official OpenAI new models; system otherwise.
                 Ok(Some(json!({"role": self.instruction_role(), "content": text})))
             }
             AgentMessageRole::User => {
@@ -157,7 +157,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
         let mut messages: Vec<Value> = Vec::new();
         let system_text = Self::extract_system(context);
         if !system_text.is_empty() {
-            // FIX 7: developer role for official OpenAI new models; system otherwise.
+            // developer role for official OpenAI new models; system otherwise.
             messages.push(json!({"role": self.instruction_role(), "content": system_text}));
         }
         for m in msgs {
@@ -173,7 +173,7 @@ impl ProviderAdapter for OpenAIChatAdapter {
             "messages": messages,
         });
         if let Some(m) = self.channel.max_output_tokens {
-            // FIX 7: official OpenAI new models require max_completion_tokens
+            // official OpenAI new models require max_completion_tokens
             // (max_tokens deprecated / incompatible with o-series). Compatible vendors
             // (DeepSeek/阿里/豆包) keep the portable max_tokens default — do NOT regress.
             if self.uses_openai_new_model_conventions() {
@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn build_request_body_reflects_multi_message_conversation() {
-        // Regression for the seed_messages bug.
+        // Regression: body must reflect the live growing messages slice passed by the loop, not a startup snapshot.
         let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![
@@ -339,7 +339,7 @@ mod tests {
         c
     }
 
-    // FIX 7: DeepSeek (portable default) keeps max_tokens + system role. No regression.
+    // DeepSeek (portable default) keeps max_tokens + system role. No regression.
     #[test]
     fn deepseek_keeps_max_tokens_and_system_role() {
         let ad = OpenAIChatAdapter::new(ch_model("deepseek-v4-flash"));
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
     }
 
-    // FIX 7: official OpenAI new models (gpt-5/o-series) use max_completion_tokens +
+    // official OpenAI new models (gpt-5/o-series) use max_completion_tokens +
     // developer role.
     #[test]
     fn openai_new_models_use_completion_tokens_and_developer_role() {

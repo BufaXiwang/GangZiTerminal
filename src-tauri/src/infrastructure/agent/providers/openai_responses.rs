@@ -26,9 +26,9 @@ impl OpenAIResponsesAdapter {
         context
             .system_parts
             .iter()
-            .filter_map(|p| match &p.content {
-                ContextContent::Text(s) => Some(s.clone()),
-                ContextContent::Json(v) => Some(v.to_string()),
+            .map(|p| match &p.content {
+                ContextContent::Text(s) => s.clone(),
+                ContextContent::Json(v) => v.to_string(),
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn build_request_body_reflects_multi_message_conversation() {
-        // Regression for the seed_messages bug.
+        // Regression: body must reflect the live growing messages slice passed by the loop, not a startup snapshot.
         let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![

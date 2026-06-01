@@ -56,7 +56,7 @@ impl ContextPart {
             ContextContent::Text(s) => s.chars().count(),
             ContextContent::Json(v) => v.to_string().chars().count(),
         };
-        ((len + 3) / 4) as u32
+        len.div_ceil(4) as u32
     }
 }
 

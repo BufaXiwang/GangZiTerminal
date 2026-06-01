@@ -74,18 +74,18 @@ pub enum MessageKind {
 impl AgentMessageBlock {
     /// 当前 block 是否允许在给定 role 下出现（spec §2 表格）。
     pub fn allowed_for_role(&self, role: AgentMessageRole) -> bool {
-        match (role, self) {
-            (AgentMessageRole::System, AgentMessageBlock::Text { .. }) => true,
-            (
-                AgentMessageRole::User,
-                AgentMessageBlock::Text { .. } | AgentMessageBlock::Image { .. },
-            ) => true,
-            (
-                AgentMessageRole::Assistant,
-                AgentMessageBlock::Text { .. } | AgentMessageBlock::Thinking { .. },
-            ) => true,
-            _ => false,
-        }
+        matches!(
+            (role, self),
+            (AgentMessageRole::System, AgentMessageBlock::Text { .. })
+                | (
+                    AgentMessageRole::User,
+                    AgentMessageBlock::Text { .. } | AgentMessageBlock::Image { .. },
+                )
+                | (
+                    AgentMessageRole::Assistant,
+                    AgentMessageBlock::Text { .. } | AgentMessageBlock::Thinking { .. },
+                )
+        )
     }
 }
 

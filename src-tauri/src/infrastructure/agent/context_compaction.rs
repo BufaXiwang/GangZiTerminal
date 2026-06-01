@@ -113,7 +113,7 @@ fn content_is_skill_result(content: &ContextContent) -> bool {
 
 fn stub_in_place(p: &mut ContextPart) {
     let text = render_stub(&p.content);
-    p.token_estimate = Some(((text.chars().count() + 3) / 4) as u32);
+    p.token_estimate = Some(text.chars().count().div_ceil(4) as u32);
     p.content = ContextContent::Text(text);
     p.kind = ContextPartKind::SkillResultStub;
 }
@@ -163,10 +163,11 @@ fn parse_skill_result_attrs(s: &str) -> Option<SkillResultAttrs> {
     let rest = &s[open_pos + "<skill_result".len()..];
     let close_gt = rest.find('>')?;
     let attrs_str = &rest[..close_gt];
-    let mut attrs = SkillResultAttrs::default();
-    attrs.name = read_attr(attrs_str, "name");
-    attrs.call_id = read_attr(attrs_str, "call_id");
-    attrs.payload_ref = read_attr(attrs_str, "ref");
+    let attrs = SkillResultAttrs {
+        name: read_attr(attrs_str, "name"),
+        call_id: read_attr(attrs_str, "call_id"),
+        payload_ref: read_attr(attrs_str, "ref"),
+    };
     // Heuristic: must look like a real skill_result tag (i.e. have at least name).
     if attrs.name.is_none() && attrs.call_id.is_none() && attrs.payload_ref.is_none() {
         return None;
@@ -273,7 +274,7 @@ pub fn estimate_message_tokens(msg: &AgentMessage) -> u32 {
             AgentMessageBlock::Image { data_ref, .. } => data_ref.chars().count(),
         })
         .sum();
-    ((chars + 3) / 4) as u32
+    chars.div_ceil(4) as u32
 }
 
 /// 启发式估算一批会话消息的 token 总和。

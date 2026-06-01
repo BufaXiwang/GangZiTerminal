@@ -32,9 +32,9 @@ impl AnthropicAdapter {
         context
             .system_parts
             .iter()
-            .filter_map(|p| match &p.content {
-                ContextContent::Text(s) => Some(s.clone()),
-                ContextContent::Json(v) => Some(v.to_string()),
+            .map(|p| match &p.content {
+                ContextContent::Text(s) => s.clone(),
+                ContextContent::Json(v) => v.to_string(),
             })
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -73,7 +73,7 @@ impl AnthropicAdapter {
                 if !self.channel.supports_thinking {
                     return Ok(None);
                 }
-                // FIX 3: redacted thinking is its own block shape.
+                // redacted thinking is its own block shape.
                 // Per anthropic-messages.md:
                 //   normal   = {type:"thinking", thinking, signature}
                 //   redacted = {type:"redacted_thinking", data}
@@ -177,7 +177,7 @@ impl ProviderAdapter for AnthropicAdapter {
         if !system_text.is_empty() {
             body["system"] = Value::String(system_text);
         }
-        // FIX 4: request-level extended-thinking config. Only emit when the channel both
+        // request-level extended-thinking config. Only emit when the channel both
         // supports thinking and has an explicit budget. Default (no budget) = no thinking,
         // preserving prior behavior. Per anthropic-messages.md: budget_tokens must be
         // ≥ 1024 and < max_tokens.
@@ -282,8 +282,8 @@ mod tests {
 
     #[test]
     fn build_request_body_reflects_multi_message_conversation() {
-        // Regression for the seed_messages bug: body must reflect the *live* growing
-        // messages incl <skill_result> user messages, not the run-start snapshot.
+        // Regression: body must reflect the live growing messages slice passed by the loop,
+        // not a startup snapshot — incl <skill_result> user messages.
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![
@@ -397,7 +397,7 @@ mod tests {
         );
     }
 
-    // FIX 3: redacted thinking serializes as {type:"redacted_thinking", data}, NOT a
+    // redacted thinking serializes as {type:"redacted_thinking", data}, NOT a
     // `redacted` field inside a `thinking` block.
     #[test]
     fn redacted_thinking_uses_redacted_thinking_block() {
@@ -419,7 +419,7 @@ mod tests {
         assert!(block.get("redacted").is_none());
     }
 
-    // FIX 3: a bare `redacted` blob (legacy metadata) also maps to redacted_thinking.
+    // a bare `redacted` blob (legacy metadata) also maps to redacted_thinking.
     #[test]
     fn redacted_metadata_blob_maps_to_redacted_thinking() {
         let ad = AnthropicAdapter::new(make_channel(false, true));
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(block["data"], "enc-xyz");
     }
 
-    // FIX 4: default (no budget) → no request-level thinking config.
+    // default (no budget) → no request-level thinking config.
     #[test]
     fn no_request_thinking_config_by_default() {
         let ad = AnthropicAdapter::new(make_channel(false, true));
@@ -451,7 +451,7 @@ mod tests {
         assert!(body.get("thinking").is_none());
     }
 
-    // FIX 4: budget + supports_thinking → top-level thinking:{type:enabled,budget_tokens}.
+    // budget + supports_thinking → top-level thinking:{type:enabled,budget_tokens}.
     #[test]
     fn request_thinking_config_emitted_with_budget() {
         let mut ch = make_channel(false, true);
@@ -468,7 +468,7 @@ mod tests {
         assert_eq!(body["thinking"]["budget_tokens"], 2048);
     }
 
-    // FIX 4: budget >= max_tokens → error (must be < max_tokens).
+    // budget >= max_tokens → error (must be < max_tokens).
     #[test]
     fn request_thinking_budget_must_be_less_than_max_tokens() {
         let mut ch = make_channel(false, true);
