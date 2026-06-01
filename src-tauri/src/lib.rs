@@ -508,8 +508,10 @@ mod specta_export_tests {
         if let Ok(k) = std::env::var("SEED_ANT_KEY") {
             let id = "ch_seed_anthropic";
             let base = std::env::var("SEED_ANT_BASE").unwrap_or_else(|_| "https://api.anthropic.com".into());
+            let model = std::env::var("SEED_ANT_MODEL")
+                .unwrap_or_else(|_| "claude-opus-4-5-20251101".into());
             let _ = repo.remove(id);
-            repo.add(&mk(id, "Anthropic", WireFormat::Messages, &base, k, "claude-haiku-4-5-20251001")).unwrap();
+            repo.add(&mk(id, "Anthropic", WireFormat::Messages, &base, k, &model)).unwrap();
             seeded.push(id);
         }
         if let Ok(k) = std::env::var("SEED_OAI_KEY") {
