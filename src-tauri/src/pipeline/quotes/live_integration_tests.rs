@@ -181,6 +181,64 @@ async fn quotes_live_tdx_universe_sz() {
     }
 }
 
+/// A2b · 把 TDX 原始全量经 `classify` 过滤后，按 类别 统计真实 universe 大小，并断言**债券不漏进**。
+/// 回答「股票/指数/基金各有多少」+ 锁定「universe 只含这三类」。Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_live_universe_classified_counts() {
+    use crate::domain::shared::Market;
+    use crate::infrastructure::quotes::universe::classify;
+    let mgr = TdxConnectionManager::new();
+    let mut stock = 0u32;
+    let mut index = 0u32;
+    let mut fund = 0u32;
+    let mut dropped = 0u32; // 债券/回购等非 universe 证券
+    let mut raw_total = 0u32;
+    let mut index_bond_leak: Vec<String> = Vec::new();
+    for (mkt, dmkt) in [(TdxMarket::SH, Market::SH), (TdxMarket::SZ, Market::SZ)] {
+        match mgr.fetch_universe(mkt).await {
+            Ok(list) => {
+                for e in &list {
+                    raw_total += 1;
+                    if e.code.len() < 6 {
+                        dropped += 1;
+                        continue;
+                    }
+                    match classify(dmkt, &e.code[..6]) {
+                        Some(c) => match c.category {
+                            InstrumentCategory::Stock => stock += 1,
+                            InstrumentCategory::Index => {
+                                index += 1;
+                                // 债券前缀不应出现在 Index 里。
+                                let p3 = &e.code[..3];
+                                if matches!(p3, "100" | "110" | "120" | "130" | "180") {
+                                    index_bond_leak.push(e.code.clone());
+                                }
+                            }
+                            InstrumentCategory::Fund => fund += 1,
+                        },
+                        None => dropped += 1,
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[A2b] SKIP — TDX 不可达: {e}");
+                return;
+            }
+        }
+    }
+    eprintln!(
+        "[A2b] raw={raw_total} → universe: 股票={stock} 指数={index} 基金={fund}（合计 {}）；丢弃(债券/回购等)={dropped}",
+        stock + index + fund
+    );
+    assert!(stock > 4000, "A 股股票应数千只，实测 {stock}");
+    assert!(
+        index_bond_leak.is_empty(),
+        "债券前缀漏进指数 universe（classify bug）: {:?}",
+        &index_bond_leak[..index_bond_leak.len().min(10)]
+    );
+}
+
 /// A3 · Eastmoney 补 BJ universe（`fetch_bj_universe`）。Provider: EM。
 #[tokio::test]
 #[ignore]

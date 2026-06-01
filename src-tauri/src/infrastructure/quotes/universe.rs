@@ -39,8 +39,12 @@ pub fn classify_sh(code6: &str) -> Option<UniverseClass> {
                 category: InstrumentCategory::Fund,
                 board: None,
             },
+            // SH 指数只有 000xxx（综指/上证50/沪深300/中证500/科创50…）+ TDX 合成 999xxx。
+            // 之前还含 100/110/120/130/180——这些其实是**债券**（100=国债、110=可转债、120=企业债、
+            // 130=企债/回购），会被错当指数塞进 universe，且报价 10× 错（3 位小数被当 Index 2 位）。
+            // universe 只收股票/指数/场内基金（spec §2/§5），债券一律丢弃。
             _ => match p3 {
-                "000" | "100" | "110" | "120" | "130" | "180" | "999" => UniverseClass {
+                "000" | "999" => UniverseClass {
                     category: InstrumentCategory::Index,
                     board: None,
                 },
@@ -131,6 +135,22 @@ mod tests {
     #[test]
     fn sh_unknown_returns_none() {
         assert!(classify_sh("888888").is_none());
+    }
+
+    // 回归：SH 债券前缀（国债 100 / 可转债 110 / 企业债 120 / 130 / 180）不是指数，必须丢弃，
+    // 不能进 universe（spec §2/§5：universe 只收股票/指数/场内基金）。
+    #[test]
+    fn sh_bond_prefixes_dropped_not_index() {
+        for code in ["100303", "110059", "113537", "120201", "130001", "180101"] {
+            assert!(
+                classify_sh(code).is_none(),
+                "{code} 是债券，应被丢弃而非分类为指数"
+            );
+        }
+        // 真指数仍保留。
+        assert_eq!(classify_sh("000001").unwrap().category, InstrumentCategory::Index);
+        assert_eq!(classify_sh("000300").unwrap().category, InstrumentCategory::Index);
+        assert_eq!(classify_sh("999999").unwrap().category, InstrumentCategory::Index);
     }
 
     #[test]
