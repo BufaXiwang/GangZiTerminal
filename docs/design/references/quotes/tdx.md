@@ -107,6 +107,7 @@ TDX HQ market 只支持：
 - TDX 不直接给出可靠 `tradeStatus`；adapter 只 normalize 可用原始状态，最终对外 `tradeStatus` 由 Quotes query facade 按 `MarketTimeContext`、instrument status 和 quote eligibility 派生。
 - TDX `SecurityQuote` 不包含可靠名称时，`name` 可为空；展示层必须从 `MarketInstrument` 补名。
 - TDX 价格、盘口、成交量字段为 0 或非法值时按 missing 处理，不能转成有效 0。
+- **价格小数位缩放（关键）**：TDX `security_quotes`（实时报价）的价格整数按**该标的的小数位**编码——A 股股票 / 指数为 2 位（×100），**场内基金 / ETF 为 3 位（×1000）**。协议层 `cal_price` 统一 `/100`，对 2 位标的正确，但对 3 位基金会得到 **10× 偏高**价（如 510300 实际 4.868 解出 48.68）。adapter `map_security_quote` 必须按 `InstrumentCategory` 校正：`Stock`/`Index` 用 2 位（不动），`Fund` 额外 `/10`。注：`security_bars`（K 线）协议层用 `/1000`，对 2/3 位标的都正确，不需校正。
 
 ## K 线规则
 

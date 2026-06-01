@@ -751,11 +751,20 @@ fn map_security_quote(
             None
         }
     };
-    let price = f64_to_price(raw.price);
-    let prev = f64_to_price(raw.last_close);
-    let open = f64_to_price(raw.open);
-    let high = f64_to_price(raw.high);
-    let low = f64_to_price(raw.low);
+    // 价格小数位校正（TDX reference §Normalize）：security_quotes 协议层统一 /100，对 2 位小数
+    // 标的（股票/指数）正确，但场内基金/ETF 是 3 位小数（×1000 编码）→ /100 会得到 10× 偏高价。
+    // 按 category 校正：Fund 额外 /10，Stock/Index 不动。（K 线走 /1000，不经此路径。）
+    let price_scale: f64 = if matches!(category, InstrumentCategory::Fund) {
+        0.1
+    } else {
+        1.0
+    };
+    let scaled_price = |v: f64| f64_to_price(v * price_scale);
+    let price = scaled_price(raw.price);
+    let prev = scaled_price(raw.last_close);
+    let open = scaled_price(raw.open);
+    let high = scaled_price(raw.high);
+    let low = scaled_price(raw.low);
     let volume = if raw.vol > 0.0 {
         Some(Volume(raw.vol as i64))
     } else {
@@ -781,7 +790,7 @@ fn map_security_quote(
     let mut ask: Vec<crate::domain::quotes::QuoteDepthLevel> = Vec::with_capacity(5);
     for level in raw.book.iter() {
         bid.push(crate::domain::quotes::QuoteDepthLevel {
-            price: f64_to_price(level.bid),
+            price: scaled_price(level.bid),
             volume: if level.bid_vol > 0.0 {
                 Some(Volume(level.bid_vol as i64))
             } else {
@@ -789,7 +798,7 @@ fn map_security_quote(
             },
         });
         ask.push(crate::domain::quotes::QuoteDepthLevel {
-            price: f64_to_price(level.ask),
+            price: scaled_price(level.ask),
             volume: if level.ask_vol > 0.0 {
                 Some(Volume(level.ask_vol as i64))
             } else {
@@ -1051,6 +1060,27 @@ mod tests {
         );
         assert!(q.price.is_none());
         assert!(q.change.is_none());
+    }
+
+    // 价格小数位校正：protocol /100 已应用，raw.price=48.68 对应 ETF 真值 4.868（3 位小数 ×1000
+    // 编码）。Fund 类必须额外 /10 → 4.868；Stock 类不校正 → 仍 48.68。同样作用于五档盘口。
+    #[test]
+    fn map_security_quote_fund_price_scaled_to_three_decimals() {
+        let mut raw = sample_raw();
+        raw.code = "510300".to_string();
+        raw.price = 48.68; // = ETF 真值 4.868 经 protocol /100 后的值
+        raw.last_close = 49.23;
+        raw.book[0] = QuoteLevel { bid: 48.68, ask: 48.69, bid_vol: 665.0, ask_vol: 532.0 };
+        let code = TsCode::parse("510300.SH").unwrap();
+        let td = TradeDate::parse("20260601").unwrap();
+        // Fund → 校正 /10
+        let qf = map_security_quote(&raw, code.clone(), InstrumentCategory::Fund, None, td, Utc::now());
+        assert_eq!(qf.price.unwrap().0.to_string(), "4.868", "ETF 价格应校正为 3 位小数真值");
+        assert_eq!(qf.previous_close.unwrap().0.to_string(), "4.923");
+        assert_eq!(qf.bid[0].price.unwrap().0.to_string(), "4.868", "盘口价同样校正");
+        // Stock（同样 raw）→ 不校正，保持 48.68（证明校正仅按 category 生效）
+        let qs = map_security_quote(&raw, code, InstrumentCategory::Stock, None, td, Utc::now());
+        assert_eq!(qs.price.unwrap().0.to_string(), "48.68");
     }
 
     fn mk_bar(year: u16, month: u8, day: u8) -> Bar {

@@ -314,6 +314,15 @@ async fn quotes_live_tdx_quote_batch_mixed() {
         assert_ne!(idx.0, stk.0, "000001.SH 指数价被错配成 000001.SZ 股票价（市场串号 bug）");
         assert!(idx.0 > rust_decimal::Decimal::from(500), "上证指数价应在指数区间（实测 ~4000），不是个股价位");
     }
+    // ETF 小数位校正回归守卫：510300(沪深300ETF) 是 3 位小数标的，实测 ~4.9。
+    // 缩放 bug（protocol /100 未按 Fund 校正）会得到 ~48.7（10×）。
+    if let Some(etf) = ok.iter().find(|q| q.ts_code.as_str() == ETF_SH).and_then(|q| q.price) {
+        assert!(
+            etf.0 < rust_decimal::Decimal::from(20),
+            "510300 ETF 价应在 ~5 元区间（3 位小数已校正），不是 ~48（10× 缩放 bug）；实测 {}",
+            etf.0
+        );
+    }
 }
 
 /// B3 · 腾讯单只报价（SH 股票），五档盘口完整性 vs 仅展示。Provider: 腾讯。
