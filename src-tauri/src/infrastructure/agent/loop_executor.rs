@@ -884,4 +884,106 @@ mod tests {
         println!("[loop-live] ran {ran} end-to-end loop checks");
         assert!(ran > 0, "no TEST_* env provided");
     }
+
+    /// 端到端实网 SKILL：注册一个 `get_secret` skill（只有工具知道答案），让真实模型
+    /// 通过 `<use_skill>` 文本协议调用它、拿到结果、再据此作答。验证整条 skill 回路
+    /// （SystemPromptBuilder 注入清单 → 模型发 use_skill → dispatch → skill_result 回灌 →
+    /// 模型用结果作答）。`#[ignore]`，凭证走 env。
+    #[tokio::test]
+    #[ignore]
+    async fn skill_loop_live() {
+        use crate::infrastructure::agent::http_provider::HttpProvider;
+        use crate::infrastructure::agent::skill_registry::SkillRegistry;
+        use chrono::Utc;
+        use serde_json::json;
+
+        async fn one(label: &str, wire: WireFormat, base: String, key: String, model: String) {
+            let registry = Arc::new(SkillRegistry::new_without_persist());
+            let secret_spec = SkillSpec::new(
+                "get_secret",
+                "返回今天的幸运数字（一个整数）。当用户问幸运数字时必须调用本 skill 获取，不要自己编。",
+                json!({"type":"object","properties":{}}),
+                vec![r#"<use_skill name="get_secret">{}</use_skill>"#.to_string()],
+                5000,
+                SideEffect::None,
+            );
+            let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(|_inv: SkillInvocation| {
+                Box::pin(async move { SkillHandlerOutput::ok(json!({"secret": 4242})) })
+                    as SkillHandlerFuture
+            }));
+            registry.register_skill(secret_spec, handler).unwrap();
+
+            let mut ch = channel();
+            ch.wire_format = wire;
+            ch.base_url = Some(base);
+            ch.api_key = key;
+            ch.model = model;
+            ch.max_output_tokens = Some(1024);
+            let provider = Box::new(HttpProvider::new(ch.clone()).unwrap());
+            let request = AgentRunRequest {
+                run_id: "skill".into(),
+                trigger: "user".into(),
+                channel: ch,
+                max_turns: 4,
+                seed_messages: vec![AgentMessage {
+                    message_id: "m1".into(),
+                    run_id: Some("skill".into()),
+                    role: AgentMessageRole::User,
+                    blocks: vec![AgentMessageBlock::Text {
+                        text: "请调用 get_secret 这个 skill 获取今天的幸运数字，然后用一句话告诉我它是多少。".into(),
+                    }],
+                    created_at: Utc::now(),
+                }],
+            };
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+            let pump = tokio::spawn(async move {
+                let mut text = String::new();
+                let mut skills: Vec<(String, bool)> = Vec::new();
+                while let Some(e) = rx.recv().await {
+                    match e {
+                        AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        AgentEvent::SkillEnd { name, is_error, .. } => skills.push((name, is_error)),
+                        _ => {}
+                    }
+                }
+                (text, skills)
+            });
+            let summary =
+                run_agent_loop(request, registry, ContextBundle::new("skill"), provider, tx)
+                    .await
+                    .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
+            let (text, skills) = pump.await.unwrap();
+            println!(
+                "[skill-live][{label}] stop={:?} skills={:?} answer={:?}",
+                summary.stop_reason, skills, text
+            );
+            assert!(
+                skills.iter().any(|(n, err)| n == "get_secret" && !err),
+                "[{label}] get_secret skill was not dispatched successfully"
+            );
+            assert!(text.contains("4242"), "[{label}] final answer didn't use the skill result");
+        }
+
+        let mut ran = 0;
+        // 用快的两家测 skill（deepseek + anthropic）；gpt-5 太慢，按需自行加 TEST_OAI_*。
+        if let Ok(k) = std::env::var("TEST_DS_KEY") {
+            let b = std::env::var("TEST_DS_BASE").unwrap_or_else(|_| "https://api.deepseek.com".into());
+            let m = std::env::var("TEST_DS_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
+            one("chat_completions", WireFormat::ChatCompletions, b, k, m).await;
+            ran += 1;
+        }
+        if let (Ok(b), Ok(k)) = (std::env::var("TEST_ANT_BASE"), std::env::var("TEST_ANT_KEY")) {
+            let m = std::env::var("TEST_ANT_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+            one("messages", WireFormat::Messages, b, k, m).await;
+            ran += 1;
+        }
+        if let (Ok(b), Ok(k)) = (std::env::var("TEST_OAI_BASE"), std::env::var("TEST_OAI_KEY")) {
+            let m = std::env::var("TEST_OAI_MODEL").unwrap_or_else(|_| "gpt-5".into());
+            one("responses", WireFormat::Responses, b, k, m).await;
+            ran += 1;
+        }
+        println!("[skill-live] ran {ran} skill-loop checks");
+        assert!(ran > 0, "no TEST_* env provided");
+    }
 }
