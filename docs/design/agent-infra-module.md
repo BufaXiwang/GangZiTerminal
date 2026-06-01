@@ -154,6 +154,9 @@ type AgentMessageBlock =
 type AgentMessage = {
   messageId: string;
   runId?: string;
+  conversationId?: string;   // 多轮会话标识（Runtime 提供）；跨 run 续接靠它分组
+  seq?: number;              // 会话内单调序号；持久化排序用
+  kind?: "chat" | "summary"; // 默认 chat；summary = 压缩检查点（durable，不再被压缩）
   role: AgentMessageRole;
   blocks: AgentMessageBlock[];
   createdAt: OccurredAt;
@@ -163,6 +166,9 @@ type AgentMessage = {
 规则：
 
 - `AgentMessage` 是 provider 上下文和聊天历史，不是投资判断。
+- **会话归属由 `conversationId` 决定**（Runtime 提供，Infra 不定义"会话"业务语义）；同一 conversationId 的消息按 `seq` 排序构成多轮历史。`runId` 仍标记是哪一次 run 产生的。
+- **持久化是全量审计**：loop 产出的每条 `AgentMessage` 落 `agent_messages`，**上下文压缩不修改已持久化的消息**（§4）；续接时按需 load 压缩视图（summary 检查点 + 最近若干轮），不是全量。
+- `kind = "summary"` 的消息是 §4 Summarize 产出的压缩检查点：在上下文投影里替代被压缩的旧消息，标记 durable（不被 MicroClear / Drop / 再次 Summarize 触碰）。
 - Skill 调用 / 结果以 XML 标签嵌在 `text` block 中，**不**作为独立 block type；这是审计可读 + provider 通用的关键。
 - Skill 调用 audit 真源是 `SkillCall`；chat 历史中的 `<use_skill>` / `<skill_result>` 是给 LLM / 用户看的副本。
 - `dataRef` 是图片在 PayloadStore / 本地文件系统的 URI（例如 `payload://pl_abc123` 或 `file:///path/to.png`）；**不是 base64 数据**。Provider adapter 在 build wire 时负责 dereference → 读字节 → base64 编码 → 塞 wire format。Dereference 失败必须返回 `ParseError` 而非静默丢弃。
@@ -459,11 +465,14 @@ Runtime builds AgentRunRequest
 
 规则：
 
-- Infra 只负责装配和压缩，不判断业务事实是否足够交易。
+- **Infra 只提供压缩「机制」，不内置任何业务保留策略**。压缩只认两个**通用信号**，二者都由 Runtime 在装配 / 注册时设置：
+  - `ContextPart.droppable`（Runtime 注入 realtime / memory 内容时自己标）：`true` = 可清理，`false` = pinned 不动。
+  - `SkillSpec.sideEffect`：`trading_write` 的 skill 结果视为不可逆事实，**永不丢 / 不替 stub**；`none` / `non_trading_write` 视为可清理。
+  - "投资场景什么该留、什么该丢"是 **Runtime 的策略**，通过设置上面两个旋钮 + 提供 `summarize_prompt` 来表达；Infra 不感知"行情/账户/交易"这些业务含义。（下文用行情/交易举例只是说明，不是 Infra 硬编码。）
+- **主动压缩（loop 每轮发请求前）**：loop 在每次 `provider.next_turn` 之前先 `estimate_context_tokens`，按下方触发表主动 MicroClear / Summarize；不只在 provider 报错时被动 ReactiveRetry。
 - `Chat Context` 只用于需要对话续接的 run；非交互后台 run 默认由 Runtime 提供 `Realtime Packet` 和 `Review / Memory`，不要求恢复完整聊天历史。
-- 易腐 skill 结果不能长期保留为事实（如行情、K 线、新闻全文等可重新拉取的数据）。
-- 交易写 skill 结果应保留操作确认摘要（订单 ID、成交价、Account event ID 等）。
-- 长上下文压缩时优先丢弃旧行情、旧搜索、旧新闻全文等易腐内容。
+- 可清理内容（`droppable=true` / 非 trading_write 的 skill 结果）：替 stub / 丢弃，LLM 仍可通过 `<use_skill>` 重新拉取。例：行情 / K 线 / 新闻全文 / 旧账户读快照。
+- 不可清理内容（`droppable=false` / `trading_write` 结果 / `kind=summary` 检查点）：永远 inline 保留。例：order_id / 成交价 / Account event ID。**Drop 一整轮时只清该轮的可清理部分，不可清理项保留**。
 
 ### 上下文压缩策略
 
@@ -524,10 +533,17 @@ Runtime builds AgentRunRequest
 - 所有可重新读取的数据 skill 结果都属于可清理对象（替换 stub 后 LLM 仍可通过 `<use_skill>` 重新拉取）。
 - 交易写 skill、策略写入、账户确认结果不属于可清理对象。
 - 易腐 skill 结果替换成 stub 时，**必须保留 `name` + `call_id` + `ref`**，让 replay 能通过 PayloadStore 拉回完整 payload。
-- Compact 模型可以独立配置（`compact_channel: ProviderChannel`）；未配置时使用当前 run 的 provider channel / model。
-- Summarize 输出必须是中文结构化摘要，至少覆盖关注标的、已建立判断、未决问题、风险纪律、用户偏好、上一轮上下文。
-- Summary 是续接上下文，不是事实真源；当前行情和账户状态仍必须重新读取。
+- **Summarize 的 prompt 由 Runtime 提供**（`CompactionConfig.summarize_prompt`）。Infra 只负责执行：把"尾窗外待压消息"作为输入、`summarize_prompt` 作为 system，调 compact 模型生成摘要，产出一条 `kind=summary` 的 durable 消息替换被压消息。**Infra 不写 prompt 内容**（"摘要要覆盖关注标的/已建判断/未决问题/风险纪律/用户偏好"等是 Runtime 在 prompt 里规定的，不是 Infra 硬编码）。未提供 `summarize_prompt` → Summarize 档降级为 Drop（仍遵守"不可清理项保留"）。
+- Compact 模型可独立配置（`CompactionConfig.compact_channel`）；未配置时复用当前 run 的 channel。
+- Summary 是续接上下文，不是事实真源；当前行情和账户状态仍必须重新读取（fail-closed 原则：因为旧数据可丢、agent 行动前必须重读最新，所以可清理项才安全可丢）。
 - 每次 compact 必须 emit `AgentEvent.compacted`，含 `tier` + `droppedMessages` + `estimatedTokensSaved`。
+
+### 多轮会话持久化与续接
+
+- loop 产出的每条 `AgentMessage`（assistant + `<skill_result>` user + `kind=summary` 检查点）落 `agent_messages`，带 `conversationId` + `seq`。这是**全量审计真源，压缩不修改它**。
+- **续接（开新 run 接上历史）**：按 `conversationId` load **压缩视图** —— 最近一个 `kind=summary` 检查点 + 其后的最近若干轮 —— 作为 `seed_messages`，而非全量历史（否则上下文随会话无限增长）。
+- `conversationId` 的"会话"业务语义（一次咨询 = 一个会话？跨天延续？）由 Runtime 定义；Infra 只按它分组 + 排序 + load/save。
+- Infra 提供 `run_agent_turn(request)` 便捷入口：带 `conversationId` 且 `seed_messages` 空 → 自动 load 压缩视图 → 跑 loop → 落新消息。Runtime 也可自行 load 后用 `seed_messages` 显式传入。
 
 ---
 
@@ -536,9 +552,30 @@ Runtime builds AgentRunRequest
 ### Infra Loop API
 
 ```rust
-run_agent_loop(request, registry, context, event_tx) -> RunSummary;
-estimate_context_tokens(context, channel) -> TokenEstimate;
-compact_context(context, policy) -> ContextBundle;
+run_agent_loop(request, registry, context, provider, event_tx) -> RunSummary;
+run_agent_turn(request, registry, context, provider, event_tx) -> RunSummary; // 带会话续接 + 持久化的便捷入口
+estimate_context_tokens(messages, context, channel) -> TokenEstimate;
+compact_context(messages, context, policy, ...) -> Compacted; // 纯计算，作用于会话 messages + ContextBundle
+
+// AgentRunRequest 关键字段
+type AgentRunRequest = {
+  runId: string;
+  trigger: string;
+  channel: ProviderChannel;
+  maxTurns: number;
+  seedMessages?: AgentMessage[];      // 续接历史；run_agent_turn 在为空且有 conversationId 时自动 load
+  conversationId?: string;            // 多轮会话标识（Runtime 提供）
+  compaction?: CompactionConfig;      // 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）
+};
+
+type CompactionConfig = {
+  softLimitTokens?: number;           // 缺省由 channel.contextWindowTokens 推导
+  summarizeThresholdTokens?: number;
+  hardLimitTokens?: number;
+  keepRecentTurns?: number;           // 最近 N 轮永不摘要（默认若干）
+  summarizePrompt?: string;           // Runtime 提供的摘要指令；缺省 → Summarize 降级为 Drop
+  compactChannel?: ProviderChannel;   // 摘要模型；缺省复用 run 的 channel
+};
 ```
 
 规则：
@@ -547,7 +584,19 @@ compact_context(context, policy) -> ContextBundle;
 - `registry` 是本次 run 的 `SkillRegistry` 实例，含 Runtime 本次允许的 skill 集合。
 - `context` 由 Runtime 构造；Infra 不主动读取 Quotes / News / Account。Skill 清单在 build 时由 `SystemPromptBuilder` prepend 到 `systemParts`，Runtime 不需要手动塞。
 - `event_tx` 接收统一 `AgentEvent`，供 Runtime 和 UI 订阅。
-- `compact_context` 是纯计算 API，**不**做 retry；retry 由 `run_agent_loop` 内部 orchestration（见 §4）。
+- `run_agent_loop` 每轮发请求前主动 `estimate_context_tokens` → 按 `compaction` 阈值主动压缩（§4）；loop 产出消息按 `conversationId` 落库。
+- `run_agent_turn` = `run_agent_loop` + 会话续接（自动 load 压缩视图为 seed）+ 落库；Runtime 也可绕过它自行 load + 用 `seedMessages`。
+- `compact_context` 是纯计算 API（作用于会话 messages + ContextBundle，按 `droppable` / `sideEffect` 通用信号），**不**做 retry、**不**调模型；Summarize 的模型调用 + ReactiveRetry 由 `run_agent_loop` orchestrate（见 §4）。
+
+### Conversation / Messages Repo API
+
+```rust
+upsert_message(msg: &AgentMessage) -> Result<()>;
+load_conversation(conversation_id: &str) -> Result<Vec<AgentMessage>>;       // 全量（审计）
+load_conversation_view(conversation_id: &str) -> Result<Vec<AgentMessage>>;  // 压缩视图：最近 summary 检查点 + 其后最近若干轮
+```
+
+- `agent_messages` 全量审计真源；`load_conversation_view` 给续接用，不返回全量。
 
 ### Skill Registry API
 
