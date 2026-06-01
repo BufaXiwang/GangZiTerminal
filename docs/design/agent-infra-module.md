@@ -750,3 +750,32 @@ discover_models(wire_format: WireFormat, base_url: &str, api_key: &str)
 - 账户估值、成交模拟、T+1 和现金校验。
 - 真券商交易。
 - 自动保证收益。
+
+---
+
+## 8. 验证记录（2026-06-01，实网 + hermetic）
+
+> 点-时验证快照，非契约。后续行为变更若推翻这里的结论，更新本节。验证方式：**LLM-as-Judge**
+> （被测 agent 真实跑 `run_agent_turn` → 裁判模型按 rubric 打 `{pass,score,reason}`），裁判恒用
+> 一个独立可靠渠道（opus-4.5），与被测渠道隔离。凭证只走环境变量，不入库。
+
+**hermetic**：`cargo test` 631 passed / 0 failed（含 5 个 retry/fallback 单测、边界-seq 有界性测、http 错误分类测、续接持久化单测）。
+
+**三种 wire format 实网全过**（持久化 / 压缩 Summarize 跑在该 wire / 上下文管理，judge 均 1.00）：
+- `messages` → Anthropic relay / claude-opus-4-5
+- `responses` → OpenAI relay / gpt-5
+- `chat_completions` → DeepSeek / deepseek-v4-flash
+
+覆盖场景：答题相关性、skill 忠实、多轮记忆、跨轮约束累积、durable 逐字保真 vs droppable 可压、MicroClear 后答案正确、摘要忠实 + 无幻觉、keep_recent 逐字、Drop 降级保 durable、滚动累积摘要折叠。
+
+**100+ 轮长跑压测**（`judge_hundred_turn_longterm_memory`，105 轮，每轮触发 Summarize）——DeepSeek 与 gpt-5/responses **两个渠道各跑满**：
+- `ok=105/105 fail=0`，`cycles≈100`，`full_audit≈310`，**`view_len` 全程恒为 6**（续接视图有界，不随轮数膨胀）。
+- 第 1 轮埋的账户代号 + 第 50 轮埋的口令穿越 ~100 次滚动折叠**逐字不丢**，终判 1.00。
+
+**容错**（瞬时退避重试 + 渠道 fallback，§4）：5 个 hermetic 单测覆盖「重试恢复 / 耗尽切备用 / 致命不重试 / context-too-long 不当瞬时 / 全渠道耗尽」；20 分钟 gpt-5 长跑期间 relay 有瞬时抖动（502 / 579 / 582 / 593 / 空响应 = 上游 `upstream_error`），被退避重试在底层吸收，长跑 `fail=0`。
+
+**测试中发现并修复的真实 bug**：
+1. `responses` 适配器多轮断链：assistant 轮误用 `input_text`（应 `output_text`），单轮侥幸过、任何多轮被上游 502 拒。
+2. 续接视图无界：`apply_summary` 让滚动摘要继承「最旧」seq，致 `load_conversation_view` 随轮数线性膨胀；改取「边界 seq」后有界。
+
+**复现环境变量**：agent 渠道 `TEST_ANT_*` / `TEST_OAI_*` / `TEST_DS_*`（设哪个 `pick_fast_agent_channel` 选哪个）；裁判 `JUDGE_BASE/KEY/MODEL/WIRE`。所有 judge 测试 `#[ignore]`，缺渠道自动跳过。
