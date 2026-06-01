@@ -1060,6 +1060,9 @@ mod tests {
         let msgs = vec![AgentMessage {
             message_id: "m1".into(),
             run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
             role: AgentMessageRole::User,
             blocks: vec![AgentMessageBlock::Image {
                 mime_type: "image/png".into(),
@@ -1111,6 +1114,9 @@ mod tests {
             let msgs = vec![AgentMessage {
                 message_id: "m1".into(),
                 run_id: Some("r1".into()),
+                conversation_id: None,
+                seq: None,
+                kind: None,
                 role: AgentMessageRole::User,
                 blocks: vec![AgentMessageBlock::Text {
                     text: "用三个字打招呼".into(),
@@ -1229,6 +1235,9 @@ mod tests {
         let msgs = vec![AgentMessage {
             message_id: "m1".into(),
             run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
             role: AgentMessageRole::User,
             blocks: vec![AgentMessageBlock::Text {
                 text: "一个数加上它自己等于10，这个数是几？请先逐步思考再给出答案。".into(),

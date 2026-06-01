@@ -58,6 +58,19 @@ pub enum AgentMessageBlock {
     },
 }
 
+/// 消息种类（spec §2 `AgentMessage.kind`）。
+///
+/// Spec: agent-infra-module.md §2
+/// - `Chat`（默认）= 普通对话消息。
+/// - `Summary` = §4 Summarize 产出的压缩检查点；durable，不再被 MicroClear / Drop / 再次 Summarize 触碰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MessageKind {
+    #[default]
+    Chat,
+    Summary,
+}
+
 impl AgentMessageBlock {
     /// 当前 block 是否允许在给定 role 下出现（spec §2 表格）。
     pub fn allowed_for_role(&self, role: AgentMessageRole) -> bool {
@@ -85,6 +98,15 @@ pub struct AgentMessage {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// 多轮会话标识（Runtime 提供）；跨 run 续接靠它分组（spec §2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// 会话内单调序号；持久化排序用（spec §2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+    /// 消息种类：默认 chat；summary = 压缩检查点（durable，不再被压缩）（spec §2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MessageKind>,
     pub role: AgentMessageRole,
     pub blocks: Vec<AgentMessageBlock>,
     pub created_at: OccurredAt,
@@ -121,6 +143,9 @@ mod tests {
         AgentMessage {
             message_id: "m1".into(),
             run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
             role,
             blocks,
             created_at: Utc::now(),

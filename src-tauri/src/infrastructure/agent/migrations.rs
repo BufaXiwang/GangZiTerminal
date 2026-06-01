@@ -19,6 +19,7 @@ pub fn migrations() -> Vec<M<'static>> {
     vec![
         M::up(MIGRATION_001_INITIAL),
         M::up(MIGRATION_002_CHANNEL_AUTH_ACTIVE),
+        M::up(MIGRATION_003_MESSAGES_CONVERSATION),
     ]
 }
 
@@ -92,6 +93,22 @@ ALTER TABLE agent_provider_channels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 
 ALTER TABLE agent_provider_channels ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// Spec: agent-infra-module.md §2 `AgentMessage` (conversationId / seq / kind)，§4 多轮会话持久化与续接
+//
+// 多轮会话支持：agent_messages 增加 conversation_id（会话分组）、seq（会话内单调序号、排序用）、
+// kind（chat | summary，summary = §4 压缩检查点）。三列均可空（NULL），全量审计真源不变。
+//
+// **append-only / global-last**：agent migrations 在 lib.rs 里被 `all.extend(agent_migrations())`
+// 最后拼接，故 agent-003 落在全局最后一位（已存在 DB user_version=6 → 只 apply 003）。
+const MIGRATION_003_MESSAGES_CONVERSATION: &str = r#"
+ALTER TABLE agent_messages ADD COLUMN conversation_id TEXT;
+ALTER TABLE agent_messages ADD COLUMN seq INTEGER;
+ALTER TABLE agent_messages ADD COLUMN kind TEXT;
+
+CREATE INDEX idx_agent_messages_conversation_seq
+    ON agent_messages (conversation_id, seq);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +172,28 @@ mod tests {
         assert_eq!(api_key, "sk-secret");
         assert_eq!(enabled, 1);
         assert_eq!(is_active, 1);
+    }
+
+    #[test]
+    fn migration_003_adds_conversation_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn, migrations()).unwrap();
+        conn.execute(
+            "INSERT INTO agent_messages
+              (message_id, run_id, conversation_id, seq, kind, role, blocks_json, created_at)
+             VALUES ('m1', 'r1', 'conv-1', 0, 'summary', 'assistant', '[]', '2026-05-27T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (conv, seq, kind): (String, i64, String) = conn
+            .query_row(
+                "SELECT conversation_id, seq, kind FROM agent_messages WHERE message_id = 'm1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(conv, "conv-1");
+        assert_eq!(seq, 0);
+        assert_eq!(kind, "summary");
     }
 }

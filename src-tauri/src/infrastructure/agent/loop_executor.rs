@@ -21,17 +21,87 @@
 
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest,
-    AgentStopReason, ContextBundle, ContextContent, ContextPart, ContextPartKind, RunSummary,
+    AgentStopReason, CompactedTier, CompactionConfig, ContextBundle, ContextContent, ContextPart,
+    ContextPartKind, MessageKind, ProviderChannel, RunSummary, SideEffect,
 };
 use crate::domain::shared::ErrorCode;
-use crate::infrastructure::agent::context_compaction::{compact_context, CompactPolicy};
+use crate::infrastructure::agent::context_compaction::{
+    compact_context, drop_oldest_round_messages, estimate_context_tokens, micro_clear_messages,
+    CompactPolicy,
+};
+use crate::infrastructure::agent::http_provider::HttpProvider;
+use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
 use crate::infrastructure::agent::skill_parser::ParserEvent;
 use crate::infrastructure::agent::skill_registry::{DispatchError, SkillRegistry};
 use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
+use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
+
+/// 默认尾窗：最近 N 轮永不摘要 / micro-clear（spec §4 keepRecentTurns 缺省）。
+const DEFAULT_KEEP_RECENT_TURNS: u32 = 3;
+
+/// loop 运行时依赖：可选持久化 repo（spec §4 多轮会话持久化）。
+/// 测试无 DB 时用 `RunAgentDeps::default()`（repo = None），跳过持久化。
+#[derive(Clone, Default)]
+pub struct RunAgentDeps {
+    pub repo: Option<AgentMessagesRepo>,
+}
+
+impl RunAgentDeps {
+    pub fn with_repo(repo: AgentMessagesRepo) -> Self {
+        Self { repo: Some(repo) }
+    }
+}
+
+/// 从 `CompactionConfig`（可空）+ channel 推导出三档阈值 + 尾窗。
+///
+/// Spec §4 / §5：阈值优先取 `CompactionConfig`；缺省由 `channel.contextWindowTokens` 推导：
+/// soft = window/2、summarize = window*0.7、hard = window*0.9。channel 也没声明窗口时退化为
+/// `ContextWindowLimits::default()`（60k / 90k / 180k）。
+struct CompactionPlan {
+    soft_limit: u32,
+    summarize_threshold: u32,
+    hard_limit: u32,
+    keep_recent_turns: u32,
+    summarize_prompt: Option<String>,
+    compact_channel: Option<ProviderChannel>,
+}
+
+impl CompactionPlan {
+    fn derive(cfg: Option<&CompactionConfig>, channel: &ProviderChannel) -> Self {
+        let defaults = crate::domain::agent::ContextWindowLimits::default();
+        let (win_soft, win_summarize, win_hard) = match channel.context_window_tokens {
+            Some(w) => {
+                let w = w as u64;
+                (
+                    (w / 2) as u32,
+                    (w * 7 / 10) as u32,
+                    (w * 9 / 10) as u32,
+                )
+            }
+            None => (
+                defaults.soft_limit_tokens,
+                defaults.summarize_threshold_tokens,
+                defaults.hard_limit_tokens,
+            ),
+        };
+        CompactionPlan {
+            soft_limit: cfg.and_then(|c| c.soft_limit_tokens).unwrap_or(win_soft),
+            summarize_threshold: cfg
+                .and_then(|c| c.summarize_threshold_tokens)
+                .unwrap_or(win_summarize),
+            hard_limit: cfg.and_then(|c| c.hard_limit_tokens).unwrap_or(win_hard),
+            keep_recent_turns: cfg
+                .and_then(|c| c.keep_recent_turns)
+                .unwrap_or(DEFAULT_KEEP_RECENT_TURNS),
+            summarize_prompt: cfg.and_then(|c| c.summarize_prompt.clone()),
+            compact_channel: cfg.and_then(|c| c.compact_channel.clone()),
+        }
+    }
+}
 
 /// 一次 provider stream 的拉取结果。
 ///
@@ -77,17 +147,67 @@ pub enum LoopError {
     EventChannelClosed,
 }
 
-/// 执行一次 Agent loop。
+/// 执行一次 Agent loop（spec §5 便捷入口，无持久化）。
 ///
-/// Spec §5：`run_agent_loop(request, registry, context, event_tx) -> RunSummary`
+/// Spec §5：`run_agent_loop(request, registry, context, provider, event_tx) -> RunSummary`。
+/// 无 DB / conversation 续接需求时使用；持久化版本走 `run_agent_loop_with_deps`。
 pub async fn run_agent_loop(
+    request: AgentRunRequest,
+    registry: Arc<SkillRegistry>,
+    context: ContextBundle,
+    provider: Box<dyn ProviderStream>,
+    event_tx: Sender<AgentEvent>,
+) -> Result<RunSummary, LoopError> {
+    run_agent_loop_with_deps(
+        request,
+        registry,
+        context,
+        provider,
+        event_tx,
+        RunAgentDeps::default(),
+    )
+    .await
+}
+
+/// 带会话续接 + 持久化的便捷入口（spec §4 / §5 `run_agent_turn`）。
+///
+/// 行为：若 `request.conversation_id` 有值且 `seed_messages` 为空 → 通过 `deps.repo`
+/// `load_conversation_view`（最近 summary 检查点 + 其后最近若干轮）作为 seed；再跑
+/// `run_agent_loop_with_deps`（loop 内部按 conversation_id + next_seq 落库）。
+pub async fn run_agent_turn(
+    mut request: AgentRunRequest,
+    registry: Arc<SkillRegistry>,
+    context: ContextBundle,
+    provider: Box<dyn ProviderStream>,
+    event_tx: Sender<AgentEvent>,
+    deps: RunAgentDeps,
+) -> Result<RunSummary, LoopError> {
+    if request.seed_messages.is_empty() {
+        if let (Some(conv), Some(repo)) = (request.conversation_id.clone(), deps.repo.as_ref()) {
+            let view = repo
+                .load_conversation_view(&conv)
+                .map_err(|e| LoopError::Provider(format!("load_conversation_view: {e}")))?;
+            request.seed_messages = view;
+        }
+    }
+    run_agent_loop_with_deps(request, registry, context, provider, event_tx, deps).await
+}
+
+/// 全功能 Agent loop：主动压缩（每轮）+ Summarize 模型调用 + 多轮会话持久化。
+///
+/// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
+pub async fn run_agent_loop_with_deps(
     request: AgentRunRequest,
     registry: Arc<SkillRegistry>,
     mut context: ContextBundle,
     mut provider: Box<dyn ProviderStream>,
     event_tx: Sender<AgentEvent>,
+    deps: RunAgentDeps,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
+    let plan = CompactionPlan::derive(request.compaction.as_ref(), &request.channel);
+    let conversation_id = request.conversation_id.clone();
+    let repo = deps.repo.clone();
 
     // Spec §2 line 209-210, §5 line 533: 每次 Agent loop 启动时,Infra 用 `SystemPromptBuilder`
     // 把 enabled `SkillSpec` 集合编译成 system prompt 前缀,自动 prepend 到 ContextBundle.systemParts。
@@ -108,6 +228,15 @@ pub async fn run_agent_loop(
     let mut skill_call_ids: Vec<String> = Vec::new();
     let mut usage_input: u32 = 0;
     let mut usage_output: u32 = 0;
+    // Spec §4 generic durable signal: message_ids that must never be compacted/stubbed.
+    // The loop derives this set ONLY from SkillSpec.sideEffect == trading_write (Infra knows
+    // nothing about "trading" semantics — it just honours the generic side-effect flag) and from
+    // kind=summary checkpoints. Seed summary messages are durable too.
+    let mut durable_message_ids: HashSet<String> = messages
+        .iter()
+        .filter(|m| m.kind == Some(MessageKind::Summary))
+        .map(|m| m.message_id.clone())
+        .collect();
 
     let mut turn: u32 = 0;
     let mut reactive_retry_used = false;
@@ -118,6 +247,23 @@ pub async fn run_agent_loop(
             break;
         }
         turn += 1;
+
+        // ---- Spec §4: proactive per-turn compaction BEFORE provider.next_turn ----
+        // estimate(messages + context) → if > soft_limit: MicroClear; if still > summarize
+        // threshold: Summarize (when summarize_prompt present) else Drop-oldest. Generic signals
+        // only: ContextPart.droppable + durable_message_ids.
+        let new_durable = proactive_compact(
+            &mut messages,
+            &mut context,
+            &durable_message_ids,
+            &plan,
+            &request.channel,
+            repo.as_ref(),
+            &event_tx,
+            &run_id,
+        )
+        .await?;
+        durable_message_ids.extend(new_durable);
 
         // ---- provider call with reactive retry ----
         let outcome = match provider
@@ -172,6 +318,9 @@ pub async fn run_agent_loop(
         // NOT re-emit TextDelta. Assistant message history uses outcome.text (raw XML).
         let mut skill_results_for_next_turn: Vec<String> = Vec::new();
         let mut any_dispatch = false;
+        // Spec §4: a turn whose skill_result message carries any trading_write skill result is
+        // durable (never compacted). Generic signal — Infra only reads SkillSpec.sideEffect.
+        let mut turn_has_trading_write = false;
 
         for ev in outcome.skill_events.iter().cloned() {
             match ev {
@@ -180,6 +329,9 @@ pub async fn run_agent_loop(
                 }
                 ParserEvent::UseSkill { name, input } => {
                     any_dispatch = true;
+                    if registry.skill_side_effect(&name) == Some(SideEffect::TradingWrite) {
+                        turn_has_trading_write = true;
+                    }
                     let call_id = SkillRegistry::new_skill_call_id();
 
                     send_event(
@@ -272,15 +424,15 @@ pub async fn run_agent_loop(
 
         // Persist assistant message (raw text, incl <use_skill> XML) for LLM history.
         if !outcome.text.is_empty() {
-            messages.push(AgentMessage {
-                message_id: format!("am-{}", Uuid::new_v4()),
-                run_id: Some(run_id.clone()),
-                role: AgentMessageRole::Assistant,
-                blocks: vec![AgentMessageBlock::Text {
-                    text: outcome.text.clone(),
-                }],
-                created_at: Utc::now(),
-            });
+            let msg = build_message(
+                AgentMessageRole::Assistant,
+                outcome.text.clone(),
+                &run_id,
+                &conversation_id,
+                repo.as_ref(),
+            );
+            persist_message(repo.as_ref(), &msg, &event_tx, &run_id).await;
+            messages.push(msg);
         }
 
         if !any_dispatch {
@@ -295,13 +447,19 @@ pub async fn run_agent_loop(
 
         // Append next-turn user message carrying the <skill_result>s.
         let user_text = skill_results_for_next_turn.join("\n");
-        messages.push(AgentMessage {
-            message_id: format!("am-{}", Uuid::new_v4()),
-            run_id: Some(run_id.clone()),
-            role: AgentMessageRole::User,
-            blocks: vec![AgentMessageBlock::Text { text: user_text }],
-            created_at: Utc::now(),
-        });
+        let user_msg = build_message(
+            AgentMessageRole::User,
+            user_text,
+            &run_id,
+            &conversation_id,
+            repo.as_ref(),
+        );
+        // Spec §4: trading_write skill_result message is durable (never compacted/stubbed).
+        if turn_has_trading_write {
+            durable_message_ids.insert(user_msg.message_id.clone());
+        }
+        persist_message(repo.as_ref(), &user_msg, &event_tx, &run_id).await;
+        messages.push(user_msg);
         // Continue to next turn.
     }
 
@@ -343,6 +501,319 @@ pub async fn run_agent_loop(
         cache_write_tokens: None,
         skill_call_ids,
     })
+}
+
+/// 构造一条会话消息：填 conversation_id + 单调 seq（有 repo + conversation_id 时取 `next_seq`）。
+fn build_message(
+    role: AgentMessageRole,
+    text: String,
+    run_id: &str,
+    conversation_id: &Option<String>,
+    repo: Option<&AgentMessagesRepo>,
+) -> AgentMessage {
+    let seq = match (conversation_id, repo) {
+        (Some(conv), Some(r)) => r.next_seq(conv).ok(),
+        _ => None,
+    };
+    AgentMessage {
+        message_id: format!("am-{}", Uuid::new_v4()),
+        run_id: Some(run_id.to_string()),
+        conversation_id: conversation_id.clone(),
+        seq,
+        kind: Some(MessageKind::Chat),
+        role,
+        blocks: vec![AgentMessageBlock::Text { text }],
+        created_at: Utc::now(),
+    }
+}
+
+/// 持久化一条消息（全量审计真源；spec §4）。无 repo 或无 conversation_id → 跳过（测试场景）。
+/// 持久化失败不终止 loop：只 emit 一个非致命 error event（loop 仍可继续）。
+async fn persist_message(
+    repo: Option<&AgentMessagesRepo>,
+    msg: &AgentMessage,
+    event_tx: &Sender<AgentEvent>,
+    run_id: &str,
+) {
+    if msg.conversation_id.is_none() {
+        return;
+    }
+    if let Some(r) = repo {
+        if let Err(e) = r.upsert_message(msg) {
+            let _ = event_tx
+                .send(AgentEvent::Error {
+                    run_id: run_id.to_string(),
+                    code: ErrorCode::DbError,
+                    message: format!("persist message failed: {e}"),
+                })
+                .await;
+        }
+    }
+}
+
+/// Spec §4 主动压缩（每轮发请求前）：estimate(messages + context) →
+/// - `> soft_limit`：MicroClear（context 易腐 part 替 stub + messages 非 durable 旧 skill_result 替 stub）
+/// - 仍 `> summarize_threshold`：有 `summarize_prompt` → Summarize（模型调用）；否则 Drop 最旧一轮
+///
+/// 只认通用信号：`ContextPart.droppable` + `durable_message_ids`。trading_write / summary 永不动。
+/// 返回本次新增的 durable message_ids（如 Summarize 产出的 summary 检查点），caller 并入集合。
+#[allow(clippy::too_many_arguments)]
+async fn proactive_compact(
+    messages: &mut Vec<AgentMessage>,
+    context: &mut ContextBundle,
+    durable_message_ids: &HashSet<String>,
+    plan: &CompactionPlan,
+    channel: &ProviderChannel,
+    repo: Option<&AgentMessagesRepo>,
+    event_tx: &Sender<AgentEvent>,
+    run_id: &str,
+) -> Result<HashSet<String>, LoopError> {
+    let mut new_durable: HashSet<String> = HashSet::new();
+    let est = estimate_context_tokens(messages, context, channel);
+    if est.total_tokens <= plan.soft_limit {
+        return Ok(new_durable);
+    }
+
+    // ---- Tier 1: MicroClear ----
+    let before = est.total_tokens;
+    let (new_ctx, ctx_stubbed) =
+        compact_context(context.clone(), CompactPolicy::MicroClear, plan_limits(plan));
+    *context = new_ctx;
+    let msg_stubbed = micro_clear_messages(
+        messages,
+        durable_message_ids,
+        plan.keep_recent_turns as usize,
+    );
+    let after_micro = estimate_context_tokens(messages, context, channel).total_tokens;
+    if ctx_stubbed + msg_stubbed > 0 {
+        send_event(
+            event_tx,
+            AgentEvent::Compacted {
+                run_id: run_id.to_string(),
+                tier: CompactedTier::MicroClear,
+                dropped_messages: ctx_stubbed + msg_stubbed,
+                estimated_tokens_saved: Some(before.saturating_sub(after_micro)),
+            },
+        )
+        .await?;
+    }
+
+    if after_micro <= plan.summarize_threshold {
+        return Ok(new_durable);
+    }
+
+    // ---- Tier 2: Summarize (if prompt provided) else Drop oldest round ----
+    if let Some(prompt) = plan.summarize_prompt.clone() {
+        match run_summarize(
+            messages,
+            durable_message_ids,
+            &prompt,
+            plan.compact_channel.clone().unwrap_or_else(|| channel.clone()),
+            plan.keep_recent_turns as usize,
+            run_id,
+        )
+        .await
+        {
+            Ok(Some((summary_msg, replaced))) => {
+                let after = estimate_context_tokens(messages, context, channel).total_tokens;
+                send_event(
+                    event_tx,
+                    AgentEvent::Compacted {
+                        run_id: run_id.to_string(),
+                        tier: CompactedTier::Summarize,
+                        dropped_messages: replaced,
+                        estimated_tokens_saved: Some(after_micro.saturating_sub(after)),
+                    },
+                )
+                .await?;
+                // Summary checkpoint is durable + persisted to agent_messages (spec §4).
+                new_durable.insert(summary_msg.message_id.clone());
+                persist_message(repo, &summary_msg, event_tx, run_id).await;
+            }
+            Ok(None) => { /* nothing to summarize */ }
+            Err(_) => {
+                // Summarize model call failed → fall back to Drop oldest round (guarantees shorter).
+                let dropped = drop_oldest_round_messages(
+                    messages,
+                    durable_message_ids,
+                    plan.keep_recent_turns as usize,
+                );
+                if dropped > 0 {
+                    let after = estimate_context_tokens(messages, context, channel).total_tokens;
+                    send_event(
+                        event_tx,
+                        AgentEvent::Compacted {
+                            run_id: run_id.to_string(),
+                            tier: CompactedTier::Drop,
+                            dropped_messages: dropped,
+                            estimated_tokens_saved: Some(after_micro.saturating_sub(after)),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+    } else {
+        // Spec §4: no summarize_prompt → Summarize tier degrades to Drop (keeps durable inline).
+        let dropped = drop_oldest_round_messages(
+            messages,
+            durable_message_ids,
+            plan.keep_recent_turns as usize,
+        );
+        if dropped > 0 {
+            let after = estimate_context_tokens(messages, context, channel).total_tokens;
+            send_event(
+                event_tx,
+                AgentEvent::Compacted {
+                    run_id: run_id.to_string(),
+                    tier: CompactedTier::Drop,
+                    dropped_messages: dropped,
+                    estimated_tokens_saved: Some(after_micro.saturating_sub(after)),
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(new_durable)
+}
+
+fn plan_limits(plan: &CompactionPlan) -> crate::domain::agent::ContextWindowLimits {
+    crate::domain::agent::ContextWindowLimits {
+        soft_limit_tokens: plan.soft_limit,
+        summarize_threshold_tokens: plan.summarize_threshold,
+        hard_limit_tokens: plan.hard_limit,
+        micro_clear_after_secs: crate::domain::agent::ContextWindowLimits::default()
+            .micro_clear_after_secs,
+    }
+}
+
+/// Spec §4 Summarize 执行（模型调用归 loop，不在 `compact_context`）：
+/// 对尾窗外（最近 `keep_recent` 之前）的非 durable 消息做一次性 collected 摘要调用
+/// （system = summarize_prompt，user = 待压消息序列化），把它们替换为单条 `kind=Summary`
+/// durable 消息。返回 `Some((summary_msg, replaced_count))`；无可压消息 → `None`。
+///
+/// 复用 `HttpProvider` + 一个丢弃事件的临时 mpsc sender——**不**把摘要 delta 泄漏到 run 的 event_tx。
+async fn run_summarize(
+    messages: &mut Vec<AgentMessage>,
+    durable_message_ids: &HashSet<String>,
+    summarize_prompt: &str,
+    compact_channel: ProviderChannel,
+    keep_recent: usize,
+    run_id: &str,
+) -> Result<Option<(AgentMessage, u32)>, LoopError> {
+    let cutoff = messages.len().saturating_sub(keep_recent);
+    // Collect indices of non-durable messages in the tail-window-excluded prefix.
+    let mut to_summarize_idx: Vec<usize> = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        if i >= cutoff {
+            break;
+        }
+        if m.kind == Some(MessageKind::Summary) || durable_message_ids.contains(&m.message_id) {
+            continue;
+        }
+        to_summarize_idx.push(i);
+    }
+    if to_summarize_idx.is_empty() {
+        return Ok(None);
+    }
+
+    // Serialize the messages-to-summarize into a single user text block.
+    let mut body = String::new();
+    for &i in &to_summarize_idx {
+        let m = &messages[i];
+        let role = match m.role {
+            AgentMessageRole::Assistant => "assistant",
+            AgentMessageRole::User => "user",
+            AgentMessageRole::System => "system",
+        };
+        for b in &m.blocks {
+            if let AgentMessageBlock::Text { text } = b {
+                body.push_str(role);
+                body.push_str(": ");
+                body.push_str(text);
+                body.push('\n');
+            }
+        }
+    }
+
+    // One-shot collected call: build a transient HttpProvider over the compact channel.
+    let mut provider = HttpProvider::new(compact_channel)?;
+    let summarize_messages = vec![
+        AgentMessage {
+            message_id: "sum-sys".into(),
+            run_id: Some(run_id.to_string()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
+            role: AgentMessageRole::System,
+            blocks: vec![AgentMessageBlock::Text {
+                text: summarize_prompt.to_string(),
+            }],
+            created_at: Utc::now(),
+        },
+        AgentMessage {
+            message_id: "sum-user".into(),
+            run_id: Some(run_id.to_string()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Text { text: body }],
+            created_at: Utc::now(),
+        },
+    ];
+    let ctx = ContextBundle::new(run_id);
+    // Throwaway sender: discard summary deltas so they don't leak to the run's event_tx.
+    let (throwaway_tx, throwaway_rx) = mpsc::channel::<AgentEvent>(256);
+    let drain = tokio::spawn(async move {
+        let mut rx = throwaway_rx;
+        while rx.recv().await.is_some() {}
+    });
+    let outcome = provider
+        .next_turn(&summarize_messages, &ctx, &throwaway_tx, run_id)
+        .await;
+    drop(throwaway_tx);
+    let _ = drain.await;
+    let summary_text = outcome?.text;
+    if summary_text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(apply_summary(
+        messages,
+        &to_summarize_idx,
+        summary_text,
+        run_id,
+    )))
+}
+
+/// 纯计算：把 `to_summarize_idx` 指向的消息替换为单条 `kind=Summary` durable 消息
+/// （插在最旧那条的位置，继承其 conversation_id + seq）。返回 (summary_msg, replaced_count)。
+fn apply_summary(
+    messages: &mut Vec<AgentMessage>,
+    to_summarize_idx: &[usize],
+    summary_text: String,
+    run_id: &str,
+) -> (AgentMessage, u32) {
+    let first = to_summarize_idx[0];
+    let conversation_id = messages.get(first).and_then(|m| m.conversation_id.clone());
+    let seq = messages.get(first).and_then(|m| m.seq);
+    let summary_msg = AgentMessage {
+        message_id: format!("sum-{}", Uuid::new_v4()),
+        run_id: Some(run_id.to_string()),
+        conversation_id,
+        seq,
+        kind: Some(MessageKind::Summary),
+        role: AgentMessageRole::Assistant,
+        blocks: vec![AgentMessageBlock::Text { text: summary_text }],
+        created_at: Utc::now(),
+    };
+    let replaced = to_summarize_idx.len() as u32;
+    for &i in to_summarize_idx.iter().rev() {
+        messages.remove(i);
+    }
+    messages.insert(first, summary_msg.clone());
+    (summary_msg, replaced)
 }
 
 fn error_code_str(c: ErrorCode) -> &'static str {
@@ -530,6 +1001,8 @@ mod tests {
             channel: channel(),
             max_turns: 5,
             seed_messages: vec![],
+            conversation_id: None,
+            compaction: None,
         }
     }
 
@@ -809,6 +1282,245 @@ mod tests {
         assert!(saw_error_end);
     }
 
+    // ---- multi-turn persistence + proactive compaction (deterministic) ----
+
+    fn fresh_repo() -> AgentMessagesRepo {
+        use crate::infrastructure::agent::migrations::migrations as agent_migrations;
+        use crate::infrastructure::db::{run_migrations, AppDb};
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, agent_migrations()).unwrap());
+        AgentMessagesRepo::new(db)
+    }
+
+    #[tokio::test]
+    async fn run_agent_turn_persists_and_reloads_view() {
+        // Two turns under one conversation: assistant text persisted with conversation_id + seq;
+        // reload via load_conversation (full) and load_conversation_view (compressed).
+        let repo = fresh_repo();
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![Ok(scripted_outcome(
+                "first answer",
+                3,
+                4,
+                AgentStopReason::Completed,
+            ))],
+            index: 0,
+        });
+        let mut request = req();
+        request.conversation_id = Some("conv-x".into());
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let summary = run_agent_turn(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            provider,
+            tx,
+            RunAgentDeps::with_repo(repo.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.stop_reason, AgentStopReason::Completed);
+        while rx.recv().await.is_some() {}
+
+        let all = repo.load_conversation("conv-x").unwrap();
+        assert_eq!(all.len(), 1, "assistant message persisted");
+        assert_eq!(all[0].conversation_id.as_deref(), Some("conv-x"));
+        assert_eq!(all[0].seq, Some(0));
+        assert_eq!(all[0].kind, Some(MessageKind::Chat));
+        // No summary checkpoint yet → view == full.
+        let view = repo.load_conversation_view("conv-x").unwrap();
+        assert_eq!(view.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_agent_turn_loads_view_as_seed_when_seed_empty() {
+        // Pre-seed a conversation with a summary checkpoint + later message; run_agent_turn must
+        // load the compressed view (summary + after) as seed.
+        let repo = fresh_repo();
+        let mk = |id: &str, seq: i64, kind: Option<MessageKind>, text: &str| AgentMessage {
+            message_id: id.into(),
+            run_id: Some("r0".into()),
+            conversation_id: Some("c".into()),
+            seq: Some(seq),
+            kind,
+            role: AgentMessageRole::Assistant,
+            blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+            created_at: Utc::now(),
+        };
+        repo.upsert_message(&mk("m0", 0, None, "old")).unwrap();
+        repo.upsert_message(&mk("s1", 1, Some(MessageKind::Summary), "SUMMARY"))
+            .unwrap();
+        repo.upsert_message(&mk("m2", 2, None, "recent")).unwrap();
+
+        // SnapshotProvider records how many seed messages the loop saw on the first turn.
+        struct SeedSnapshot {
+            seen: Arc<std::sync::Mutex<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl ProviderStream for SeedSnapshot {
+            async fn next_turn(
+                &mut self,
+                messages: &[AgentMessage],
+                _c: &ContextBundle,
+                _tx: &Sender<AgentEvent>,
+                _r: &str,
+            ) -> Result<ProviderTurnOutcome, LoopError> {
+                *self.seen.lock().unwrap() = messages.len();
+                Ok(ProviderTurnOutcome {
+                    text: "ok".into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                    skill_events: Vec::new(),
+                })
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let provider = Box::new(SeedSnapshot { seen: Arc::clone(&seen) });
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let mut request = req();
+        request.conversation_id = Some("c".into());
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let _ = run_agent_turn(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            provider,
+            tx,
+            RunAgentDeps::with_repo(repo.clone()),
+        )
+        .await
+        .unwrap();
+        while rx.recv().await.is_some() {}
+        // view = summary s1 + m2 = 2 messages (not the full 3).
+        assert_eq!(*seen.lock().unwrap(), 2, "loop should seed from compressed view");
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_micro_clears_old_skill_results_at_threshold() {
+        // Tiny window forces proactive compaction. Seed a large droppable realtime skill_result
+        // part; first turn's pre-compaction MicroClear should stub it.
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![Ok(scripted_outcome("done", 1, 1, AgentStopReason::Completed))],
+            index: 0,
+        });
+        let mut request = req();
+        // Tiny window: soft = 200/2 = 100, summarize = 140, hard = 180.
+        request.channel.context_window_tokens = Some(200);
+        let mut ctx = ContextBundle::new("r1");
+        ctx.realtime_parts.push(ContextPart {
+            kind: ContextPartKind::Realtime,
+            content: ContextContent::Text(format!(
+                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                "q".repeat(2000)
+            )),
+            freshness: None,
+            token_estimate: None,
+            droppable: true,
+        });
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let _ = run_agent_loop(request, registry, ctx, provider, tx)
+            .await
+            .unwrap();
+        let mut saw_micro = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::Compacted { tier, .. } = e {
+                if matches!(tier, CompactedTier::MicroClear) {
+                    saw_micro = true;
+                }
+            }
+        }
+        assert!(saw_micro, "proactive MicroClear should fire above soft limit");
+    }
+
+    #[tokio::test]
+    async fn proactive_compaction_drops_when_no_summarize_prompt() {
+        // Above summarize threshold, with no summarize_prompt → Summarize degrades to Drop.
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            script: vec![Ok(scripted_outcome("done", 1, 1, AgentStopReason::Completed))],
+            index: 0,
+        });
+        let mut request = req();
+        request.channel.context_window_tokens = Some(200); // soft 100 / summarize 140 / hard 180
+        // Many old non-durable assistant messages (well past keep_recent) → big + droppable.
+        let mut seed = Vec::new();
+        for i in 0..8 {
+            seed.push(AgentMessage {
+                message_id: format!("seed-{i}"),
+                run_id: Some("r1".into()),
+                conversation_id: None,
+                seq: None,
+                kind: None,
+                role: AgentMessageRole::Assistant,
+                blocks: vec![AgentMessageBlock::Text {
+                    text: "x".repeat(400),
+                }],
+                created_at: Utc::now(),
+            });
+        }
+        request.seed_messages = seed;
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let _ = run_agent_loop(request, registry, ContextBundle::new("r1"), provider, tx)
+            .await
+            .unwrap();
+        let mut saw_drop = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::Compacted { tier, .. } = e {
+                if matches!(tier, CompactedTier::Drop) {
+                    saw_drop = true;
+                }
+            }
+        }
+        assert!(saw_drop, "no summarize_prompt → Drop oldest round");
+    }
+
+    #[test]
+    fn apply_summary_replaces_turns_with_single_summary_message() {
+        let mut msgs = vec![
+            AgentMessage {
+                message_id: "a0".into(),
+                run_id: Some("r".into()),
+                conversation_id: Some("c".into()),
+                seq: Some(0),
+                kind: Some(MessageKind::Chat),
+                role: AgentMessageRole::Assistant,
+                blocks: vec![AgentMessageBlock::Text { text: "old0".into() }],
+                created_at: Utc::now(),
+            },
+            AgentMessage {
+                message_id: "u1".into(),
+                run_id: Some("r".into()),
+                conversation_id: Some("c".into()),
+                seq: Some(1),
+                kind: Some(MessageKind::Chat),
+                role: AgentMessageRole::User,
+                blocks: vec![AgentMessageBlock::Text { text: "old1".into() }],
+                created_at: Utc::now(),
+            },
+            AgentMessage {
+                message_id: "a2".into(),
+                run_id: Some("r".into()),
+                conversation_id: Some("c".into()),
+                seq: Some(2),
+                kind: Some(MessageKind::Chat),
+                role: AgentMessageRole::Assistant,
+                blocks: vec![AgentMessageBlock::Text { text: "recent".into() }],
+                created_at: Utc::now(),
+            },
+        ];
+        let (summary, replaced) =
+            apply_summary(&mut msgs, &[0, 1], "SUMMARY TEXT".into(), "r");
+        assert_eq!(replaced, 2);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].message_id, summary.message_id);
+        assert_eq!(msgs[0].kind, Some(MessageKind::Summary));
+        assert_eq!(msgs[0].seq, Some(0), "summary inherits oldest seq");
+        assert_eq!(msgs[1].message_id, "a2", "recent message kept");
+    }
+
     /// 端到端实网 chat：跑完整 `run_agent_loop`（loop + HttpProvider + 真 SSE）对三个真实
     /// relay，用真实问题，打印流式答案。`#[ignore]`，凭证全走 env（无硬编码 secret）。
     ///   TEST_OAI_BASE/KEY/MODEL（responses）, TEST_ANT_BASE/KEY/MODEL（messages）,
@@ -836,12 +1548,17 @@ mod tests {
                 seed_messages: vec![AgentMessage {
                     message_id: "m1".into(),
                     run_id: Some("live".into()),
+                    conversation_id: None,
+                    seq: None,
+                    kind: None,
                     role: AgentMessageRole::User,
                     blocks: vec![AgentMessageBlock::Text {
                         text: "用一句话解释A股的T+1交易制度".into(),
                     }],
                     created_at: Utc::now(),
                 }],
+                conversation_id: None,
+                compaction: None,
             };
             let registry = Arc::new(SkillRegistry::new_without_persist());
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
@@ -928,12 +1645,17 @@ mod tests {
                 seed_messages: vec![AgentMessage {
                     message_id: "m1".into(),
                     run_id: Some("skill".into()),
+                    conversation_id: None,
+                    seq: None,
+                    kind: None,
                     role: AgentMessageRole::User,
                     blocks: vec![AgentMessageBlock::Text {
                         text: "请调用 get_secret 这个 skill 获取今天的幸运数字，然后用一句话告诉我它是多少。".into(),
                     }],
                     created_at: Utc::now(),
                 }],
+                conversation_id: None,
+                compaction: None,
             };
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
             let pump = tokio::spawn(async move {
@@ -985,5 +1707,186 @@ mod tests {
         }
         println!("[skill-live] ran {ran} skill-loop checks");
         assert!(ran > 0, "no TEST_* env provided");
+    }
+
+    /// 实网多轮 + Summarize 烟测：
+    /// (a) 一个短多轮会话持久化到 in-memory DB（一个 conversationId），reload 压缩视图；
+    /// (b) 用极小 summarize_threshold + 一个 summarizePrompt 强制触发 Summarize，断言产出一条
+    ///     `kind=Summary` 消息且模型调用成功。
+    /// `#[ignore]`，凭证全走 env（无硬编码 secret）：
+    ///   TEST_ANT_BASE/KEY（messages）或 TEST_DS_KEY（chat_completions）。
+    #[tokio::test]
+    #[ignore]
+    async fn multiturn_summarize_live() {
+        use crate::infrastructure::agent::http_provider::HttpProvider;
+        use crate::infrastructure::agent::migrations::migrations as agent_migrations;
+        use crate::infrastructure::db::{run_migrations, AppDb};
+        use chrono::Utc;
+
+        // Pick a live channel from env (prefer DeepSeek chat_completions, else Anthropic messages).
+        let channel = if let Ok(k) = std::env::var("TEST_DS_KEY") {
+            let b =
+                std::env::var("TEST_DS_BASE").unwrap_or_else(|_| "https://api.deepseek.com".into());
+            let m = std::env::var("TEST_DS_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
+            let mut c = channel();
+            c.wire_format = WireFormat::ChatCompletions;
+            c.base_url = Some(b);
+            c.api_key = k;
+            c.model = m;
+            c.max_output_tokens = Some(512);
+            c
+        } else if let (Ok(b), Ok(k)) =
+            (std::env::var("TEST_ANT_BASE"), std::env::var("TEST_ANT_KEY"))
+        {
+            let m = std::env::var("TEST_ANT_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+            let mut c = channel();
+            c.wire_format = WireFormat::Messages;
+            c.base_url = Some(b);
+            c.api_key = k;
+            c.model = m;
+            c.max_output_tokens = Some(512);
+            c
+        } else {
+            println!("[multiturn-summarize-live] skip: set TEST_DS_KEY or TEST_ANT_BASE/KEY");
+            return;
+        };
+
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, agent_migrations()).unwrap());
+        let repo = AgentMessagesRepo::new(db);
+        let conversation_id = "live-conv".to_string();
+
+        // (a) Turn 1: a short multi-turn conversation persisted under the conversation_id.
+        async fn user_seed(conv: &str, run: &str, text: &str) -> Vec<AgentMessage> {
+            vec![AgentMessage {
+                message_id: format!("u-{run}"),
+                run_id: Some(run.to_string()),
+                conversation_id: Some(conv.to_string()),
+                seq: None,
+                kind: Some(MessageKind::Chat),
+                role: AgentMessageRole::User,
+                blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+                created_at: Utc::now(),
+            }]
+        }
+
+        // Persist the user seed for turn 1 ourselves (loop only persists what it produces).
+        let mut seed1 = user_seed(&conversation_id, "run-1", "我关注贵州茅台(600519.SH)，简单说说它。").await;
+        seed1[0].seq = repo.next_seq(&conversation_id).ok();
+        repo.upsert_message(&seed1[0]).unwrap();
+
+        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
+        let mut req1 = AgentRunRequest {
+            run_id: "run-1".into(),
+            trigger: "user".into(),
+            channel: channel.clone(),
+            max_turns: 1,
+            seed_messages: seed1,
+            conversation_id: Some(conversation_id.clone()),
+            compaction: None,
+        };
+        req1.compaction = None;
+        let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
+        let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
+        let s1 = run_agent_loop_with_deps(
+            req1,
+            registry.clone(),
+            ContextBundle::new("run-1"),
+            provider,
+            tx1,
+            RunAgentDeps::with_repo(repo.clone()),
+        )
+        .await
+        .expect("turn 1 loop");
+        pump1.await.unwrap();
+        println!("[multiturn-summarize-live] turn1 stop={:?}", s1.stop_reason);
+
+        // Reload the compressed view (no summary yet → full).
+        let view = repo.load_conversation_view(&conversation_id).unwrap();
+        assert!(!view.is_empty(), "conversation persisted + reloadable");
+        println!("[multiturn-summarize-live] view len after turn1 = {}", view.len());
+
+        // (b) Turn 2: force Summarize with a tiny summarize_threshold + a summarizePrompt.
+        let mut seed2 = repo.load_conversation_view(&conversation_id).unwrap();
+        let mut follow = user_seed(&conversation_id, "run-2", "它的护城河主要是什么？").await;
+        follow[0].seq = repo.next_seq(&conversation_id).ok();
+        repo.upsert_message(&follow[0]).unwrap();
+        seed2.append(&mut follow);
+
+        let provider2 = Box::new(HttpProvider::new(channel.clone()).unwrap());
+        let req2 = AgentRunRequest {
+            run_id: "run-2".into(),
+            trigger: "user".into(),
+            channel: channel.clone(),
+            max_turns: 1,
+            seed_messages: seed2,
+            conversation_id: Some(conversation_id.clone()),
+            compaction: Some(CompactionConfig {
+                soft_limit_tokens: Some(1),
+                summarize_threshold_tokens: Some(1),
+                hard_limit_tokens: Some(1_000_000),
+                keep_recent_turns: Some(1),
+                summarize_prompt: Some(
+                    "你是会话压缩器。用中文把以下对话压缩成一段要点摘要，覆盖关注标的与已建立的判断。仅输出摘要正文。"
+                        .into(),
+                ),
+                compact_channel: None,
+            }),
+        };
+        let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
+        let pump2 = tokio::spawn(async move {
+            let mut tiers = Vec::new();
+            while let Some(e) = rx2.recv().await {
+                if let AgentEvent::Compacted { tier, .. } = e {
+                    tiers.push(tier);
+                }
+            }
+            tiers
+        });
+        let s2 = run_agent_loop_with_deps(
+            req2,
+            registry,
+            ContextBundle::new("run-2"),
+            provider2,
+            tx2,
+            RunAgentDeps::with_repo(repo.clone()),
+        )
+        .await
+        .expect("turn 2 loop");
+        let tiers = pump2.await.unwrap();
+        println!(
+            "[multiturn-summarize-live] turn2 stop={:?} compaction_tiers={:?}",
+            s2.stop_reason, tiers
+        );
+        assert!(
+            tiers.iter().any(|t| matches!(t, CompactedTier::Summarize)),
+            "expected a Summarize compaction tier"
+        );
+
+        // A kind=Summary message must now exist in the conversation (persisted).
+        let all = repo.load_conversation(&conversation_id).unwrap();
+        let n_summary = all
+            .iter()
+            .filter(|m| m.kind == Some(MessageKind::Summary))
+            .count();
+        println!(
+            "[multiturn-summarize-live] total persisted = {}, summary checkpoints = {}",
+            all.len(),
+            n_summary
+        );
+        assert!(n_summary >= 1, "a Summary checkpoint must be produced");
+        let summary_text = all
+            .iter()
+            .find(|m| m.kind == Some(MessageKind::Summary))
+            .and_then(|m| m.blocks.first())
+            .map(|b| match b {
+                AgentMessageBlock::Text { text } => text.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        assert!(!summary_text.trim().is_empty(), "summary model call must produce text");
+        println!("[multiturn-summarize-live] summary = {:?}", summary_text);
     }
 }

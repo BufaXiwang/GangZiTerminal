@@ -12,14 +12,21 @@
 //! 本文件提供：
 //! - `micro_clear`：替换易腐 part 为 stub
 //! - `drop_oldest_chat_until`：按 soft limit 丢弃最旧 chat part
-//! - `compact_context(bundle, policy)`：spec §4 描述的纯计算 API
+//! - `compact_context(bundle, policy)`：spec §4 描述的纯计算 API（作用于 ContextBundle）
+//! - `compact_messages(messages, policy, durable_ids, ...)`：spec §4/§5 — 作用于会话 messages 的纯计算
 //! - `decide_tier`：纯判定函数
-//! - `estimate_context_tokens(context, channel)`：spec §5 描述的纯计算 token 估算
+//! - `estimate_context_tokens(messages, context, channel)`：spec §5 描述的纯计算 token 估算
+//!
+//! **边界（spec §4）**：Infra 只提供压缩「机制」，不内置业务保留策略。压缩只认两个通用信号：
+//! - `ContextPart.droppable`（Runtime 注入时自己标）
+//! - 消息 durable 标记（loop 从 dispatched skill 的 `SkillSpec.sideEffect == trading_write` 派生，
+//!   或 `kind=summary` 检查点）—— 以 `durable_message_ids: &HashSet<String>` 传入，保持通用。
 
 use crate::domain::agent::{
-    CompactTier, ContextBundle, ContextWindowLimits, ContextContent, ContextPart, ContextPartKind,
-    ProviderChannel, TokenEstimate,
+    AgentMessage, AgentMessageBlock, CompactTier, ContextBundle, ContextWindowLimits,
+    ContextContent, ContextPart, ContextPartKind, MessageKind, ProviderChannel, TokenEstimate,
 };
+use std::collections::HashSet;
 
 /// 压缩策略（spec §4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,23 +261,47 @@ pub fn decide_tier(
     None
 }
 
-/// `estimate_context_tokens(context, channel)` — spec §5 描述的纯计算 token 估算。
+/// 启发式估算一条消息的 token 数（4 字符 / token，跨所有 text / thinking block）。
+pub fn estimate_message_tokens(msg: &AgentMessage) -> u32 {
+    let chars: usize = msg
+        .blocks
+        .iter()
+        .map(|b| match b {
+            AgentMessageBlock::Text { text } => text.chars().count(),
+            AgentMessageBlock::Thinking { text, .. } => text.chars().count(),
+            // image dataRef 只是 URI 引用；wire 时才 base64，估算时按引用长度近似。
+            AgentMessageBlock::Image { data_ref, .. } => data_ref.chars().count(),
+        })
+        .sum();
+    ((chars + 3) / 4) as u32
+}
+
+/// 启发式估算一批会话消息的 token 总和。
+pub fn estimate_messages_tokens(messages: &[AgentMessage]) -> u32 {
+    let sum: u64 = messages.iter().map(|m| u64::from(estimate_message_tokens(m))).sum();
+    sum.min(u32::MAX as u64) as u32
+}
+
+/// `estimate_context_tokens(messages, context, channel)` — spec §5 描述的纯计算 token 估算。
 ///
-/// 行为：按 `ContextBundle::estimated_tokens()` 启发式求和（4 字符 / token），
-/// 与 `channel.context_window_tokens` 对照判断是否超过 soft limit。
+/// 行为：会话 messages 估算（`estimate_messages_tokens`）+ `ContextBundle::estimated_tokens()`
+/// 启发式求和（4 字符 / token），与 `channel.context_window_tokens` 对照判断是否超过 soft limit。
 /// 当 channel 没有声明 `context_window_tokens` 时,使用 `ContextWindowLimits::default()` 的
 /// `soft_limit_tokens` 作为软限制。
 pub fn estimate_context_tokens(
+    messages: &[AgentMessage],
     context: &ContextBundle,
     channel: &ProviderChannel,
 ) -> TokenEstimate {
-    let total_tokens = context.estimated_tokens();
+    let total_tokens = context
+        .estimated_tokens()
+        .saturating_add(estimate_messages_tokens(messages));
     // Spec §4: soft limit drives MicroClear。channel 没声明窗口大小时退化到默认软限制。
     let soft_limit = channel
         .context_window_tokens
         .map(|w| {
             // 默认软限制按窗口的 ~33% 估算(与 ContextWindowLimits::default 60k / 180k 比例一致)。
-            (w as u64 * 1).max(1) / 3
+            (w as u64).max(1) / 3
         })
         .map(|v| v.min(u32::MAX as u64) as u32)
         .unwrap_or(ContextWindowLimits::default().soft_limit_tokens);
@@ -316,6 +347,107 @@ pub fn compact_context(
             (bundle, rep.stubbed_parts + extra)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Message-lane compaction (spec §4 多轮会话持久化与续接 + §5 compact_context 作用于 messages)
+// ---------------------------------------------------------------------------
+
+/// 一条消息是否 durable（永不压缩 / 替 stub）。通用信号，不感知业务：
+/// - `kind == Summary`（§4 压缩检查点）；
+/// - `message_id ∈ durable_message_ids`（loop 从 dispatched skill 的 `sideEffect == trading_write`
+///   派生；Infra 不知道"交易"含义，只消费 id 集合）。
+pub fn message_is_durable(msg: &AgentMessage, durable_message_ids: &HashSet<String>) -> bool {
+    msg.kind == Some(MessageKind::Summary) || durable_message_ids.contains(&msg.message_id)
+}
+
+/// 一条消息体是否含 `<skill_result ...>` wrapper（可被 MicroClear 替 stub）。
+fn message_is_skill_result(msg: &AgentMessage) -> bool {
+    msg.blocks.iter().any(|b| match b {
+        AgentMessageBlock::Text { text } => parse_skill_result_attrs(text).is_some(),
+        _ => false,
+    })
+}
+
+/// 把一条 skill_result 消息的 text block 替换为 `<skill_result_stub .. />`（保留 name/call_id/ref）。
+fn stub_message_in_place(msg: &mut AgentMessage) {
+    for b in msg.blocks.iter_mut() {
+        if let AgentMessageBlock::Text { text } = b {
+            if parse_skill_result_attrs(text).is_some() {
+                *text = render_stub(&ContextContent::Text(text.clone()));
+            }
+        }
+    }
+}
+
+/// MicroClear（messages lane）：把尾窗（最近 `keep_recent` 条）**之外**的非 durable
+/// skill_result 消息替换为 stub（保留 name/call_id/ref）。durable / summary / 非 skill_result
+/// 消息原样保留。返回被 stub 化的消息数。
+///
+/// Spec §4：可清理内容替 stub，LLM 仍可通过 `<use_skill>` 重新拉取；不可清理项（trading_write /
+/// summary）永远 inline 保留。
+pub fn micro_clear_messages(
+    messages: &mut [AgentMessage],
+    durable_message_ids: &HashSet<String>,
+    keep_recent: usize,
+) -> u32 {
+    let n = messages.len();
+    let cutoff = n.saturating_sub(keep_recent);
+    let mut stubbed = 0u32;
+    for (i, msg) in messages.iter_mut().enumerate() {
+        if i >= cutoff {
+            break;
+        }
+        if message_is_durable(msg, durable_message_ids) {
+            continue;
+        }
+        if message_is_skill_result(msg) {
+            // already a stub? parse_skill_result_attrs matches stub too (it has name/call_id/ref),
+            // but stub tag is `<skill_result_stub`. Guard: skip if already stubbed.
+            let already_stub = msg.blocks.iter().any(|b| {
+                matches!(b, AgentMessageBlock::Text { text } if text.contains("<skill_result_stub"))
+            });
+            if !already_stub {
+                stub_message_in_place(msg);
+                stubbed += 1;
+            }
+        }
+    }
+    stubbed
+}
+
+/// Drop 最旧一轮 API round（messages lane）：移除尾窗外、最旧的非 durable 消息。
+/// 只清非 durable（droppable）部分；durable（trading_write / summary）保留 inline（spec §4）。
+/// 返回被移除的消息数。
+pub fn drop_oldest_round_messages(
+    messages: &mut Vec<AgentMessage>,
+    durable_message_ids: &HashSet<String>,
+    keep_recent: usize,
+) -> u32 {
+    let cutoff = messages.len().saturating_sub(keep_recent);
+    // 找尾窗外第一条非 durable 消息移除（一轮的近似：最旧 assistant + 紧随 skill_result user）。
+    let mut removed = 0u32;
+    let mut i = 0usize;
+    while i < messages.len() && i < cutoff {
+        if !message_is_durable(&messages[i], durable_message_ids) {
+            messages.remove(i);
+            removed += 1;
+            // remove at most one "round" worth: the assistant turn + its following skill_result.
+            // After removing one assistant message, also remove a following non-durable
+            // skill_result user message if present (same logical round).
+            if i < messages.len()
+                && i < messages.len().saturating_sub(keep_recent.saturating_sub(removed as usize))
+                && !message_is_durable(&messages[i], durable_message_ids)
+                && message_is_skill_result(&messages[i])
+            {
+                messages.remove(i);
+                removed += 1;
+            }
+            break;
+        }
+        i += 1;
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -612,7 +744,7 @@ mod tests {
             context_window_tokens: Some(9000), // soft = 9000/3 = 3000
             thinking_budget_tokens: None,
         };
-        let est = estimate_context_tokens(&b, &channel);
+        let est = estimate_context_tokens(&[], &b, &channel);
         assert!(est.total_tokens >= 10_000);
         assert!(est.over_soft_limit);
     }
@@ -636,7 +768,7 @@ mod tests {
             context_window_tokens: Some(200_000),
             thinking_budget_tokens: None,
         };
-        let est = estimate_context_tokens(&b, &channel);
+        let est = estimate_context_tokens(&[], &b, &channel);
         assert_eq!(est.total_tokens, 0);
         assert!(!est.over_soft_limit);
     }
@@ -660,7 +792,7 @@ mod tests {
             context_window_tokens: None,
             thinking_budget_tokens: None,
         };
-        let est = estimate_context_tokens(&b, &channel);
+        let est = estimate_context_tokens(&[], &b, &channel);
         // No window: default soft_limit_tokens is 60_000; empty bundle is 0 → under.
         assert!(!est.over_soft_limit);
     }
@@ -687,5 +819,145 @@ mod tests {
         ));
         // chat untouched
         assert_eq!(out.chat_parts.len(), 1);
+    }
+
+    // ---- message-lane compaction ----
+
+    fn amsg(id: &str, role: crate::domain::agent::AgentMessageRole, text: &str) -> AgentMessage {
+        AgentMessage {
+            message_id: id.into(),
+            run_id: Some("r1".into()),
+            conversation_id: Some("c".into()),
+            seq: None,
+            kind: None,
+            role,
+            blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn micro_clear_messages_stubs_non_durable_old_skill_results() {
+        use crate::domain::agent::AgentMessageRole;
+        let mut msgs = vec![
+            amsg("a0", AgentMessageRole::Assistant, "thinking"),
+            amsg(
+                "u1",
+                AgentMessageRole::User,
+                r#"<skill_result name="fetch_quote" call_id="sc_1" ref="pl_1">{"px":"1"}</skill_result>"#,
+            ),
+            amsg(
+                "u2",
+                AgentMessageRole::User,
+                r#"<skill_result name="operate_account" call_id="sc_2" ref="pl_2">{"orderId":"o1"}</skill_result>"#,
+            ),
+            amsg("a3", AgentMessageRole::Assistant, "recent"),
+        ];
+        // u2 is durable (trading_write); keep_recent=0 so all are candidates.
+        let durable: HashSet<String> = ["u2".to_string()].into_iter().collect();
+        let n = micro_clear_messages(&mut msgs, &durable, 0);
+        assert_eq!(n, 1, "only u1 (non-durable skill_result) stubbed");
+        // u1 stubbed, preserves name/call_id/ref
+        let u1 = match &msgs[1].blocks[0] {
+            AgentMessageBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(u1.starts_with("<skill_result_stub"));
+        assert!(u1.contains(r#"name="fetch_quote""#));
+        assert!(u1.contains(r#"ref="pl_1""#));
+        // u2 (durable trading_write) untouched
+        let u2 = match &msgs[2].blocks[0] {
+            AgentMessageBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(u2.contains("<skill_result name="), "durable trading_write must stay inline");
+        assert!(u2.contains("orderId"));
+    }
+
+    #[test]
+    fn micro_clear_messages_respects_keep_recent_window() {
+        use crate::domain::agent::AgentMessageRole;
+        let mut msgs = vec![
+            amsg(
+                "u0",
+                AgentMessageRole::User,
+                r#"<skill_result name="q" call_id="sc_0" ref="pl_0">{}</skill_result>"#,
+            ),
+            amsg(
+                "u1",
+                AgentMessageRole::User,
+                r#"<skill_result name="q" call_id="sc_1" ref="pl_1">{}</skill_result>"#,
+            ),
+        ];
+        // keep_recent=1 → only u0 eligible.
+        let n = micro_clear_messages(&mut msgs, &HashSet::new(), 1);
+        assert_eq!(n, 1);
+        let u1 = match &msgs[1].blocks[0] {
+            AgentMessageBlock::Text { text } => text.clone(),
+            _ => panic!(),
+        };
+        assert!(u1.contains("<skill_result name="), "recent window kept inline");
+    }
+
+    #[test]
+    fn micro_clear_messages_keeps_summary_durable() {
+        use crate::domain::agent::AgentMessageRole;
+        let mut summary = amsg(
+            "s0",
+            AgentMessageRole::Assistant,
+            r#"<skill_result name="q" call_id="sc" ref="pl">{}</skill_result>"#,
+        );
+        summary.kind = Some(MessageKind::Summary);
+        let mut msgs = vec![summary, amsg("a1", AgentMessageRole::Assistant, "x")];
+        let n = micro_clear_messages(&mut msgs, &HashSet::new(), 0);
+        assert_eq!(n, 0, "summary checkpoint is durable, never stubbed");
+    }
+
+    #[test]
+    fn drop_oldest_round_messages_removes_oldest_non_durable() {
+        use crate::domain::agent::AgentMessageRole;
+        let mut msgs = vec![
+            amsg("a0", AgentMessageRole::Assistant, "old assistant"),
+            amsg(
+                "u1",
+                AgentMessageRole::User,
+                r#"<skill_result name="q" call_id="sc_1" ref="pl_1">{}</skill_result>"#,
+            ),
+            amsg("a2", AgentMessageRole::Assistant, "recent"),
+        ];
+        let removed = drop_oldest_round_messages(&mut msgs, &HashSet::new(), 1);
+        assert!(removed >= 1);
+        // a0 (oldest) removed; the recent tail kept.
+        assert!(msgs.iter().all(|m| m.message_id != "a0"));
+        assert!(msgs.iter().any(|m| m.message_id == "a2"));
+    }
+
+    #[test]
+    fn estimate_context_tokens_includes_messages() {
+        use crate::domain::agent::{AgentMessageRole, ProviderChannel, WireFormat};
+        let msgs = vec![amsg(
+            "a0",
+            AgentMessageRole::Assistant,
+            &"x".repeat(40_000),
+        )]; // ~10k tokens
+        let b = ContextBundle::new("r1");
+        let channel = ProviderChannel {
+            channel_id: "c".into(),
+            provider: "p".into(),
+            wire_format: WireFormat::Messages,
+            base_url: None,
+            api_key: String::new(),
+            model: "m".into(),
+            stream: true,
+            enabled: true,
+            supports_vision: false,
+            supports_thinking: false,
+            max_output_tokens: None,
+            context_window_tokens: Some(9000), // soft = 3000
+            thinking_budget_tokens: None,
+        };
+        let est = estimate_context_tokens(&msgs, &b, &channel);
+        assert!(est.total_tokens >= 10_000, "messages must count: {}", est.total_tokens);
+        assert!(est.over_soft_limit);
     }
 }

@@ -190,6 +190,16 @@ impl SkillRegistry {
             .contains_key(name)
     }
 
+    /// 返回某 skill 的 `sideEffect`（spec §4 通用压缩信号；`trading_write` = 结果不可丢）。
+    /// 未注册返回 None。
+    pub fn skill_side_effect(&self, name: &str) -> Option<crate::domain::agent::SideEffect> {
+        self.skills
+            .read()
+            .expect("RwLock poisoned")
+            .get(name)
+            .map(|e| e.spec.side_effect)
+    }
+
     /// 列出所有 SkillSpec — 喂 SystemPromptBuilder 用。
     pub fn list_skills(&self) -> Vec<SkillSpec> {
         self.skills

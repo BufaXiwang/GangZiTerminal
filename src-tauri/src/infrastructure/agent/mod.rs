@@ -33,8 +33,11 @@ pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
 pub use presets::{channel_presets, ChannelPreset};
 pub use context_compaction::{
-    compact_context, decide_tier, estimate_context_tokens, CompactPolicy,
+    compact_context, decide_tier, drop_oldest_round_messages, estimate_context_tokens,
+    estimate_message_tokens, estimate_messages_tokens, message_is_durable, micro_clear_messages,
+    CompactPolicy,
 };
+pub use loop_executor::{run_agent_loop, run_agent_turn, LoopError, ProviderStream, RunAgentDeps};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};

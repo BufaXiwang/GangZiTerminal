@@ -229,6 +229,9 @@ mod tests {
         AgentMessage {
             message_id: "m1".into(),
             run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
             role,
             blocks,
             created_at: Utc::now(),

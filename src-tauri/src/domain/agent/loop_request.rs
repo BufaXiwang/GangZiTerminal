@@ -11,6 +11,33 @@ use super::channel::ProviderChannel;
 use super::events::AgentStopReason;
 use super::messages::AgentMessage;
 
+/// 上下文压缩配置（spec §5 `CompactionConfig`）。
+///
+/// Runtime 提供；所有字段缺省 → Infra 用 `channel.contextWindowTokens` 推导阈值。
+/// Infra 只消费这些通用旋钮，不内置任何业务保留策略（spec §4 边界）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionConfig {
+    /// 缺省由 `channel.contextWindowTokens` 推导（window/2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit_tokens: Option<u32>,
+    /// 缺省由 `channel.contextWindowTokens` 推导（window*0.7）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarize_threshold_tokens: Option<u32>,
+    /// 缺省由 `channel.contextWindowTokens` 推导（window*0.9）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit_tokens: Option<u32>,
+    /// 最近 N 轮永不摘要（缺省若干）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_recent_turns: Option<u32>,
+    /// Runtime 提供的摘要指令；缺省 → Summarize 降级为 Drop（spec §4）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarize_prompt: Option<String>,
+    /// 摘要模型渠道；缺省复用 run 的 channel（spec §4）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_channel: Option<ProviderChannel>,
+}
+
 /// 单次 Agent run 的执行参数。
 ///
 /// Spec: agent-infra-module.md §5 Infra Loop API
@@ -27,6 +54,12 @@ pub struct AgentRunRequest {
     /// 把已有聊天历史 / 续接消息一起带入；Infra 不负责拉取历史。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seed_messages: Vec<AgentMessage>,
+    /// 多轮会话标识（Runtime 提供）；`run_agent_turn` 在 seed 为空且有 conversationId 时自动 load 压缩视图。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）（spec §5）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionConfig>,
 }
 
 /// 一次 run 完成后的总结，供 Runtime 关闭审计。
@@ -102,6 +135,8 @@ mod tests {
             },
             max_turns: 12,
             seed_messages: vec![],
+            conversation_id: None,
+            compaction: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: AgentRunRequest = serde_json::from_str(&j).unwrap();

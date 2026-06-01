@@ -4,7 +4,7 @@
 //! - 所有 skill 调用必须先通过 `SkillRegistry` 校验。
 //! - 所有 skill 调用都必须记录 `SkillCall`。
 
-use crate::domain::agent::{AgentMessage, SkillCall};
+use crate::domain::agent::{AgentMessage, MessageKind, SkillCall};
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::db::AppDb;
 use chrono::{DateTime, Utc};
@@ -41,14 +41,26 @@ impl AgentMessagesRepo {
             .as_str()
             .ok_or(RepoError::InvalidRow("role"))?
             .to_string();
+        let kind = match msg.kind {
+            Some(k) => Some(
+                serde_json::to_value(k)?
+                    .as_str()
+                    .ok_or(RepoError::InvalidRow("kind"))?
+                    .to_string(),
+            ),
+            None => None,
+        };
         self.db.with(|c| {
             c.execute(
                 "INSERT OR REPLACE INTO agent_messages
-                  (message_id, run_id, role, blocks_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                  (message_id, run_id, conversation_id, seq, kind, role, blocks_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     msg.message_id,
                     msg.run_id,
+                    msg.conversation_id,
+                    msg.seq,
+                    kind,
                     role,
                     blocks_json,
                     msg.created_at.to_rfc3339()
@@ -58,10 +70,60 @@ impl AgentMessagesRepo {
         })
     }
 
+    /// 给定 conversation 的下一个 seq（max(seq)+1，无消息则 0）。
+    ///
+    /// Spec: agent-infra-module.md §4 多轮会话持久化（会话内单调序号）。
+    pub fn next_seq(&self, conversation_id: &str) -> Result<i64, RepoError> {
+        self.db.with(|c| {
+            let max: Option<i64> = c.query_row(
+                "SELECT MAX(seq) FROM agent_messages WHERE conversation_id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )?;
+            Ok::<_, RepoError>(max.map(|m| m + 1).unwrap_or(0))
+        })
+    }
+
+    /// 全量加载会话（按 seq 排序）—— 审计真源。
+    ///
+    /// Spec: agent-infra-module.md §5 `load_conversation`。seq 为 NULL 的行排到末尾（按 created_at）。
+    pub fn load_conversation(&self, conversation_id: &str) -> Result<Vec<AgentMessage>, RepoError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT message_id, run_id, conversation_id, seq, kind, role, blocks_json, created_at
+                 FROM agent_messages WHERE conversation_id = ?1
+                 ORDER BY seq IS NULL, seq ASC, created_at ASC, message_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![conversation_id], row_to_message)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 加载会话的压缩视图（续接用，不返回全量）。
+    ///
+    /// Spec: agent-infra-module.md §5 `load_conversation_view` / §4 续接：
+    /// 最近一个 `kind=summary` 检查点 + 其后（seq 更大）的所有消息；无 summary → 返回全量。
+    pub fn load_conversation_view(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<AgentMessage>, RepoError> {
+        let all = self.load_conversation(conversation_id)?;
+        // 找最后一个 summary 检查点的位置（按已排序顺序）。
+        let last_summary_idx = all
+            .iter()
+            .rposition(|m| m.kind == Some(MessageKind::Summary));
+        match last_summary_idx {
+            Some(i) => Ok(all[i..].to_vec()),
+            None => Ok(all),
+        }
+    }
+
     pub fn load_messages_by_run(&self, run_id: &str) -> Result<Vec<AgentMessage>, RepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT message_id, run_id, role, blocks_json, created_at
+                "SELECT message_id, run_id, conversation_id, seq, kind, role, blocks_json, created_at
                  FROM agent_messages WHERE run_id = ?1 ORDER BY created_at ASC, message_id ASC",
             )?;
             let rows = stmt
@@ -133,23 +195,35 @@ impl AgentMessagesRepo {
 fn row_to_message(row: &Row) -> rusqlite::Result<AgentMessage> {
     let message_id: String = row.get(0)?;
     let run_id: Option<String> = row.get(1)?;
-    let role_s: String = row.get(2)?;
-    let blocks_json: String = row.get(3)?;
-    let created_at_s: String = row.get(4)?;
+    let conversation_id: Option<String> = row.get(2)?;
+    let seq: Option<i64> = row.get(3)?;
+    let kind_s: Option<String> = row.get(4)?;
+    let role_s: String = row.get(5)?;
+    let blocks_json: String = row.get(6)?;
+    let created_at_s: String = row.get(7)?;
     let role = serde_json::from_value(Json::String(role_s)).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let kind: Option<MessageKind> = match kind_s {
+        Some(s) => Some(serde_json::from_value(Json::String(s)).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?),
+        None => None,
+    };
     let blocks = serde_json::from_str(&blocks_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let created_at: DateTime<Utc> = DateTime::parse_from_rfc3339(&created_at_s)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&Utc);
     Ok(AgentMessage {
         message_id,
         run_id,
+        conversation_id,
+        seq,
+        kind,
         role,
         blocks,
         created_at,
@@ -240,6 +314,9 @@ mod tests {
         let msg = AgentMessage {
             message_id: "m1".into(),
             run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
             role: AgentMessageRole::Assistant,
             blocks: vec![AgentMessageBlock::Text { text: "hi".into() }],
             created_at: Utc::now(),
@@ -249,6 +326,77 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].message_id, "m1");
         assert_eq!(loaded[0].role, AgentMessageRole::Assistant);
+    }
+
+    fn conv_msg(id: &str, conv: &str, seq: i64, kind: Option<MessageKind>) -> AgentMessage {
+        AgentMessage {
+            message_id: id.into(),
+            run_id: Some("r1".into()),
+            conversation_id: Some(conv.into()),
+            seq: Some(seq),
+            kind,
+            role: AgentMessageRole::Assistant,
+            blocks: vec![AgentMessageBlock::Text {
+                text: format!("msg {id}"),
+            }],
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn next_seq_increments_per_conversation() {
+        let db = fresh_db();
+        let repo = AgentMessagesRepo::new(db);
+        assert_eq!(repo.next_seq("conv-a").unwrap(), 0);
+        repo.upsert_message(&conv_msg("m1", "conv-a", 0, None)).unwrap();
+        assert_eq!(repo.next_seq("conv-a").unwrap(), 1);
+        repo.upsert_message(&conv_msg("m2", "conv-a", 1, None)).unwrap();
+        assert_eq!(repo.next_seq("conv-a").unwrap(), 2);
+        // other conversation independent
+        assert_eq!(repo.next_seq("conv-b").unwrap(), 0);
+    }
+
+    #[test]
+    fn load_conversation_returns_all_in_seq_order() {
+        let db = fresh_db();
+        let repo = AgentMessagesRepo::new(db);
+        // insert out of order
+        repo.upsert_message(&conv_msg("m2", "c", 1, None)).unwrap();
+        repo.upsert_message(&conv_msg("m0", "c", 0, None)).unwrap();
+        repo.upsert_message(&conv_msg("m3", "c", 2, None)).unwrap();
+        let all = repo.load_conversation("c").unwrap();
+        let ids: Vec<&str> = all.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["m0", "m2", "m3"]);
+    }
+
+    #[test]
+    fn load_conversation_view_returns_latest_summary_plus_after() {
+        // Spec §5: view = latest summary checkpoint + all messages after it.
+        let db = fresh_db();
+        let repo = AgentMessagesRepo::new(db);
+        repo.upsert_message(&conv_msg("m0", "c", 0, None)).unwrap();
+        repo.upsert_message(&conv_msg("m1", "c", 1, None)).unwrap();
+        repo.upsert_message(&conv_msg("s2", "c", 2, Some(MessageKind::Summary)))
+            .unwrap();
+        repo.upsert_message(&conv_msg("m3", "c", 3, None)).unwrap();
+        repo.upsert_message(&conv_msg("m4", "c", 4, None)).unwrap();
+        // full audit still returns everything
+        assert_eq!(repo.load_conversation("c").unwrap().len(), 5);
+        // view: summary s2 + m3 + m4
+        let view = repo.load_conversation_view("c").unwrap();
+        let ids: Vec<&str> = view.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["s2", "m3", "m4"]);
+        assert_eq!(view[0].kind, Some(MessageKind::Summary));
+    }
+
+    #[test]
+    fn load_conversation_view_no_summary_returns_all() {
+        let db = fresh_db();
+        let repo = AgentMessagesRepo::new(db);
+        repo.upsert_message(&conv_msg("m0", "c", 0, None)).unwrap();
+        repo.upsert_message(&conv_msg("m1", "c", 1, None)).unwrap();
+        let view = repo.load_conversation_view("c").unwrap();
+        assert_eq!(view.len(), 2);
     }
 
     #[test]
