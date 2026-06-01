@@ -808,4 +808,80 @@ mod tests {
         }
         assert!(saw_error_end);
     }
+
+    /// 端到端实网 chat：跑完整 `run_agent_loop`（loop + HttpProvider + 真 SSE）对三个真实
+    /// relay，用真实问题，打印流式答案。`#[ignore]`，凭证全走 env（无硬编码 secret）。
+    ///   TEST_OAI_BASE/KEY/MODEL（responses）, TEST_ANT_BASE/KEY/MODEL（messages）,
+    ///   TEST_DS_BASE/KEY/MODEL（chat_completions） → cargo test loop_chat_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn loop_chat_live() {
+        use crate::infrastructure::agent::http_provider::HttpProvider;
+        use crate::infrastructure::agent::skill_registry::SkillRegistry;
+        use chrono::Utc;
+
+        async fn one(label: &str, wire: WireFormat, base: String, key: String, model: String) {
+            let mut ch = channel();
+            ch.wire_format = wire;
+            ch.base_url = Some(base);
+            ch.api_key = key;
+            ch.model = model;
+            ch.max_output_tokens = Some(512);
+            let provider = Box::new(HttpProvider::new(ch.clone()).unwrap());
+            let request = AgentRunRequest {
+                run_id: "live".into(),
+                trigger: "user".into(),
+                channel: ch,
+                max_turns: 1,
+                seed_messages: vec![AgentMessage {
+                    message_id: "m1".into(),
+                    run_id: Some("live".into()),
+                    role: AgentMessageRole::User,
+                    blocks: vec![AgentMessageBlock::Text {
+                        text: "用一句话解释A股的T+1交易制度".into(),
+                    }],
+                    created_at: Utc::now(),
+                }],
+            };
+            let registry = Arc::new(SkillRegistry::new_without_persist());
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+            let pump = tokio::spawn(async move {
+                let mut text = String::new();
+                while let Some(e) = rx.recv().await {
+                    if let AgentEvent::TextDelta { delta, .. } = e {
+                        text.push_str(&delta);
+                    }
+                }
+                text
+            });
+            let summary =
+                run_agent_loop(request, registry, ContextBundle::new("live"), provider, tx)
+                    .await
+                    .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
+            let streamed = pump.await.unwrap();
+            println!("[loop-live][{label}] stop={:?} answer={:?}", summary.stop_reason, streamed);
+            assert!(!streamed.is_empty(), "[{label}] empty answer");
+        }
+
+        let mut ran = 0;
+        if let (Ok(b), Ok(k)) = (std::env::var("TEST_OAI_BASE"), std::env::var("TEST_OAI_KEY")) {
+            let m = std::env::var("TEST_OAI_MODEL").unwrap_or_else(|_| "gpt-5".into());
+            one("responses", WireFormat::Responses, b, k, m).await;
+            ran += 1;
+        }
+        if let (Ok(b), Ok(k)) = (std::env::var("TEST_ANT_BASE"), std::env::var("TEST_ANT_KEY")) {
+            let m = std::env::var("TEST_ANT_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into());
+            one("messages", WireFormat::Messages, b, k, m).await;
+            ran += 1;
+        }
+        if let Ok(k) = std::env::var("TEST_DS_KEY") {
+            let b = std::env::var("TEST_DS_BASE").unwrap_or_else(|_| "https://api.deepseek.com".into());
+            let m = std::env::var("TEST_DS_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
+            one("chat_completions", WireFormat::ChatCompletions, b, k, m).await;
+            ran += 1;
+        }
+        println!("[loop-live] ran {ran} end-to-end loop checks");
+        assert!(ran > 0, "no TEST_* env provided");
+    }
 }
