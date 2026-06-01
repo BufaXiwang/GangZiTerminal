@@ -28,6 +28,11 @@ pub mod skill_parser;
 pub mod skill_registry;
 pub mod system_prompt;
 
+/// LLM-as-Judge live test suite (test-only, all `#[ignore]`).
+/// Spec: docs/design/agent-infra-module.md §2/§3/§4/§5 — semantic validation via a judge LLM.
+#[cfg(test)]
+mod llm_judge_tests;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
