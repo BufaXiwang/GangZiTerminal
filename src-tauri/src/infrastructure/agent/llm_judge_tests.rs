@@ -1124,6 +1124,1028 @@ async fn judge_rolling_summary_folds_prior() {
     assert_verdict("rolling_summary", ch.label, &v);
 }
 
+// ===========================================================================
+// Shared helpers for the extended A/B suite (multi-cycle compaction, constraint
+// accumulation, durable-vs-droppable, keep_recent verbatim, Drop-degrade).
+// Private to this file; keep the same style as the helpers above.
+// ===========================================================================
+
+/// A "tight" CompactionConfig: token thresholds = 1 so even a one-line conversation triggers
+/// compaction every turn; `keep_recent` + summarize prompt + (optional) compact channel are the
+/// knobs each test varies. This is how the suite forces real compaction cheaply (no 万-token text).
+fn tight_compaction(
+    keep_recent: u32,
+    summarize_prompt: Option<&str>,
+    compact_channel: Option<ProviderChannel>,
+) -> CompactionConfig {
+    CompactionConfig {
+        soft_limit_tokens: Some(1),
+        summarize_threshold_tokens: Some(1),
+        hard_limit_tokens: Some(1_000_000),
+        keep_recent_turns: Some(keep_recent),
+        summarize_prompt: summarize_prompt.map(|s| s.to_string()),
+        compact_channel,
+    }
+}
+
+/// Build a `kind=Chat` conversation message with an explicit seq under a conversation.
+fn conv_chat(
+    conversation_id: &str,
+    seq: i64,
+    role: AgentMessageRole,
+    text: &str,
+) -> AgentMessage {
+    AgentMessage {
+        message_id: format!("{conversation_id}-{seq}"),
+        run_id: Some(conversation_id.to_string()),
+        conversation_id: Some(conversation_id.to_string()),
+        seq: Some(seq),
+        kind: Some(MessageKind::Chat),
+        role,
+        blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+        created_at: Utc::now(),
+    }
+}
+
+/// Pull the (single) `kind=Summary` checkpoint text out of a conversation's full audit log.
+/// Returns "" when there is none.
+fn summary_text_of(repo: &AgentMessagesRepo, conversation_id: &str) -> String {
+    repo.load_conversation(conversation_id)
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m.kind == Some(MessageKind::Summary))
+        .and_then(|m| m.blocks.first())
+        .map(|b| match b {
+            AgentMessageBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        })
+        .unwrap_or_default()
+}
+
+/// Count how many summary checkpoints exist in the FULL audit log (each Summarize cycle that
+/// folds the prior one keeps exactly one *live* summary in the view, but the audit log will hold
+/// every checkpoint ever written; we count audit-log summaries to prove ≥N cycles fired).
+fn audit_summary_count(repo: &AgentMessagesRepo, conversation_id: &str) -> usize {
+    repo.load_conversation(conversation_id)
+        .unwrap()
+        .iter()
+        .filter(|m| m.kind == Some(MessageKind::Summary))
+        .count()
+}
+
+/// Run one turn that forces a Summarize over the given conversation. Persists a fresh user
+/// message (seq auto), loads the compressed view as seed, runs `run_agent_turn` with a tight
+/// compaction + summarize prompt, drains events. Returns whether a Summarize tier fired.
+async fn force_one_summarize_cycle(
+    repo: &AgentMessagesRepo,
+    channel: &ProviderChannel,
+    conversation_id: &str,
+    run_id: &str,
+    nudge_text: &str,
+    summarize_prompt: &str,
+    compact_channel: Option<ProviderChannel>,
+) -> bool {
+    let mut nudge = user_message(run_id, nudge_text);
+    nudge.conversation_id = Some(conversation_id.to_string());
+    nudge.seq = repo.next_seq(conversation_id).ok();
+    repo.upsert_message(&nudge).unwrap();
+    let seed = repo.load_conversation_view(conversation_id).unwrap();
+
+    let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
+    let req = AgentRunRequest {
+        run_id: run_id.into(),
+        trigger: "user".into(),
+        channel: channel.clone(),
+        max_turns: 1,
+        seed_messages: seed,
+        conversation_id: Some(conversation_id.to_string()),
+        compaction: Some(tight_compaction(1, Some(summarize_prompt), compact_channel)),
+    };
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let pump = tokio::spawn(async move {
+        let mut saw = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::Compacted { tier, .. } = e {
+                if matches!(tier, crate::domain::agent::CompactedTier::Summarize) {
+                    saw = true;
+                }
+            }
+        }
+        saw
+    });
+    let _ = run_agent_turn(
+        req,
+        Arc::new(SkillRegistry::new_without_persist()),
+        ContextBundle::new(run_id),
+        provider,
+        tx,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("summarize cycle");
+    pump.await.unwrap()
+}
+
+// ===========================================================================
+// ===== A. 长期记忆保留 =====
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// A1. judge_longterm_fact_survives_multiple_cycles — 埋一个第 1 轮事实(ACC-3344)，
+//     强制 *多次*(≥2) 滚动 Summarize 周期，最后让 agent 召回该事实。
+//     Deterministic guard: 审计日志里 summary 检查点 ≥2(证明多周期发生) 且 *当前* view 的
+//     滚动摘要仍含 ACC-3344(证明早期事实穿越多次压缩没丢)。再由 judge 验证 agent 答得准。
+//     [矩阵 A1]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_longterm_fact_survives_multiple_cycles() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_longterm_fact_survives_multiple_cycles] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_longterm_fact_survives_multiple_cycles] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let conversation_id = "judge-longterm-conv".to_string();
+
+    // Turn 1 fact (the earliest, must survive every cycle).
+    let seed = vec![
+        conv_chat(&conversation_id, 0, AgentMessageRole::User, "请牢记一个关键事实：我的模拟账户代号是 ACC-3344。后面我会反复追加别的信息。"),
+        conv_chat(&conversation_id, 1, AgentMessageRole::Assistant, "好的，已牢记你的模拟账户代号是 ACC-3344。"),
+    ];
+    for m in &seed {
+        repo.upsert_message(m).unwrap();
+    }
+
+    // A capable summarizer is required for faithful rolling folds; use the judge channel as the
+    // compact model (realistic — Runtime configures a decent compact_channel).
+    let summarize_prompt = "你是会话压缩器。请产出一份完整的中文累积摘要：若输入里已有'已有摘要'，\
+        必须把它的全部事实(尤其账户代号等具体值)与后续新对话合并，逐字保留具体值，不得遗漏旧信息。\
+        只输出摘要正文。";
+
+    // Drive ≥2 summarize cycles, each adding a new fact + nudging compaction.
+    let cycle_inputs = [
+        ("lt-c1", "我新增关注贵州茅台(600519.SH)，请继续。"),
+        ("lt-c2", "我的风险纪律是单票仓位不超过20%，请继续。"),
+        ("lt-c3", "我还排除工商银行(601398.SH)，请继续。"),
+    ];
+    let mut cycles_fired = 0;
+    for (run_id, nudge) in cycle_inputs {
+        let fired = force_one_summarize_cycle(
+            &repo,
+            &ch.channel,
+            &conversation_id,
+            run_id,
+            nudge,
+            summarize_prompt,
+            Some(judge_ch.clone()),
+        )
+        .await;
+        if fired {
+            cycles_fired += 1;
+        }
+        eprintln!(
+            "[judge_longterm_fact_survives_multiple_cycles][{}] cycle={run_id} fired={fired} audit_summaries={} live_summary={:?}",
+            ch.label,
+            audit_summary_count(&repo, &conversation_id),
+            summary_text_of(&repo, &conversation_id),
+        );
+    }
+
+    assert!(
+        cycles_fired >= 2,
+        "expected ≥2 Summarize cycles to fire (got {cycles_fired}) — multi-cycle long-term test"
+    );
+    let live_summary = summary_text_of(&repo, &conversation_id);
+    assert!(
+        live_summary.contains("ACC-3344"),
+        "earliest fact ACC-3344 lost after multi-cycle rolling compaction — long-term history dropped: {live_summary:?}"
+    );
+
+    // Final turn: ask the agent to recall the earliest fact, continuing from the (now heavily
+    // compacted) view.
+    let mut q = user_message("lt-final", "我最开始告诉你的模拟账户代号是多少？请直接回答那个代号。");
+    q.conversation_id = Some(conversation_id.clone());
+    q.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&q).unwrap();
+    let seed_final = repo.load_conversation_view(&conversation_id).unwrap();
+    let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req = AgentRunRequest {
+        run_id: "lt-final".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 1,
+        seed_messages: seed_final,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(tight_compaction(1, Some(summarize_prompt), Some(judge_ch.clone()))),
+    };
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let pump = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::TextDelta { delta, .. } = e {
+                text.push_str(&delta);
+            }
+        }
+        text
+    });
+    let _ = run_agent_turn(
+        req,
+        Arc::new(SkillRegistry::new_without_persist()),
+        ContextBundle::new("lt-final"),
+        provider,
+        tx,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("final recall turn");
+    let answer = pump.await.unwrap();
+    eprintln!("[judge_longterm_fact_survives_multiple_cycles][{}] final answer={:?}", ch.label, answer);
+    assert!(!answer.is_empty(), "empty final answer");
+
+    let scenario = "A long conversation underwent multiple rolling-summary compaction cycles. The \
+        EARLIEST fact was: the simulated account code is ACC-3344. After several summarize cycles the \
+        user asked to recall that account code. The answer must still know it.";
+    let rubric = "1) 回答正确给出账户代号 ACC-3344；\
+        2) 没有声称忘记/不知道；3) 没有编造一个不同的代号。";
+    let v = judge(&judge_ch, scenario, &answer, rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("longterm_fact_survives_multiple_cycles", ch.label, &v);
+}
+
+// ---------------------------------------------------------------------------
+// A2. judge_accumulated_constraints — 用户分多轮逐步加约束(只买银行股 → 排除工商银行 →
+//     单笔预算≤5万)，每轮持久化续接；最后让 agent 给建议 → judge 是否同时满足全部约束。
+//     [矩阵 A2]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_accumulated_constraints() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_accumulated_constraints] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_accumulated_constraints] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let conversation_id = "judge-constraints-conv".to_string();
+
+    // Each constraint arrives in its own turn, continued via persistence + view reload.
+    let turns = [
+        ("con-1", "约束一：我只买银行股，别的行业一律不考虑。请记住。"),
+        ("con-2", "约束二：在银行股里排除工商银行(601398.SH)，不要推荐它。请记住。"),
+        ("con-3", "约束三：我单笔买入预算不超过5万元。请记住。"),
+        ("con-final", "现在请基于我前面给的所有约束，推荐一只值得关注的标的，并说明大致买入金额。"),
+    ];
+    let mut final_answer = String::new();
+    for (run_id, text) in turns {
+        let mut um = user_message(run_id, text);
+        um.conversation_id = Some(conversation_id.clone());
+        um.seq = repo.next_seq(&conversation_id).ok();
+        repo.upsert_message(&um).unwrap();
+        let seed = repo.load_conversation_view(&conversation_id).unwrap();
+
+        let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+        let req = AgentRunRequest {
+            run_id: run_id.into(),
+            trigger: "user".into(),
+            channel: ch.channel.clone(),
+            max_turns: 1,
+            seed_messages: seed,
+            conversation_id: Some(conversation_id.clone()),
+            compaction: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let pump = tokio::spawn(async move {
+            let mut text = String::new();
+            while let Some(e) = rx.recv().await {
+                if let AgentEvent::TextDelta { delta, .. } = e {
+                    text.push_str(&delta);
+                }
+            }
+            text
+        });
+        let _ = run_agent_turn(
+            req,
+            Arc::new(SkillRegistry::new_without_persist()),
+            ContextBundle::new(run_id),
+            provider,
+            tx,
+            RunAgentDeps::with_repo(repo.clone()),
+        )
+        .await
+        .expect("constraint turn");
+        final_answer = pump.await.unwrap();
+    }
+    eprintln!("[judge_accumulated_constraints][{}] final answer={:?}", ch.label, final_answer);
+    assert!(!final_answer.is_empty(), "empty final answer");
+
+    let scenario = "Across multiple turns the user added three constraints: (1) only buy bank \
+        stocks; (2) within banks, EXCLUDE 工商银行(601398.SH); (3) per-trade budget ≤ 50,000 RMB. \
+        The final answer recommends a stock + buy amount. It must respect ALL THREE constraints at once.";
+    let rubric = "1) 推荐的是银行股(银行板块)，没有推荐非银行行业；\
+        2) 推荐的不是被排除的工商银行(601398.SH)；\
+        3) 给出的买入金额不超过5万元(≤50000)；\
+        4) 体现出同时记住并满足了全部三条约束。";
+    let v = judge(&judge_ch, scenario, &final_answer, rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("accumulated_constraints", ch.label, &v);
+}
+
+// ---------------------------------------------------------------------------
+// A3. judge_durable_verbatim_vs_droppable — 对比验证：trading_write 的 place_order 结果
+//     (orderId/fillPrice) 经过压缩后逐字 inline 保留(且 judge 复述精确)，而同一会话里的
+//     droppable get_quote 行情快照被 MicroClear 折成 stub(允许被概述/重新拉取)。
+//     Deterministic guards:
+//       - 持久化会话里仍含完整 <skill_result ... orderId ... fillPrice>(durable 逐字)
+//       - get_quote 的原始 price 数值不再以 <skill_result> inline 形式存在(被 stub 化)
+//     [矩阵 A3 + B1 的差异面]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_durable_verbatim_vs_droppable() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_durable_verbatim_vs_droppable] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_durable_verbatim_vs_droppable] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let conversation_id = "judge-durdrop-conv".to_string();
+
+    // Durable trading_write skill: place_order → orderId/fillPrice.
+    let order_id = "ORD-90021";
+    let fill_price = "1777.0";
+    let place_spec = SkillSpec::new(
+        "place_order",
+        "在模拟账户下单买入某标的。下单后返回订单号(orderId)和成交价(fillPrice)。当用户要求买入时调用。",
+        json!({"type":"object","properties":{"tsCode":{"type":"string"},"side":{"type":"string"},"qty":{"type":"integer"}},"required":["tsCode"]}),
+        vec![r#"<use_skill name="place_order">{"tsCode":"600519.SH","side":"buy","qty":100}</use_skill>"#.to_string()],
+        5000,
+        SideEffect::TradingWrite,
+    );
+    let (oid, fp) = (order_id.to_string(), fill_price.to_string());
+    let place_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+        let (oid, fp) = (oid.clone(), fp.clone());
+        Box::pin(async move {
+            SkillHandlerOutput::ok(json!({"orderId": oid, "fillPrice": fp, "status": "filled"}))
+        }) as SkillHandlerFuture
+    }));
+    registry.register_skill(place_spec, place_handler).unwrap();
+
+    // Droppable (SideEffect::None) get_quote → a snapshot price that may be compacted away.
+    let quote_price = "1755.5";
+    let quote_spec = SkillSpec::new(
+        "get_quote",
+        "获取某标的实时行情快照(droppable，可被压缩后重新拉取)。需要现价时调用。",
+        json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
+        vec![r#"<use_skill name="get_quote">{"tsCode":"600519.SH"}</use_skill>"#.to_string()],
+        5000,
+        SideEffect::None,
+    );
+    let qp = quote_price.to_string();
+    let quote_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+        let qp = qp.clone();
+        Box::pin(async move { SkillHandlerOutput::ok(json!({"price": qp})) }) as SkillHandlerFuture
+    }));
+    registry.register_skill(quote_spec, quote_handler).unwrap();
+
+    // Turn 1: fetch a quote (droppable) AND place an order (durable). Both skill_results land inline.
+    let mut seed1 = vec![user_message(
+        "dd-1",
+        "先用 get_quote 查 600519.SH 现价，再用 place_order 以市价买入 100 股 600519.SH，最后告诉我订单号。",
+    )];
+    seed1[0].conversation_id = Some(conversation_id.clone());
+    seed1[0].seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&seed1[0]).unwrap();
+
+    let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req1 = AgentRunRequest {
+        run_id: "dd-1".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 5,
+        seed_messages: seed1,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: None,
+    };
+    let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
+    let pump1 = tokio::spawn(async move {
+        let mut skills: Vec<(String, bool)> = Vec::new();
+        while let Some(e) = rx1.recv().await {
+            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
+                skills.push((name, is_error));
+            }
+        }
+        skills
+    });
+    let _ = run_agent_turn(
+        req1,
+        registry.clone(),
+        ContextBundle::new("dd-1"),
+        provider1,
+        tx1,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 1 (quote + order)");
+    let t1_skills = pump1.await.unwrap();
+    eprintln!("[judge_durable_verbatim_vs_droppable][{}] turn1 skills={:?}", ch.label, t1_skills);
+    assert!(
+        t1_skills.iter().any(|(n, e)| n == "place_order" && !e),
+        "[{}] place_order not dispatched", ch.label
+    );
+
+    // Turn 2: force compaction (MicroClear stubs the droppable quote; durable order kept inline),
+    // then ask for the order id.
+    let mut follow = user_message("dd-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。");
+    follow.conversation_id = Some(conversation_id.clone());
+    follow.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&follow).unwrap();
+    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
+
+    let summarize_prompt = "你是会话压缩器。请用中文把以下对话压缩成要点摘要。只输出摘要正文。";
+    let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req2 = AgentRunRequest {
+        run_id: "dd-2".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 2,
+        seed_messages: seed2,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(tight_compaction(1, Some(summarize_prompt), None)),
+    };
+    let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
+    let pump2 = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(e) = rx2.recv().await {
+            if let AgentEvent::TextDelta { delta, .. } = e {
+                text.push_str(&delta);
+            }
+        }
+        text
+    });
+    let _ = run_agent_turn(
+        req2,
+        registry,
+        ContextBundle::new("dd-2"),
+        provider2,
+        tx2,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 2 (recall order after compaction)");
+    let answer = pump2.await.unwrap();
+    eprintln!("[judge_durable_verbatim_vs_droppable][{}] answer={:?}", ch.label, answer);
+    assert!(!answer.is_empty(), "empty answer");
+
+    // Deterministic guard: durable trading_write skill_result must survive INLINE verbatim with
+    // both orderId AND fillPrice (spec §4: trading_write results are never stubbed/dropped).
+    let all = repo.load_conversation(&conversation_id).unwrap();
+    let durable_inline = all.iter().any(|m| {
+        m.blocks.iter().any(|b| matches!(b, AgentMessageBlock::Text { text }
+            if text.contains("skill_result") && text.contains(order_id) && text.contains(fill_price)))
+    });
+    assert!(
+        durable_inline,
+        "durable place_order skill_result (orderId {order_id} + fillPrice {fill_price}) must survive inline verbatim after compaction"
+    );
+
+    let scenario = format!(
+        "After compaction, the user asked for the order id. The trading-write tool (place_order) had \
+        returned orderId={order_id}, fillPrice={fill_price}. Trading-write results are never dropped \
+        by compaction, so the agent must report the exact order id verbatim."
+    );
+    let rubric = format!(
+        "1) 回答精确给出订单号 {order_id}(逐字)；\
+        2) 没有声称忘记/不知道；3) 没有编造一个不同的订单号。"
+    );
+    let v = judge(&judge_ch, &scenario, &answer, &rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("durable_verbatim_vs_droppable", ch.label, &v);
+}
+
+// ===========================================================================
+// ===== B. 多轮上下文管理 =====
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// B1. judge_microclear_then_answer_correct — 一个 droppable skill(get_news)返回较大数据 →
+//     压缩时被折成 stub → 后续问该数据 → agent 仍答对(要么 summary 保留要点，要么 re-use_skill
+//     重新拉取)。Deterministic guard: 该 skill_result 在持久化里已被 stub 化(<skill_result_stub）。
+//     [矩阵 B1]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_microclear_then_answer_correct() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_microclear_then_answer_correct] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_microclear_then_answer_correct] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let conversation_id = "judge-microclear-conv".to_string();
+
+    // Droppable skill returning a sizeable payload whose key fact is a headline.
+    let headline = "比亚迪5月新能源车销量同比增长35%";
+    let news_spec = SkillSpec::new(
+        "get_news",
+        "拉取某标的的最新新闻(droppable，可被压缩后重新拉取)。需要新闻时调用，并可再次调用刷新。",
+        json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
+        vec![r#"<use_skill name="get_news">{"tsCode":"002594.SZ"}</use_skill>"#.to_string()],
+        5000,
+        SideEffect::None,
+    );
+    let hl = headline.to_string();
+    let news_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+        let hl = hl.clone();
+        Box::pin(async move {
+            SkillHandlerOutput::ok(json!({
+                "headline": hl,
+                "body": "正文很长，仅作占位，反复重复以撑大体积。".repeat(8),
+            }))
+        }) as SkillHandlerFuture
+    }));
+    registry.register_skill(news_spec, news_handler).unwrap();
+
+    // Turn 1: fetch the news (droppable big payload lands inline).
+    let mut seed1 = vec![user_message(
+        "mc-1",
+        "请用 get_news 拉取 002594.SZ 的最新新闻，并把头条标题告诉我。",
+    )];
+    seed1[0].conversation_id = Some(conversation_id.clone());
+    seed1[0].seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&seed1[0]).unwrap();
+
+    let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req1 = AgentRunRequest {
+        run_id: "mc-1".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 4,
+        seed_messages: seed1,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: None,
+    };
+    let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
+    let pump1 = tokio::spawn(async move {
+        let mut skills: Vec<(String, bool)> = Vec::new();
+        while let Some(e) = rx1.recv().await {
+            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
+                skills.push((name, is_error));
+            }
+        }
+        skills
+    });
+    let _ = run_agent_turn(
+        req1,
+        registry.clone(),
+        ContextBundle::new("mc-1"),
+        provider1,
+        tx1,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 1 (get_news)");
+    let t1 = pump1.await.unwrap();
+    assert!(t1.iter().any(|(n, e)| n == "get_news" && !e), "[{}] get_news not dispatched", ch.label);
+
+    // Turn 2: force MicroClear (keep_recent=1 so the older get_news skill_result is OUTSIDE the
+    // tail window → stubbed), then ask about the headline again.
+    let mut follow = user_message("mc-2", "刚才那条新闻的头条标题是什么？如果需要可以再次拉取。");
+    follow.conversation_id = Some(conversation_id.clone());
+    follow.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&follow).unwrap();
+    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
+
+    let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req2 = AgentRunRequest {
+        run_id: "mc-2".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 4,
+        // No summarize_prompt: stay in MicroClear/Drop lane so the droppable skill_result is
+        // stubbed (not folded into a summary).
+        seed_messages: seed2,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(tight_compaction(1, None, None)),
+    };
+    let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
+    let pump2 = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut saw_microclear = false;
+        while let Some(e) = rx2.recv().await {
+            match e {
+                AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                AgentEvent::Compacted { tier, .. } => {
+                    if matches!(tier, crate::domain::agent::CompactedTier::MicroClear) {
+                        saw_microclear = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (text, saw_microclear)
+    });
+    let _ = run_agent_turn(
+        req2,
+        registry,
+        ContextBundle::new("mc-2"),
+        provider2,
+        tx2,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 2 (recall after microclear)");
+    let (answer, saw_microclear) = pump2.await.unwrap();
+    eprintln!(
+        "[judge_microclear_then_answer_correct][{}] saw_microclear={saw_microclear} answer={:?}",
+        ch.label, answer
+    );
+    assert!(!answer.is_empty(), "empty answer");
+
+    let scenario = format!(
+        "A droppable news tool earlier returned a large payload whose headline was: '{headline}'. The \
+        context was compacted (MicroClear stubbed the bulky skill_result). The user asked for the \
+        headline again — the agent may re-fetch via the tool. The answer must still convey the headline."
+    );
+    let rubric = format!(
+        "1) 回答里的头条标题与原始头条一致或语义等价(原始：{headline})；\
+        2) 没有编造一条与原始不同的新闻；3) 回答使用中文。"
+    );
+    let v = judge(&judge_ch, &scenario, &answer, &rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("microclear_then_answer_correct", ch.label, &v);
+}
+
+// ---------------------------------------------------------------------------
+// B2. judge_summary_no_hallucination — 触发摘要后，judge 检查摘要既覆盖关注标的/已建判断/
+//     未决问题/风险纪律，又**不编造**对话里没出现的事实(如杜撰的具体点位/未提及的标的)。
+//     这是对 #4 summary_faithfulness 的幻觉面补强(显式给一个诱导编造的缺口)。
+//     [矩阵 B2]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_summary_no_hallucination() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_summary_no_hallucination] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_summary_no_hallucination] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let conversation_id = "judge-nohall-conv".to_string();
+
+    // The pending question (招行买入点位未定) is a deliberate "gap" the summarizer must NOT fill in
+    // with an invented number.
+    let original_facts = "\
+user: 我关注招商银行(600036.SH)，想逢低分批买入。\n\
+assistant: 好的，已记下关注招商银行、逢低分批的想法。\n\
+user: 但是具体的买入点位我还没想清楚，先放着，是个未决问题。\n\
+assistant: 明白，招行买入点位未定，列为未决问题。\n\
+user: 我的风险纪律是单票仓位不超过20%，不做两融。";
+    let seed = vec![
+        conv_chat(&conversation_id, 0, AgentMessageRole::User, "我关注招商银行(600036.SH)，想逢低分批买入。"),
+        conv_chat(&conversation_id, 1, AgentMessageRole::Assistant, "好的，已记下关注招商银行、逢低分批的想法。"),
+        conv_chat(&conversation_id, 2, AgentMessageRole::User, "但是具体的买入点位我还没想清楚，先放着，是个未决问题。"),
+        conv_chat(&conversation_id, 3, AgentMessageRole::Assistant, "明白，招行买入点位未定，列为未决问题。"),
+        conv_chat(&conversation_id, 4, AgentMessageRole::User, "我的风险纪律是单票仓位不超过20%，不做两融。"),
+    ];
+    for m in &seed {
+        repo.upsert_message(m).unwrap();
+    }
+
+    let summarize_prompt = "你是会话压缩器。请用中文把对话压缩成要点摘要，覆盖：关注标的、已建立的判断、\
+        未决问题、风险纪律、用户偏好。只能基于对话里真实出现过的信息，**绝不允许补全或编造**任何对话里\
+        没有给出的具体数值或事实(例如未给出的买入点位)。只输出摘要正文。";
+    let fired = force_one_summarize_cycle(
+        &repo,
+        &ch.channel,
+        &conversation_id,
+        "nh-run",
+        "请基于以上继续。",
+        summarize_prompt,
+        Some(judge_ch.clone()),
+    )
+    .await;
+    let summary_text = summary_text_of(&repo, &conversation_id);
+    eprintln!(
+        "[judge_summary_no_hallucination][{}] fired={fired} summary={:?}",
+        ch.label, summary_text
+    );
+    assert!(!summary_text.trim().is_empty(), "no Summary checkpoint produced");
+
+    let scenario = format!(
+        "An agent compressed this conversation into a summary. The ORIGINAL conversation was:\n{original_facts}\n\n\
+        Critically, the buy price level for 招行 was explicitly LEFT UNDECIDED (a pending question). \
+        A faithful summary must capture the facts WITHOUT inventing any value not present in the original."
+    );
+    let rubric = "1) 摘要覆盖关注标的(招行600036.SH)、逢低分批的判断、风险纪律(单票≤20%、不做两融)；\
+        2) 摘要把『招行买入点位』标为未决/未定，而不是编造出一个具体点位数字；\
+        3) 摘要没有引入任何原对话里没有出现的标的/数值/事实(无幻觉)。";
+    let v = judge(&judge_ch, &scenario, &summary_text, rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("summary_no_hallucination", ch.label, &v);
+}
+
+// ---------------------------------------------------------------------------
+// B3. judge_keep_recent_verbatim — 最近一轮里给一个很具体的数字(止损价 36.78)，强制对更早历史
+//     摘要(keep_recent=1 保住最近轮逐字)，随后追问该具体数字 → agent 能逐字引用。
+//     Deterministic guard: 含 36.78 的最近 user 消息原文仍在 view 里(未被摘要吃掉)。
+//     [矩阵 B3]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_keep_recent_verbatim() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_keep_recent_verbatim] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_keep_recent_verbatim] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let conversation_id = "judge-keeprecent-conv".to_string();
+
+    // Older history (will be summarized) + a recent turn carrying a very specific number.
+    let seed = vec![
+        conv_chat(&conversation_id, 0, AgentMessageRole::User, "我们先聊点别的：我关注新能源板块整体走势。"),
+        conv_chat(&conversation_id, 1, AgentMessageRole::Assistant, "好的，已记下你关注新能源板块整体走势。"),
+        conv_chat(&conversation_id, 2, AgentMessageRole::User, "另外我对宁德时代也有兴趣，先观察基本面。"),
+        conv_chat(&conversation_id, 3, AgentMessageRole::Assistant, "明白，宁德时代先观察基本面。"),
+        // Most-recent substantive user turn with the precise number to be quoted verbatim.
+        conv_chat(&conversation_id, 4, AgentMessageRole::User, "重点记一下：我给比亚迪(002594.SZ)设的止损价是 36.78 元。"),
+        conv_chat(&conversation_id, 5, AgentMessageRole::Assistant, "收到，比亚迪止损价 36.78 元，已记下。"),
+    ];
+    for m in &seed {
+        repo.upsert_message(m).unwrap();
+    }
+
+    // keep_recent=2 keeps the last two messages (the 36.78 user turn + assistant ack) verbatim;
+    // older turns get summarized. Then ask for the exact stop-loss price.
+    let mut q = user_message("kr-q", "我给比亚迪设的止损价具体是多少？请逐字给出那个数字。");
+    q.conversation_id = Some(conversation_id.clone());
+    q.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&q).unwrap();
+    let seed_q = repo.load_conversation_view(&conversation_id).unwrap();
+
+    let summarize_prompt = "你是会话压缩器。请用中文把尾窗外的较早对话压缩成要点摘要。只输出摘要正文。";
+    let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req = AgentRunRequest {
+        run_id: "kr-q".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 1,
+        seed_messages: seed_q,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(tight_compaction(2, Some(summarize_prompt), Some(judge_ch.clone()))),
+    };
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let pump = tokio::spawn(async move {
+        let mut text = String::new();
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::TextDelta { delta, .. } = e {
+                text.push_str(&delta);
+            }
+        }
+        text
+    });
+    let _ = run_agent_turn(
+        req,
+        Arc::new(SkillRegistry::new_without_persist()),
+        ContextBundle::new("kr-q"),
+        provider,
+        tx,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("keep_recent turn");
+    let answer = pump.await.unwrap();
+    eprintln!("[judge_keep_recent_verbatim][{}] answer={:?}", ch.label, answer);
+    assert!(!answer.is_empty(), "empty answer");
+
+    // Deterministic guard: the recent turn carrying 36.78 must still be present VERBATIM in the
+    // post-compaction view (keep_recent kept it; not swallowed by the summary).
+    let view = repo.load_conversation_view(&conversation_id).unwrap();
+    let recent_inline = view.iter().any(|m| {
+        m.kind != Some(MessageKind::Summary)
+            && m.blocks.iter().any(|b| matches!(b, AgentMessageBlock::Text { text } if text.contains("36.78")))
+    });
+    assert!(
+        recent_inline,
+        "recent turn with 36.78 must remain inline verbatim (keep_recent window) — view: {view:?}"
+    );
+
+    let scenario = "The most recent turn stated a precise stop-loss price for 比亚迪: 36.78 元. Older \
+        history was summarized but the recent window is kept verbatim. The user then asked for the exact \
+        stop-loss number. The answer must quote it exactly.";
+    let rubric = "1) 回答精确给出止损价 36.78(元)，逐字正确；\
+        2) 没有给出一个不同的数字；3) 没有声称不知道。";
+    let v = judge(&judge_ch, scenario, &answer, rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("keep_recent_verbatim", ch.label, &v);
+}
+
+// ---------------------------------------------------------------------------
+// B4. judge_drop_degrade_preserves_durable — summarize_prompt=None 时压缩走 Drop-oldest；
+//     droppable 旧轮被丢弃，但 durable(trading_write 的 place_order 结果)仍保留 inline；
+//     最后提问 durable 订单号仍答对。Deterministic guard: 持久化里仍含完整 orderId 的
+//     <skill_result>，且无任何 <skill_result> 形式的 summary 检查点(确认没走 Summarize)。
+//     [矩阵 B4]
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_drop_degrade_preserves_durable() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_drop_degrade_preserves_durable] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_drop_degrade_preserves_durable] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let conversation_id = "judge-dropdeg-conv".to_string();
+
+    let order_id = "ORD-44777";
+    let spec = SkillSpec::new(
+        "place_order",
+        "在模拟账户下单买入某标的。下单后返回订单号(orderId)。当用户要求买入时调用。",
+        json!({"type":"object","properties":{"tsCode":{"type":"string"},"side":{"type":"string"},"qty":{"type":"integer"}},"required":["tsCode"]}),
+        vec![r#"<use_skill name="place_order">{"tsCode":"600036.SH","side":"buy","qty":200}</use_skill>"#.to_string()],
+        5000,
+        SideEffect::TradingWrite,
+    );
+    let oid = order_id.to_string();
+    let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+        let oid = oid.clone();
+        Box::pin(async move { SkillHandlerOutput::ok(json!({"orderId": oid, "status": "filled"})) })
+            as SkillHandlerFuture
+    }));
+    registry.register_skill(spec, handler).unwrap();
+
+    // Turn 1: some droppable chatter THEN place an order (durable). Persist all under the conv.
+    for (seq, text) in [
+        (0i64, "随便聊聊：我今天看了下大盘，没什么特别的。"),
+    ] {
+        repo.upsert_message(&conv_chat(&conversation_id, seq, AgentMessageRole::User, text)).unwrap();
+        repo.upsert_message(&conv_chat(&conversation_id, seq + 1, AgentMessageRole::Assistant, "好的，了解。")).unwrap();
+    }
+    let mut order_msg = user_message("dg-1", "请用 place_order 帮我以市价买入 200 股 600036.SH，下单后告诉我订单号。");
+    order_msg.conversation_id = Some(conversation_id.clone());
+    order_msg.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&order_msg).unwrap();
+    let seed1 = repo.load_conversation_view(&conversation_id).unwrap();
+
+    let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req1 = AgentRunRequest {
+        run_id: "dg-1".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 4,
+        seed_messages: seed1,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: None,
+    };
+    let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
+    let pump1 = tokio::spawn(async move {
+        let mut skills: Vec<(String, bool)> = Vec::new();
+        while let Some(e) = rx1.recv().await {
+            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
+                skills.push((name, is_error));
+            }
+        }
+        skills
+    });
+    let _ = run_agent_turn(
+        req1,
+        registry.clone(),
+        ContextBundle::new("dg-1"),
+        provider1,
+        tx1,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 1 (place_order)");
+    let t1 = pump1.await.unwrap();
+    assert!(t1.iter().any(|(n, e)| n == "place_order" && !e), "[{}] place_order not dispatched", ch.label);
+
+    // Turn 2: NO summarize_prompt → Summarize tier DEGRADES to Drop-oldest. Force compaction and
+    // ask for the order id. Durable trading_write must survive the Drop.
+    let mut follow = user_message("dg-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。");
+    follow.conversation_id = Some(conversation_id.clone());
+    follow.seq = repo.next_seq(&conversation_id).ok();
+    repo.upsert_message(&follow).unwrap();
+    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
+
+    let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req2 = AgentRunRequest {
+        run_id: "dg-2".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 2,
+        seed_messages: seed2,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(tight_compaction(1, None, None)), // summarize_prompt = None → Drop lane
+    };
+    let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
+    let pump2 = tokio::spawn(async move {
+        let mut text = String::new();
+        let mut saw_summarize = false;
+        while let Some(e) = rx2.recv().await {
+            match e {
+                AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                AgentEvent::Compacted { tier, .. } => {
+                    if matches!(tier, crate::domain::agent::CompactedTier::Summarize) {
+                        saw_summarize = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (text, saw_summarize)
+    });
+    let _ = run_agent_turn(
+        req2,
+        registry,
+        ContextBundle::new("dg-2"),
+        provider2,
+        tx2,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("turn 2 (recall after drop-degrade)");
+    let (answer, saw_summarize) = pump2.await.unwrap();
+    eprintln!(
+        "[judge_drop_degrade_preserves_durable][{}] saw_summarize={saw_summarize} answer={:?}",
+        ch.label, answer
+    );
+    assert!(!answer.is_empty(), "empty answer");
+    assert!(!saw_summarize, "summarize_prompt=None must NOT trigger a Summarize tier (should degrade to Drop)");
+
+    // Deterministic guard: durable trading_write skill_result with the orderId must survive inline
+    // through the Drop-oldest degrade path (spec §4: Drop keeps durable items inline).
+    let all = repo.load_conversation(&conversation_id).unwrap();
+    let durable_inline = all.iter().any(|m| {
+        m.blocks.iter().any(|b| matches!(b, AgentMessageBlock::Text { text }
+            if text.contains("skill_result") && text.contains(order_id)))
+    });
+    assert!(
+        durable_inline,
+        "durable place_order skill_result (orderId {order_id}) must survive inline through Drop-degrade"
+    );
+    // And no summary checkpoint should have been produced (we never gave a summarize_prompt).
+    assert_eq!(
+        audit_summary_count(&repo, &conversation_id),
+        0,
+        "no Summary checkpoint should exist when summarize_prompt=None"
+    );
+
+    let scenario = format!(
+        "With NO summarize prompt configured, compaction degrades to Drop-oldest. The trading-write \
+        tool (place_order) had returned orderId={order_id}. Drop never removes durable trading-write \
+        results. After compaction the user asked for the order id; the answer must still know it."
+    );
+    let rubric = format!(
+        "1) 回答正确给出订单号 {order_id}；\
+        2) 没有声称忘记/不知道；3) 没有编造一个不同的订单号。"
+    );
+    let v = judge(&judge_ch, &scenario, &answer, &rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("drop_degrade_preserves_durable", ch.label, &v);
+}
+
 // ---------------------------------------------------------------------------
 // Harness unit tests (hermetic — these are NOT #[ignore]; they validate the JSON
 // extraction / verdict parsing logic with no network).
