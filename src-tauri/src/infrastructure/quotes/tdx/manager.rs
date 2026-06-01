@@ -233,9 +233,10 @@ impl TdxConnectionManager {
                     continue;
                 }
             };
-            // 按 (market, code) 匹配回 ts_code。
-            for (_, code, ts, cat, name) in pairs {
-                let raw = raws.iter().find(|q| q.code == code);
+            // 按 (market, code) 匹配回 ts_code。**必须带 market**：同代码跨市场（如上证指数
+            // 000001.SH 与 平安银行 000001.SZ）只按 code 匹配会串号，把指数的报价错配成深市股票。
+            for (m, code, ts, cat, name) in pairs {
+                let raw = raws.iter().find(|q| q.market == m.as_u8() && q.code == code);
                 match raw {
                     Some(r) => out.push(Ok(map_security_quote(r, ts, cat, name, trade_date, now))),
                     None => out.push(Err(TdxManagerError::Protocol("missing in response".into()))),
