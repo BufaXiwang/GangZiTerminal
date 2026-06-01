@@ -448,7 +448,7 @@ Runtime builds AgentRunRequest
 - Stream 解析必须**实时**（不等整个 turn 结束）：用户能从 UI 看到 LLM 思考 + skill 调用进度。
 - 同一 turn 内多个 `<use_skill>` 按出现顺序**串行** dispatch；不并行（保证 LLM 看到的 skill_result 顺序与发出顺序一致）。
 
-**ProviderStream 实现归属**：Agent Infra 定义 `ProviderStream` trait（接 canonical request、产 stream of chunks）。HTTP + SSE 实现（reqwest 调 Anthropic / OpenAI、解 SSE event、转 stop_reason、聚合 usage）归 Agent Runtime 在 Phase 3 实现，因为它涉及 Runtime 的 `ProviderChannel` 选择 / 鉴权 / retry 策略。Infra 自带一个用于测试的 `ScriptedProvider`，能让 loop_executor 测试无网络运行。
+**ProviderStream 实现归属**：Agent Infra 定义 `ProviderStream` trait（接 canonical request、产 stream of chunks）**并自带 HTTP + SSE 实现** `HttpProvider`（reqwest 调三种 wire format、解 SSE event、转 stop_reason、聚合 usage、把 provider 错误分类成 `ProviderContextTooLong` / 瞬时 / 致命）。**容错机制**（瞬时退避重试 + 渠道 fallback，§4）也在 Infra：loop 在调用方传入的有序 `providers` 上执行。归 **Runtime 的只是策略**：选哪些 `ProviderChannel` 作主/备、鉴权、`RetryConfig` 取值——通过 `request.channel` / `fallback_channels` / `retry` 注入。Infra 另自带 `ScriptedProvider`，让 loop_executor 测试无网络运行。
 
 ---
 
@@ -506,6 +506,18 @@ Runtime builds AgentRunRequest
   4. **最多重试 1 次**；第二次仍失败 → finalize loop，`stop_reason = context_limit`，emit `error event (code = provider_context_too_long)` + `done event`
 - `ReactiveRetry` 策略比 `Summarize` 更激进：直接 Drop 最老一轮 API round（包括其 chat history + skill_results），不等 summarize 模型返回，**保证下一次发送一定更短**。
 
+**Provider 调用容错：瞬时退避重试 + 渠道 fallback**（与 context-too-long reactive retry 正交，按错误分类分别处理）：
+
+- Infra 把 provider 错误分三类（HttpProvider / adapter 翻译成 canonical 错误）：
+  - `ProviderContextTooLong`：上下文超长 → 走上面的 reactive retry（压缩 + 重发），**不**走退避 / fallback。
+  - **瞬时（transient）**：HTTP 5xx / 429 / 连接失败 / 超时 / 流中断 / 上游 `upstream_error` → 可重试。
+  - **致命（fatal）**：4xx（非 429）/ 鉴权 / 请求格式 / wire 映射错误 → **立即失败**，不重试不 fallback（重试无意义）。
+- **退避重试（同渠道）**：遇瞬时错误对**同一渠道**重发 provider 调用，指数退避（`baseBackoffMs * 2^(n-1)`，封顶 `maxBackoffMs`），每渠道最多 `maxAttemptsPerChannel` 次。重试**只重发 provider 调用**——`input` 已在 turn 开始时由 Infra 落库一次，**不重复持久化**；turn 计数不前进。
+- **渠道 fallback**：某渠道退避重试耗尽后，按 Runtime 提供的**有序备用渠道列表**切到下一个渠道、重复退避策略；切换后 **sticky**（后续 turn 从当前可用渠道起，不再每轮重试已死的主渠道）。全部渠道耗尽 → fail closed（emit error event，`stop_reason` 反映 provider 错误）。
+- **边界**：选哪些渠道做 fallback、各自鉴权 = **Runtime 策略**（通过 `fallback_channels` + 各自 `ProviderChannel` 注入）；Infra 只做「按序退避重试 + 切换」的**机制**。⚠ 换渠道 = 换模型，对话中途能力 / 风格可能突变，由 Runtime 权衡。
+- **可观测**：每次重试 / fallback 切换记 `tracing` warn（v1 不新增 `AgentEvent` 变体）。
+- 配置 `RetryConfig { maxAttemptsPerChannel?, baseBackoffMs?, maxBackoffMs? }`（Runtime 提供，缺省内置 **3 次 / 500ms / 8000ms**）。
+
 丢弃 / 压缩顺序：
 
 ```text
@@ -562,7 +574,10 @@ Runtime builds AgentRunRequest
 //   repo=Some & conversationId 新/None → 只跑 input（新会话），产出仍落库（若有 conversationId）
 //   repo=None                          → 纯无状态：不 persist、不 load，只跑 input
 // 调用方永远不自己 upsert / 分配 seq / load 历史 —— 那是 Infra 的职责。
-run_agent_turn(request, registry, context, provider, event_tx, repo) -> RunSummary;
+// providers = 有序 provider 列表：providers[0] = primary（对应 request.channel），
+// providers[1..] 对应 request.fallback_channels（顺序一致）。调用方按 [channel]++fallback_channels
+// 构建（生产用 HttpProvider，测试注入 ScriptedProvider）。loop 按 §4 容错策略在其上退避重试 + fallback。
+run_agent_turn(request, registry, context, providers, event_tx, repo) -> RunSummary;
 estimate_context_tokens(messages, context, channel) -> TokenEstimate;
 compact_context(messages, context, policy, ...) -> Compacted; // 纯计算，作用于会话 messages + ContextBundle
 
@@ -570,11 +585,19 @@ compact_context(messages, context, policy, ...) -> Compacted; // 纯计算，作
 type AgentRunRequest = {
   runId: string;
   trigger: string;
-  channel: ProviderChannel;
+  channel: ProviderChannel;           // 主渠道
   maxTurns: number;
   input: AgentMessage[];              // 这一轮的新消息（通常一条 user）；Infra 负责落库，调用方不自己 upsert
   conversationId?: string;            // 多轮会话标识（Runtime 提供）；有它 + repo 即自动续接 + 落库
   compaction?: CompactionConfig;      // 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）
+  fallbackChannels?: ProviderChannel[]; // 有序备用渠道（§4 容错）；主渠道瞬时重试耗尽后按序切换。缺省空
+  retry?: RetryConfig;                // 瞬时退避重试策略（§4）；缺省内置 3 次 / 500ms / 8000ms
+};
+
+type RetryConfig = {
+  maxAttemptsPerChannel?: number;     // 每渠道瞬时错误最多尝试次数（含首次），缺省 3
+  baseBackoffMs?: number;             // 指数退避基数，缺省 500（500→1000→2000…）
+  maxBackoffMs?: number;              // 退避封顶，缺省 8000
 };
 
 type CompactionConfig = {

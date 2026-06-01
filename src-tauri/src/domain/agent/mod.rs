@@ -22,7 +22,9 @@ pub use context::{
     ContextWindowLimits,
 };
 pub use events::{AgentEvent, AgentStopReason, CompactedTier, UsageBreakdown};
-pub use loop_request::{AgentRunRequest, CompactionConfig, RunSummary, TokenEstimate};
+pub use loop_request::{
+    AgentRunRequest, CompactionConfig, RetryConfig, RunSummary, TokenEstimate,
+};
 pub use messages::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, JsonSummary, MessageKind,
     MessageRoleBlockError,

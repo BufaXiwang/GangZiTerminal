@@ -105,6 +105,11 @@ impl AgentMessagesRepo {
     ///
     /// Spec: agent-infra-module.md §5 `load_conversation_view` / §4 续接：
     /// 最近一个 `kind=summary` 检查点 + 其后（seq 更大）的所有消息；无 summary → 返回全量。
+    ///
+    /// **有界性来自 `apply_summary`（loop_executor）的「边界 seq」选择**：滚动摘要继承「被压缩区间
+    /// 最大 seq」，故在审计序里紧贴保留尾窗之前，「其后」= 仅摘要 + 最近若干轮 → 有界。若改回让摘要
+    /// 继承最旧 seq，此处会退化为「摘要 + 其后全部历史」随轮数线性膨胀（回归）。摘要 seq 与边界原始
+    /// 消息相同时，平局由 `created_at` / `message_id` 打破（摘要晚于原始消息，排其后）。
     pub fn load_conversation_view(
         &self,
         conversation_id: &str,

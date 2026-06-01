@@ -61,6 +61,32 @@ pub struct AgentRunRequest {
     /// 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）（spec §5）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionConfig>,
+    /// 有序备用渠道（spec §4 容错）：主渠道瞬时重试耗尽后按序切换。缺省空 = 不 fallback。
+    /// 调用方按 `[channel] ++ fallback_channels` 构建传给 loop 的有序 `providers`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_channels: Vec<ProviderChannel>,
+    /// 瞬时错误退避重试策略（spec §4）；缺省内置 3 次 / 500ms / 8000ms。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
+}
+
+/// 瞬时错误退避重试配置（spec §4 / §5 `RetryConfig`）。
+///
+/// Runtime 提供；缺省 → Infra 用内置默认（`max_attempts_per_channel=3`、`base_backoff_ms=500`、
+/// `max_backoff_ms=8000`）。只作用于**瞬时**错误（5xx/429/超时/连接/上游失败）；context-too-long
+/// 与致命错误不走此策略。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryConfig {
+    /// 每渠道瞬时错误最多尝试次数（含首次）。缺省 3。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts_per_channel: Option<u32>,
+    /// 指数退避基数（毫秒）：第 n 次失败后退避 `base * 2^(n-1)`。缺省 500。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_backoff_ms: Option<u64>,
+    /// 退避封顶（毫秒）。缺省 8000。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_backoff_ms: Option<u64>,
 }
 
 /// 一次 run 完成后的总结，供 Runtime 关闭审计。
@@ -138,6 +164,8 @@ mod tests {
             input: vec![],
             conversation_id: None,
             compaction: None,
+            fallback_channels: vec![],
+            retry: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: AgentRunRequest = serde_json::from_str(&j).unwrap();

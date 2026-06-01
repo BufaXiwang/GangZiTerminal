@@ -344,6 +344,8 @@ async fn run_loop_collect(
         input: vec![user_message("judge-run", user_text)],
         conversation_id: None,
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -358,7 +360,7 @@ async fn run_loop_collect(
         }
         (text, skills)
     });
-    let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), provider, tx, None)
+    let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), vec![provider], tx, None)
         .await
         .expect("loop run");
     let (answer, skills) = pump.await.unwrap();
@@ -515,6 +517,8 @@ async fn judge_multiturn_memory() {
         input: vec![user_message("mem-1", "我的风险偏好是只买银行股，请记住这一点。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
@@ -522,7 +526,7 @@ async fn judge_multiturn_memory() {
         req1,
         registry.clone(),
         ContextBundle::new("mem-1"),
-        provider1,
+        vec![provider1],
         tx1,
         Some(repo.clone()),
     )
@@ -541,6 +545,8 @@ async fn judge_multiturn_memory() {
         input: vec![user_message("mem-2", "根据我之前告诉你的偏好，给我推荐一个值得关注的方向。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -556,7 +562,7 @@ async fn judge_multiturn_memory() {
         req2,
         registry,
         ContextBundle::new("mem-2"),
-        provider2,
+        vec![provider2],
         tx2,
         Some(repo.clone()),
     )
@@ -655,6 +661,8 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
             summarize_prompt: Some(summarize_prompt.into()),
             compact_channel: None,
         }),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -663,7 +671,7 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
         req,
         registry,
         ContextBundle::new("sum-run2"),
-        provider,
+        vec![provider],
         tx,
         Some(repo.clone()),
     )
@@ -768,6 +776,8 @@ async fn judge_memory_through_compaction() {
             summarize_prompt: Some(summarize_prompt.into()),
             compact_channel: None,
         }),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -786,7 +796,7 @@ async fn judge_memory_through_compaction() {
         }
         (text, saw_summarize)
     });
-    let _ = run_agent_turn(req, registry, ContextBundle::new("cmp-2"), provider, tx, Some(repo.clone()))
+    let _ = run_agent_turn(req, registry, ContextBundle::new("cmp-2"), vec![provider], tx, Some(repo.clone()))
         .await
         .expect("compaction run");
     let (answer, saw_summarize) = pump.await.unwrap();
@@ -868,6 +878,8 @@ async fn judge_durable_fact_preserved() {
         )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -883,7 +895,7 @@ async fn judge_durable_fact_preserved() {
         req1,
         registry.clone(),
         ContextBundle::new("dur-1"),
-        provider1,
+        vec![provider1],
         tx1,
         Some(repo.clone()),
     )
@@ -917,6 +929,8 @@ async fn judge_durable_fact_preserved() {
             summarize_prompt: Some(summarize_prompt.into()),
             compact_channel: None,
         }),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -935,7 +949,7 @@ async fn judge_durable_fact_preserved() {
         req2,
         registry,
         ContextBundle::new("dur-2"),
-        provider2,
+        vec![provider2],
         tx2,
         Some(repo.clone()),
     )
@@ -1046,6 +1060,8 @@ async fn judge_rolling_summary_folds_prior() {
             // compact_channel; a weak summarizer may drop folded facts).
             compact_channel: Some(judge_ch.clone()),
         }),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1053,7 +1069,7 @@ async fn judge_rolling_summary_folds_prior() {
         req,
         registry,
         ContextBundle::new("roll"),
-        provider,
+        vec![provider],
         tx,
         Some(repo.clone()),
     )
@@ -1187,6 +1203,8 @@ async fn force_one_summarize_cycle(
         input: vec![user_message(run_id, nudge_text)],
         conversation_id: Some(conversation_id.to_string()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), compact_channel)),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -1204,13 +1222,214 @@ async fn force_one_summarize_cycle(
         req,
         Arc::new(SkillRegistry::new_without_persist()),
         ContextBundle::new(run_id),
-        provider,
+        vec![provider],
         tx,
         Some(repo.clone()),
     )
     .await
     .expect("summarize cycle");
     pump.await.unwrap()
+}
+
+/// Run ONE conversational turn with transient-retry resilience (for long stress runs over a flaky
+/// relay). Hands the engine only this round's new user message; the engine persists it + loads the
+/// compressed view + persists outputs. Drains events, counting Summarize cycles and collecting the
+/// streamed answer. On a transient 5xx / upstream / timeout it retries the turn (small backoff);
+/// non-transient errors return ok=false. Returns (ok, summarize_cycles_fired, answer_text).
+async fn run_turn_resilient(
+    repo: &AgentMessagesRepo,
+    channel: &ProviderChannel,
+    conversation_id: &str,
+    run_id: &str,
+    text: &str,
+    compaction: &CompactionConfig,
+) -> (bool, u32, String) {
+    for attempt in 0..6u32 {
+        let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
+        let req = AgentRunRequest {
+            run_id: format!("{run_id}-a{attempt}"),
+            trigger: "user".into(),
+            channel: channel.clone(),
+            max_turns: 1,
+            input: vec![user_message(run_id, text)],
+            conversation_id: Some(conversation_id.to_string()),
+            compaction: Some(compaction.clone()),
+            fallback_channels: vec![],
+            retry: None,
+        };
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let pump = tokio::spawn(async move {
+            let mut fired = 0u32;
+            let mut answer = String::new();
+            while let Some(e) = rx.recv().await {
+                match e {
+                    AgentEvent::Compacted {
+                        tier: crate::domain::agent::CompactedTier::Summarize,
+                        ..
+                    } => fired += 1,
+                    AgentEvent::TextDelta { delta, .. } => answer.push_str(&delta),
+                    _ => {}
+                }
+            }
+            (fired, answer)
+        });
+        let res = run_agent_turn(
+            req,
+            Arc::new(SkillRegistry::new_without_persist()),
+            ContextBundle::new(run_id),
+            vec![provider],
+            tx,
+            Some(repo.clone()),
+        )
+        .await;
+        let (fired, answer) = pump.await.unwrap();
+        match res {
+            Ok(_) => return (true, fired, answer),
+            Err(e) => {
+                let msg = format!("{e}").to_lowercase();
+                let transient = msg.contains("provider returned 5") // any 5xx
+                    || msg.contains("upstream")
+                    || msg.contains("timed out")
+                    || msg.contains("timeout")
+                    || msg.contains("connection");
+                if transient && attempt < 5 {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                eprintln!("[100turn] turn {run_id} failed (non-retryable or retries exhausted): {e}");
+                return (false, fired, answer);
+            }
+        }
+    }
+    (false, 0, String::new())
+}
+
+// ---------------------------------------------------------------------------
+// A0. judge_hundred_turn_longterm_memory — 100+ 轮压测：第 1 轮埋账户代号、第 50 轮埋纪律口令，
+//     中间 tight_compaction 让 Summarize **每轮**触发（≈100 次滚动折叠 = 摘要"传话游戏"压测），
+//     最后让 agent 同时召回两个早期事实。验证：①持久化在规模下不丢（审计全量增长）；②上下文
+//     恒定收敛（view 不随轮数增长）；③早期事实穿越上百次滚动折叠仍逐字在；④judge 召回准确。
+//     summarizer 用 judge(opus) 渠道（可靠），agent 用被测渠道；单轮带瞬时重试抗 relay 抖动。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore]
+async fn judge_hundred_turn_longterm_memory() {
+    let Some(judge_ch) = judge_channel() else {
+        eprintln!("[judge_hundred_turn_longterm_memory] skipped: channels not configured (JUDGE_*)");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        eprintln!("[judge_hundred_turn_longterm_memory] skipped: channels not configured (agent)");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let conv = "judge-100turn-conv".to_string();
+    const ACCOUNT: &str = "ACC-7711";
+    const PASSPHRASE: &str = "BLUE-OWL-42";
+
+    let summarize_prompt = "你是会话压缩器。产出一份完整的中文累积摘要：若输入里含『已有摘要』，\
+        必须把其中的全部具体值（尤其是账户代号 ACC-xxxx、纪律口令等关键标识）逐字保留，并与后续\
+        新对话合并，绝不遗漏或改写早期事实。无关的流水笔记可概括。只输出摘要正文。";
+    // tight = Summarize fires basically every turn → maximal rolling-fold stress on the early facts.
+    let compaction = tight_compaction(4, Some(summarize_prompt), Some(judge_ch.clone()));
+
+    const TOTAL: u32 = 105;
+    let mut ok_turns = 0u32;
+    let mut failed_turns = 0u32;
+    let mut summarize_cycles = 0u32;
+
+    for i in 1..=TOTAL {
+        let text = if i == 1 {
+            format!("请牢记第 1 条关键信息：我的模拟账户代号是 {ACCOUNT}。后面我会持续追加很多条笔记，但这条要一直记住。")
+        } else if i == 50 {
+            format!("第 50 条，追加一条同样关键的纪律口令：{PASSPHRASE}，请和账户代号一样长期记牢。")
+        } else {
+            format!("第 {i} 条笔记：随手记录一条市场观察 #{i}，不重要，简短确认收到即可。")
+        };
+        let (ok, fired, _) =
+            run_turn_resilient(&repo, &ch.channel, &conv, &format!("ht-{i}"), &text, &compaction).await;
+        if ok {
+            ok_turns += 1;
+        } else {
+            failed_turns += 1;
+        }
+        summarize_cycles += fired;
+        if i == 1 || i == 50 || i % 20 == 0 {
+            let view = repo.load_conversation_view(&conv).unwrap();
+            eprintln!(
+                "[100turn][{}] turn={i} ok={ok_turns} fail={failed_turns} cycles={summarize_cycles} view_len={} summary={:?}",
+                ch.label,
+                view.len(),
+                summary_text_of(&repo, &conv)
+            );
+        }
+    }
+
+    let full = repo.load_conversation(&conv).unwrap();
+    let view = repo.load_conversation_view(&conv).unwrap();
+    let live_summary = summary_text_of(&repo, &conv);
+    eprintln!(
+        "[100turn] DONE ok={ok_turns}/{TOTAL} fail={failed_turns} cycles={summarize_cycles} full_audit={} view_len={}\n  final_summary={:?}",
+        full.len(),
+        view.len(),
+        live_summary
+    );
+
+    // ① persistence at scale: the full audit log holds (most of) the turns.
+    assert!(
+        ok_turns >= 100,
+        "expected ≥100 successful turns (got {ok_turns}; {failed_turns} exhausted retries — relay too flaky to conclude)"
+    );
+    assert!(
+        full.len() >= 150,
+        "persistence at scale: full audit should accumulate all turns (got {})",
+        full.len()
+    );
+    // ② many rolling Summarize cycles actually happened.
+    assert!(
+        summarize_cycles >= 30,
+        "expected many rolling Summarize cycles across 100 turns (got {summarize_cycles})"
+    );
+    // ③ context stayed bounded — the view does NOT grow with turn count.
+    assert!(
+        view.len() <= 30,
+        "context must stay bounded via compaction, not grow with turns (view={}, full_audit={})",
+        view.len(),
+        full.len()
+    );
+    // ④ both early facts survived ~100 rolling folds, verbatim, in the live summary.
+    assert!(
+        live_summary.contains(ACCOUNT),
+        "turn-1 fact {ACCOUNT} lost from rolling summary after {TOTAL} turns: {live_summary:?}"
+    );
+    assert!(
+        live_summary.contains(PASSPHRASE),
+        "turn-50 fact {PASSPHRASE} lost from rolling summary after {TOTAL} turns: {live_summary:?}"
+    );
+
+    // Final recall, judged by the LLM.
+    let q = "请直接回答两个问题：1) 我在第 1 条告诉你的模拟账户代号是多少？\
+        2) 我在中途（第 50 条）给你的纪律口令是什么？";
+    let (ok, _, answer) =
+        run_turn_resilient(&repo, &ch.channel, &conv, "ht-final", q, &compaction).await;
+    assert!(ok, "final recall turn failed");
+    eprintln!("[100turn] final answer={answer:?}");
+
+    let scenario = format!(
+        "A 100+ turn conversation. In turn 1 the user stated their simulated account code {ACCOUNT}; \
+         at turn 50 they added a discipline passphrase {PASSPHRASE}. Dozens of rolling summarization \
+         cycles happened in between (the context was repeatedly compacted). The user now asks the \
+         agent to recall BOTH early facts."
+    );
+    let rubric = format!(
+        "1) 回答里准确给出账户代号 {ACCOUNT}；2) 准确给出纪律口令 {PASSPHRASE}；\
+         3) 没有编造不同的值，也没有声称忘记/不知道。三条全满足才算 pass。"
+    );
+    let v = judge(&judge_ch, &scenario, &answer, &rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("hundred_turn_longterm_memory", ch.label, &v);
 }
 
 // ===========================================================================
@@ -1304,6 +1523,8 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
         input: vec![user_message("lt-final", "我最开始告诉你的模拟账户代号是多少？请直接回答那个代号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), Some(judge_ch.clone()))),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -1319,7 +1540,7 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
         req,
         Arc::new(SkillRegistry::new_without_persist()),
         ContextBundle::new("lt-final"),
-        provider,
+        vec![provider],
         tx,
         Some(repo.clone()),
     )
@@ -1380,6 +1601,8 @@ async fn judge_accumulated_constraints() {
             input: vec![user_message(run_id, text)],
             conversation_id: Some(conversation_id.clone()),
             compaction: None,
+            fallback_channels: vec![],
+            retry: None,
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let pump = tokio::spawn(async move {
@@ -1395,7 +1618,7 @@ async fn judge_accumulated_constraints() {
             req,
             Arc::new(SkillRegistry::new_without_persist()),
             ContextBundle::new(run_id),
-            provider,
+            vec![provider],
             tx,
             Some(repo.clone()),
         )
@@ -1495,6 +1718,8 @@ async fn judge_durable_verbatim_vs_droppable() {
         )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -1510,7 +1735,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         req1,
         registry.clone(),
         ContextBundle::new("dd-1"),
-        provider1,
+        vec![provider1],
         tx1,
         Some(repo.clone()),
     )
@@ -1535,6 +1760,8 @@ async fn judge_durable_verbatim_vs_droppable() {
         input: vec![user_message("dd-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), None)),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -1550,7 +1777,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         req2,
         registry,
         ContextBundle::new("dd-2"),
-        provider2,
+        vec![provider2],
         tx2,
         Some(repo.clone()),
     )
@@ -1649,6 +1876,8 @@ async fn judge_microclear_then_answer_correct() {
         )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -1664,7 +1893,7 @@ async fn judge_microclear_then_answer_correct() {
         req1,
         registry.clone(),
         ContextBundle::new("mc-1"),
-        provider1,
+        vec![provider1],
         tx1,
         Some(repo.clone()),
     )
@@ -1687,6 +1916,8 @@ async fn judge_microclear_then_answer_correct() {
         input: vec![user_message("mc-2", "刚才那条新闻的头条标题是什么？如果需要可以再次拉取。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, None, None)),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -1709,7 +1940,7 @@ async fn judge_microclear_then_answer_correct() {
         req2,
         registry,
         ContextBundle::new("mc-2"),
-        provider2,
+        vec![provider2],
         tx2,
         Some(repo.clone()),
     )
@@ -1859,6 +2090,8 @@ async fn judge_keep_recent_verbatim() {
         input: vec![user_message("kr-q", "我给比亚迪设的止损价具体是多少？请逐字给出那个数字。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(2, Some(summarize_prompt), Some(judge_ch.clone()))),
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -1874,7 +2107,7 @@ async fn judge_keep_recent_verbatim() {
         req,
         Arc::new(SkillRegistry::new_without_persist()),
         ContextBundle::new("kr-q"),
-        provider,
+        vec![provider],
         tx,
         Some(repo.clone()),
     )
@@ -1966,6 +2199,8 @@ async fn judge_drop_degrade_preserves_durable() {
         input: vec![user_message("dg-1", "请用 place_order 帮我以市价买入 200 股 600036.SH，下单后告诉我订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -1981,7 +2216,7 @@ async fn judge_drop_degrade_preserves_durable() {
         req1,
         registry.clone(),
         ContextBundle::new("dg-1"),
-        provider1,
+        vec![provider1],
         tx1,
         Some(repo.clone()),
     )
@@ -2002,6 +2237,8 @@ async fn judge_drop_degrade_preserves_durable() {
         input: vec![user_message("dg-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, None, None)), // summarize_prompt = None → Drop lane
+        fallback_channels: vec![],
+        retry: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -2024,7 +2261,7 @@ async fn judge_drop_degrade_preserves_durable() {
         req2,
         registry,
         ContextBundle::new("dg-2"),
-        provider2,
+        vec![provider2],
         tx2,
         Some(repo.clone()),
     )

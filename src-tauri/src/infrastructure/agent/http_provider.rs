@@ -13,11 +13,13 @@
 //!   `ParseError` 收集进 `ProviderTurnOutcome.skill_events` 交给 loop dispatch。
 //! - Image dataRef 用注入的 `PayloadStore` deref 成 base64（`None` = chat-only）。
 //!
-//! Error mapping（spec §4）：
-//! - 非 2xx：anthropic 400 含 "prompt is too long" 或 openai/deepseek error.code ==
+//! Error mapping（spec §4，三类）：
+//! - context-too-long：anthropic 400 含 "prompt is too long" / openai-deepseek
 //!   "context_length_exceeded"（或 body 含 "context length" / "maximum context"）
-//!   → `LoopError::ProviderContextTooLong`；否则 `LoopError::Provider`。
-//! - 网络 / 超时 → `LoopError::Provider`。
+//!   → `LoopError::ProviderContextTooLong`。
+//! - 瞬时（可退避重试 + fallback）：HTTP 5xx / 429、连接/超时/DNS 失败、流中断、SSE 错误事件含
+//!   upstream/overloaded/rate-limit/unavailable 等 → `LoopError::ProviderTransient`。
+//! - 致命：其余 4xx / 鉴权 / wire 映射 → `LoopError::Provider`（不重试不 fallback）。
 
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentStopReason, ContextBundle, ProviderChannel, WireFormat,
@@ -116,6 +118,34 @@ fn body_is_context_too_long(body: &str) -> bool {
         || lower.contains("maximum context")
 }
 
+/// HTTP status → 是否瞬时（可退避重试）。5xx 服务端错误 + 429 限流（spec §4）。
+fn status_is_transient(status: u16) -> bool {
+    status == 429 || status >= 500
+}
+
+/// SSE 流内 / 错误 body 文本 → 是否瞬时（上游失败 / 过载 / 限流 / 服务不可用）。
+/// 命中 → `ProviderTransient`，否则 `Provider`（致命）。
+fn classify_stream_error(msg: &str) -> LoopError {
+    let lower = msg.to_ascii_lowercase();
+    // Phrases (not bare words) to avoid misclassifying permanent errors like "model unavailable".
+    let transient = lower.contains("upstream")
+        || lower.contains("overloaded")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+        || lower.contains("service unavailable")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporarily")
+        || lower.contains("try again");
+    if transient {
+        LoopError::ProviderTransient(msg.to_string())
+    } else {
+        LoopError::Provider(msg.to_string())
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderStream for HttpProvider {
     async fn next_turn(
@@ -139,10 +169,10 @@ impl ProviderStream for HttpProvider {
             req = req.header(name, value);
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| LoopError::Provider(format!("request send failed: {e}")))?;
+        // Connection / timeout / DNS failures: nothing emitted yet → transient (retryable). §4
+        let resp = req.send().await.map_err(|e| {
+            LoopError::ProviderTransient(format!("request send failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -151,11 +181,13 @@ impl ProviderStream for HttpProvider {
                 return Err(LoopError::ProviderContextTooLong);
             }
             let snippet: String = body.chars().take(800).collect();
-            return Err(LoopError::Provider(format!(
-                "provider returned {}: {}",
-                status.as_u16(),
-                snippet
-            )));
+            let msg = format!("provider returned {}: {}", status.as_u16(), snippet);
+            // 5xx / 429 → transient (retryable + falls back); other 4xx → fatal. §4
+            return Err(if status_is_transient(status.as_u16()) {
+                LoopError::ProviderTransient(msg)
+            } else {
+                LoopError::Provider(msg)
+            });
         }
 
         // 3. + 4. stream body → SSE parser → per-format parse。
@@ -164,8 +196,9 @@ impl ProviderStream for HttpProvider {
         let mut state = StreamState::default();
 
         while let Some(chunk) = byte_stream.next().await {
-            let bytes =
-                chunk.map_err(|e| LoopError::Provider(format!("stream chunk error: {e}")))?;
+            // Mid-stream connection drop → transient (retry the turn). §4
+            let bytes = chunk
+                .map_err(|e| LoopError::ProviderTransient(format!("stream chunk error: {e}")))?;
             for ev in sse.feed(&bytes) {
                 let done = handle_sse_event(
                     self.channel.wire_format,
@@ -527,7 +560,7 @@ async fn handle_messages_event(
             if body_is_context_too_long(msg) {
                 return Err(LoopError::ProviderContextTooLong);
             }
-            return Err(LoopError::Provider(msg.to_string()));
+            return Err(classify_stream_error(msg));
         }
         _ => {}
     }
@@ -562,7 +595,7 @@ async fn handle_chat_event(
         if code == "context_length_exceeded" || body_is_context_too_long(msg) {
             return Err(LoopError::ProviderContextTooLong);
         }
-        return Err(LoopError::Provider(msg.to_string()));
+        return Err(classify_stream_error(msg));
     }
     // choices[0].delta.content → text。
     if let Some(t) = v
@@ -661,7 +694,7 @@ async fn handle_responses_event(
             if body_is_context_too_long(msg) {
                 return Err(LoopError::ProviderContextTooLong);
             }
-            return Err(LoopError::Provider(msg.to_string()));
+            return Err(classify_stream_error(msg));
         }
         // item-lifecycle events carry no visible delta we need; ignore gracefully.
         // (response.output_item.added/done, response.content_part.added/done,
@@ -973,17 +1006,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_error_event_maps_to_provider_error() {
-        let hp = HttpProvider::new(channel(WireFormat::Messages, "http://x", "m", "k")).unwrap();
-        let _ = &hp;
+    async fn messages_fatal_error_event_maps_to_provider_error() {
+        // A stream error with no transient marker → fatal LoopError::Provider (no retry/fallback).
         let mut state = StreamState::default();
         let (tx, _rx) = mpsc::channel::<AgentEvent>(8);
         let ev = SseEvent {
             event: Some("error".into()),
-            data: r#"{"type":"error","error":{"message":"overloaded"}}"#.into(),
+            data: r#"{"type":"error","error":{"message":"invalid request payload"}}"#.into(),
         };
         let res = handle_messages_event(&ev, &mut state, &tx, "r1").await;
         assert!(matches!(res, Err(LoopError::Provider(_))));
+    }
+
+    #[tokio::test]
+    async fn messages_transient_error_event_maps_to_transient() {
+        // "overloaded" (and upstream/rate-limit/unavailable/timeout) → ProviderTransient (§4).
+        let mut state = StreamState::default();
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let ev = SseEvent {
+            event: Some("error".into()),
+            data: r#"{"type":"error","error":{"message":"overloaded, please try again"}}"#.into(),
+        };
+        let res = handle_messages_event(&ev, &mut state, &tx, "r1").await;
+        assert!(matches!(res, Err(LoopError::ProviderTransient(_))));
     }
 
     #[tokio::test]
