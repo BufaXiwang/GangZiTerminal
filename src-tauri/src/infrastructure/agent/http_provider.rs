@@ -301,7 +301,11 @@ async fn drain_parser_events(
     for ev in events {
         match ev {
             ParserEvent::TextDelta(s) => {
-                if !s.is_empty() {
+                // 最佳实践（spec §2/§3）：工具调用是本轮文本的逻辑终点。首个 `<use_skill>`
+                // 出现后的文本是模型在「无工具结果」下的推测续写（幻觉），**抑制不 emit**；
+                // 只有首个 skill 之前的 preamble/推理文本 emit 给 UI。这样 emit 顺序天然是
+                // `text… → skill_start/end`，无需交错。同一轮多个 skill 仍按序收集 + dispatch。
+                if !s.is_empty() && state.skill_events.is_empty() {
                     send_event(
                         event_tx,
                         AgentEvent::TextDelta {
@@ -869,8 +873,11 @@ mod tests {
         assert_eq!(usage.1, Some(2048));
     }
 
-    // FIX 1: a <use_skill> turn emits clean TextDelta (no raw XML) exactly once and the
-    // skill is parsed into outcome.skill_events for the loop to dispatch.
+    // FIX 1 + best-practice: a <use_skill> turn emits clean TextDelta (no raw XML) for the
+    // preamble BEFORE the first skill only; text AFTER the first <use_skill> is the model's
+    // speculative continuation (no tool result yet) and is SUPPRESSED (not emitted). The skill
+    // is parsed into outcome.skill_events for the loop to dispatch; raw text keeps the XML for
+    // message history.
     #[tokio::test]
     async fn parse_messages_stream_suppresses_use_skill_xml() {
         let canned = concat!(
@@ -900,7 +907,10 @@ mod tests {
             .collect();
         assert!(!joined.contains("<use_skill"), "leaked XML: {joined:?}");
         assert_eq!(joined.matches("check: ").count(), 1);
-        assert!(joined.contains("done"));
+        // best practice: text AFTER the first <use_skill> ("done") is suppressed, not emitted.
+        assert!(!joined.contains("done"), "post-skill text must be suppressed: {joined:?}");
+        // raw history still retains the trailing text + XML.
+        assert!(outcome.text.contains("done"));
     }
 
     #[tokio::test]

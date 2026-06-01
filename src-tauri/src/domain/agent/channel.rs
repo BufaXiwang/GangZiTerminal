@@ -62,6 +62,11 @@ pub struct ProviderChannel {
     /// `Some(n)` 且 `supports_thinking = true` 时，Anthropic adapter 发
     /// top-level `thinking: {type:"enabled", budget_tokens:n}`，并校验 `n < max_tokens`。
     /// 参考 anthropic-messages.md §thinking：budget_tokens ≥ 1024 且 < max_tokens。
+    ///
+    /// **现状（runtime-only）**：wire 形状已就绪，但**尚未接入配置入口**——
+    /// `agent_provider_channels` 没有对应列、`channels_repo` 读行时恒为 `None`、
+    /// `agent_add_channel` 命令也不接收它。即默认关闭、当前无法经设置页 / DB 配置，
+    /// 仅 Runtime 直接构造 channel 时可设。接入需加 DB 列 + DTO + migration（留待 Phase 3）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_budget_tokens: Option<u32>,
 }

@@ -77,28 +77,27 @@ impl AnthropicAdapter {
                 // Per anthropic-messages.md:
                 //   normal   = {type:"thinking", thinking, signature}
                 //   redacted = {type:"redacted_thinking", data}
-                // Treat the block as redacted when metadata carries `redacted` (the encrypted
-                // `data` payload) or an explicit `data` field, or `type=="redacted_thinking"`.
+                // Trigger redaction ONLY on a definite signal — `type=="redacted_thinking"`
+                // or the dedicated `redacted` key. A bare `data` field must NOT flip a normal
+                // thinking block to redacted (that over-broad trigger was a latent footgun).
                 let redacted_data = metadata.as_ref().and_then(|m| {
-                    // explicit type marker
                     let is_redacted_type = m
                         .get("type")
                         .and_then(|t| t.as_str())
                         .map(|t| t == "redacted_thinking")
                         .unwrap_or(false);
-                    // the encrypted blob can live under `data` or `redacted`
-                    let data = m
-                        .get("data")
-                        .or_else(|| m.get("redacted"))
-                        .and_then(|d| d.as_str());
-                    match (is_redacted_type, data) {
-                        // redacted_thinking type → use data (fall back to text if absent)
-                        (true, Some(d)) => Some(d.to_string()),
-                        (true, None) => Some(text.clone()),
-                        // no explicit type but a string `data`/`redacted` blob present
-                        (false, Some(d)) => Some(d.to_string()),
-                        (false, None) => None,
+                    let redacted_blob = m.get("redacted").and_then(|d| d.as_str());
+                    if !is_redacted_type && redacted_blob.is_none() {
+                        return None; // normal thinking
                     }
+                    // redacted: prefer the encrypted blob (`redacted` or `data`), else fall back
+                    // to the thinking text so we still emit a well-formed redacted_thinking block.
+                    Some(
+                        redacted_blob
+                            .or_else(|| m.get("data").and_then(|d| d.as_str()))
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| text.clone()),
+                    )
                 });
 
                 if let Some(data) = redacted_data {

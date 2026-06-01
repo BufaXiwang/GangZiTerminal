@@ -460,9 +460,11 @@ fn parse_quote(
 ) -> Result<StockQuote, EmError> {
     let price = d.f43.and_then(em_div100);
     let prev = d.f60.and_then(em_div100);
-    // Completeness guard (Spec finding #2): EM 偶尔为 BJ（及已退市/已迁移代码）返回一个
-    // 占位 payload —— price/prevClose 字段为 0、name 含「已切换」类标记。这种 payload 不
-    // 应被当作可用行情发出，否则会污染快照。要求至少 price 与 identity(code/name) 有效。
+    // Completeness guard (Spec finding #2): EM 偶尔返回占位 payload —— price/prevClose 为 0、
+    // name 含「已切换」类标记（BJ 已退市/已迁移代码最常见，但本守卫作用于**所有** SH/SZ/BJ
+    // 的 EM `get` 路径，不限 BJ）。这种 payload 不应被当作可用行情发出，否则污染快照。
+    // 要求至少 price 与 identity(code/name) 有效；price≤0 经 em_div100 已为 None，与下游
+    // is_display_complete 一致，本守卫额外加 identity 校验并在 parse 处即拒绝。
     // (live 2026-05-30 观测: secid=0.430047 返回 0 价 + “已切换” name；secid=2.430047 无数据。)
     let identity_ok = d.f57.as_deref().map(|c| !c.is_empty()).unwrap_or(false)
         || d.f58.as_deref().map(|n| !n.is_empty()).unwrap_or(false);

@@ -131,8 +131,12 @@ LLM 输出：
 - `<use_skill>` 内容必须是合法 JSON（即 `SkillSpec.inputSchema` 校验的 input）。
 - `<skill_result>` 内容是 JSON；`<skill_error>` 内容是 JSON 且必须带 `code` 属性（取 `ErrorCode` 封闭集合）。
 - `call_id` 由 Infra 在 parser 检测到 `<use_skill>` 闭合时生成（`sc_<uuid>`），写入回传标签，供模型在后续推理中显式引用某次结果。
-- LLM 输出单 turn 内可以有多个 `<use_skill>`；Infra 按出现顺序串行 dispatch（不并行），逐个回传 `<skill_result>`。
-- Stream 解析顺序：`<use_skill>` 之前的文本必须先作为 `text_delta` event 完整 emit；遇到 `</use_skill>` 闭合时触发 dispatch；dispatch 完成后继续 emit 后续 text_delta。
+- LLM 输出单 turn 内可以有多个 `<use_skill>`；Infra 按出现顺序串行 dispatch（不并行），逐个回传 `<skill_result>`（支持批量工具调用）。
+- **工具调用是本轮文本的逻辑终点（best practice，对齐 native tool-calling 语义）**：
+  - 首个 `<use_skill>` **之前**的文本（preamble / 推理）实时 emit 为 `text_delta`。
+  - 首个 `<use_skill>` **之后**的文本是模型在「无工具结果」下的推测续写（hallucination）——**不 emit、不作权威输出**（native 协议里模型在工具调用处即 `stop_reason=tool_use` 结束本轮；文本协议下模型可能继续吐字，按此规则丢弃）。
+  - 同一 turn 内多个 `<use_skill>` 仍**全部按序收集 + dispatch**；skill 结果在**下一轮** user message 回灌。
+  - 因此事件顺序天然是 `text_delta…（preamble）→ skill_start/skill_end…`，无需文本与 skill 交错。
 - 模型在自然语言中提到"我想调用 fetch_quote"但**没**输出闭合标签时，**不**触发 dispatch；这是 chat 文本，不是调用。
 - 标签嵌套不合法（例如 `<use_skill>` 内出现 `<use_skill>`）→ `<skill_error>` `parse_error`。
 - 未闭合标签（流到 turn 结束仍未见 `</use_skill>`）→ 当 turn 文本处理；不 dispatch。
@@ -298,7 +302,7 @@ type AgentEvent =
 - `AgentEvent` 是 loop 执行事件，不是业务领域事件。
 - Runtime 可以监听 `skill_end`、`done`、`error` 来更新 `AgentRun` 状态和业务审计记录。
 - 后台 run 也必须产生事件流；前端可选择折叠展示。
-- `text_delta` 的 stream 顺序必须与原始 LLM 输出一致；parser 在 `<use_skill>` 之前的 text 必须先 emit，再 dispatch；dispatch 完成后继续 emit 后续 text。
+- `text_delta` 只 emit 首个 `<use_skill>` **之前**的 preamble 文本（实时、与原始 LLM 输出顺序一致）；首个 skill 之后的文本按上文「工具调用是本轮文本逻辑终点」规则抑制，不 emit。
 - Skill input / output 在 event 内是摘要；完整 payload 通过 `skillCallId` 查 `agent_skill_calls` + `agent_payloads`。
 - `compacted.tier = "reactive_retry"` 专用于 §4 描述的 context-too-long 触发的压缩。
 - `error.code` 必须取自 `ErrorCode` 封闭集合（shared-types §5）。
