@@ -580,6 +580,42 @@ async fn quotes_live_em_minute_kline() {
     }
 }
 
+/// C7 · EM 日线 K fallback（TuShare 不可用时）。Provider: EM。
+///
+/// 盲区④：EM 日线兜底 `fetch_daily_kline`。断言：根数 > 0、OHLC 有序
+/// (high≥low、close/open 落在 [low,high])、日期严格单调递增。
+/// 本环境 EM 出口屏蔽（实测 HTTP 000）→ 不可达时优雅 skip。
+#[tokio::test]
+#[ignore]
+async fn quotes_live_em_daily_kline() {
+    let em = EastmoneyProvider::new().expect("build em");
+    let code = ts(OLD_STOCK_SH);
+    match em.fetch_daily_kline(&code, 120).await {
+        Ok(pts) => {
+            eprintln!("[C7] EM 茅台 日线 K 根数 = {}", pts.len());
+            assert!(!pts.is_empty(), "EM 应返回日线 K");
+            for p in &pts {
+                assert!(p.high.0 >= p.low.0, "high >= low");
+                assert!(p.close.0 >= p.low.0 && p.close.0 <= p.high.0, "close ∈ [low,high]");
+                assert!(p.open.0 >= p.low.0 && p.open.0 <= p.high.0, "open ∈ [low,high]");
+            }
+            // 日期严格单调递增（EM kline 升序返回）。
+            for w in pts.windows(2) {
+                assert!(
+                    w[0].date.format() < w[1].date.format(),
+                    "日期应严格单调递增: {} !< {}",
+                    w[0].date.format(),
+                    w[1].date.format()
+                );
+            }
+            if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
+                eprintln!("[C7]   日期区间 {} .. {}", first.date.format(), last.date.format());
+            }
+        }
+        Err(e) => eprintln!("[C7] SKIP — EM 不可达（本环境实测 000）: {e}"),
+    }
+}
+
 // ============================================================================= D. 复权（本地基于 TDX xdxr）
 // 依赖：TDX（xdxr 事件 + unadjusted K）。复权计算为本地纯算。
 

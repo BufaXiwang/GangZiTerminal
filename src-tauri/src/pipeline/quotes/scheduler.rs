@@ -325,6 +325,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hot_interval_default_is_3s() {
+        // Spec §5 热点档：核心指数 ∪ 前端热点集，3s。
+        let i = QuotesSchedulerIntervals::default();
+        assert_eq!(i.hot_interval.as_secs(), 3);
+        assert_eq!(i.daily_tick_interval.as_secs(), 60);
+        assert_eq!(QUOTES_HOT_INTERVAL_SECS, 3);
+        assert_eq!(QUOTES_REFRESH_INTERVAL_SECS, 60);
+        assert_eq!(QUOTES_SUBSCRIBED_INTERVAL_SECS, 15);
+    }
+
+    #[tokio::test]
+    async fn refresh_hot_quotes_never_panics_on_empty_universe() {
+        // 盲区②：热点档单步刷新（scheduler 3s tick body）必须能裸调不 panic，
+        // 无论当前是否交易时段。in-memory 空 DB + 无网络：
+        //   - 盘外 → is_trading_time gate 提前 return；
+        //   - 盘中 → core_indexes 走 TDX/HTTP fallback（不可达即静默失败），
+        //     不写任何 cache、不 panic。
+        // 注：gate 依赖 wall-clock，无法在不注入时钟的前提下断言确切分支，
+        // 但「单步可调用且不 panic」是 scheduler tick body 的核心契约。
+        let svc = make_service();
+        svc.refresh_hot_quotes().await; // 不应 panic
+    }
+
+    #[tokio::test]
+    async fn set_quote_hotset_then_refresh_hot_quotes_no_panic() {
+        // set_quote_hotset 设置后，热点路径选取 core_indexes ∪ hot_set 仍不 panic。
+        // （选取后的 dedup 逻辑本身在 service::set_quote_hotset 测试里已硬断言。）
+        let svc = make_service();
+        svc.set_quote_hotset(vec![
+            crate::domain::shared::TsCode::parse("600519.SH").unwrap(),
+            crate::domain::shared::TsCode::parse("000001.SZ").unwrap(),
+        ]);
+        svc.refresh_hot_quotes().await;
+    }
+
+    #[tokio::test]
     async fn scheduler_handles_drop_without_panic() {
         let svc = make_service();
         // 1s tick to short-circuit
