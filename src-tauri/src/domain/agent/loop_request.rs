@@ -51,10 +51,11 @@ pub struct AgentRunRequest {
     pub trigger: String,
     pub channel: ProviderChannel,
     pub max_turns: u32,
-    /// 把已有聊天历史 / 续接消息一起带入；Infra 不负责拉取历史。
+    /// 这一轮的新消息（通常一条 user）。**Infra 负责把它落库 + 续接历史**，调用方不自己 upsert。
+    /// 无 conversationId / 无 repo 时（无状态运行），`input` 就是本轮跑的全部消息。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub seed_messages: Vec<AgentMessage>,
-    /// 多轮会话标识（Runtime 提供）；`run_agent_turn` 在 seed 为空且有 conversationId 时自动 load 压缩视图。
+    pub input: Vec<AgentMessage>,
+    /// 多轮会话标识（Runtime 提供）；有它 + repo 时 `run_agent_turn` 自动落 input + load 压缩视图续接。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
     /// 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）（spec §5）。
@@ -134,7 +135,7 @@ mod tests {
                 thinking_budget_tokens: None,
             },
             max_turns: 12,
-            seed_messages: vec![],
+            input: vec![],
             conversation_id: None,
             compaction: None,
         };

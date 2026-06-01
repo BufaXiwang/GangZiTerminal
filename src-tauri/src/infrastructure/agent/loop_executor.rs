@@ -43,19 +43,6 @@ use uuid::Uuid;
 /// 默认尾窗：最近 N 轮永不摘要 / micro-clear（spec §4 keepRecentTurns 缺省）。
 const DEFAULT_KEEP_RECENT_TURNS: u32 = 3;
 
-/// loop 运行时依赖：可选持久化 repo（spec §4 多轮会话持久化）。
-/// 测试无 DB 时用 `RunAgentDeps::default()`（repo = None），跳过持久化。
-#[derive(Clone, Default)]
-pub struct RunAgentDeps {
-    pub repo: Option<AgentMessagesRepo>,
-}
-
-impl RunAgentDeps {
-    pub fn with_repo(repo: AgentMessagesRepo) -> Self {
-        Self { repo: Some(repo) }
-    }
-}
-
 /// 从 `CompactionConfig`（可空）+ channel 推导出三档阈值 + 尾窗。
 ///
 /// Spec §4 / §5：阈值优先取 `CompactionConfig`；缺省由 `channel.contextWindowTokens` 推导：
@@ -149,13 +136,12 @@ pub enum LoopError {
 
 /// 唯一 Agent loop 入口：推进一个会话 turn（一次 user→assistant，内部可多次 provider / skill 往返）。
 ///
-/// 行为完全由 `deps` + `request.seed_messages` 决定，不再有「持久化 / 无状态」「续接 / 一次性」
-/// 的分裂入口：
-/// - `deps.repo = None` → 不持久化、不读会话视图（无状态一次性运行；测试 / 不关心落库时用）。
-/// - `seed_messages` 为空 且 有 `conversation_id` 且 `deps.repo` 存在 → 先 `load_conversation_view`
-///   （最近 summary 检查点 + 其后最近若干轮）当 seed，实现跨 run 续接。
-/// - `seed_messages` 非空 → 直接用调用方给的 seed（忽略自动加载）。
-/// 主动压缩（每轮）+ Summarize 模型调用 + 多轮会话持久化都在此函数内完成。
+/// **持久化与续接全归 Infra**（spec §4）。调用方只给 `request.input`（这一轮的新消息，通常一条 user）
+/// + 可选 `conversation_id` + 可选 `repo`：
+/// - `repo=Some` 且有 `conversation_id` → Infra 先把 `input` 落库（分配 seq + 打 conversationId），
+///   再 `load_conversation_view`（含刚落库的 input）作为本轮上下文，跑完把产出也落库。
+/// - 无 `conversation_id` 或 `repo=None` → 不 load 不持久化，`input` 即本轮全部上下文（无状态运行）。
+/// 调用方**永不**自己 upsert / 分配 seq / load 历史。主动压缩 + Summarize 也都在此函数内完成。
 ///
 /// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
 pub async fn run_agent_turn(
@@ -164,21 +150,30 @@ pub async fn run_agent_turn(
     mut context: ContextBundle,
     mut provider: Box<dyn ProviderStream>,
     event_tx: Sender<AgentEvent>,
-    deps: RunAgentDeps,
+    repo: Option<AgentMessagesRepo>,
 ) -> Result<RunSummary, LoopError> {
-    // 续接：调用方没给 seed 但指定了会话且提供了 repo → 自动 load 压缩视图当 seed。
-    if request.seed_messages.is_empty() {
-        if let (Some(conv), Some(repo)) = (request.conversation_id.clone(), deps.repo.as_ref()) {
-            let view = repo
-                .load_conversation_view(&conv)
-                .map_err(|e| LoopError::Provider(format!("load_conversation_view: {e}")))?;
-            request.seed_messages = view;
-        }
-    }
     let run_id = request.run_id.clone();
     let plan = CompactionPlan::derive(request.compaction.as_ref(), &request.channel);
     let conversation_id = request.conversation_id.clone();
-    let repo = deps.repo.clone();
+
+    // ---- 消息持久化 + 续接全归 Infra（spec §4）----
+    // 有 conversationId + repo：先把这一轮 input 落库（分配 seq + 打 conversationId + 默认 kind=Chat），
+    // 再 load 压缩视图作为本轮上下文（含刚落库的 input）；否则（无状态 / 新会话）直接用 input。
+    let mut messages: Vec<AgentMessage> = match (&conversation_id, &repo) {
+        (Some(conv), Some(r)) => {
+            for m in request.input.iter_mut() {
+                m.conversation_id = Some(conv.clone());
+                m.seq = r.next_seq(conv).ok();
+                if m.kind.is_none() {
+                    m.kind = Some(MessageKind::Chat);
+                }
+                persist_message(Some(r), m, &event_tx, &run_id).await;
+            }
+            r.load_conversation_view(conv)
+                .map_err(|e| LoopError::Provider(format!("load_conversation_view: {e}")))?
+        }
+        _ => request.input.clone(),
+    };
 
     // Spec §2 line 209-210, §5 line 533: 每次 Agent loop 启动时,Infra 用 `SystemPromptBuilder`
     // 把 enabled `SkillSpec` 集合编译成 system prompt 前缀,自动 prepend 到 ContextBundle.systemParts。
@@ -195,7 +190,6 @@ pub async fn run_agent_turn(
     )
     .await?;
 
-    let mut messages: Vec<AgentMessage> = request.seed_messages.clone();
     let mut skill_call_ids: Vec<String> = Vec::new();
     let mut usage_input: u32 = 0;
     let mut usage_output: u32 = 0;
@@ -1008,7 +1002,7 @@ mod tests {
             trigger: "u".into(),
             channel: channel(),
             max_turns: 5,
-            seed_messages: vec![],
+            input: vec![],
             conversation_id: None,
             compaction: None,
         }
@@ -1028,7 +1022,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.turns, 1);
@@ -1062,7 +1056,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1121,7 +1115,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.skill_call_ids.len(), 2);
@@ -1146,7 +1140,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1173,7 +1167,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::ContextLimit);
@@ -1223,7 +1217,7 @@ mod tests {
             captured: Arc::clone(&captured),
         });
         let (tx, _rx) = mpsc::channel::<AgentEvent>(64);
-        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
             .await
             .unwrap();
         let parts = captured.lock().unwrap().clone();
@@ -1246,7 +1240,7 @@ mod tests {
             index: 0,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
-        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+        let _ = run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
             .await
             .unwrap();
         // First event should be RunStart with the channel's model.
@@ -1275,7 +1269,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary =
-            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+            run_agent_turn(req(), registry, ContextBundle::new("r1"), provider, tx, None)
                 .await
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
@@ -1300,10 +1294,12 @@ mod tests {
         AgentMessagesRepo::new(db)
     }
 
+    /// New contract (spec §4): the engine itself persists both the round's `input` (the new user
+    /// message) AND its own produced assistant output under the conversation_id, assigning seq.
+    /// The caller only supplies `input=[user]` + `conversation_id` + `Some(repo)` — never upserts
+    /// or assigns seq itself.
     #[tokio::test]
     async fn run_agent_turn_persists_and_reloads_view() {
-        // Two turns under one conversation: assistant text persisted with conversation_id + seq;
-        // reload via load_conversation (full) and load_conversation_view (compressed).
         let repo = fresh_repo();
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
@@ -1317,6 +1313,20 @@ mod tests {
         });
         let mut request = req();
         request.conversation_id = Some("conv-x".into());
+        // Only the new user message — engine persists it (assigns conversation_id + seq) then
+        // persists the assistant output it produces.
+        request.input = vec![AgentMessage {
+            message_id: "u-1".into(),
+            run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Text {
+                text: "hello".into(),
+            }],
+            created_at: Utc::now(),
+        }];
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let summary = run_agent_turn(
             request,
@@ -1324,28 +1334,38 @@ mod tests {
             ContextBundle::new("r1"),
             provider,
             tx,
-            RunAgentDeps::with_repo(repo.clone()),
+            Some(repo.clone()),
         )
         .await
         .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
         while rx.recv().await.is_some() {}
 
+        // Engine persisted BOTH the input user message and the produced assistant message.
         let all = repo.load_conversation("conv-x").unwrap();
-        assert_eq!(all.len(), 1, "assistant message persisted");
-        assert_eq!(all[0].conversation_id.as_deref(), Some("conv-x"));
+        assert_eq!(all.len(), 2, "engine persists input + produced output");
+        // All carry conversation_id, monotonic seq starting at 0, default kind=Chat.
+        assert!(all.iter().all(|m| m.conversation_id.as_deref() == Some("conv-x")));
         assert_eq!(all[0].seq, Some(0));
-        assert_eq!(all[0].kind, Some(MessageKind::Chat));
+        assert_eq!(all[1].seq, Some(1));
+        assert!(all[0].seq < all[1].seq, "seq monotonic");
+        assert!(all.iter().all(|m| m.kind == Some(MessageKind::Chat)));
+        // Engine persisted input first (user) then output (assistant).
+        assert_eq!(all[0].role, AgentMessageRole::User);
+        assert_eq!(all[1].role, AgentMessageRole::Assistant);
         // No summary checkpoint yet → view == full.
         let view = repo.load_conversation_view("conv-x").unwrap();
-        assert_eq!(view.len(), 1);
+        assert_eq!(view.len(), 2);
     }
 
+    /// New contract (spec §4): given a conversation that already has a summary checkpoint (fixture
+    /// representing prior persisted rounds), the caller passes only this round's new `input`. The
+    /// engine persists that input, then loads the *compressed* view (summary + post-summary tail +
+    /// the just-persisted input) as the turn context — the caller never pre-loads the view.
     #[tokio::test]
-    async fn run_agent_turn_loads_view_as_seed_when_seed_empty() {
-        // Pre-seed a conversation with a summary checkpoint + later message; run_agent_turn must
-        // load the compressed view (summary + after) as seed.
+    async fn run_agent_turn_loads_compressed_view_plus_persisted_input() {
         let repo = fresh_repo();
+        // Fixture: prior persisted state — an old message, a Summary checkpoint, a recent message.
         let mk = |id: &str, seq: i64, kind: Option<MessageKind>, text: &str| AgentMessage {
             message_id: id.into(),
             run_id: Some("r0".into()),
@@ -1361,9 +1381,9 @@ mod tests {
             .unwrap();
         repo.upsert_message(&mk("m2", 2, None, "recent")).unwrap();
 
-        // SnapshotProvider records how many seed messages the loop saw on the first turn.
+        // SnapshotProvider records the messages the loop seeded the turn with.
         struct SeedSnapshot {
-            seen: Arc<std::sync::Mutex<usize>>,
+            seen: Arc<std::sync::Mutex<Vec<AgentMessage>>>,
         }
         #[async_trait::async_trait]
         impl ProviderStream for SeedSnapshot {
@@ -1374,7 +1394,7 @@ mod tests {
                 _tx: &Sender<AgentEvent>,
                 _r: &str,
             ) -> Result<ProviderTurnOutcome, LoopError> {
-                *self.seen.lock().unwrap() = messages.len();
+                *self.seen.lock().unwrap() = messages.to_vec();
                 Ok(ProviderTurnOutcome {
                     text: "ok".into(),
                     usage_input: 1,
@@ -1384,11 +1404,26 @@ mod tests {
                 })
             }
         }
-        let seen = Arc::new(std::sync::Mutex::new(0usize));
-        let provider = Box::new(SeedSnapshot { seen: Arc::clone(&seen) });
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Box::new(SeedSnapshot {
+            seen: Arc::clone(&seen),
+        });
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let mut request = req();
         request.conversation_id = Some("c".into());
+        // Only the new user input for this round — engine persists it, then loads the view.
+        request.input = vec![AgentMessage {
+            message_id: "u-new".into(),
+            run_id: Some("r1".into()),
+            conversation_id: None,
+            seq: None,
+            kind: None,
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Text {
+                text: "follow up".into(),
+            }],
+            created_at: Utc::now(),
+        }];
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
         let _ = run_agent_turn(
             request,
@@ -1396,13 +1431,28 @@ mod tests {
             ContextBundle::new("r1"),
             provider,
             tx,
-            RunAgentDeps::with_repo(repo.clone()),
+            Some(repo.clone()),
         )
         .await
         .unwrap();
         while rx.recv().await.is_some() {}
-        // view = summary s1 + m2 = 2 messages (not the full 3).
-        assert_eq!(*seen.lock().unwrap(), 2, "loop should seed from compressed view");
+
+        // Engine persisted the input (assigning conversation_id + seq=3) — m0 stays elided by the
+        // compressed view, so the turn saw: summary s1 + recent m2 + the just-persisted input.
+        let persisted_input = repo.load_conversation("c").unwrap();
+        assert!(
+            persisted_input.iter().any(|m| m.message_id == "u-new"
+                && m.conversation_id.as_deref() == Some("c")
+                && m.seq == Some(3)),
+            "engine persisted the new input with conversation_id + monotonic seq"
+        );
+        let seeded = seen.lock().unwrap().clone();
+        let ids: Vec<&str> = seeded.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["s1", "m2", "u-new"],
+            "turn seeded from compressed view (summary + tail) plus the persisted input"
+        );
     }
 
     #[tokio::test]
@@ -1429,7 +1479,7 @@ mod tests {
             droppable: true,
         });
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let _ = run_agent_turn(request, registry, ctx, provider, tx, RunAgentDeps::default())
+        let _ = run_agent_turn(request, registry, ctx, provider, tx, None)
             .await
             .unwrap();
         let mut saw_micro = false;
@@ -1469,9 +1519,9 @@ mod tests {
                 created_at: Utc::now(),
             });
         }
-        request.seed_messages = seed;
+        request.input = seed;
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
-        let _ = run_agent_turn(request, registry, ContextBundle::new("r1"), provider, tx, RunAgentDeps::default())
+        let _ = run_agent_turn(request, registry, ContextBundle::new("r1"), provider, tx, None)
             .await
             .unwrap();
         let mut saw_drop = false;
@@ -1553,7 +1603,7 @@ mod tests {
                 trigger: "user".into(),
                 channel: ch,
                 max_turns: 1,
-                seed_messages: vec![AgentMessage {
+                input: vec![AgentMessage {
                     message_id: "m1".into(),
                     run_id: Some("live".into()),
                     conversation_id: None,
@@ -1580,7 +1630,7 @@ mod tests {
                 text
             });
             let summary =
-                run_agent_turn(request, registry, ContextBundle::new("live"), provider, tx, RunAgentDeps::default())
+                run_agent_turn(request, registry, ContextBundle::new("live"), provider, tx, None)
                     .await
                     .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
             let streamed = pump.await.unwrap();
@@ -1650,7 +1700,7 @@ mod tests {
                 trigger: "user".into(),
                 channel: ch,
                 max_turns: 4,
-                seed_messages: vec![AgentMessage {
+                input: vec![AgentMessage {
                     message_id: "m1".into(),
                     run_id: Some("skill".into()),
                     conversation_id: None,
@@ -1679,7 +1729,7 @@ mod tests {
                 (text, skills)
             });
             let summary =
-                run_agent_turn(request, registry, ContextBundle::new("skill"), provider, tx, RunAgentDeps::default())
+                run_agent_turn(request, registry, ContextBundle::new("skill"), provider, tx, None)
                     .await
                     .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
             let (text, skills) = pump.await.unwrap();
@@ -1779,23 +1829,21 @@ mod tests {
             }]
         }
 
-        // Persist the user seed for turn 1 ourselves (loop only persists what it produces).
-        let mut seed1 = user_seed(&conversation_id, "run-1", "我关注贵州茅台(600519.SH)，简单说说它。").await;
-        seed1[0].seq = repo.next_seq(&conversation_id).ok();
-        repo.upsert_message(&seed1[0]).unwrap();
+        // New contract: hand the engine only this round's new user input; it persists input +
+        // produced output under conversation_id itself.
+        let input1 = user_seed(&conversation_id, "run-1", "我关注贵州茅台(600519.SH)，简单说说它。").await;
 
         let registry = Arc::new(SkillRegistry::new_without_persist());
         let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
-        let mut req1 = AgentRunRequest {
+        let req1 = AgentRunRequest {
             run_id: "run-1".into(),
             trigger: "user".into(),
             channel: channel.clone(),
             max_turns: 1,
-            seed_messages: seed1,
+            input: input1,
             conversation_id: Some(conversation_id.clone()),
             compaction: None,
         };
-        req1.compaction = None;
         let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
         let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
         let s1 = run_agent_turn(
@@ -1804,7 +1852,7 @@ mod tests {
             ContextBundle::new("run-1"),
             provider,
             tx1,
-            RunAgentDeps::with_repo(repo.clone()),
+            Some(repo.clone()),
         )
         .await
         .expect("turn 1 loop");
@@ -1817,11 +1865,8 @@ mod tests {
         println!("[multiturn-summarize-live] view len after turn1 = {}", view.len());
 
         // (b) Turn 2: force Summarize with a tiny summarize_threshold + a summarizePrompt.
-        let mut seed2 = repo.load_conversation_view(&conversation_id).unwrap();
-        let mut follow = user_seed(&conversation_id, "run-2", "它的护城河主要是什么？").await;
-        follow[0].seq = repo.next_seq(&conversation_id).ok();
-        repo.upsert_message(&follow[0]).unwrap();
-        seed2.append(&mut follow);
+        // Engine loads turn-1 history (persisted above) + persists this round's new input itself.
+        let input2 = user_seed(&conversation_id, "run-2", "它的护城河主要是什么？").await;
 
         let provider2 = Box::new(HttpProvider::new(channel.clone()).unwrap());
         let req2 = AgentRunRequest {
@@ -1829,7 +1874,7 @@ mod tests {
             trigger: "user".into(),
             channel: channel.clone(),
             max_turns: 1,
-            seed_messages: seed2,
+            input: input2,
             conversation_id: Some(conversation_id.clone()),
             compaction: Some(CompactionConfig {
                 soft_limit_tokens: Some(1),
@@ -1859,7 +1904,7 @@ mod tests {
             ContextBundle::new("run-2"),
             provider2,
             tx2,
-            RunAgentDeps::with_repo(repo.clone()),
+            Some(repo.clone()),
         )
         .await
         .expect("turn 2 loop");

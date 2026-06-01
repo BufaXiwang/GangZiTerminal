@@ -545,10 +545,10 @@ Runtime builds AgentRunRequest
 
 ### 多轮会话持久化与续接
 
-- loop 产出的每条 `AgentMessage`（assistant + `<skill_result>` user + `kind=summary` 检查点）落 `agent_messages`，带 `conversationId` + `seq`。这是**全量审计真源，压缩不修改它**。
-- **续接（开新 run 接上历史）**：按 `conversationId` load **压缩视图** —— 最近一个 `kind=summary` 检查点 + 其后的最近若干轮 —— 作为 `seed_messages`，而非全量历史（否则上下文随会话无限增长）。
+- **消息持久化完全归 Infra**：调用方（Runtime）只把这一轮的新消息放进 `request.input`，**绝不自己 upsert / 分配 seq / 打 conversationId**。`run_agent_turn` 在 `conversationId` + `repo` 都有时，自己 ① 先把 `input` 落库（分配 `seq` + 打 `conversationId`）② loop 产出的每条 `AgentMessage`（assistant + `<skill_result>` user + `kind=summary` 检查点）也由 Infra 落库。`agent_messages` 是**全量审计真源，压缩不修改它**。持久化是 Infra 的本职，不是调用方的责任。
+- **续接（开新 run 接上历史）= Infra 自动完成**：只要带 `conversationId` 且 `repo` 存在，Infra 在持久化 `input` 后自动按 `conversationId` load **压缩视图**（最近一个 `kind=summary` 检查点 + 其后的最近若干轮，含刚落库的 `input`）作为本轮上下文，而非全量历史（否则上下文随会话无限增长）。无 `conversationId` 或无 `repo` → 只跑 `input`（新会话 / 无状态）。**调用方无需、也不应手动 load 历史**。
 - `conversationId` 的"会话"业务语义（一次咨询 = 一个会话？跨天延续？）由 Runtime 定义；Infra 只按它分组 + 排序 + load/save。
-- Infra 只暴露**唯一编排入口** `run_agent_turn(request, …, deps)`：带 `conversationId` 且 `seed_messages` 空且 `deps.repo` 存在 → 自动 load 压缩视图 → 跑 loop → 落新消息；Runtime 也可自行 load 后用 `seed_messages` 显式传入。无持久化 / 无状态运行 = 传 `deps.repo = None`。
+- Infra 只暴露**唯一编排入口** `run_agent_turn(request{ conversationId, input, … }, …, repo)`，行为由 `conversationId` + `repo` 决定：`repo=Some` + `conversationId` → persist(input) → load 压缩视图 → 跑 loop → persist(产出)；`conversationId` 新建 / None → 只跑 `input`（新会话）；`repo=None` → 纯无状态（不 persist 不 load）。**不再有 `seed_messages` 这种"内容 + 续接"双控字段，也不需要调用方代劳任何持久化。**
 
 ---
 
@@ -557,11 +557,12 @@ Runtime builds AgentRunRequest
 ### Infra Loop API
 
 ```rust
-// 唯一编排入口。行为完全由 deps + seed 决定，不再有「持久化 vs 无状态」「续接 vs 一次性」的分裂入口：
-//   deps.repo = None                         → 不持久化、不读会话视图（无状态一次性运行）
-//   seedMessages 空 + conversationId + repo  → 自动 load_conversation_view 当 seed（跨 run 续接）
-//   seedMessages 非空                        → 直接用调用方给的 seed
-run_agent_turn(request, registry, context, provider, event_tx, deps) -> RunSummary;
+// 唯一编排入口。调用方只给「这轮新消息 input」+「会话 id」，持久化与续接由 Infra 全包：
+//   repo=Some & conversationId 已存在 → Infra persist(input) → load_conversation_view 续接 → 跑 → persist(产出)
+//   repo=Some & conversationId 新/None → 只跑 input（新会话），产出仍落库（若有 conversationId）
+//   repo=None                          → 纯无状态：不 persist、不 load，只跑 input
+// 调用方永远不自己 upsert / 分配 seq / load 历史 —— 那是 Infra 的职责。
+run_agent_turn(request, registry, context, provider, event_tx, repo) -> RunSummary;
 estimate_context_tokens(messages, context, channel) -> TokenEstimate;
 compact_context(messages, context, policy, ...) -> Compacted; // 纯计算，作用于会话 messages + ContextBundle
 
@@ -571,8 +572,8 @@ type AgentRunRequest = {
   trigger: string;
   channel: ProviderChannel;
   maxTurns: number;
-  seedMessages?: AgentMessage[];      // 续接历史；为空且有 conversationId + repo 时 run_agent_turn 自动 load
-  conversationId?: string;            // 多轮会话标识（Runtime 提供）
+  input: AgentMessage[];              // 这一轮的新消息（通常一条 user）；Infra 负责落库，调用方不自己 upsert
+  conversationId?: string;            // 多轮会话标识（Runtime 提供）；有它 + repo 即自动续接 + 落库
   compaction?: CompactionConfig;      // 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）
 };
 
@@ -592,7 +593,7 @@ type CompactionConfig = {
 - `registry` 是本次 run 的 `SkillRegistry` 实例，含 Runtime 本次允许的 skill 集合。
 - `context` 由 Runtime 构造；Infra 不主动读取 Quotes / News / Account。Skill 清单在 build 时由 `SystemPromptBuilder` prepend 到 `systemParts`，Runtime 不需要手动塞。
 - `event_tx` 接收统一 `AgentEvent`，供 Runtime 和 UI 订阅。
-- `run_agent_turn` 每轮发请求前主动 `estimate_context_tokens` → 按 `compaction` 阈值主动压缩（§4）；`deps.repo` 存在时，loop 产出消息按 `conversationId` 落库，且 seed 为空时自动 load 压缩视图续接。Runtime 也可绕过自动续接、自行 load + 用 `seedMessages`。
+- `run_agent_turn` 持久化与续接全包（§4「多轮会话持久化与续接」）：`repo` + `conversationId` 都有时，先落 `input`、自动 load 压缩视图续接、产出按 `conversationId` 落库；调用方不碰持久化。每轮发请求前主动 `estimate_context_tokens` → 按 `compaction` 阈值主动压缩（§4）。`repo = None` → 纯无状态。
 - `compact_context` 是纯计算 API（作用于会话 messages + ContextBundle，按 `droppable` / `sideEffect` 通用信号），**不**做 retry、**不**调模型；Summarize 的模型调用 + ReactiveRetry 由 `run_agent_turn` orchestrate（见 §4）。
 
 ### Conversation / Messages Repo API

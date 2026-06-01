@@ -39,9 +39,7 @@ use crate::domain::agent::{
     WireFormat,
 };
 use crate::infrastructure::agent::http_provider::HttpProvider;
-use crate::infrastructure::agent::loop_executor::{
-    run_agent_turn, ProviderStream, RunAgentDeps,
-};
+use crate::infrastructure::agent::loop_executor::{run_agent_turn, ProviderStream};
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
 use crate::infrastructure::agent::skill_registry::{
     FnSkillHandler, SkillHandler, SkillHandlerFuture, SkillHandlerOutput, SkillInvocation,
@@ -343,7 +341,7 @@ async fn run_loop_collect(
         trigger: "user".into(),
         channel,
         max_turns,
-        seed_messages: vec![user_message("judge-run", user_text)],
+        input: vec![user_message("judge-run", user_text)],
         conversation_id: None,
         compaction: None,
     };
@@ -360,7 +358,7 @@ async fn run_loop_collect(
         }
         (text, skills)
     });
-    let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), provider, tx, RunAgentDeps::default())
+    let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), provider, tx, None)
         .await
         .expect("loop run");
     let (answer, skills) = pump.await.unwrap();
@@ -506,20 +504,15 @@ async fn judge_multiturn_memory() {
     let registry = Arc::new(SkillRegistry::new_without_persist());
     let conversation_id = "judge-mem-conv".to_string();
 
-    // Turn 1: user states the constraint. Persist the user seed ourselves (loop only persists
-    // what it produces), then run the turn so the assistant reply also persists.
-    let mut seed1 = vec![user_message("mem-1", "我的风险偏好是只买银行股，请记住这一点。")];
-    seed1[0].conversation_id = Some(conversation_id.clone());
-    seed1[0].seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&seed1[0]).unwrap();
-
+    // Turn 1: user states the constraint. New contract: hand only the new user message; the
+    // engine persists it + its produced assistant reply under conversation_id.
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
         run_id: "mem-1".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed1,
+        input: vec![user_message("mem-1", "我的风险偏好是只买银行股，请记住这一点。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -531,28 +524,21 @@ async fn judge_multiturn_memory() {
         ContextBundle::new("mem-1"),
         provider1,
         tx1,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 1");
     pump1.await.unwrap();
 
-    // Turn 2: NEW run, same conversation_id, empty seed → run_agent_turn auto-loads the
-    // compressed view (turn-1 history) as seed. Persist the turn-2 user message first.
-    let mut follow = user_message("mem-2", "根据我之前告诉你的偏好，给我推荐一个值得关注的方向。");
-    follow.conversation_id = Some(conversation_id.clone());
-    follow.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&follow).unwrap();
-
-    // Load the view (incl. the just-persisted turn-2 user message) as explicit seed.
-    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
+    // Turn 2: NEW run, same conversation_id. Hand only the new user message → the engine persists
+    // it and auto-loads the compressed view (turn-1 history) as the turn context.
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req2 = AgentRunRequest {
         run_id: "mem-2".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed2,
+        input: vec![user_message("mem-2", "根据我之前告诉你的偏好，给我推荐一个值得关注的方向。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -572,7 +558,7 @@ async fn judge_multiturn_memory() {
         ContextBundle::new("mem-2"),
         provider2,
         tx2,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 2");
@@ -648,15 +634,10 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
     }
 
     // Trigger a real follow-up turn that forces Summarize via tiny thresholds + summarize_prompt.
+    // New contract: the prior conversation above is the persisted fixture; hand only the new
+    // user message — the engine persists it then loads the full prior history as turn context.
     let summarize_prompt = "你是会话压缩器。请用中文把以下对话压缩成一段要点摘要，必须覆盖以下要点：\
         关注标的、已建立的判断、未决问题、风险纪律、用户偏好。只输出摘要正文，不要添加额外解释。";
-    let mut seed2 = seed.clone();
-    seed2.push(user_message("sum-run2", "请基于以上信息继续。"));
-    // Ensure the trailing message also has the conversation id + a fresh seq so it persists/ orders right.
-    if let Some(last) = seed2.last_mut() {
-        last.conversation_id = Some(conversation_id.clone());
-        last.seq = Some(7);
-    }
 
     let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req = AgentRunRequest {
@@ -664,7 +645,7 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed2,
+        input: vec![user_message("sum-run2", "请基于以上信息继续。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(CompactionConfig {
             soft_limit_tokens: Some(1),
@@ -684,7 +665,7 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
         ContextBundle::new("sum-run2"),
         provider,
         tx,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("summarize run");
@@ -764,11 +745,9 @@ async fn judge_memory_through_compaction() {
 
     // Turn that forces Summarize AND asks about the earlier fact in one shot. keep_recent=1 keeps
     // only the trailing question in the tail window; the account-number turn is summarized.
-    let mut seed = history.clone();
-    let mut q = user_message("cmp-2", "我前面告诉过你的模拟账户代号是多少？请直接回答那个代号。");
-    q.conversation_id = Some(conversation_id.clone());
-    q.seq = Some(4);
-    seed.push(q);
+    // New contract: hand only the new question; the engine persists it then loads the
+    // (now-summarized) prior history fixture as turn context.
+    let q = user_message("cmp-2", "我前面告诉过你的模拟账户代号是多少？请直接回答那个代号。");
 
     let summarize_prompt = "你是会话压缩器。请用中文把以下对话压缩成要点摘要，务必完整保留对话中提到的\
         所有关键事实（包括账户代号、关注标的等具体值）。只输出摘要正文。";
@@ -779,7 +758,7 @@ async fn judge_memory_through_compaction() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed,
+        input: vec![q],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(CompactionConfig {
             soft_limit_tokens: Some(1),
@@ -807,7 +786,7 @@ async fn judge_memory_through_compaction() {
         }
         (text, saw_summarize)
     });
-    let _ = run_agent_turn(req, registry, ContextBundle::new("cmp-2"), provider, tx, RunAgentDeps::default())
+    let _ = run_agent_turn(req, registry, ContextBundle::new("cmp-2"), provider, tx, Some(repo.clone()))
         .await
         .expect("compaction run");
     let (answer, saw_summarize) = pump.await.unwrap();
@@ -875,22 +854,18 @@ async fn judge_durable_fact_preserved() {
     let conversation_id = "judge-durable-conv".to_string();
 
     // Turn 1: ask the model to place an order (it must call place_order, getting the durable
-    // orderId). Persist via run_agent_turn under the conversation.
-    let mut seed1 = vec![user_message(
-        "dur-1",
-        "请用 place_order 帮我以市价买入 100 股 600519.SH，下单后告诉我订单号。",
-    )];
-    seed1[0].conversation_id = Some(conversation_id.clone());
-    seed1[0].seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&seed1[0]).unwrap();
-
+    // orderId). New contract: hand only the new user message — the engine persists it + the
+    // produced turn under the conversation.
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
         run_id: "dur-1".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 4,
-        seed_messages: seed1,
+        input: vec![user_message(
+            "dur-1",
+            "请用 place_order 帮我以市价买入 100 股 600519.SH，下单后告诉我订单号。",
+        )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -910,7 +885,7 @@ async fn judge_durable_fact_preserved() {
         ContextBundle::new("dur-1"),
         provider1,
         tx1,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 1 (place_order)");
@@ -922,14 +897,9 @@ async fn judge_durable_fact_preserved() {
         ch.label
     );
 
-    // Turn 2: NEW run, same conversation, FORCE compaction, ask for the order id. Load the view as
-    // seed, append + persist the follow-up question, and pass tiny thresholds + summarize_prompt.
-    let mut follow = user_message("dur-2", "我刚才下的那笔订单的订单号是多少？请直接回答订单号。");
-    follow.conversation_id = Some(conversation_id.clone());
-    follow.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&follow).unwrap();
-    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
-
+    // Turn 2: NEW run, same conversation, FORCE compaction, ask for the order id. New contract:
+    // hand only the follow-up question — the engine persists it, loads the prior turn (with the
+    // durable place_order result) and applies tiny thresholds + summarize_prompt to compact.
     let summarize_prompt = "你是会话压缩器。请用中文把以下对话压缩成要点摘要。只输出摘要正文。";
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req2 = AgentRunRequest {
@@ -937,7 +907,7 @@ async fn judge_durable_fact_preserved() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 2,
-        seed_messages: seed2,
+        input: vec![user_message("dur-2", "我刚才下的那笔订单的订单号是多少？请直接回答订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(CompactionConfig {
             soft_limit_tokens: Some(1),
@@ -967,7 +937,7 @@ async fn judge_durable_fact_preserved() {
         ContextBundle::new("dur-2"),
         provider2,
         tx2,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 2 (recall after compaction)");
@@ -1053,9 +1023,10 @@ async fn judge_rolling_summary_folds_prior() {
         repo.upsert_message(m).unwrap();
     }
 
+    // New contract: the prior summary + chats above are the persisted fixture (an
+    // already-compressed conversation state). Hand only the new user message — the engine
+    // persists it, loads the compressed view (prior summary + tail + input) and re-summarizes.
     let summarize_prompt = "你是会话压缩器。请产出一份完整的中文累积摘要：若输入里已有'前情摘要'，必须把它的内容与后续新对话合并，不得遗漏旧信息。必须覆盖：账户/标的、已建立判断、未决问题、风险纪律。只输出摘要正文。";
-    let mut seed2 = seed.clone();
-    seed2.push(mk(4, AgentMessageRole::User, Some(MessageKind::Chat), "请基于以上继续。"));
 
     let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req = AgentRunRequest {
@@ -1063,7 +1034,7 @@ async fn judge_rolling_summary_folds_prior() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed2,
+        input: vec![user_message("roll", "请基于以上继续。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(CompactionConfig {
             soft_limit_tokens: Some(1),
@@ -1084,7 +1055,7 @@ async fn judge_rolling_summary_folds_prior() {
         ContextBundle::new("roll"),
         provider,
         tx,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("rolling summarize run");
@@ -1194,9 +1165,10 @@ fn audit_summary_count(repo: &AgentMessagesRepo, conversation_id: &str) -> usize
         .count()
 }
 
-/// Run one turn that forces a Summarize over the given conversation. Persists a fresh user
-/// message (seq auto), loads the compressed view as seed, runs `run_agent_turn` with a tight
-/// compaction + summarize prompt, drains events. Returns whether a Summarize tier fired.
+/// Run one turn that forces a Summarize over the given conversation. New contract: hands the
+/// engine only this round's new user nudge (the engine persists it + loads the compressed view as
+/// the turn context itself), with a tight compaction + summarize prompt; drains events. Returns
+/// whether a Summarize tier fired.
 async fn force_one_summarize_cycle(
     repo: &AgentMessagesRepo,
     channel: &ProviderChannel,
@@ -1206,19 +1178,13 @@ async fn force_one_summarize_cycle(
     summarize_prompt: &str,
     compact_channel: Option<ProviderChannel>,
 ) -> bool {
-    let mut nudge = user_message(run_id, nudge_text);
-    nudge.conversation_id = Some(conversation_id.to_string());
-    nudge.seq = repo.next_seq(conversation_id).ok();
-    repo.upsert_message(&nudge).unwrap();
-    let seed = repo.load_conversation_view(conversation_id).unwrap();
-
     let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
     let req = AgentRunRequest {
         run_id: run_id.into(),
         trigger: "user".into(),
         channel: channel.clone(),
         max_turns: 1,
-        seed_messages: seed,
+        input: vec![user_message(run_id, nudge_text)],
         conversation_id: Some(conversation_id.to_string()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), compact_channel)),
     };
@@ -1240,7 +1206,7 @@ async fn force_one_summarize_cycle(
         ContextBundle::new(run_id),
         provider,
         tx,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("summarize cycle");
@@ -1328,19 +1294,14 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
     );
 
     // Final turn: ask the agent to recall the earliest fact, continuing from the (now heavily
-    // compacted) view.
-    let mut q = user_message("lt-final", "我最开始告诉你的模拟账户代号是多少？请直接回答那个代号。");
-    q.conversation_id = Some(conversation_id.clone());
-    q.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&q).unwrap();
-    let seed_final = repo.load_conversation_view(&conversation_id).unwrap();
+    // compacted) view. New contract: hand only the new question — engine persists + loads view.
     let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req = AgentRunRequest {
         run_id: "lt-final".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed_final,
+        input: vec![user_message("lt-final", "我最开始告诉你的模拟账户代号是多少？请直接回答那个代号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), Some(judge_ch.clone()))),
     };
@@ -1360,7 +1321,7 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
         ContextBundle::new("lt-final"),
         provider,
         tx,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("final recall turn");
@@ -1408,19 +1369,15 @@ async fn judge_accumulated_constraints() {
     ];
     let mut final_answer = String::new();
     for (run_id, text) in turns {
-        let mut um = user_message(run_id, text);
-        um.conversation_id = Some(conversation_id.clone());
-        um.seq = repo.next_seq(&conversation_id).ok();
-        repo.upsert_message(&um).unwrap();
-        let seed = repo.load_conversation_view(&conversation_id).unwrap();
-
+        // New contract: hand only this turn's new user message; the engine persists it and loads
+        // the accumulated history (all prior constraints) as the turn context.
         let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
         let req = AgentRunRequest {
             run_id: run_id.into(),
             trigger: "user".into(),
             channel: ch.channel.clone(),
             max_turns: 1,
-            seed_messages: seed,
+            input: vec![user_message(run_id, text)],
             conversation_id: Some(conversation_id.clone()),
             compaction: None,
         };
@@ -1440,7 +1397,7 @@ async fn judge_accumulated_constraints() {
             ContextBundle::new(run_id),
             provider,
             tx,
-            RunAgentDeps::with_repo(repo.clone()),
+            Some(repo.clone()),
         )
         .await
         .expect("constraint turn");
@@ -1525,21 +1482,17 @@ async fn judge_durable_verbatim_vs_droppable() {
     registry.register_skill(quote_spec, quote_handler).unwrap();
 
     // Turn 1: fetch a quote (droppable) AND place an order (durable). Both skill_results land inline.
-    let mut seed1 = vec![user_message(
-        "dd-1",
-        "先用 get_quote 查 600519.SH 现价，再用 place_order 以市价买入 100 股 600519.SH，最后告诉我订单号。",
-    )];
-    seed1[0].conversation_id = Some(conversation_id.clone());
-    seed1[0].seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&seed1[0]).unwrap();
-
+    // New contract: hand only the new user message; the engine persists it + the produced turn.
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
         run_id: "dd-1".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 5,
-        seed_messages: seed1,
+        input: vec![user_message(
+            "dd-1",
+            "先用 get_quote 查 600519.SH 现价，再用 place_order 以市价买入 100 股 600519.SH，最后告诉我订单号。",
+        )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -1559,7 +1512,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         ContextBundle::new("dd-1"),
         provider1,
         tx1,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 1 (quote + order)");
@@ -1571,13 +1524,7 @@ async fn judge_durable_verbatim_vs_droppable() {
     );
 
     // Turn 2: force compaction (MicroClear stubs the droppable quote; durable order kept inline),
-    // then ask for the order id.
-    let mut follow = user_message("dd-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。");
-    follow.conversation_id = Some(conversation_id.clone());
-    follow.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&follow).unwrap();
-    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
-
+    // then ask for the order id. New contract: hand only the follow-up; engine persists + loads.
     let summarize_prompt = "你是会话压缩器。请用中文把以下对话压缩成要点摘要。只输出摘要正文。";
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req2 = AgentRunRequest {
@@ -1585,7 +1532,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 2,
-        seed_messages: seed2,
+        input: vec![user_message("dd-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, Some(summarize_prompt), None)),
     };
@@ -1605,7 +1552,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         ContextBundle::new("dd-2"),
         provider2,
         tx2,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 2 (recall order after compaction)");
@@ -1689,21 +1636,17 @@ async fn judge_microclear_then_answer_correct() {
     registry.register_skill(news_spec, news_handler).unwrap();
 
     // Turn 1: fetch the news (droppable big payload lands inline).
-    let mut seed1 = vec![user_message(
-        "mc-1",
-        "请用 get_news 拉取 002594.SZ 的最新新闻，并把头条标题告诉我。",
-    )];
-    seed1[0].conversation_id = Some(conversation_id.clone());
-    seed1[0].seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&seed1[0]).unwrap();
-
+    // New contract: hand only the new user message; the engine persists it + the produced turn.
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
         run_id: "mc-1".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 4,
-        seed_messages: seed1,
+        input: vec![user_message(
+            "mc-1",
+            "请用 get_news 拉取 002594.SZ 的最新新闻，并把头条标题告诉我。",
+        )],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -1723,7 +1666,7 @@ async fn judge_microclear_then_answer_correct() {
         ContextBundle::new("mc-1"),
         provider1,
         tx1,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 1 (get_news)");
@@ -1731,13 +1674,8 @@ async fn judge_microclear_then_answer_correct() {
     assert!(t1.iter().any(|(n, e)| n == "get_news" && !e), "[{}] get_news not dispatched", ch.label);
 
     // Turn 2: force MicroClear (keep_recent=1 so the older get_news skill_result is OUTSIDE the
-    // tail window → stubbed), then ask about the headline again.
-    let mut follow = user_message("mc-2", "刚才那条新闻的头条标题是什么？如果需要可以再次拉取。");
-    follow.conversation_id = Some(conversation_id.clone());
-    follow.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&follow).unwrap();
-    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
-
+    // tail window → stubbed), then ask about the headline again. New contract: hand only the
+    // follow-up; engine persists + loads.
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req2 = AgentRunRequest {
         run_id: "mc-2".into(),
@@ -1746,7 +1684,7 @@ async fn judge_microclear_then_answer_correct() {
         max_turns: 4,
         // No summarize_prompt: stay in MicroClear/Drop lane so the droppable skill_result is
         // stubbed (not folded into a summary).
-        seed_messages: seed2,
+        input: vec![user_message("mc-2", "刚才那条新闻的头条标题是什么？如果需要可以再次拉取。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, None, None)),
     };
@@ -1773,7 +1711,7 @@ async fn judge_microclear_then_answer_correct() {
         ContextBundle::new("mc-2"),
         provider2,
         tx2,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 2 (recall after microclear)");
@@ -1909,13 +1847,8 @@ async fn judge_keep_recent_verbatim() {
     }
 
     // keep_recent=2 keeps the last two messages (the 36.78 user turn + assistant ack) verbatim;
-    // older turns get summarized. Then ask for the exact stop-loss price.
-    let mut q = user_message("kr-q", "我给比亚迪设的止损价具体是多少？请逐字给出那个数字。");
-    q.conversation_id = Some(conversation_id.clone());
-    q.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&q).unwrap();
-    let seed_q = repo.load_conversation_view(&conversation_id).unwrap();
-
+    // older turns get summarized. Then ask for the exact stop-loss price. New contract: hand only
+    // the new question — the engine persists it and loads the prior history fixture as context.
     let summarize_prompt = "你是会话压缩器。请用中文把尾窗外的较早对话压缩成要点摘要。只输出摘要正文。";
     let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req = AgentRunRequest {
@@ -1923,7 +1856,7 @@ async fn judge_keep_recent_verbatim() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 1,
-        seed_messages: seed_q,
+        input: vec![user_message("kr-q", "我给比亚迪设的止损价具体是多少？请逐字给出那个数字。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(2, Some(summarize_prompt), Some(judge_ch.clone()))),
     };
@@ -1943,7 +1876,7 @@ async fn judge_keep_recent_verbatim() {
         ContextBundle::new("kr-q"),
         provider,
         tx,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("keep_recent turn");
@@ -2014,18 +1947,15 @@ async fn judge_drop_degrade_preserves_durable() {
     }));
     registry.register_skill(spec, handler).unwrap();
 
-    // Turn 1: some droppable chatter THEN place an order (durable). Persist all under the conv.
+    // Turn 1: some droppable chatter (persisted fixture) THEN place an order (durable). New
+    // contract: the chatter above is the persisted fixture; hand only the new order request —
+    // the engine persists it + the produced turn (incl. the durable place_order result).
     for (seq, text) in [
         (0i64, "随便聊聊：我今天看了下大盘，没什么特别的。"),
     ] {
         repo.upsert_message(&conv_chat(&conversation_id, seq, AgentMessageRole::User, text)).unwrap();
         repo.upsert_message(&conv_chat(&conversation_id, seq + 1, AgentMessageRole::Assistant, "好的，了解。")).unwrap();
     }
-    let mut order_msg = user_message("dg-1", "请用 place_order 帮我以市价买入 200 股 600036.SH，下单后告诉我订单号。");
-    order_msg.conversation_id = Some(conversation_id.clone());
-    order_msg.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&order_msg).unwrap();
-    let seed1 = repo.load_conversation_view(&conversation_id).unwrap();
 
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
@@ -2033,7 +1963,7 @@ async fn judge_drop_degrade_preserves_durable() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 4,
-        seed_messages: seed1,
+        input: vec![user_message("dg-1", "请用 place_order 帮我以市价买入 200 股 600036.SH，下单后告诉我订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: None,
     };
@@ -2053,7 +1983,7 @@ async fn judge_drop_degrade_preserves_durable() {
         ContextBundle::new("dg-1"),
         provider1,
         tx1,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 1 (place_order)");
@@ -2061,20 +1991,15 @@ async fn judge_drop_degrade_preserves_durable() {
     assert!(t1.iter().any(|(n, e)| n == "place_order" && !e), "[{}] place_order not dispatched", ch.label);
 
     // Turn 2: NO summarize_prompt → Summarize tier DEGRADES to Drop-oldest. Force compaction and
-    // ask for the order id. Durable trading_write must survive the Drop.
-    let mut follow = user_message("dg-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。");
-    follow.conversation_id = Some(conversation_id.clone());
-    follow.seq = repo.next_seq(&conversation_id).ok();
-    repo.upsert_message(&follow).unwrap();
-    let seed2 = repo.load_conversation_view(&conversation_id).unwrap();
-
+    // ask for the order id. Durable trading_write must survive the Drop. New contract: hand only
+    // the follow-up; engine persists + loads.
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req2 = AgentRunRequest {
         run_id: "dg-2".into(),
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 2,
-        seed_messages: seed2,
+        input: vec![user_message("dg-2", "我刚才那笔订单的订单号是多少？请直接回答订单号。")],
         conversation_id: Some(conversation_id.clone()),
         compaction: Some(tight_compaction(1, None, None)), // summarize_prompt = None → Drop lane
     };
@@ -2101,7 +2026,7 @@ async fn judge_drop_degrade_preserves_durable() {
         ContextBundle::new("dg-2"),
         provider2,
         tx2,
-        RunAgentDeps::with_repo(repo.clone()),
+        Some(repo.clone()),
     )
     .await
     .expect("turn 2 (recall after drop-degrade)");

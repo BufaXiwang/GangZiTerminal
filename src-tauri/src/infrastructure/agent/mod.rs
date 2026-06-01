@@ -42,7 +42,7 @@ pub use context_compaction::{
     estimate_message_tokens, estimate_messages_tokens, message_is_durable, micro_clear_messages,
     CompactPolicy,
 };
-pub use loop_executor::{run_agent_turn, LoopError, ProviderStream, RunAgentDeps};
+pub use loop_executor::{run_agent_turn, LoopError, ProviderStream};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};
