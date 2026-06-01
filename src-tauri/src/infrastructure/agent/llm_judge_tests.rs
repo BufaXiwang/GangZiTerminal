@@ -1012,6 +1012,118 @@ async fn judge_durable_fact_preserved() {
     assert_verdict("durable_fact_preserved", ch.label, &v);
 }
 
+// 7. rolling_summary — a SECOND summarize must FOLD the prior summary checkpoint
+//    (long-term: multi-cycle compaction must not lose the earliest history).
+#[tokio::test]
+#[ignore]
+async fn judge_rolling_summary_folds_prior() {
+    let Some(judge_ch) = judge_channel() else {
+        println!("[judge_rolling_summary] skip: set JUDGE_*");
+        return;
+    };
+    let Some(ch) = pick_fast_agent_channel() else {
+        println!("[judge_rolling_summary] skip: set an agent channel");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let conversation_id = "judge-rolling-conv".to_string();
+    let mk = |seq: i64, role: AgentMessageRole, kind: Option<MessageKind>, text: &str| AgentMessage {
+        message_id: format!("roll-{seq}"),
+        run_id: Some("roll".into()),
+        conversation_id: Some(conversation_id.clone()),
+        seq: Some(seq),
+        kind,
+        role,
+        blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+        created_at: Utc::now(),
+    };
+
+    // Pre-seed a PRIOR summary checkpoint carrying a distinctive early fact (ACC-9001),
+    // then new turns after it. The next summarize must fold the prior summary in.
+    let prior_summary = "前情摘要：用户账户代码 ACC-9001；关注标的 贵州茅台(600519.SH)；风险纪律 单票仓位≤20%、不做两融。";
+    let seed = vec![
+        mk(0, AgentMessageRole::Assistant, Some(MessageKind::Summary), prior_summary),
+        mk(1, AgentMessageRole::User, Some(MessageKind::Chat), "我新增关注招商银行(600036.SH)，想逢低分批买。"),
+        mk(2, AgentMessageRole::Assistant, Some(MessageKind::Chat), "好的，已记下新增关注招商银行、逢低分批。"),
+        mk(3, AgentMessageRole::User, Some(MessageKind::Chat), "还有个未决问题：招行的买入点位我还没定。"),
+    ];
+    for m in &seed {
+        repo.upsert_message(m).unwrap();
+    }
+
+    let summarize_prompt = "你是会话压缩器。请产出一份完整的中文累积摘要：若输入里已有'前情摘要'，必须把它的内容与后续新对话合并，不得遗漏旧信息。必须覆盖：账户/标的、已建立判断、未决问题、风险纪律。只输出摘要正文。";
+    let mut seed2 = seed.clone();
+    seed2.push(mk(4, AgentMessageRole::User, Some(MessageKind::Chat), "请基于以上继续。"));
+
+    let provider = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
+    let req = AgentRunRequest {
+        run_id: "roll".into(),
+        trigger: "user".into(),
+        channel: ch.channel.clone(),
+        max_turns: 1,
+        seed_messages: seed2,
+        conversation_id: Some(conversation_id.clone()),
+        compaction: Some(CompactionConfig {
+            soft_limit_tokens: Some(1),
+            summarize_threshold_tokens: Some(1),
+            hard_limit_tokens: Some(1_000_000),
+            keep_recent_turns: Some(1),
+            summarize_prompt: Some(summarize_prompt.into()),
+            // Use a capable compaction model (realistic — Runtime configures a decent
+            // compact_channel; a weak summarizer may drop folded facts).
+            compact_channel: Some(judge_ch.clone()),
+        }),
+    };
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+    let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let _ = run_agent_loop_with_deps(
+        req,
+        registry,
+        ContextBundle::new("roll"),
+        provider,
+        tx,
+        RunAgentDeps::with_repo(repo.clone()),
+    )
+    .await
+    .expect("rolling summarize run");
+    pump.await.unwrap();
+
+    // Deterministic: exactly ONE summary remains (rolling replaced the prior) and it still
+    // carries the earliest fact (ACC-9001) — proves the prior summary was folded, not lost.
+    let view = repo.load_conversation_view(&conversation_id).unwrap();
+    let summaries: Vec<&AgentMessage> =
+        view.iter().filter(|m| m.kind == Some(MessageKind::Summary)).collect();
+    assert_eq!(summaries.len(), 1, "rolling summary must keep exactly one checkpoint");
+    let summary_text = summaries[0]
+        .blocks
+        .first()
+        .map(|b| match b {
+            AgentMessageBlock::Text { text } => text.clone(),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    println!("[judge_rolling_summary][{}] rolling summary={:?}", ch.label, summary_text);
+    assert!(
+        summary_text.contains("ACC-9001"),
+        "prior-summary fact ACC-9001 lost — rolling fold failed: {summary_text:?}"
+    );
+
+    let scenario = format!(
+        "A prior summary checkpoint was:\n{prior_summary}\n\nThen new turns added: \
+        新增关注招商银行(600036.SH) 逢低分批；未决问题 = 招行买入点位未定。\n\nThe agent produced a \
+        NEW rolling summary that must MERGE the prior summary AND the new turns."
+    );
+    let rubric = "1) 保留前情摘要的事实：账户代码 ACC-9001、关注贵州茅台(600519.SH)、风险纪律单票≤20%且不做两融；\
+        2) 纳入新事实：新增关注招商银行(600036.SH)、逢低分批；\
+        3) 纳入未决问题：招行买入点位未定；4) 无编造。";
+    let v = judge(&judge_ch, &scenario, &summary_text, rubric)
+        .await
+        .unwrap_or_else(|e| panic!("judge error: {e}"));
+    assert_verdict("rolling_summary", ch.label, &v);
+}
+
 // ---------------------------------------------------------------------------
 // Harness unit tests (hermetic — these are NOT #[ignore]; they validate the JSON
 // extraction / verdict parsing logic with no network).

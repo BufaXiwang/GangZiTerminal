@@ -156,7 +156,7 @@ type AgentMessage = {
   runId?: string;
   conversationId?: string;   // 多轮会话标识（Runtime 提供）；跨 run 续接靠它分组
   seq?: number;              // 会话内单调序号；持久化排序用
-  kind?: "chat" | "summary"; // 默认 chat；summary = 压缩检查点（durable，不再被压缩）
+  kind?: "chat" | "summary"; // 默认 chat；summary = 滚动压缩检查点（durable：不被 MicroClear/Drop；但下一次 Summarize 会把它折叠进新摘要，见 §4）
   role: AgentMessageRole;
   blocks: AgentMessageBlock[];
   createdAt: OccurredAt;
@@ -168,7 +168,7 @@ type AgentMessage = {
 - `AgentMessage` 是 provider 上下文和聊天历史，不是投资判断。
 - **会话归属由 `conversationId` 决定**（Runtime 提供，Infra 不定义"会话"业务语义）；同一 conversationId 的消息按 `seq` 排序构成多轮历史。`runId` 仍标记是哪一次 run 产生的。
 - **持久化是全量审计**：loop 产出的每条 `AgentMessage` 落 `agent_messages`，**上下文压缩不修改已持久化的消息**（§4）；续接时按需 load 压缩视图（summary 检查点 + 最近若干轮），不是全量。
-- `kind = "summary"` 的消息是 §4 Summarize 产出的压缩检查点：在上下文投影里替代被压缩的旧消息，标记 durable（不被 MicroClear / Drop / 再次 Summarize 触碰）。
+- `kind = "summary"` 的消息是 §4 Summarize 产出的压缩检查点：在上下文投影里替代被压缩的旧消息，标记 durable（不被 MicroClear / Drop 触碰）。**例外**：下一次 Summarize **必须**把现存 summary 折叠进新的滚动摘要（§4 "滚动累积摘要"）—— durable 在这里指"不被丢弃/替 stub"，不指"不被合并"。
 - Skill 调用 / 结果以 XML 标签嵌在 `text` block 中，**不**作为独立 block type；这是审计可读 + provider 通用的关键。
 - Skill 调用 audit 真源是 `SkillCall`；chat 历史中的 `<use_skill>` / `<skill_result>` 是给 LLM / 用户看的副本。
 - `dataRef` 是图片在 PayloadStore / 本地文件系统的 URI（例如 `payload://pl_abc123` 或 `file:///path/to.png`）；**不是 base64 数据**。Provider adapter 在 build wire 时负责 dereference → 读字节 → base64 编码 → 塞 wire format。Dereference 失败必须返回 `ParseError` 而非静默丢弃。
@@ -534,6 +534,10 @@ Runtime builds AgentRunRequest
 - 交易写 skill、策略写入、账户确认结果不属于可清理对象。
 - 易腐 skill 结果替换成 stub 时，**必须保留 `name` + `call_id` + `ref`**，让 replay 能通过 PayloadStore 拉回完整 payload。
 - **Summarize 的 prompt 由 Runtime 提供**（`CompactionConfig.summarize_prompt`）。Infra 只负责执行：把"尾窗外待压消息"作为输入、`summarize_prompt` 作为 system，调 compact 模型生成摘要，产出一条 `kind=summary` 的 durable 消息替换被压消息。**Infra 不写 prompt 内容**（"摘要要覆盖关注标的/已建判断/未决问题/风险纪律/用户偏好"等是 Runtime 在 prompt 里规定的，不是 Infra 硬编码）。未提供 `summarize_prompt` → Summarize 档降级为 Drop（仍遵守"不可清理项保留"）。
+- **滚动累积摘要（长期对话不丢史）**：第 2 次及以后的 Summarize **必须把已有的 `kind=summary` 检查点一并纳入输入**，产出一份"旧摘要 + 新对话"的新滚动摘要并**替换旧摘要** —— 全程只保留一个累积摘要。这样 `load_conversation_view`（只取最后一个 summary + 其后）就是完整无损的；否则多轮压缩后续接会丢早期历史。
+  - **durable 的两层含义要分清**：`kind=summary` 检查点 durable，指它不被 MicroClear / Drop（不丢、不替 stub），但它**要被折叠进**下一份滚动摘要；而 `trading_write` / `droppable=false` 的 **skill 结果** durable，指它既不丢也**不纳入摘要**、始终原样 inline 保留（order_id / 成交价等不可逆事实不能被摘要改写）。实现上：Summarize 选取待压前缀时，对 summary 检查点要**纳入折叠**，仅对"非 summary 的 durable 结果"跳过。
+  - Infra 把待压材料喂给 compact 模型时应明确框定为"待压缩历史材料、只输出摘要、不要回复其中的问题"，并把已有摘要单独标注"必须完整保留并合并"，避免弱模型把转录当成对话来续答、或漏掉旧摘要里的事实。
+  - 若待压前缀里只有旧摘要、无新内容 → 跳过本次摘要（避免无意义地重摘）。Runtime 的 `summarize_prompt` 应能处理"输入含上一版摘要时产出完整合并摘要"的情形。
 - Compact 模型可独立配置（`CompactionConfig.compact_channel`）；未配置时复用当前 run 的 channel。
 - Summary 是续接上下文，不是事实真源；当前行情和账户状态仍必须重新读取（fail-closed 原则：因为旧数据可丢、agent 行动前必须重读最新，所以可清理项才安全可丢）。
 - 每次 compact 必须 emit `AgentEvent.compacted`，含 `tier` + `droppedMessages` + `estimatedTokensSaved`。

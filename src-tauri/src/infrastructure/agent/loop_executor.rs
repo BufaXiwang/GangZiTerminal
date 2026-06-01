@@ -702,25 +702,43 @@ async fn run_summarize(
     run_id: &str,
 ) -> Result<Option<(AgentMessage, u32)>, LoopError> {
     let cutoff = messages.len().saturating_sub(keep_recent);
-    // Collect indices of non-durable messages in the tail-window-excluded prefix.
+    // Collect indices to summarize (tail-window-excluded prefix).
+    // ROLLING SUMMARY: a prior `kind=Summary` checkpoint IS folded into the input and
+    // replaced by the new (cumulative) summary — so multi-cycle compaction never loses the
+    // earliest history (load_conversation_view returns only the latest summary). Only
+    // trading_write / durable results are kept inline verbatim (never summarized — audit /
+    // double-trade safety). Skip if there is no NEW (non-summary) content to fold, to avoid
+    // pointlessly re-summarizing a lone prior summary.
     let mut to_summarize_idx: Vec<usize> = Vec::new();
+    let mut has_new_content = false;
     for (i, m) in messages.iter().enumerate() {
         if i >= cutoff {
             break;
         }
-        if m.kind == Some(MessageKind::Summary) || durable_message_ids.contains(&m.message_id) {
+        let is_summary = m.kind == Some(MessageKind::Summary);
+        // Prior summaries are ALWAYS folded (even though they're durable for MicroClear/Drop),
+        // so multi-cycle compaction accumulates rather than loses history. Other durables
+        // (trading_write etc.) are kept inline verbatim — never summarized.
+        if !is_summary && durable_message_ids.contains(&m.message_id) {
             continue;
+        }
+        if !is_summary {
+            has_new_content = true;
         }
         to_summarize_idx.push(i);
     }
-    if to_summarize_idx.is_empty() {
+    if to_summarize_idx.is_empty() || !has_new_content {
         return Ok(None);
     }
 
-    // Serialize the messages-to-summarize into a single user text block.
-    let mut body = String::new();
+    // Serialize the messages-to-summarize. ROLLING: prior summary checkpoints are
+    // demarcated under an explicit "existing summary (must be preserved + merged)"
+    // header so the compact model reliably folds them in rather than dropping them.
+    let mut prior_summaries = String::new();
+    let mut new_convo = String::new();
     for &i in &to_summarize_idx {
         let m = &messages[i];
+        let is_summary = m.kind == Some(MessageKind::Summary);
         let role = match m.role {
             AgentMessageRole::Assistant => "assistant",
             AgentMessageRole::User => "user",
@@ -728,13 +746,32 @@ async fn run_summarize(
         };
         for b in &m.blocks {
             if let AgentMessageBlock::Text { text } = b {
-                body.push_str(role);
-                body.push_str(": ");
-                body.push_str(text);
-                body.push('\n');
+                let target = if is_summary { &mut prior_summaries } else { &mut new_convo };
+                if !is_summary {
+                    target.push_str(role);
+                    target.push_str(": ");
+                }
+                target.push_str(text);
+                target.push('\n');
             }
         }
     }
+    // Wrap in a clear "this is material to summarize — do NOT reply to it" envelope.
+    // Without this, a transcript ending in a user turn tempts the model to ANSWER the
+    // conversation instead of summarizing it. Prior summaries are demarcated so the model
+    // folds (not drops) them into the new rolling summary.
+    let material = if prior_summaries.trim().is_empty() {
+        format!("【对话记录】\n{new_convo}")
+    } else {
+        format!(
+            "【已有摘要——其中的事实必须完整保留并合并进新摘要，不得遗漏】\n{}\n\n【后续新增对话记录】\n{}",
+            prior_summaries.trim_end(),
+            new_convo
+        )
+    };
+    let body = format!(
+        "以下是需要你压缩成摘要的历史材料。请只输出摘要正文，**不要回复或回答材料中的任何问题**。\n\n{material}"
+    );
 
     // One-shot collected call: build a transient HttpProvider over the compact channel.
     let mut provider = HttpProvider::new(compact_channel)?;
