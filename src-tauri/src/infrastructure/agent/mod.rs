@@ -27,6 +27,7 @@ pub mod presets;
 pub mod providers;
 pub mod skill_store;
 pub mod skill_tools;
+pub mod subagent;
 pub mod tool_parser;
 pub mod tool_registry;
 pub mod system_prompt;
@@ -62,6 +63,11 @@ pub use context_compaction::{
 pub use local_tools::register_local_tools;
 pub use skill_store::{parse_frontmatter, render_skill_md, SkillIndexEntry, SkillStore};
 pub use skill_tools::register_skill_tools;
+pub use subagent::{
+    http_provider_factory, register_subagent_tools, run_forked_agent, stop_subagent,
+    subagent_output, ForkHandle, ProviderFactory, SubAgentProgress, SubAgentStatus,
+    SubAgentTaskRegistry, MAX_FORK_DEPTH,
+};
 pub use loop_executor::{run_agent_turn, LoopError, ProviderStream};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
@@ -85,7 +91,8 @@ use std::sync::Arc;
 /// Phase 3 / adapter 应注入 `<appData>/gangzi/workspace` 作为绝对路径；此处给占位默认。
 ///
 /// `skills_dir` 是 Skill（playbook）存盘根（Spec: agent-runtime-module.md §Skills），独立于 workspace：
-/// `<appData>/gangzi/skills/<name>/SKILL.md`。bootstrap 时默认注册 create_skill / load_skill 两个编排 tool。
+/// `<appData>/gangzi/skills/<name>/SKILL.md`。bootstrap 时默认注册 create_skill（编排 tool）+
+/// run_skill / run_subagent（fork 子 agent，spec §3.5 / §3.6）。
 /// skills 初始为空（没有 SKILL.md → 索引为空）。
 pub fn bootstrap(
     db: crate::infrastructure::db::AppDb,
@@ -100,17 +107,54 @@ pub fn bootstrap(
     if let Err(e) = register_local_tools(&registry, workspace_dir) {
         tracing::warn!("register_local_tools failed: {e}");
     }
-    // 默认注册 skill 编排 tool（create_skill / load_skill）。
+    // 默认注册 skill 编排 tool（create_skill）。
     if let Err(e) = register_skill_tools(&registry, skills_dir.clone()) {
         tracing::warn!("register_skill_tools failed: {e}");
     }
     let skill_store = SkillStore::new(skills_dir);
+    // 默认注册 fork 子 agent tool（run_subagent / run_skill）（spec §3.5 / §3.6）。
+    //
+    // ForkHandle 的 channel 是占位默认——run_forked_agent 在真正起子 run 时，**应**由触发入口
+    // （Tauri command / scheduler / Runtime）按当前 run 的实际 channel + parent_run_id 重新装配
+    // ForkHandle（见 `ForkHandle::for_parent_run` / `with_max_turns` 等 builder）。bootstrap 这里
+    // 只先把 tool 名注册进 registry（system prompt 需要它们出现在 tool 清单里），子 run 的 provider
+    // 工厂用 http_provider_factory（生产）。channel 缺省取 channels_repo 暂不在此读，交由 adapter 接线时
+    // 用真 channel 重注册 / 覆盖 ForkHandle。
+    let tasks = SubAgentTaskRegistry::new();
+    let fork_channel = crate::domain::agent::ProviderChannel {
+        channel_id: String::new(),
+        provider: String::new(),
+        wire_format: crate::domain::agent::WireFormat::Messages,
+        base_url: None,
+        api_key: String::new(),
+        model: String::new(),
+        stream: true,
+        enabled: true,
+        supports_vision: false,
+        supports_thinking: false,
+        max_output_tokens: None,
+        context_window_tokens: None,
+        thinking_budget_tokens: None,
+    };
+    let fork_handle = ForkHandle::new(
+        registry.clone(),
+        http_provider_factory(),
+        Some(repo.clone()),
+        Some(payload_store.clone()),
+        fork_channel,
+        skill_store.clone(),
+        tasks.clone(),
+    );
+    if let Err(e) = register_subagent_tools(&registry, fork_handle) {
+        tracing::warn!("register_subagent_tools failed: {e}");
+    }
     AgentInfra {
         repo,
         registry,
         payload_store,
         channels_repo,
         skill_store,
+        subagent_tasks: tasks,
     }
 }
 
@@ -138,4 +182,7 @@ pub struct AgentInfra {
     /// Skill（playbook）存盘访问。Runtime 构建 system prompt 时用 `skill_store.list_index()`
     /// 注入 skill 索引（渐进披露，Spec: agent-runtime-module.md §Skills）。
     pub skill_store: SkillStore,
+    /// 子 agent 任务注册表（spec §3.5）。Runtime / adapter 据此实现 stop_subagent / subagent_output
+    /// 的对外命令。
+    pub subagent_tasks: SubAgentTaskRegistry,
 }

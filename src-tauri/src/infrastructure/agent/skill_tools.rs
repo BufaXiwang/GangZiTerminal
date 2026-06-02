@@ -1,13 +1,15 @@
-//! Skill creator tool —— create_skill / load_skill。
+//! Skill creator tool —— create_skill。
 //!
-//! Spec: docs/design/agent-runtime-module.md §Skills（playbook，渐进披露）+ §4.2 本地通用 tool 契约
+//! Spec: docs/design/agent-infra-module.md §3.6 Skill 子系统 + agent-runtime-module.md §Skills / §4.2
 //!
 //! 两层模型：Tool = 原语（注册 handler，经 `<use_tool>` 调用），Skill = playbook（`SKILL.md`，不是 handler）。
-//! 这两个 tool 是 skill 的**编排工具**：
-//! - `create_skill`：模型把一段 playbook 写成 `<skills_dir>/<name>/SKILL.md`（frontmatter + body）。
-//! - `load_skill`：模型按 system prompt 里的索引（name + description）按需取某 skill 的完整正文进上下文。
+//! `create_skill` 是 skill 的**编排工具**：模型把一段 playbook 写成 `<skills_dir>/<name>/SKILL.md`
+//! （frontmatter + body）。
 //!
-//! 渐进披露：system prompt 只放索引（见 system_prompt.rs），正文不进 prompt，由 load_skill 拉取。
+//! 渐进披露（spec §3.6 三级）：① system prompt 只放索引（name + description，见 system_prompt.rs）；
+//! ② 要按某 skill 行事调 `run_skill`（fork 子 agent，以 SKILL.md 全文为 prompt，正文不进父上下文，
+//! 见 subagent.rs）；③ 子 agent 按 SKILL.md 用 read_file/run_bash 读 references / 跑 scripts。
+//! 旧的 `load_skill`（把正文 inline 进父上下文）已被 `run_skill`（fork）取代——见 subagent.rs。
 //!
 //! 路径安全：`name` 必须是 slug（`^[a-z0-9][a-z0-9-]*$`），防路径穿越（`../`、`/`、绝对路径）。
 //! 校验后再次确认目标落在 skills_dir 内（纵深防御）。
@@ -24,7 +26,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const CREATE_TIMEOUT_MS: u64 = 15_000;
-const LOAD_TIMEOUT_MS: u64 = 15_000;
 
 // ───────────────────────── slug 校验 ─────────────────────────
 
@@ -51,12 +52,6 @@ struct CreateSkillInput {
     name: String,
     description: String,
     body: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LoadSkillInput {
-    name: String,
 }
 
 fn parse_input<T: for<'de> Deserialize<'de>>(inv: &ToolInvocation) -> Result<T, ToolHandlerOutput> {
@@ -129,28 +124,6 @@ async fn handle_create_skill(store: SkillStore, inv: ToolInvocation) -> ToolHand
     }))
 }
 
-async fn handle_load_skill(store: SkillStore, inv: ToolInvocation) -> ToolHandlerOutput {
-    let input: LoadSkillInput = match parse_input(&inv) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-
-    if !is_valid_skill_name(&input.name) {
-        return err_out(
-            ErrorCode::InvalidInput,
-            "skill name must match ^[a-z0-9][a-z0-9-]*$",
-        );
-    }
-
-    match store.read_body(&input.name) {
-        Ok(content) => ToolHandlerOutput::ok(serde_json::json!({
-            "name": input.name,
-            "content": content,
-        })),
-        Err(code) => err_out(code, format!("skill not found: {}", input.name)),
-    }
-}
-
 // ───────────────────────── 注册 ─────────────────────────
 
 fn handler_for<F, Fut>(
@@ -168,10 +141,11 @@ where
     }))
 }
 
-/// 把 create_skill / load_skill 注册进 registry。
+/// 把 create_skill 注册进 registry。
 ///
-/// Spec: agent-runtime-module.md §Skills + §4.2。`skills_dir` 由 adapter / bootstrap 注入绝对路径。
-/// 注册时确保 skills 目录存在（create_skill 写盘需要其父链）。
+/// Spec: agent-infra-module.md §3.6 + agent-runtime-module.md §Skills / §4.2。`skills_dir` 由
+/// adapter / bootstrap 注入绝对路径。注册时确保 skills 目录存在（create_skill 写盘需要其父链）。
+/// `run_skill`（fork 子 agent 执行 skill）由 subagent.rs 注册，不在此处。
 pub fn register_skill_tools(
     registry: &ToolRegistry,
     skills_dir: PathBuf,
@@ -181,11 +155,7 @@ pub fn register_skill_tools(
 
     registry.register_tool(
         tool_spec_create_skill(),
-        handler_for(store.clone(), |s, inv| handle_create_skill(s, inv)),
-    )?;
-    registry.register_tool(
-        tool_spec_load_skill(),
-        handler_for(store, |s, inv| handle_load_skill(s, inv)),
+        handler_for(store, |s, inv| handle_create_skill(s, inv)),
     )?;
     Ok(())
 }
@@ -206,23 +176,6 @@ fn tool_spec_create_skill() -> ToolSpec {
         vec![r##"<use_tool name="create_skill">{"name":"momentum-scan","description":"扫动量候选并形成判断","body":"# 动量扫描\n1. fetch_quotes scan ..."}</use_tool>"##.into()],
         CREATE_TIMEOUT_MS,
         SideEffect::NonTradingWrite,
-    )
-}
-
-fn tool_spec_load_skill() -> ToolSpec {
-    ToolSpec::new(
-        "load_skill",
-        "按 name 取某 skill 的完整 SKILL.md 正文（含 frontmatter）进上下文。system prompt 只给 skill 索引（name+description）；要按某 skill 行事先 load 它。不存在 → not_found。",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "skill slug（见 system prompt 的可用 Skill 索引）" }
-            },
-            "required": ["name"]
-        }),
-        vec![r#"<use_tool name="load_skill">{"name":"momentum-scan"}</use_tool>"#.into()],
-        LOAD_TIMEOUT_MS,
-        SideEffect::None,
     )
 }
 
@@ -267,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_then_index_then_load_roundtrip() {
+    async fn create_then_index_then_read_body_roundtrip() {
         let dir = temp_skills_dir("roundtrip");
         let out = handle_create_skill(
             SkillStore::new(dir.clone()),
@@ -288,15 +241,8 @@ mod tests {
         assert_eq!(idx[0].name, "alpha");
         assert_eq!(idx[0].description, "do alpha things");
 
-        // load returns full body
-        let out = handle_load_skill(
-            SkillStore::new(dir.clone()),
-            inv(serde_json::json!({ "name": "alpha" })),
-        )
-        .await;
-        assert!(!out.is_error);
-        assert_eq!(out.output_summary["name"], "alpha");
-        let content = out.output_summary["content"].as_str().unwrap();
+        // SkillStore.read_body returns full body (run_skill forks a sub-agent over this body).
+        let content = store.read_body("alpha").unwrap();
         assert!(content.contains("# Alpha"));
         assert!(content.contains("description:"));
 
@@ -353,25 +299,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_missing_is_not_found() {
+    async fn read_body_missing_is_not_found() {
         let dir = temp_skills_dir("load-missing");
-        let out = handle_load_skill(
-            SkillStore::new(dir.clone()),
-            inv(serde_json::json!({ "name": "ghost" })),
-        )
-        .await;
-        assert!(out.is_error);
-        assert_eq!(out.error_code, Some(ErrorCode::NotFound));
+        let store = SkillStore::new(dir.clone());
+        assert_eq!(store.read_body("ghost"), Err(ErrorCode::NotFound));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn register_skill_tools_registers_two() {
+    async fn register_skill_tools_registers_create_skill() {
         let dir = temp_skills_dir("register");
         let registry = ToolRegistry::new_without_persist();
         register_skill_tools(&registry, dir.clone()).unwrap();
         assert!(registry.has_tool("create_skill"));
-        assert!(registry.has_tool("load_skill"));
+        // load_skill is gone; run_skill is registered separately by subagent.rs.
+        assert!(!registry.has_tool("load_skill"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

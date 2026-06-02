@@ -10,7 +10,7 @@
 //!
 //! Skill 索引（渐进披露，Spec: agent-runtime-module.md §Skills）：
 //! - tool 清单之后追加「## 可用 Skill（playbook）」索引段——每条 `- <name>: <description>`。
-//! - 只放索引（name + description），**不放正文**；要用某 skill 时调 `load_skill` 取完整说明。
+//! - 只放索引（name + description），**不放正文**；要按某 skill 行事调 `run_skill`（fork 子 agent 执行）。
 //! - 索引按 name 字典序（prompt cache 稳定）；为空时省略该段。
 
 use crate::domain::agent::ToolSpec;
@@ -74,7 +74,7 @@ fn render_skill_index(skills: &[SkillIndexEntry]) -> Option<String> {
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let mut s = String::new();
     s.push_str("## 可用 Skill（playbook）\n");
-    s.push_str("以下是可用的 skill（playbook）索引。要按某个 skill 行事，先调用 `load_skill` 取其完整说明。\n");
+    s.push_str("以下是可用的 skill（playbook）索引。要按某个 skill 行事，调用 `run_skill` fork 一个子 agent 执行它。\n");
     for e in sorted {
         s.push_str("- ");
         s.push_str(&e.name);
@@ -178,14 +178,14 @@ mod tests {
 
     #[test]
     fn skill_index_present_when_skills_exist() {
-        let tools = vec![sp("load_skill", "load a skill")];
+        let tools = vec![sp("run_skill", "run a skill")];
         let skills = vec![
             skill("zebra", "z playbook"),
             skill("alpha", "a playbook"),
         ];
         let s = build_system_prompt_with_skills(&tools, &skills, "");
         assert!(s.contains("## 可用 Skill（playbook）"));
-        assert!(s.contains("load_skill")); // protocol hint mentions load_skill
+        assert!(s.contains("run_skill")); // protocol hint mentions run_skill (fork)
         assert!(s.contains("- alpha: a playbook"));
         assert!(s.contains("- zebra: z playbook"));
         // sorted: alpha before zebra
@@ -193,7 +193,7 @@ mod tests {
         let pz = s.find("- zebra").unwrap();
         assert!(pa < pz);
         // skill section appears after tool sections
-        let pt = s.find("## load_skill").unwrap();
+        let pt = s.find("## run_skill").unwrap();
         let psk = s.find("## 可用 Skill").unwrap();
         assert!(pt < psk);
     }

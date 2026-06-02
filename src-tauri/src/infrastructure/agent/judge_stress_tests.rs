@@ -769,17 +769,17 @@ async fn judge_stress_multiturn_tool_chain() {
 }
 
 // ===========================================================================
-// S2. Skill orchestration of MULTI-tool. DeepSeek + a strong provider.
+// S2. Skill via fork (run_skill). DeepSeek + a strong provider.
 //
-//   T1: create_skill 'chain-task' whose body NAMES an ordered tool plan A→B→C
-//       (kv_put 'seed'=21  →  add seed+21  →  kv_put 'doubled'=result).
-//   T2 (NEW turn): "执行 chain-task" → model should load_skill to read the body, then run the
-//       named tools in order, ending with the doubled value (42) stored + reported.
+//   T1: create_skill 'product-via-shell' whose body (plain prose) tells how to multiply A*B via
+//       run_bash (echo $((A*B))).
+//   T2 (NEW turn): "执行 product-via-shell" → model calls run_skill, which FORKS an isolated
+//       sub-agent over the SKILL.md body; the sub-agent runs run_bash and returns the result; the
+//       parent only sees the returned text (isolation = fork's core value).
 //
-// Hard asserts: create_skill ok, load_skill ok, each named tool (kv_put/add) dispatched ok;
-//   0 parse_error; 0 wrong-tool selections (registered set incl. the skill + chain tools);
-//   server-side KV 'doubled' == 42.
-// Judge: did it actually follow the skill's ordered plan and produce 42.
+// Hard asserts: create_skill ok, run_skill ok; 0 parse_error; 0 wrong-tool selections (registered
+//   set incl. the skill + fork tools). The sub-agent's run_bash is NOT in the parent's tool record.
+// Judge: did the parent relay the forked sub-agent's correct result (1517).
 // ===========================================================================
 #[tokio::test]
 #[ignore]
@@ -804,6 +804,20 @@ async fn judge_stress_skill_orchestrates_multitool() {
         let registry = Arc::new(ToolRegistry::new_without_persist());
         register_local_tools(&registry, ws.clone()).unwrap();
         register_skill_tools(&registry, skills_dir.clone()).unwrap();
+        // run_skill (fork) over the same registry + channel: the forked sub-agent inherits run_bash
+        // and executes the skill body in isolation (spec §3.5/§3.6).
+        let tasks = crate::infrastructure::agent::subagent::SubAgentTaskRegistry::new();
+        let fork = crate::infrastructure::agent::subagent::ForkHandle::new(
+            registry.clone(),
+            crate::infrastructure::agent::subagent::http_provider_factory(),
+            None,
+            None,
+            ch.channel.clone(),
+            crate::infrastructure::agent::skill_store::SkillStore::new(skills_dir.clone()),
+            tasks,
+        )
+        .with_max_turns(8);
+        crate::infrastructure::agent::subagent::register_subagent_tools(&registry, fork).unwrap();
         let repo = fresh_repo();
         let conv = format!("stress-skill-orch-{}", ch.label);
 
@@ -813,7 +827,8 @@ async fn judge_stress_skill_orchestrates_multitool() {
             "edit_file",
             "run_bash",
             "create_skill",
-            "load_skill",
+            "run_skill",
+            "run_subagent",
         ];
 
         // T1: 创建一个**自包含** skill——正文是自然语言说明（无任何 XML 标签、不点名 infra tool），
@@ -829,10 +844,11 @@ async fn judge_stress_skill_orchestrates_multitool() {
             ch.label, t1.tools, t1.answer
         );
 
-        // T2: 新一轮——load_skill 取回正文，按正文用 run_bash 执行（不心算）。
-        let exec_q = "现在请用 product-via-shell 这个 skill 计算 37 乘以 41。\
-            先用 load_skill 取回它的正文，然后严格照正文里写的方法、用 run_bash 执行，\
-            最后用一句话告诉我结果是多少。";
+        // T2: 新一轮——run_skill fork 子 agent 执行该 skill（子 agent 在隔离上下文里用 run_bash），
+        // 父只拿子返回的结果。
+        let exec_q = "现在请用 run_skill 执行 product-via-shell 这个 skill 来计算 37 乘以 41\
+            （在 args 里把要算的 A=37、B=41 传给子 agent）。\
+            子 agent 会照 skill 正文用 run_bash 算出来并把结果带回，最后用一句话告诉我结果是多少。";
         let t2 = run_turn(&repo, registry.clone(), &ch.channel, &conv, "s2", exec_q, 8).await;
         println!(
             "[judge_stress_skill_orchestrates_multitool][{}][s2] tools={:?} answer={:?}",
@@ -861,25 +877,21 @@ async fn judge_stress_skill_orchestrates_multitool() {
             ch.label, all_turn_tools
         );
         assert!(
-            any_dispatched_ok(&all_turn_tools, "load_skill"),
-            "[{}] load_skill not dispatched ok ({:?})",
+            any_dispatched_ok(&all_turn_tools, "run_skill"),
+            "[{}] run_skill not dispatched ok ({:?})",
             ch.label, all_turn_tools
         );
-        // skill 的预期执行手段是 run_bash。强模型会真去调；弱模型（如 haiku）有时读完 skill 正文后
-        // 直接给答案而不实际 dispatch run_bash（属模型「工具纪律」问题——已由 S1/S3/S4 专门压测，
-        // 不是 skill 机制问题）。故此处**只记录不硬断言**；skill 机制（create/load/渐进披露）由
-        // create_skill/load_skill dispatched + parse_errors==0 + 答案正确性（judge）保证。
-        let used_bash = any_dispatched_ok(&all_turn_tools, "run_bash");
-        println!(
-            "[judge_stress_skill_orchestrates_multitool][{}] executed_via_run_bash={}",
-            ch.label, used_bash
-        );
+        // skill 的预期执行手段是 run_bash——但在 fork 语义下 run_bash 在**子 agent**里跑，父这一轮的
+        // tool 记录里看不到（隔离 = fork 核心价值）。父只 dispatch run_skill，子的 run_bash 不回灌父
+        // 历史。故此处不再检查父侧 run_bash；skill 机制（create/run_skill/fork 渐进披露）由
+        // create_skill + run_skill dispatched ok + parse_errors==0 + 答案正确性（judge）保证。
 
         let scenario = "The agent first created a SELF-CONTAINED skill `product-via-shell` whose body \
             (plain prose, no tool tags, no infra-tool orchestration) instructs: to multiply A by B, run \
-            `echo $((A*B))` via run_bash and report the printed number. Then in a NEW turn it loaded the \
-            skill and used run_bash to compute 37*41. The correct result is 1517. The final answer is below.";
-        // 注：judge 只能看最终回答文本，看不到 tool 调用记录；"是否真的 load_skill + run_bash"
+            `echo $((A*B))` via run_bash and report the printed number. Then in a NEW turn it invoked \
+            run_skill, which forked an isolated sub-agent that ran the skill (using run_bash) to compute \
+            37*41 and returned the result to the parent. The correct result is 1517. The final answer is below.";
+        // 注：judge 只能看最终回答文本，看不到 tool 调用记录；"是否真的 run_skill + 子 agent run_bash"
         // 已由上面的硬断言（dispatched_ok + parse_errors==0）证明，rubric 只判答案对不对。
         let rubric = "1) 最终回答里的结果是 1517（这正是 run_bash 跑 echo $((37*41)) 的输出）；\
             2) 没有报一个不同 / 编造的数字。";

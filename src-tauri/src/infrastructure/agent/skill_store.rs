@@ -3,7 +3,7 @@
 //! Spec: docs/design/agent-runtime-module.md §Skills（playbook，渐进披露）
 //!
 //! 两层模型：Tool = 原语（注册 handler），Skill = playbook（`SKILL.md`，不是 handler）。
-//! 渐进披露：system prompt 只放 skill 索引（name + description），正文由模型按需 `load_skill` 取。
+//! 渐进披露：system prompt 只放 skill 索引（name + description），正文由 `run_skill` fork 的子 agent 读取。
 //!
 //! 存盘约定：`<skills_dir>/<name>/SKILL.md`，YAML frontmatter（`name` + `description`）+ markdown 正文。
 //! frontmatter 用手写轻量解析（只需两个 string 字段；项目无 serde_yaml 依赖，不为此新增）。

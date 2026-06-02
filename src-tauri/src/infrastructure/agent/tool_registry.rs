@@ -200,6 +200,18 @@ impl ToolRegistry {
             .map(|e| e.spec.side_effect)
     }
 
+    /// 取出某 tool 的 handler `Arc` 克隆（用于构造收紧的子 registry：fork 子 agent 的
+    /// `allowed_tools` 子集复用父 handler）。未注册返回 None。
+    ///
+    /// Spec: agent-infra-module.md §3.5（fork 工具集默认继承父，可收紧到子集）。
+    pub fn clone_handler(&self, name: &str) -> Option<Arc<dyn ToolHandler>> {
+        self.tools
+            .read()
+            .expect("RwLock poisoned")
+            .get(name)
+            .map(|e| e.handler.clone())
+    }
+
     /// 列出所有 ToolSpec — 喂 SystemPromptBuilder 用。
     pub fn list_tools(&self) -> Vec<ToolSpec> {
         self.tools

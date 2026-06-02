@@ -542,6 +542,15 @@ type SubAgentTask = {
 - **`worktree` / `remote` 隔离**：CC 给编码场景（独立 git 工作树 / 远端 CCR）；本项目（A 股研究，不在工作树改代码）不需要。
 - **`SendMessage` / teams / swarms**：多 agent 互发消息协作；本项目 fan-out + 汇总即可，过重，不做。
 
+### 实现注记（2026-06-02 已落地：`infrastructure/agent/subagent.rs`）
+
+机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入：`ForkHandle`（持 ProviderFactory + registry + repo + SkillStore + 父 channel/depth/event_tx），tool handler 捕获其 `Arc` clone，`child_handle()` 产下一深度句柄。以下几点**当前为务实折中 / 待补**：
+
+- **`parentRunId` 关联**：暂编码在子 `conversation_id`（`fork:<parentRunId>:<uuid>`）+ 内存 `SubAgentTask`，**未加 DB 列**（加列 = migration + domain 改动）。要按父 replay 审计再加列。
+- **`<task-notification>`**：暂以 `AgentEvent::TextDelta` 文本信封发（不新增 event 变体，保协议不变）；后续可加专用变体。
+- **独立 token 预算**：暂未做（`run_agent_turn` 无预算入参）；子继承父 compaction/window。要硬配额需给 loop API 加 knob。
+- **生产接线**：`bootstrap` 的 `ForkHandle` channel 是占位；真正的 per-run channel / parentRunId / 父 event_tx 由**触发入口**（Tauri command / scheduler / Runtime）在发起 run 时组装 `ForkHandle` 注入——属 Phase 3。即：**fork 机制已就绪 + 单测通过；生产联动随 Phase 3 的 run 触发接入。**
+
 ---
 
 ## 3.6 Infra 默认 Tools + Skill 子系统（业务无关，Infra 注册）

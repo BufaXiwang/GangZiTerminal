@@ -930,40 +930,53 @@ async fn judge_local_bash_danger_rejected() {
 // C. Skill subsystem end-to-end (register_skill_tools into a temp skills dir).
 // ===========================================================================
 
-/// C1. judge_skill_create_then_load — model creates a skill playbook via create_skill, then later
-/// retrieves it via load_skill and confirms a distinctive marker in the body. Strong assertions:
-/// both tools dispatched ok; the SKILL.md exists on disk and contains the marker; load returned it.
-/// Judge verifies the create+load behavior + body fidelity.
+/// C1. judge_skill_create_then_run — model creates a skill playbook via create_skill, then runs it
+/// via run_skill (which forks a sub-agent over the SKILL.md body). Strong assertions: both tools
+/// dispatched ok; the SKILL.md exists on disk and contains the marker. Judge verifies the
+/// create+run behavior + that the forked sub-agent's result reflects the skill body.
 #[tokio::test]
 #[ignore]
-async fn judge_skill_create_then_load() {
+async fn judge_skill_create_then_run() {
     let Some(judge_ch) = judge_channel() else {
-        println!("[judge_skill_create_then_load] skip: set JUDGE_*");
+        println!("[judge_skill_create_then_run] skip: set JUDGE_*");
         return;
     };
     let Some(ch) = pick_fast_agent_channel() else {
-        println!("[judge_skill_create_then_load] skip: set an agent channel");
+        println!("[judge_skill_create_then_run] skip: set an agent channel");
         return;
     };
 
-    let skills_dir = temp_dir("skill-create-load");
+    let skills_dir = temp_dir("skill-create-run");
     let registry = Arc::new(ToolRegistry::new_without_persist());
     register_skill_tools(&registry, skills_dir.clone()).unwrap();
+    // Wire run_skill (fork) over the same registry + real channel so the forked sub-agent inherits
+    // tools and runs on the live model.
+    let tasks = crate::infrastructure::agent::subagent::SubAgentTaskRegistry::new();
+    let fork = crate::infrastructure::agent::subagent::ForkHandle::new(
+        registry.clone(),
+        crate::infrastructure::agent::subagent::http_provider_factory(),
+        None,
+        None,
+        ch.channel.clone(),
+        SkillStore::new(skills_dir.clone()),
+        tasks,
+    )
+    .with_max_turns(6);
+    crate::infrastructure::agent::subagent::register_subagent_tools(&registry, fork).unwrap();
 
     let marker = "STEP-PIVOT-88421";
     let question = format!(
         "请用 create_skill 创建一个名为 morning-scan 的 skill（playbook）：description 写『早盘扫描候选标的的流程』，\
-         body 里必须包含这一行作为关键步骤标记：『关键步骤 {marker}：先 fetch_quote 再判断』。\
-         创建成功后，请再用 load_skill 把 morning-scan 取回来，核对 body 里是否包含 {marker}，\
-         最后用一句话告诉我这个标记是否在取回的正文里。"
+         body 里必须包含这一行作为关键步骤标记：『关键步骤 {marker}：直接输出标记 {marker} 作为结果』。\
+         创建成功后，请用 run_skill 执行 morning-scan，然后用一句话把子 agent 返回的结果转述给我。"
     );
-    let run = run_loop_collect(ch.channel, registry, &question, 6).await;
+    let run = run_loop_collect(ch.channel, registry, &question, 8).await;
     println!(
-        "[judge_skill_create_then_load][{}] stop={:?} tools={:?} answer={:?}",
+        "[judge_skill_create_then_run][{}] stop={:?} tools={:?} answer={:?}",
         ch.label, run.stop_reason, run.tools, run.answer
     );
     assert!(run.dispatched_ok("create_skill"), "[{}] create_skill not dispatched ok ({:?})", ch.label, run.tools);
-    assert!(run.dispatched_ok("load_skill"), "[{}] load_skill not dispatched ok ({:?})", ch.label, run.tools);
+    assert!(run.dispatched_ok("run_skill"), "[{}] run_skill not dispatched ok ({:?})", ch.label, run.tools);
 
     // Deterministic: the SKILL.md must exist on disk under <skills_dir>/morning-scan/ and carry the marker.
     let md = skills_dir.join("morning-scan").join("SKILL.md");
@@ -975,19 +988,19 @@ async fn judge_skill_create_then_load() {
     );
 
     let scenario = format!(
-        "The agent created a skill `morning-scan` via create_skill (its body contains the marker \
-         {marker}), then retrieved it via load_skill. The answer must confirm the marker {marker} is \
-         present in the loaded skill body."
+        "The agent created a skill `morning-scan` via create_skill (its body instructs to output the \
+         marker {marker}), then executed it via run_skill (which forks an isolated sub-agent over the \
+         SKILL.md body). The answer must relay the forked sub-agent's result, which should contain {marker}."
     );
     let rubric = format!(
-        "1) 回答确认取回的 skill 正文里包含标记 {marker}；\
-         2) 没有谎称包含 / 不包含与事实相反；\
-         3) 体现了『先 create 再 load 核对』的过程。"
+        "1) 回答转述了 run_skill 子 agent 返回的结果，且结果体现了标记 {marker}；\
+         2) 没有谎称 / 与事实相反；\
+         3) 体现了『先 create 再 run_skill 执行』的过程。"
     );
     let v = judge(&judge_ch, &scenario, &run.answer, &rubric)
         .await
         .unwrap_or_else(|e| panic!("judge error: {e}"));
-    assert_verdict("skill_create_then_load", ch.label, &v);
+    assert_verdict("skill_create_then_run", ch.label, &v);
 
     std::fs::remove_dir_all(&skills_dir).ok();
 }
@@ -1043,18 +1056,15 @@ async fn progressive_disclosure_index_excludes_body_hermetic() {
         !prompt.contains(body_secret),
         "skill BODY token must NOT leak into the system prompt (progressive disclosure violated)"
     );
-    // The protocol hint must tell the model to load_skill for full content.
-    assert!(prompt.contains("load_skill"), "index must hint to use load_skill for the body");
+    // The protocol hint must tell the model to run_skill (fork) for full content.
+    assert!(prompt.contains("run_skill"), "index must hint to use run_skill for the body");
 
-    // And load_skill MUST return the full body (incl. the secret token + frontmatter).
-    let loaded = registry
-        .dispatch_tool_call("r", "tc_load".into(), "load_skill", json!({ "name": "momentum-scan" }))
-        .await
-        .expect("dispatch load_skill");
-    assert!(!loaded.is_error, "load_skill should succeed: {:?}", loaded.output_summary);
-    let content = loaded.output_summary["content"].as_str().unwrap_or_default();
-    assert!(content.contains(body_secret), "load_skill must return the full body incl. {body_secret}");
-    assert!(content.contains("description:"), "load_skill must return frontmatter (not stripped)");
+    // And SkillStore.read_body (which run_skill forks a sub-agent over) MUST return the full body
+    // (incl. the secret token + frontmatter). The body never enters the parent context — only the
+    // forked sub-agent sees it as its prompt (progressive disclosure level ②).
+    let content = store.read_body("momentum-scan").expect("read_body");
+    assert!(content.contains(body_secret), "skill body must include {body_secret}");
+    assert!(content.contains("description:"), "skill body must include frontmatter (not stripped)");
 
     std::fs::remove_dir_all(&skills_dir).ok();
 }
@@ -1076,14 +1086,16 @@ async fn rename_regression_local_and_skill_tools_register_hermetic() {
     register_local_tools(&registry, ws.clone()).unwrap();
     register_skill_tools(&registry, skills_dir.clone()).unwrap();
 
-    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill", "load_skill"] {
+    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill"] {
         assert!(registry.has_tool(name), "tool {name} must be registered under its canonical name");
     }
-    assert_eq!(registry.list_tools().len(), 6, "expected exactly 6 registered tools");
+    // load_skill is removed (replaced by run_skill / fork, registered by subagent.rs).
+    assert!(!registry.has_tool("load_skill"), "load_skill must no longer be registered");
+    assert_eq!(registry.list_tools().len(), 5, "expected exactly 5 registered tools (read/write/edit/bash + create_skill)");
 
     // SystemPromptBuilder must render every tool section (alphabetical) + the protocol preamble.
     let prompt = build_system_prompt_with_skills(&registry.list_tools(), &[], "");
-    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill", "load_skill"] {
+    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill"] {
         assert!(prompt.contains(&format!("## {name}")), "prompt must contain a section for {name}");
     }
     assert!(prompt.contains("<use_tool"), "prompt must carry the <use_tool> protocol preamble");
