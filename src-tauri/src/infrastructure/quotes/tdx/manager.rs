@@ -751,16 +751,21 @@ fn map_security_quote(
             None
         }
     };
-    // 价格小数位校正（TDX reference §Normalize）：security_quotes 协议层统一 /100，对 2 位小数
-    // 标的（股票/指数）正确，但 3 位小数标的（场内基金/ETF + 债券）是 ×1000 编码 → /100 会得到
-    // 10× 偏高价。按**推导的小数位**校正（decimal-driven，不再 category 特判）：
-    //   - Fund → 3 位
-    //   - 债券（按需取，universe 外；is_bond 按代码段判定）→ 3 位
-    //   - 股票 / 指数 → 2 位
-    // 3 位 → 额外 /10（×0.1），2 位 → 不动。（K 线走 /1000，不经此路径。）
-    let three_decimals = matches!(category, InstrumentCategory::Fund)
-        || crate::infrastructure::quotes::universe::is_bond(ts_code.market(), &ts_code.as_str()[..6]);
-    let price_scale: f64 = if three_decimals { 0.1 } else { 1.0 };
+    // 价格小数位校正（TDX reference §Normalize）：security_quotes 协议层统一 `/100`（假设 2 位
+    // 小数）。实测不同标的的 quote 整数按其**小数位**编码（integer = price × 10^decimals）：
+    //   - 股票 / 指数：2 位 → 协议 `/100` 已正确 → scale 1.0
+    //   - 场内基金 / ETF：3 位（×1000）→ 协议 `/100` 余 ×10 → scale 0.1
+    //   - 债券（可转债等，按需取、universe 外）：**4 位**（×10000，实测 110073 raw=10694 ⇔ 真值
+    //     106.94）→ 协议 `/100` 余 ×100 → scale 0.01
+    // 按 is_bond / category 推导小数位（K 线走 `/1000`，不经此路径）。
+    let price_scale: f64 =
+        if crate::infrastructure::quotes::universe::is_bond(ts_code.market(), &ts_code.as_str()[..6]) {
+            0.01
+        } else if matches!(category, InstrumentCategory::Fund) {
+            0.1
+        } else {
+            1.0
+        };
     let scaled_price = |v: f64| f64_to_price(v * price_scale);
     let price = scaled_price(raw.price);
     let prev = scaled_price(raw.last_close);
@@ -1085,21 +1090,21 @@ mod tests {
         assert_eq!(qs.price.unwrap().0.to_string(), "48.68");
     }
 
-    // 按需取债券（universe 外）：可转债 3 位小数。即使 category 传 Stock（调用方默认），
-    // is_bond 按代码段识别 → 仍按 3 位校正。raw.price=120.50（=真值 120.500 经 /100）→ 12.05? 不，
-    // 协议 /100 把 ×1000 的 120500 变成 1205.0；再 ×0.1 → 120.5。这里 raw 直接用协议输出 1205.0。
+    // 按需取债券（universe 外）：可转债是 **4 位小数**编码（实测 TDX integer = 真值 × 10000，
+    // 协议 /100 后 raw.price = 真值 × 100）。即使 category 传 Stock（调用方默认），is_bond 识别
+    // 110xxx → scale 0.01 → 真值。raw.price=10690（真值 106.90 经协议 /100）→ 106.9。
     #[test]
-    fn map_security_quote_bond_price_scaled_to_three_decimals() {
+    fn map_security_quote_bond_price_scaled_to_four_decimals() {
         let mut raw = sample_raw();
         raw.code = "110059".to_string();
-        raw.price = 1205.0; // 可转债真值 120.500 经协议 /100 后
-        raw.last_close = 1200.0;
+        raw.price = 10690.0; // 可转债真值 106.90，TDX 协议 /100 后
+        raw.last_close = 10650.0;
         let code = TsCode::parse("110059.SH").unwrap();
         let td = TradeDate::parse("20260601").unwrap();
-        // category=Stock（债券无专属类目，调用方默认传 Stock）；is_bond 识别 110xxx → 3 位
+        // category=Stock（债券无专属类目）；is_bond 识别 110xxx → scale 0.01（4 位小数）
         let q = map_security_quote(&raw, code, InstrumentCategory::Stock, None, td, Utc::now());
-        assert_eq!(q.price.unwrap().0.to_string(), "120.5", "可转债应按 3 位小数校正");
-        assert_eq!(q.previous_close.unwrap().0.to_string(), "120");
+        assert_eq!(q.price.unwrap().0.to_string(), "106.9", "可转债应按 4 位小数校正（×0.01）");
+        assert_eq!(q.previous_close.unwrap().0.to_string(), "106.5");
     }
 
     fn mk_bar(year: u16, month: u8, day: u8) -> Bar {

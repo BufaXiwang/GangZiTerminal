@@ -4,7 +4,8 @@
 >
 > **✅ 已完成（2026-06-02，commit 待填）：按需取债券的价格处理**。底层 provider 方法本就 category-无关，
 > 现把 `map_security_quote` 的价格缩放改成 **decimal-driven**：`universe::is_bond(market, code)` 识别债券
-> （3 位小数）→ 正确 `/10` 校正，不再 10× 错。**universe 仍不收债券**。债券无复权（xdxr 空 → none）。
+> （**4 位小数**，实测可转债 TDX integer=真值×10000）→ `×0.01` 校正，不再 10× 错（实证与腾讯一致）。
+> **universe 仍不收债券**。债券无复权（xdxr 空 → none）。
 > 即「按代码取债券行情」开箱即用且报价正确。
 >
 > **⏳ 仍延后：债券一等公民**（下面「真要做时的清单」里除价格处理外的部分）。决策日 2026-06-01。
@@ -30,8 +31,8 @@ fetch_quotes / fetch_daily_kline / fetch_kline_* / fetch_minute_*`）是 **categ
 
 1. **spec 先行**：在 `quotes-module.md` 把债券纳入 universe 范围 + canonical model 落点（`InstrumentCategory`
    增 `Bond`，可能再细分可转债 / 国债 / 企业债）。
-2. **价格小数位**：债券是 **3 位小数**报价（可转债 quote 到 0.001）。`map_security_quote` 的缩放校正
-   目前是 `Fund → 3dp（额外 /10）`、其余 2dp；债券必须同样按 3dp 校正，否则报价 **10× 偏高**（与之前
+2. **价格小数位**：债券（可转债）在 TDX quote 是 **4 位小数**编码（integer=真值×10000）。`map_security_quote`
+   已处理：`is_bond → ×0.01`、`Fund → ×0.1`、股/指 ×1.0。否则报价 **10× / 100× 偏高**（与之前
    ETF `510300` 那个 bug 同类，commit ce25baf）。最稳妥是按 `category` 或真实 `decimal_point` 缩放。
 3. **classify 放行**：`universe.rs::classify_sh` / `classify_sz` 把债券前缀映射到 `Bond`（SH 100/110/120/130、
    SZ 12xxxx 可转债等），不再 `None` 丢弃。注意：当前 SH 这些前缀是被**有意丢弃**的（见 commit 92cd9e6

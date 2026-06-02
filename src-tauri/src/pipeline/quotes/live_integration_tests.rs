@@ -1237,6 +1237,134 @@ async fn quotes_live_pipeline_close_snapshot_fallback() {
     }
 }
 
+/// H6 · 端到端 fetch_data(dailyBasic + events) 读回：pipeline refresh（TuShare）→ DB → facade。
+/// 验证「TuShare 拉取 → 落库 → fetch_data 读回」完整链路（hermetic 只能 seed 后读，这里测真拉真读）。
+/// Provider: TuShare。Env: TUSHARE_TOKEN。
+#[tokio::test]
+#[ignore]
+async fn quotes_live_pipeline_fetch_data_daily_basic_and_events() {
+    let Some(_t) = tushare_token() else {
+        eprintln!("[H6] SKIP — TUSHARE_TOKEN 未设");
+        return;
+    };
+    let svc = make_service();
+    seed_instrument(&svc, OLD_STOCK_SH, "贵州茅台", InstrumentCategory::Stock);
+    svc.health().initial_ping().await;
+    if !svc.health().is_available() {
+        eprintln!("[H6] SKIP — TuShare health 不可用: {:?}", svc.health().state());
+        return;
+    }
+    let code = ts(OLD_STOCK_SH);
+    // 拉一个已知交易日的 daily_basic + 一段时间窗口的公司事件。
+    let db_res = svc
+        .refresh_daily_basic(
+            RefreshDataScope::Manual { ts_codes: vec![code.clone()] },
+            Some(TradeDate::parse("20240102").unwrap()),
+        )
+        .await;
+    let ev_res = svc
+        .refresh_company_events(
+            RefreshDataScope::Manual { ts_codes: vec![code.clone()] },
+            None,
+        )
+        .await;
+    eprintln!("[H6] refresh daily_basic={:?} events={:?}", db_res.map(|r| r.success), ev_res.map(|r| r.success));
+
+    // fetch_data 只读本地——验证 daily_basic / events 能否读回（取决于 refresh 是否写入）。
+    let res = svc.fetch_data(FetchDataRequest {
+        ts_codes: Some(vec![OLD_STOCK_SH.into()]),
+        include: Some(FetchInclude {
+            daily_basic: Some(true),
+            events: Some(true),
+            profile: Some(true),
+            ..Default::default()
+        }),
+        limit: None,
+    });
+    assert_eq!(res.items.len(), 1);
+    let item = &res.items[0];
+    eprintln!(
+        "[H6] daily_basic_present={} events={:?} warnings={:?}",
+        item.daily_basic.is_some(),
+        item.events.as_ref().map(|e| e.len()),
+        item.warnings
+    );
+    // daily_basic 写入成功则应读回；写入失败（如该日无数据）则 daily_basic_missing warning。
+    // 两种都是合法终态，断言「读回 ⟺ 无 missing warning」自洽，不硬依赖网络拉到具体值。
+    if item.daily_basic.is_some() {
+        assert!(
+            !item.warnings.contains(&crate::domain::shared::WarningCode::DailyBasicMissing),
+            "读回 daily_basic 时不应同时报 missing"
+        );
+        let db = item.daily_basic.as_ref().unwrap();
+        assert_eq!(db.ts_code.as_str(), OLD_STOCK_SH);
+    } else {
+        assert!(item.warnings.contains(&crate::domain::shared::WarningCode::DailyBasicMissing));
+    }
+}
+
+/// H7 · 端到端 fetch_data(quote + klines[day,week] + minuteKlines[5m]) 读回：
+/// pipeline refresh（TDX）→ DB → facade 一次取齐多读模型。验证多 include 组合在真链路一致。
+/// Provider: TDX/腾讯。
+#[tokio::test]
+#[ignore]
+async fn quotes_live_pipeline_fetch_data_multi_include() {
+    let svc = make_service();
+    seed_instrument(&svc, OLD_STOCK_SH, "贵州茅台", InstrumentCategory::Stock);
+    let code = ts(OLD_STOCK_SH);
+    let _ = svc
+        .refresh_market_quotes(RefreshMarketQuotesRequest {
+            scope: RefreshMarketQuotesScope::Manual { ts_codes: vec![code.clone()] },
+            purpose: RefreshPurpose::Intraday,
+            trade_date: None,
+        })
+        .await;
+    let kl = svc
+        .refresh_klines(
+            RefreshDataScope::Manual { ts_codes: vec![code.clone()] },
+            vec![KlinePeriod::Day, KlinePeriod::Week],
+        )
+        .await;
+    let mk = svc
+        .refresh_minute_klines(
+            RefreshDataScope::Manual { ts_codes: vec![code.clone()] },
+            vec![MinuteKlinePeriod::M5],
+        )
+        .await;
+    if kl.is_err() {
+        eprintln!("[H7] SKIP — refresh_klines 失败（TDX 不可达?）");
+        return;
+    }
+    eprintln!("[H7] kline={:?} minute={:?}", kl.map(|r| r.success), mk.map(|r| r.success));
+
+    let res = svc.fetch_data(FetchDataRequest {
+        ts_codes: Some(vec![OLD_STOCK_SH.into()]),
+        include: Some(FetchInclude {
+            quote: Some(true),
+            klines: Some(vec![KlinePeriod::Day, KlinePeriod::Week]),
+            minute_klines: Some(vec![MinuteKlinePeriod::M5]),
+            profile: Some(true),
+            ..Default::default()
+        }),
+        limit: None,
+    });
+    let item = &res.items[0];
+    if let Some(klines) = &item.klines {
+        eprintln!("[H7] klines keys={:?}", klines.keys().collect::<Vec<_>>());
+        // 只请求 day+week → 不应出现 month。
+        assert!(!klines.contains_key(KlinePeriod::Month.as_str()), "未请求 month 不应出现");
+        if let Some(day) = klines.get(KlinePeriod::Day.as_str()) {
+            for w in day.points.windows(2) {
+                assert!(w[0].date <= w[1].date, "日 K 升序");
+            }
+        }
+    }
+    if let Some(minute) = &item.minute_klines {
+        eprintln!("[H7] minute keys={:?}", minute.keys().collect::<Vec<_>>());
+        assert!(!minute.contains_key("1m"), "未请求 1m 不应出现");
+    }
+}
+
 // ===== ACC. 数据准确性（跨源一致 + 数学一致）=====
 //
 // 与 A–H 的「结构 / 契约」测试不同，本节验**数值对不对**：

@@ -83,8 +83,9 @@ Quotes 不负责：
 > 「6 位数字 + 市场后缀」，传入债券代码（如 `110059.SH`）TDX 同样会返回数据。所以「不取债券」是 universe
 > 策展层（`classify` + 读路径只遍历 curated universe）的约束，**不是 provider 方法的硬限制**。
 > **按需取债券已可正确处理（universe 仍不收）**：底层 provider 方法 category-无关，按代码取债券时
-> `map_security_quote` 的价格缩放是 **decimal-driven** 的——`is_bond(market, code)` 识别债券（3 位小数）
-> 并正确 `/10` 校正（否则同 ETF 那样 10× 错）。所以「取债券行情」开箱即用且报价正确，但债券**不进
+> `map_security_quote` 的价格缩放是 **decimal-driven** 的——`is_bond(market, code)` 识别债券（**4 位小数**，
+> 实测可转债 TDX integer = 真值×10000）并 `×0.01` 校正（ETF 是 3 位 `×0.1`；否则同样 10× 错）。所以
+> 「取债券行情」开箱即用且报价正确（实证与腾讯一致），但债券**不进
 > universe**（list_market / 扫描 / 详情遍历 curated universe，看不到债券）。债券**无复权**：xdxr 为空
 > → adjust 自然退化为 none。
 > **债券作为一等公民**（纳入 universe 展示 / 可转债交易 / 专属类目）**仍延后**——见

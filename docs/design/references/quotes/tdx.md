@@ -107,7 +107,12 @@ TDX HQ market 只支持：
 - TDX 不直接给出可靠 `tradeStatus`；adapter 只 normalize 可用原始状态，最终对外 `tradeStatus` 由 Quotes query facade 按 `MarketTimeContext`、instrument status 和 quote eligibility 派生。
 - TDX `SecurityQuote` 不包含可靠名称时，`name` 可为空；展示层必须从 `MarketInstrument` 补名。
 - TDX 价格、盘口、成交量字段为 0 或非法值时按 missing 处理，不能转成有效 0。
-- **价格小数位缩放（关键）**：TDX `security_quotes`（实时报价）的价格整数按**该标的的小数位**编码——A 股股票 / 指数为 2 位（×100），**场内基金 / ETF + 债券为 3 位（×1000）**。协议层 `cal_price` 统一 `/100`，对 2 位标的正确，但对 3 位标的会得到 **10× 偏高**价（如 510300 实际 4.868 解出 48.68）。adapter `map_security_quote` 按**推导的小数位**校正（decimal-driven，非 category 特判）：3 位标的额外 `/10`，2 位不动。3 位判定 = `category == Fund` 或 `universe::is_bond(market, code)`（债券按代码段识别：SH 1xxxxx、SZ 1xxxxx 除 159 ETF）。这样**按需取债券**（universe 外，见 [quotes-module.md](../../quotes-module.md) §2）报价也正确。注：`security_bars`（K 线）协议层用 `/1000`，对 2/3 位标的都正确，不需校正。
+- **价格小数位缩放（关键）**：TDX `security_quotes`（实时报价）的价格整数按**该标的的小数位**编码（integer = 真值 × 10^小数位），但协议层 `cal_price` 统一 `/100`（假设 2 位）。实测各类小数位不同：
+  - **股票 / 指数 = 2 位**（×100）→ 协议 `/100` 已正确 → 不校正。
+  - **场内基金 / ETF = 3 位**（×1000）→ 协议 `/100` 余 ×10 → adapter `×0.1`（如 510300 实际 4.868，协议出 48.68）。
+  - **债券（可转债等）= 4 位**（×10000）→ 协议 `/100` 余 ×100 → adapter `×0.01`（实测 110073 协议出 raw.price=10694 ⇔ 真值 106.94，与腾讯一致）。
+
+  adapter `map_security_quote` 按 `is_bond` / `category` 推导小数位做对应 `scale`（debond=0.01、Fund=0.1、其余=1.0）。债券判定 `universe::is_bond(market, code)`（SH 1xxxxx、SZ 1xxxxx 除 159 ETF）。这样**按需取债券**（universe 外，见 [quotes-module.md](../../quotes-module.md) §2）报价正确。注：`security_bars`（K 线）协议层用 `/1000`，对各类标的都正确，不需校正。
 
 ## K 线规则
 

@@ -4857,4 +4857,642 @@ mod tests {
         assert_eq!(h.top_losers.len(), 2);
         // 全 4 都正/0 → top_losers 仍按 asc 排序，取最小 2 个。
     }
+
+    // ====================================================================== SPEC-GAP hermetic
+    //
+    // Spec: docs/design/quotes-module.md §4（read facade 读取契约）。这些测试**不打 provider**，
+    // 用 cache.put + repo seed 直接铺本地读模型，确定性地补齐既有 live 测试无法覆盖（provider
+    // 不可达即 skip）的 §4 场景。命名 spec_gap_*。
+    //
+    // 注意：freshness 状态机（fresh/stale/missing/snapshot_expired × detail/universe × 盘中/盘后）
+    // 已由 domain/quotes/freshness_rules.rs 单测全覆盖；这里只覆盖 facade 层的 include 组合 /
+    // 过滤 / 排序 / warning 透传，避免重复造时间相关断言。
+
+    /// 富 snapshot helper：可设 changePercent / amount / volume / 五档盘口 / category。
+    /// 写到 eligible trade date 上，确保 derive_freshness 接受为有效当日 quote。
+    #[allow(clippy::too_many_arguments)]
+    fn put_rich_snapshot(
+        svc: &QuotesService,
+        ts: &str,
+        category: InstrumentCategory,
+        change_percent: f64,
+        amount: Option<f64>,
+        volume: Option<i64>,
+        with_depth: bool,
+    ) {
+        use crate::domain::quotes::QuoteDepthLevel;
+        use crate::domain::shared::{Amount, Freshness, FreshnessStatus, Price, Volume};
+        use rust_decimal::prelude::FromPrimitive;
+        let ts_code = TsCode::parse(ts).unwrap();
+        let eligible = eligible_trade_date(&svc.market_time_now());
+        let now = Utc::now();
+        let (bid, ask) = if with_depth {
+            (
+                vec![QuoteDepthLevel {
+                    price: Some(Price(Decimal::new(999, 2))),
+                    volume: Some(Volume(100)),
+                }],
+                vec![QuoteDepthLevel {
+                    price: Some(Price(Decimal::new(1001, 2))),
+                    volume: Some(Volume(100)),
+                }],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let q = StockQuote {
+            ts_code: ts_code.clone(),
+            name: None,
+            category,
+            trade_date: eligible.trade_date,
+            price: Some(Price(Decimal::new(1000, 2))),
+            previous_close: Some(Price(Decimal::new(1000, 2))),
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: Some(change_percent),
+            volume: volume.map(Volume),
+            amount: amount.map(|a| Amount(Decimal::from_f64(a).unwrap())),
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid,
+            ask,
+            trade_status: TradeStatus::Trading,
+            source: QuoteSource::Tdx,
+            captured_at: now,
+            exchange_time: None,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: Some(0),
+                source: Some("tdx".into()),
+                warning: None,
+            },
+            warnings: Vec::new(),
+        };
+        svc.cache.put(crate::infrastructure::quotes::CachedSnapshot {
+            quote: q,
+            captured_at: now,
+            trade_date: eligible.trade_date,
+            source: "tdx".into(),
+        });
+    }
+
+    // ----------------------------------------------------------------- §4 list_market（含 quote 摘要）
+
+    /// includeQuote=true 时从 MARKET_SNAPSHOT 填充 quote 摘要（不触发 provider）。
+    #[test]
+    fn spec_gap_list_market_include_quote_populates_summary() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        put_rich_snapshot(&svc, "600519.SH", InstrumentCategory::Stock, 2.5, Some(1.0e8), Some(10000), true);
+        let res = svc.list_market(ListMarketRequest {
+            include_quote: Some(true),
+            ..Default::default()
+        });
+        let item = res
+            .items
+            .iter()
+            .find(|i| i.instrument.ts_code.as_str() == "600519.SH")
+            .unwrap();
+        let q = item.quote.as_ref().expect("includeQuote should fill summary");
+        assert_eq!(q.change_percent, Some(2.5));
+        assert!(q.price.is_some());
+        assert!(item.quote_freshness.is_some());
+        // 摘要不含五档盘口 —— 类型上 ListMarketQuoteSummary 没有 bid/ask 字段（编译期保证）。
+    }
+
+    /// includeQuote=true 但无 snapshot → quote 为空 + quote_missing warning（spec §4 line 642）。
+    #[test]
+    fn spec_gap_list_market_include_quote_missing_snapshot() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let res = svc.list_market(ListMarketRequest {
+            include_quote: Some(true),
+            ..Default::default()
+        });
+        let item = &res.items[0];
+        assert!(item.quote.is_none(), "无 snapshot → quote 空");
+        assert!(item.warnings.contains(&WarningCode::QuoteMissing));
+    }
+
+    /// category 过滤只返回该类别标的。
+    #[test]
+    fn spec_gap_list_market_category_filter() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        seed_instrument(&svc, "000001.SH", "上证指数", InstrumentCategory::Index);
+        seed_instrument(&svc, "510300.SH", "沪深300ETF", InstrumentCategory::Fund);
+        let only_index = svc.list_market(ListMarketRequest {
+            category: Some(InstrumentCategory::Index),
+            ..Default::default()
+        });
+        assert_eq!(only_index.items.len(), 1);
+        assert_eq!(only_index.items[0].instrument.ts_code.as_str(), "000001.SH");
+    }
+
+    // ----------------------------------------------------------------- §4 fetch_data include 组合
+
+    /// include.quote=true：snapshot 缺失 → quote 空 + quoteFreshness 承载 quote_missing。
+    #[test]
+    fn spec_gap_fetch_data_quote_missing_warning() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                quote: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let item = &res.items[0];
+        assert!(item.quote.is_none());
+        assert!(item.warnings.contains(&WarningCode::QuoteMissing));
+        assert!(item.quote_freshness.is_some(), "quote 空时仍须返回 quoteFreshness 承载原因");
+    }
+
+    /// include.quote=true：有 snapshot 但无五档盘口 → quote 带 depth_missing warning（透传到 item）。
+    #[test]
+    fn spec_gap_fetch_data_quote_depth_missing() {
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        put_rich_snapshot(&svc, "600519.SH", InstrumentCategory::Stock, 1.0, None, None, false);
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                quote: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let item = &res.items[0];
+        let q = item.quote.as_ref().expect("snapshot 存在");
+        assert!(
+            q.warnings.contains(&WarningCode::DepthMissing),
+            "无盘口 → quote.warnings 应含 depth_missing"
+        );
+    }
+
+    /// include.klines：本地仅有 unadjusted、无 xdxr → qfq 降级 none，item 带 using_unadjusted_kline。
+    #[test]
+    fn spec_gap_fetch_data_klines_downgrade_unadjusted_warning() {
+        use crate::domain::shared::{Amount, Price, Volume};
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20240620").unwrap(),
+            open: Price(Decimal::new(20000, 2)),
+            close: Price(Decimal::new(20000, 2)),
+            high: Price(Decimal::new(20100, 2)),
+            low: Price(Decimal::new(19900, 2)),
+            volume: Some(Volume(1_000_000)),
+            amount: Some(Amount(Decimal::new(200_000_000, 2))),
+        };
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &[bar], "test", Utc::now())
+            .unwrap();
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                klines: Some(vec![KlinePeriod::Day]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let item = &res.items[0];
+        let klines = item.klines.as_ref().expect("应返回 day klines");
+        let day = klines.get(KlinePeriod::Day.as_str()).expect("day series 存在");
+        assert_eq!(day.points.len(), 1);
+        // 无 xdxr → qfq 退化；item 级须含 using_unadjusted_kline 或 qfq_missing（spec §4 line 707）。
+        assert!(
+            item.warnings.contains(&WarningCode::UsingUnadjustedKline)
+                || item.warnings.contains(&WarningCode::QfqMissing),
+            "qfq 降级须透传 unadjusted/qfq_missing warning, got {:?}",
+            item.warnings
+        );
+    }
+
+    /// include.klines 只返回请求周期；未请求的 week/month 不出现在 key 中（spec §4 line 705）。
+    #[test]
+    fn spec_gap_fetch_data_klines_only_requested_periods() {
+        use crate::domain::shared::{Price, Volume};
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let bar = KlinePoint {
+            date: TradeDate::parse("20240620").unwrap(),
+            open: Price(Decimal::new(20000, 2)),
+            close: Price(Decimal::new(20000, 2)),
+            high: Price(Decimal::new(20000, 2)),
+            low: Price(Decimal::new(20000, 2)),
+            volume: Some(Volume(1)),
+            amount: None,
+        };
+        // 落 day + week 两个周期，但只请求 day。
+        for p in [KlinePeriod::Day, KlinePeriod::Week] {
+            svc.repo()
+                .upsert_daily_klines(&ts, p, AdjEnum::None, &[bar.clone()], "test", Utc::now())
+                .unwrap();
+        }
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                klines: Some(vec![KlinePeriod::Day]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let klines = res.items[0].klines.as_ref().unwrap();
+        assert!(klines.contains_key(KlinePeriod::Day.as_str()));
+        assert!(
+            !klines.contains_key(KlinePeriod::Week.as_str()),
+            "未请求的 week 不应出现在响应 key 中"
+        );
+    }
+
+    /// include.dailyBasic：本地有行 → 读回；无行 → daily_basic_missing warning（spec §4）。
+    #[test]
+    fn spec_gap_fetch_data_daily_basic_read_back_and_missing() {
+        use crate::domain::quotes::DailyBasic;
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        seed_instrument(&svc, "000001.SZ", "平安银行", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let eligible = eligible_trade_date(&svc.market_time_now());
+        let db = DailyBasic {
+            ts_code: ts.clone(),
+            trade_date: eligible.trade_date,
+            pe: Some(30.0),
+            pe_ttm: Some(28.5),
+            pb: Some(8.0),
+            ps: None,
+            ps_ttm: None,
+            turnover_rate: Some(0.5),
+            turnover_rate_float: None,
+            volume_ratio: Some(1.1),
+            total_mv: None,
+            circ_mv: None,
+            source: "test".into(),
+            fetched_at: Utc::now(),
+        };
+        svc.repo().upsert_daily_basic(&[db]).unwrap();
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into(), "000001.SZ".into()]),
+            include: Some(FetchInclude {
+                daily_basic: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // 600519：读回 daily_basic。
+        let with_db = &res.items[0];
+        let got = with_db.daily_basic.as_ref().expect("应读回 daily_basic");
+        assert_eq!(got.pe_ttm, Some(28.5));
+        // 000001：无 daily_basic → warning。
+        let without_db = &res.items[1];
+        assert!(without_db.daily_basic.is_none());
+        assert!(without_db.warnings.contains(&WarningCode::DailyBasicMissing));
+    }
+
+    /// include.events：本地有事件（窗口内）→ 读回；无事件 → events_missing warning。
+    #[test]
+    fn spec_gap_fetch_data_events_read_back_and_missing() {
+        use crate::domain::quotes::{CompanyEvent, CompanyEventType};
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        seed_instrument(&svc, "000001.SZ", "平安银行", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 事件窗口 = [昨天, 今天 + days_ahead]；用「今天」的 effective_date 确保落窗口。
+        let today = TradeDate::from_naive(Utc::now().date_naive());
+        let ev = CompanyEvent {
+            id: "ev-test-1".into(),
+            ts_code: ts.clone(),
+            event_type: CompanyEventType::Dividend,
+            announce_date: Some(today),
+            effective_date: Some(today),
+            payload: serde_json::json!({"per_share": 25.0}),
+            source: "test".into(),
+            fetched_at: Utc::now(),
+        };
+        svc.repo().upsert_company_events(&[ev]).unwrap();
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into(), "000001.SZ".into()]),
+            include: Some(FetchInclude {
+                events: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let with_ev = &res.items[0];
+        let events = with_ev.events.as_ref().expect("应返回 events 数组");
+        assert!(events.iter().any(|e| e.id == "ev-test-1"));
+        // 无事件标的 → events_missing。
+        let without = &res.items[1];
+        assert!(without.warnings.contains(&WarningCode::EventsMissing));
+    }
+
+    /// include.minuteKlines：本地有分钟 K → 读回对应周期 key。
+    #[test]
+    fn spec_gap_fetch_data_minute_klines_read_back() {
+        use crate::domain::quotes::MinuteKlinePoint;
+        use crate::domain::shared::{Amount, Price, Volume};
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        let p = MinuteKlinePoint {
+            timestamp_ms: 1_700_000_000_000,
+            open: Price(Decimal::new(10000, 2)),
+            close: Price(Decimal::new(10010, 2)),
+            high: Price(Decimal::new(10020, 2)),
+            low: Price(Decimal::new(9990, 2)),
+            volume: Volume(100),
+            amount: Amount(Decimal::new(1_000_000, 2)),
+        };
+        svc.repo()
+            .upsert_minute_klines(&ts, MinuteKlinePeriod::M5, &[p], "test", Utc::now())
+            .unwrap();
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                minute_klines: Some(vec![MinuteKlinePeriod::M5]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let minute = res.items[0].minute_klines.as_ref().expect("应返回 minute klines");
+        assert_eq!(minute.len(), 1, "只请求 5m，只返回 5m");
+        let series = minute.values().next().unwrap();
+        assert_eq!(series.points.len(), 1);
+    }
+
+    /// include.indicators=Subset：只返回请求的指标子集，且基于 qfq→none 降级时仍能算。
+    #[test]
+    fn spec_gap_fetch_data_indicators_subset() {
+        use crate::domain::shared::{Price, Volume};
+        let svc = make_service();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let ts = TsCode::parse("600519.SH").unwrap();
+        // 6 根递增 close，足以算出 ma5。
+        let bars: Vec<KlinePoint> = (0..6)
+            .map(|i| {
+                let c = Price(Decimal::new(20000 + i * 100, 2));
+                KlinePoint {
+                    date: TradeDate::parse(&format!("202406{:02}", 10 + i)).unwrap(),
+                    open: c,
+                    close: c,
+                    high: c,
+                    low: c,
+                    volume: Some(Volume(1_000_000)),
+                    amount: None,
+                }
+            })
+            .collect();
+        svc.repo()
+            .upsert_daily_klines(&ts, KlinePeriod::Day, AdjEnum::None, &bars, "test", Utc::now())
+            .unwrap();
+        let res = svc.fetch_data(FetchDataRequest {
+            ts_codes: Some(vec!["600519.SH".into()]),
+            include: Some(FetchInclude {
+                indicators: Some(FetchIndicators::Subset(vec![IndicatorName::Ma5])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let snap = res.items[0].indicators.as_ref().expect("应返回 indicators");
+        // 只请求 ma5 → values 仅含 ma5（不含 ma10/macd 等）。values 以 IndicatorName 序列化串为 key。
+        assert!(snap.values.contains_key("ma5"));
+        assert!(
+            !snap.values.contains_key("ma10"),
+            "subset 只应含请求的指标"
+        );
+        // 6 根 close 算 ma5 应非空。
+        assert!(snap.values.get("ma5").and_then(|v| *v).is_some());
+    }
+
+    // ----------------------------------------------------------------- §4 scan_market filter / conditions / sort
+
+    /// 富 universe：5 只 stock，不同 changePercent / amount / volume。
+    fn seed_scan_universe(svc: &QuotesService) {
+        seed_instrument_with(svc, "600001.SH", "A", None, Some("主板"), false);
+        put_rich_snapshot(svc, "600001.SH", InstrumentCategory::Stock, 5.0, Some(3.0e8), Some(30000), true);
+        seed_instrument_with(svc, "600002.SH", "B", None, Some("主板"), false);
+        put_rich_snapshot(svc, "600002.SH", InstrumentCategory::Stock, 9.97, Some(5.0e8), Some(10000), true);
+        seed_instrument_with(svc, "600003.SH", "C", None, Some("主板"), false);
+        put_rich_snapshot(svc, "600003.SH", InstrumentCategory::Stock, -3.0, Some(1.0e8), Some(50000), true);
+        seed_instrument_with(svc, "600004.SH", "D", None, Some("主板"), false);
+        put_rich_snapshot(svc, "600004.SH", InstrumentCategory::Stock, -9.98, Some(2.0e8), Some(20000), true);
+        seed_instrument_with(svc, "600005.SH", "E", None, Some("主板"), false);
+        put_rich_snapshot(svc, "600005.SH", InstrumentCategory::Stock, 1.0, Some(4.0e8), Some(40000), true);
+    }
+
+    /// filter=top_loss → changePercent asc 排序。
+    #[test]
+    fn spec_gap_scan_filter_top_loss_sorts_ascending() {
+        let svc = make_service();
+        seed_scan_universe(&svc);
+        let res = svc.scan_market(ScanMarketRequest {
+            filter: Some(ScanFilter::TopLoss),
+            ..Default::default()
+        });
+        // 最跌的在前：600004(-9.98) < 600003(-3) < 600005(+1) < 600001(+5) < 600002(+9.97)
+        assert_eq!(res.result.items[0].ts_code.as_str(), "600004.SH");
+        assert_eq!(res.result.items[1].ts_code.as_str(), "600003.SH");
+        // 单调非降。
+        let pcts: Vec<f64> = res
+            .result
+            .items
+            .iter()
+            .map(|i| i.quote.as_ref().unwrap().change_percent.unwrap())
+            .collect();
+        for w in pcts.windows(2) {
+            assert!(w[0] <= w[1], "top_loss 应按 changePercent 升序");
+        }
+    }
+
+    /// filter=top_amount → amount desc 排序。
+    #[test]
+    fn spec_gap_scan_filter_top_amount_sorts_by_amount_desc() {
+        let svc = make_service();
+        seed_scan_universe(&svc);
+        let res = svc.scan_market(ScanMarketRequest {
+            filter: Some(ScanFilter::TopAmount),
+            ..Default::default()
+        });
+        // amount: 600002(5e8) > 600005(4e8) > 600001(3e8) > 600004(2e8) > 600003(1e8)
+        assert_eq!(res.result.items[0].ts_code.as_str(), "600002.SH");
+        assert_eq!(res.result.items[1].ts_code.as_str(), "600005.SH");
+    }
+
+    /// filter=top_volume → volume desc 排序。
+    #[test]
+    fn spec_gap_scan_filter_top_volume_sorts_by_volume_desc() {
+        let svc = make_service();
+        seed_scan_universe(&svc);
+        let res = svc.scan_market(ScanMarketRequest {
+            filter: Some(ScanFilter::TopVolume),
+            ..Default::default()
+        });
+        // volume: 600003(50000) > 600005(40000) > 600001(30000) > 600004(20000) > 600002(10000)
+        assert_eq!(res.result.items[0].ts_code.as_str(), "600003.SH");
+        assert_eq!(res.result.items[1].ts_code.as_str(), "600005.SH");
+    }
+
+    /// filter=limit_up → 只命中 price==limitUp 的标的。
+    /// put_rich_snapshot 设 price=10.00 / prevClose=10.00，build_full_quote 会按主板 10% 算
+    /// limitUp=11.00；price(10) != limitUp(11) → 不命中。故构造一只 price==limitUp 的标的验证命中。
+    #[test]
+    fn spec_gap_scan_filter_limit_up_matches_only_at_band() {
+        use crate::domain::shared::{Freshness, FreshnessStatus, Price};
+        let svc = make_service();
+        seed_instrument_with(&svc, "600001.SH", "Hit", None, Some("主板"), false);
+        seed_instrument_with(&svc, "600002.SH", "Miss", None, Some("主板"), false);
+        // Hit：prevClose=10.00 → 主板涨停=11.00；price 也=11.00 → price==limitUp 命中。
+        let eligible = eligible_trade_date(&svc.market_time_now());
+        let now = Utc::now();
+        let mk = |code: &str, price: i64, prev: i64| {
+            let ts_code = TsCode::parse(code).unwrap();
+            let q = StockQuote {
+                ts_code: ts_code.clone(),
+                name: None,
+                category: InstrumentCategory::Stock,
+                trade_date: eligible.trade_date,
+                price: Some(Price(Decimal::new(price, 2))),
+                previous_close: Some(Price(Decimal::new(prev, 2))),
+                open: None,
+                high: None,
+                low: None,
+                change: None,
+                change_percent: Some(((price - prev) as f64) / (prev as f64) * 100.0),
+                volume: None,
+                amount: Some(crate::domain::shared::Amount(Decimal::new(100, 0))),
+                turnover_rate: None,
+                volume_ratio: None,
+                limit_up: None,
+                limit_down: None,
+                bid: Vec::new(),
+                ask: Vec::new(),
+                trade_status: TradeStatus::Trading,
+                source: QuoteSource::Tdx,
+                captured_at: now,
+                exchange_time: None,
+                freshness: Freshness {
+                    status: FreshnessStatus::Fresh,
+                    captured_at: Some(now),
+                    exchange_time: None,
+                    age_ms: Some(0),
+                    source: Some("tdx".into()),
+                    warning: None,
+                },
+                warnings: Vec::new(),
+            };
+            svc.cache.put(crate::infrastructure::quotes::CachedSnapshot {
+                quote: q,
+                captured_at: now,
+                trade_date: eligible.trade_date,
+                source: "tdx".into(),
+            });
+        };
+        mk("600001.SH", 1100, 1000); // price 11.00 == limitUp 11.00
+        mk("600002.SH", 1050, 1000); // price 10.50 != limitUp 11.00
+        let res = svc.scan_market(ScanMarketRequest {
+            filter: Some(ScanFilter::LimitUp),
+            ..Default::default()
+        });
+        let codes: Vec<_> = res.result.items.iter().map(|i| i.ts_code.as_str().to_string()).collect();
+        assert!(codes.contains(&"600001.SH".to_string()), "price==limitUp 应命中 limit_up");
+        assert!(!codes.contains(&"600002.SH".to_string()), "price<limitUp 不应命中");
+    }
+
+    /// conditions AND 组合 + sortBy 覆盖 filter 默认排序。
+    #[test]
+    fn spec_gap_scan_conditions_and_with_sort_override() {
+        use crate::domain::quotes::{ScanCondition, ScanConditionField, ScanConditionValue, ScanOp};
+        let svc = make_service();
+        seed_scan_universe(&svc);
+        // condition: changePercent gt 0（命中 600001/600002/600005），sortBy=amount_desc 覆盖。
+        let res = svc.scan_market(ScanMarketRequest {
+            conditions: Some(vec![ScanCondition {
+                field: ScanConditionField::ChangePercent,
+                op: ScanOp::Gt,
+                value: ScanConditionValue::Single(0.0),
+            }]),
+            sort_by: Some(ScanSortBy::AmountDesc),
+            ..Default::default()
+        });
+        let codes: Vec<_> = res.result.items.iter().map(|i| i.ts_code.as_str().to_string()).collect();
+        assert_eq!(codes.len(), 3, "只有 3 只 changePercent>0");
+        assert!(!codes.contains(&"600003.SH".to_string()));
+        assert!(!codes.contains(&"600004.SH".to_string()));
+        // sortBy=amount_desc：600002(5e8) > 600005(4e8) > 600001(3e8)。
+        assert_eq!(res.result.items[0].ts_code.as_str(), "600002.SH");
+        assert_eq!(res.result.items[1].ts_code.as_str(), "600005.SH");
+        assert_eq!(res.result.items[2].ts_code.as_str(), "600001.SH");
+    }
+
+    /// conditions 引用 daily_basic 字段但本地缺 daily_basic → 该 item 不匹配 + response data_partial。
+    #[test]
+    fn spec_gap_scan_condition_missing_daily_basic_emits_data_partial() {
+        use crate::domain::quotes::{ScanCondition, ScanConditionField, ScanConditionValue, ScanOp};
+        let svc = make_service();
+        // 一只有 quote 但无 daily_basic 的标的；condition 用 peTtm。
+        seed_instrument_with(&svc, "600001.SH", "A", None, Some("主板"), false);
+        put_rich_snapshot(&svc, "600001.SH", InstrumentCategory::Stock, 3.0, Some(1.0e8), Some(10000), true);
+        let res = svc.scan_market(ScanMarketRequest {
+            conditions: Some(vec![ScanCondition {
+                field: ScanConditionField::PeTtm,
+                op: ScanOp::Lt,
+                value: ScanConditionValue::Single(50.0),
+            }]),
+            ..Default::default()
+        });
+        // daily_basic 缺失 → 该 item 不匹配该条件（不当 0 处理）。
+        assert!(
+            res.result.items.iter().all(|i| i.ts_code.as_str() != "600001.SH"),
+            "缺 daily_basic 的 item 不应匹配 peTtm 条件"
+        );
+        assert!(
+            res.result.warnings.contains(&WarningCode::DataPartial),
+            "条件字段缺失须 response 级 data_partial"
+        );
+    }
+
+    /// scan 返回 rank 从 1 连续递增（spec §2 ScanResult.items.rank）。
+    #[test]
+    fn spec_gap_scan_rank_is_dense_from_one() {
+        let svc = make_service();
+        seed_scan_universe(&svc);
+        let res = svc.scan_market(ScanMarketRequest {
+            filter: Some(ScanFilter::TopGain),
+            ..Default::default()
+        });
+        for (i, it) in res.result.items.iter().enumerate() {
+            assert_eq!(it.rank as usize, i + 1, "rank 应从 1 连续");
+        }
+    }
+
+    // ----------------------------------------------------------------- §4 market_breadth 北交所 30%
+
+    /// 北交所标的涨跌停阈值 = 30%。
+    #[test]
+    fn spec_gap_market_breadth_bj_limit_at_30pct() {
+        let svc = make_service();
+        // BJ 标的：29.96% 应视为涨停（epsilon 0.05）；19.96% 不是。
+        seed_instrument_with(&svc, "830001.BJ", "BJ Up", None, None, false);
+        put_rich_snapshot(&svc, "830001.BJ", InstrumentCategory::Stock, 29.96, None, None, false);
+        let b = svc.market_breadth();
+        assert_eq!(b.up, 1);
+        assert_eq!(b.limit_up, 1, "BJ 29.96% 应达 30% 涨停");
+
+        let svc2 = make_service();
+        seed_instrument_with(&svc2, "830002.BJ", "BJ Mid", None, None, false);
+        put_rich_snapshot(&svc2, "830002.BJ", InstrumentCategory::Stock, 19.96, None, None, false);
+        let b2 = svc2.market_breadth();
+        assert_eq!(b2.limit_up, 0, "BJ 19.96% 未达 30% 不算涨停");
+    }
 }
