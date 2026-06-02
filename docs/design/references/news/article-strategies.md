@@ -13,6 +13,7 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 | 策略 | 含义 |
 |---|---|
 | `TitleIsContent` | 快讯，标题即全文，不发 HTTP |
+| `Jin10Flash` | 金十 detail 页 `<title>`=`【标题】正文 - 金十数据`：解读/长讯型抽完整正文；一句话快讯正文 <MIN → TooShort（仍只显示标题）|
 | `JsonApi` | 打源的内容 JSON API 取结构化正文 |
 | `NextData` | SSR 页面内 `<script id="__NEXT_DATA__">` JSON 内嵌正文 |
 | `InitialState` | SSR 页面 `window.initialState` JSON（或 `<meta name=description>` 快捷） |
@@ -33,7 +34,7 @@ NewsNow API（`https://newsnow.busiyi.world/api/s?id=<channel>&latest`，需带�
 | `cankaoxiaoxi` | 参考消息 | InlineScript | `item.url` 内联 JS `var contentTxt="…"` | utf-8 |
 | `sputniknewscn` | 卫星通讯社 | StaticHtml | `item.url`（`sputniknews.cn/YYYYMMDD/<id>.html`）selector `.article__body` | utf-8 |
 | `zaobao` | 联合早报(zaochenbao) | StaticHtml | `item.url` selector `#article-body` | **GBK/gb18030** |
-| `jin10` | 金十数据 | TitleIsContent | 标题即全文，不抓 | — |
+| `jin10` | 金十数据 | Jin10Flash | detail `<title>` 抽正文（解读/长讯型有 body）；一句话快讯 <MIN→只显示标题 | — |
 
 ## 具体接入
 

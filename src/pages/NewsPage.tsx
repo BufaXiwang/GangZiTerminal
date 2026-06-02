@@ -15,6 +15,7 @@
 //   - 正文在刷新时按 source 策略同步抓取（无侧边 drawer）；行内点击展开/收起
 
 import { Search, X } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 import {
   useCallback,
   useEffect,
@@ -142,6 +143,38 @@ export default function NewsPage() {
       cancelled = true;
     };
   }, [fetchPage, refreshTick]);
+
+  // === 后端 scheduler 刷新出新资讯时同步前端 ===
+  // 后端每 ~60s run_refresh，若 savedCount>0 / articleUpdated>0 会 emit `news-refreshed`
+  // (lib.rs → app.emit)。这里监听并**静默**拉第一页，把新条目并入列表顶部——
+  // 不清空、不闪 loading、不动用户滚动位置（区别于手动刷新的整页重置）。
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void listen("news-refreshed", () => {
+      void fetchPage(0).then((res) => {
+        if (cancelled || res.status !== "ok") return;
+        setItems((prev) => {
+          const seen = new Set(prev.map((x) => x.id));
+          const fresh = res.data.items.filter((x) => !seen.has(x.id));
+          if (fresh.length === 0) return prev;
+          // 新条目时间最新 → 放在倒序时间线最前；已存在的保持原序与滚动锚点。
+          return [...fresh, ...prev];
+        });
+        const m: Record<string, number> = {};
+        for (const dc of res.data.dateCounts ?? []) m[dc.date] = dc.count;
+        setDateCounts(m);
+        setLastUpdated(new Date());
+      });
+    }).then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [fetchPage]);
 
   // === load more (append) ===
   const handleLoadMore = useCallback(async () => {

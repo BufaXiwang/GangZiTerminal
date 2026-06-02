@@ -71,6 +71,9 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 pub enum ArticleStrategy {
     /// 快讯：标题即全文，不抓取。
     TitleIsContent,
+    /// 金十快讯 detail 页 `<title>`="【标题】正文 - 金十数据"：解读 / 长讯型 title 里带完整正文，
+    /// 抽出存为正文；一句话快讯正文过短(<MIN)→上层 TooShort，仍只显示标题（合理：本就无独立正文）。
+    Jin10Flash,
     /// 财联社详情页 `__NEXT_DATA__` JSON 内嵌正文（cls-telegraph / cls-depth）。
     ClsNextData,
     /// 华尔街见闻 api-one JSON（wallstreetcn-quick / wallstreetcn，按 url 判 lives/articles）。
@@ -112,7 +115,7 @@ pub fn strategy_for(source: &str) -> ArticleStrategy {
         },
         "newsnow:cankaoxiaoxi" => ArticleStrategy::CankaoInlineScript,
         "newsnow:zaobao" => ArticleStrategy::ZaochenbaoStatic,
-        "newsnow:jin10" => ArticleStrategy::TitleIsContent,
+        "newsnow:jin10" => ArticleStrategy::Jin10Flash,
         _ => ArticleStrategy::Generic,
     }
 }
@@ -165,6 +168,7 @@ impl ArticleExtractor {
                 self.extract_static(canonical_url, "#article-body", &[".warning"]).await
             }
             ArticleStrategy::CankaoInlineScript => self.extract_cankao(canonical_url).await,
+            ArticleStrategy::Jin10Flash => self.extract_jin10(canonical_url).await,
             ArticleStrategy::TitleIsContent => unreachable!(),
             ArticleStrategy::Generic => {
                 return Some(self.extract(canonical_url, first_news_id).await)
@@ -289,6 +293,27 @@ impl ArticleExtractor {
             return Err(parse_err("cankao: empty content"));
         }
         Ok((None, text))
+    }
+
+    /// 金十快讯：detail 页 `<title>` 文本带完整正文（解读 / 长讯型）。解析见 [`parse_jin10_title`]。
+    /// 一句话快讯解析出的正文短于 `ARTICLE_MIN_CONTENT_CHARS` → 上层判 `TooShort`（仍只显示标题）。
+    async fn extract_jin10(&self, url: &str) -> Result<(Option<String>, String), ExtractErr> {
+        let page = self.fetch_decoded(url).await?;
+        // 块内同步解析，scraper 的 Html 不跨 await。
+        let raw = {
+            let doc = Html::parse_document(&page);
+            let sel =
+                Selector::parse("title").map_err(|_| parse_err("jin10: bad title selector"))?;
+            doc.select(&sel)
+                .next()
+                .map(|el| el.text().collect::<String>())
+        }
+        .ok_or_else(|| parse_err("jin10: no <title>"))?;
+        let (title, content) = parse_jin10_title(&raw);
+        if content.is_empty() {
+            return Err(parse_err("jin10: empty title"));
+        }
+        Ok((title, content))
     }
 
     /// 36 氪：快讯页 `<meta name=description>` == 正文。
@@ -454,6 +479,39 @@ struct ExtractErr {
 
 fn parse_err(msg: &str) -> ExtractErr {
     ExtractErr { reason: ArticleExtractReason::ParseError, message: msg.to_string() }
+}
+
+/// 解析金十 detail 页 `<title>` 文本 → `(headline, content)`。
+///
+/// 格式恒为 `【X】Y - 金十数据`：
+/// - `X == "金十数据"`（一句话快讯）：`Y` 就是标题本身 → `(None, Y)`，通常 <MIN 字、上层判 TooShort。
+/// - `X` 为真实标题（解读 / 长讯型）：`Y` 是 `金十数据…讯，<正文>` → `(Some(X), "X\n\nY")` 完整快讯。
+/// - 无 `【】`：整段作正文。
+fn parse_jin10_title(raw: &str) -> (Option<String>, String) {
+    let t = raw.trim();
+    // 去站点后缀 " - 金十数据"
+    let t = t.strip_suffix("金十数据").map(|s| s.trim_end()).unwrap_or(t);
+    let t = t.strip_suffix('-').map(|s| s.trim_end()).unwrap_or(t).trim();
+    let bracketed = t.strip_prefix('【').and_then(|r| {
+        r.find('】').map(|i| {
+            (
+                r[..i].trim().to_string(),
+                r[i + '】'.len_utf8()..].trim().to_string(),
+            )
+        })
+    });
+    match bracketed {
+        // 一句话快讯：方括号里是源名"金十数据"，正文即标题。
+        Some((b, rest)) if b == "金十数据" => (None, rest),
+        // 长讯但正文缺失：退化为标题。
+        Some((b, rest)) if rest.is_empty() => (Some(b.clone()), b),
+        // 解读 / 长讯：标题 + 完整正文。
+        Some((b, rest)) => {
+            let body = format!("{b}\n\n{rest}");
+            (Some(b), body)
+        }
+        None => (None, t.to_string()),
+    }
 }
 
 /// 取 URL 最后一个路径段（去 query/fragment），用于从 detail url 提 id。
@@ -736,6 +794,42 @@ fn clean_whitespace(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jin10_strategy_is_flash_not_title_is_content() {
+        // 金十从 TitleIsContent 改成 Jin10Flash（detail 页抽正文）。
+        assert_eq!(strategy_for("newsnow:jin10"), ArticleStrategy::Jin10Flash);
+    }
+
+    #[test]
+    fn parse_jin10_long_flash_extracts_full_body() {
+        // 解读 / 长讯型：方括号是真实标题，其后是完整正文。
+        let raw = "【机构：三大原厂将于2027年大幅调高HBM的报价】金十数据6月2日讯，集邦咨询最新研究指出，自2H25以来，一般型DRAM价格大涨，反映供不应求形势，三大原厂的HBM年度议价机制导致合约价无法及时反映季度涨价趋势。 - 金十数据";
+        let (title, content) = parse_jin10_title(raw);
+        assert_eq!(
+            title.as_deref(),
+            Some("机构：三大原厂将于2027年大幅调高HBM的报价")
+        );
+        assert!(content.contains("金十数据6月2日讯"), "正文应含 detail body");
+        assert!(content.contains("集邦咨询"));
+        assert!(
+            content.chars().count() >= ARTICLE_MIN_CONTENT_CHARS,
+            "长讯正文应过 MIN 阈值被存为正文"
+        );
+    }
+
+    #[test]
+    fn parse_jin10_oneliner_has_no_separate_body() {
+        // 一句话快讯：方括号是源名"金十数据"，正文即标题本身、短于 MIN → 上层 TooShort（只显示标题）。
+        let raw = "【金十数据】阿联酋总统顾问安瓦尔：中东地区正在为伊朗膨胀的地区野心付出代价。 - 金十数据";
+        let (title, content) = parse_jin10_title(raw);
+        assert_eq!(title, None);
+        assert!(content.starts_with("阿联酋总统顾问"));
+        assert!(
+            content.chars().count() < ARTICLE_MIN_CONTENT_CHARS,
+            "一句话快讯正文短于 MIN → 不会被误存正文"
+        );
+    }
 
     #[test]
     fn charset_from_content_type_parses() {

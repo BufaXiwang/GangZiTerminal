@@ -329,6 +329,13 @@ export function KlineCanvas({
     // 副图：成交量
     chart.createIndicator("VOL", false, { id: "vol_pane" });
 
+    // 容器尺寸变化时让图表重算布局（窗口 / 面板 resize；以及万一在 0 尺寸下 init 后获得尺寸）。
+    // 注：页面懒挂载（App.tsx）已保证图表首次在可见状态下 init，这里是兜底 + 处理后续 resize。
+    const resizeObserver = new ResizeObserver(() => {
+      chartRef.current?.resize();
+    });
+    resizeObserver.observe(container);
+
     let cancelled = false;
 
     void (async () => {
@@ -413,6 +420,7 @@ export function KlineCanvas({
 
     return () => {
       cancelled = true;
+      resizeObserver.disconnect();
       const tBeforeDispose = performance.now();
       dispose(container);
       perf(
