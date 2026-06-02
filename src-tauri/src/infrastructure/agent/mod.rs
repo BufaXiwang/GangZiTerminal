@@ -36,6 +36,13 @@ pub mod system_prompt;
 #[cfg(test)]
 mod llm_judge_tests;
 
+/// LLM-as-Judge + adversarial test suite for the Tool subsystem (text protocol across 3 wires,
+/// local file/bash tools + workspace sandbox, skill create/load + progressive disclosure).
+/// Live tests `#[ignore]`; hermetic protocol/rename-regression tests run normally.
+/// Spec: agent-infra-module.md §2/§3/§5 + agent-runtime-module.md §4.2/§Skills.
+#[cfg(test)]
+mod judge_tools_tests;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
