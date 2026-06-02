@@ -20,7 +20,7 @@ pub enum AgentStopReason {
     MaxTurns,
     Cancelled,
     ProviderStop,
-    SkillError,
+    ToolError,
     ContextLimit,
     Error,
 }
@@ -69,20 +69,20 @@ pub enum AgentEvent {
         run_id: String,
         delta: String,
     },
-    SkillStart {
+    ToolStart {
         #[serde(rename = "runId")]
         run_id: String,
-        #[serde(rename = "skillCallId")]
-        skill_call_id: String,
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
         name: String,
         #[serde(rename = "inputSummary")]
         input_summary: JsonSummary,
     },
-    SkillEnd {
+    ToolEnd {
         #[serde(rename = "runId")]
         run_id: String,
-        #[serde(rename = "skillCallId")]
-        skill_call_id: String,
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
         name: String,
         #[serde(rename = "outputSummary")]
         output_summary: JsonSummary,
@@ -146,8 +146,8 @@ impl AgentEvent {
             AgentEvent::RunStart { run_id, .. }
             | AgentEvent::TextDelta { run_id, .. }
             | AgentEvent::ThinkingDelta { run_id, .. }
-            | AgentEvent::SkillStart { run_id, .. }
-            | AgentEvent::SkillEnd { run_id, .. }
+            | AgentEvent::ToolStart { run_id, .. }
+            | AgentEvent::ToolEnd { run_id, .. }
             | AgentEvent::Compacted { run_id, .. }
             | AgentEvent::Usage { run_id, .. }
             | AgentEvent::Done { run_id, .. }
@@ -212,26 +212,26 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_skill_start_and_end_serialize() {
-        let s = AgentEvent::SkillStart {
+    fn agent_event_tool_start_and_end_serialize() {
+        let s = AgentEvent::ToolStart {
             run_id: "r1".into(),
-            skill_call_id: "sc_1".into(),
+            tool_call_id: "tc_1".into(),
             name: "fetch_quote".into(),
             input_summary: serde_json::json!({"tsCode": "600519.SH"}),
         };
         let j = serde_json::to_value(&s).unwrap();
-        assert_eq!(j["type"], "skill_start");
-        assert_eq!(j["skillCallId"], "sc_1");
-        let e = AgentEvent::SkillEnd {
+        assert_eq!(j["type"], "tool_start");
+        assert_eq!(j["toolCallId"], "tc_1");
+        let e = AgentEvent::ToolEnd {
             run_id: "r1".into(),
-            skill_call_id: "sc_1".into(),
+            tool_call_id: "tc_1".into(),
             name: "fetch_quote".into(),
             output_summary: serde_json::json!({"ok": true}),
             is_error: false,
             duration_ms: 30,
         };
         let j = serde_json::to_value(&e).unwrap();
-        assert_eq!(j["type"], "skill_end");
+        assert_eq!(j["type"], "tool_end");
         assert_eq!(j["durationMs"], 30);
     }
 

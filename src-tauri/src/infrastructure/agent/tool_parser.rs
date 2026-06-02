@@ -1,14 +1,14 @@
-//! SkillCallParser — 在 chat stream 中扫描 `<use_skill>` 闭合。
+//! ToolCallParser — 在 chat stream 中扫描 `<use_tool>` 闭合。
 //!
-//! Spec: docs/design/agent-infra-module.md §2 Skill 调用文本协议，§5 SkillCallParser API
+//! Spec: docs/design/agent-infra-module.md §2 Tool 调用文本协议，§5 ToolCallParser API
 //!
 //! 规则：
 //! - Parser 实时增量扫描 provider stream；不缓冲整 turn。
-//! - 检测到 `<use_skill name="X">` 后**只**缓冲到 `</use_skill>` 闭合，期间不 emit text_delta
+//! - 检测到 `<use_tool name="X">` 后**只**缓冲到 `</use_tool>` 闭合，期间不 emit text_delta
 //!   （避免泄漏 raw XML 给 UI）。
-//! - 闭合后解析 JSON：成功 → emit `UseSkill`；失败 → emit `ParseError`。
-//! - 嵌套非法（`<use_skill>` 内部又出现 `<use_skill>`）→ `ParseError`。
-//! - 流到 turn 结束（`finalize`）仍未闭合的 `<use_skill>` 当 text 处理（不 dispatch）。
+//! - 闭合后解析 JSON：成功 → emit `UseTool`；失败 → emit `ParseError`。
+//! - 嵌套非法（`<use_tool>` 内部又出现 `<use_tool>`）→ `ParseError`。
+//! - 流到 turn 结束（`finalize`）仍未闭合的 `<use_tool>` 当 text 处理（不 dispatch）。
 
 use crate::domain::agent::JsonSummary;
 
@@ -17,16 +17,16 @@ use crate::domain::agent::JsonSummary;
 pub enum ParserEvent {
     /// 透传给 stream 的文本。
     TextDelta(String),
-    /// 检测到一次完整 `<use_skill name="X">{...}</use_skill>`，可 dispatch。
-    UseSkill { name: String, input: JsonSummary },
-    /// 标签格式 / JSON 解析错误 → caller 应包装为 `<skill_error code="parse_error">` 回给模型。
+    /// 检测到一次完整 `<use_tool name="X">{...}</use_tool>`，可 dispatch。
+    UseTool { name: String, input: JsonSummary },
+    /// 标签格式 / JSON 解析错误 → caller 应包装为 `<tool_error code="parse_error">` 回给模型。
     ParseError { reason: String, partial: String },
 }
 
 /// Parser 状态机：
-/// - `Idle`：在普通文本中；检测 `<use_skill` 起手时切到 InOpeningTag。
+/// - `Idle`：在普通文本中；检测 `<use_tool` 起手时切到 InOpeningTag。
 /// - `InOpeningTag`：累积 opening tag 内容（直到 `>`）。
-/// - `InContent`：在 `<use_skill ...>` 和 `</use_skill>` 之间，累积 JSON。
+/// - `InContent`：在 `<use_tool ...>` 和 `</use_tool>` 之间，累积 JSON。
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     Idle,
@@ -34,23 +34,23 @@ enum State {
     InContent,
 }
 
-const USE_SKILL_OPEN: &str = "<use_skill";
-const USE_SKILL_CLOSE: &str = "</use_skill>";
+const USE_TOOL_OPEN: &str = "<use_tool";
+const USE_TOOL_CLOSE: &str = "</use_tool>";
 
-/// SkillCallParser — 增量扫描 chat stream 检测 `<use_skill>` 标签。
-pub struct SkillCallParser {
+/// ToolCallParser — 增量扫描 chat stream 检测 `<use_tool>` 标签。
+pub struct ToolCallParser {
     state: State,
     /// 当前还没决定是文本还是 tag 的字节缓冲（处理 partial chunk）。
     pending: String,
     /// `InContent` 状态下累积的 inner content（不含闭合标签）。
     content_buf: String,
-    /// `InOpeningTag` 状态下累积的 opening tag（含 `<use_skill` 前缀）。
+    /// `InOpeningTag` 状态下累积的 opening tag（含 `<use_tool` 前缀）。
     opening_buf: String,
-    /// 当前正在解析的 skill name（opening tag 解析出来的）。
+    /// 当前正在解析的 tool name（opening tag 解析出来的）。
     current_name: Option<String>,
 }
 
-impl SkillCallParser {
+impl ToolCallParser {
     pub fn new() -> Self {
         Self {
             state: State::Idle,
@@ -91,7 +91,7 @@ impl SkillCallParser {
             }
             State::InContent => {
                 // Unclosed: flush opening + content as text.
-                let mut text = format!("<use_skill name=\"{}\">", self.current_name.clone().unwrap_or_default());
+                let mut text = format!("<use_tool name=\"{}\">", self.current_name.clone().unwrap_or_default());
                 text.push_str(&std::mem::take(&mut self.content_buf));
                 text.push_str(&std::mem::take(&mut self.pending));
                 events.push(ParserEvent::TextDelta(text));
@@ -116,24 +116,24 @@ impl SkillCallParser {
         }
     }
 
-    /// In Idle state: emit text up to next `<use_skill` (if seen). If partial prefix of `<use_skill`
+    /// In Idle state: emit text up to next `<use_tool` (if seen). If partial prefix of `<use_tool`
     /// at end of pending, hold off to wait for more input.
     fn step_idle(&mut self, events: &mut Vec<ParserEvent>) -> bool {
-        if let Some(pos) = self.pending.find(USE_SKILL_OPEN) {
+        if let Some(pos) = self.pending.find(USE_TOOL_OPEN) {
             // Emit everything before the tag start as text.
             let prefix: String = self.pending.drain(..pos).collect();
             if !prefix.is_empty() {
                 events.push(ParserEvent::TextDelta(prefix));
             }
-            // Move USE_SKILL_OPEN ("<use_skill") into opening_buf and advance.
-            let head: String = self.pending.drain(..USE_SKILL_OPEN.len()).collect();
+            // Move USE_TOOL_OPEN ("<use_tool") into opening_buf and advance.
+            let head: String = self.pending.drain(..USE_TOOL_OPEN.len()).collect();
             self.opening_buf = head;
             self.state = State::InOpeningTag;
             return true;
         }
-        // Tag not found. We may have a partial prefix of `<use_skill` at the end. Keep it pending
+        // Tag not found. We may have a partial prefix of `<use_tool` at the end. Keep it pending
         // and flush the safe-text prefix.
-        if let Some(safe_end) = safe_emit_idx(&self.pending, USE_SKILL_OPEN) {
+        if let Some(safe_end) = safe_emit_idx(&self.pending, USE_TOOL_OPEN) {
             if safe_end > 0 {
                 let prefix: String = self.pending.drain(..safe_end).collect();
                 if !prefix.is_empty() {
@@ -146,7 +146,7 @@ impl SkillCallParser {
     }
 
     /// Accumulate opening tag bytes until `>` is found. Then parse `name="..."` and switch to
-    /// InContent. Disallow nested `<use_skill` inside opening tag.
+    /// InContent. Disallow nested `<use_tool` inside opening tag.
     fn step_opening(&mut self, events: &mut Vec<ParserEvent>) -> bool {
         // Move bytes from pending to opening_buf until `>` is found, with a safety cap.
         let mut found_gt = None;
@@ -164,7 +164,7 @@ impl SkillCallParser {
         };
         let head: String = self.pending.drain(..end).collect();
         self.opening_buf.push_str(&head);
-        // self.opening_buf now contains `<use_skill ... >`
+        // self.opening_buf now contains `<use_tool ... >`
         match parse_opening_tag(&self.opening_buf) {
             Ok(name) => {
                 self.current_name = Some(name);
@@ -182,11 +182,11 @@ impl SkillCallParser {
         true
     }
 
-    /// Accumulate JSON content until `</use_skill>` or detect nested `<use_skill` (illegal).
+    /// Accumulate JSON content until `</use_tool>` or detect nested `<use_tool` (illegal).
     fn step_content(&mut self, events: &mut Vec<ParserEvent>) -> bool {
-        // Find the earlier of `</use_skill>` (close) or `<use_skill` (illegal nest).
-        let pos_close = self.pending.find(USE_SKILL_CLOSE);
-        let pos_nest = self.pending.find(USE_SKILL_OPEN);
+        // Find the earlier of `</use_tool>` (close) or `<use_tool` (illegal nest).
+        let pos_close = self.pending.find(USE_TOOL_CLOSE);
+        let pos_nest = self.pending.find(USE_TOOL_OPEN);
 
         if let (Some(pn), Some(pc)) = (pos_nest, pos_close) {
             // If nest occurs before close: illegal.
@@ -196,7 +196,7 @@ impl SkillCallParser {
                 self.content_buf.clear();
                 self.pending.clear();
                 events.push(ParserEvent::ParseError {
-                    reason: "nested <use_skill> not allowed".into(),
+                    reason: "nested <use_tool> not allowed".into(),
                     partial,
                 });
                 self.state = State::Idle;
@@ -210,7 +210,7 @@ impl SkillCallParser {
             self.content_buf.clear();
             self.pending.clear();
             events.push(ParserEvent::ParseError {
-                reason: "nested <use_skill> not allowed".into(),
+                reason: "nested <use_tool> not allowed".into(),
                 partial,
             });
             self.state = State::Idle;
@@ -223,15 +223,15 @@ impl SkillCallParser {
             let inner: String = self.pending.drain(..pc).collect();
             self.content_buf.push_str(&inner);
             // Drop the close tag.
-            self.pending.drain(..USE_SKILL_CLOSE.len());
+            self.pending.drain(..USE_TOOL_CLOSE.len());
             // Parse JSON
             let raw_inner = std::mem::take(&mut self.content_buf);
             let trimmed = raw_inner.trim();
             let name = self.current_name.take().unwrap_or_default();
             match serde_json::from_str::<JsonSummary>(trimmed) {
-                Ok(input) => events.push(ParserEvent::UseSkill { name, input }),
+                Ok(input) => events.push(ParserEvent::UseTool { name, input }),
                 Err(e) => events.push(ParserEvent::ParseError {
-                    reason: format!("invalid JSON in <use_skill>: {}", e),
+                    reason: format!("invalid JSON in <use_tool>: {}", e),
                     partial: raw_inner,
                 }),
             }
@@ -240,9 +240,9 @@ impl SkillCallParser {
         }
 
         // Neither close nor nest found. Keep bytes in content_buf but hold a small tail to handle
-        // partial `</use_skill>` or `<use_skill` straddling chunks.
-        if let Some(safe_end) = safe_emit_idx(&self.pending, USE_SKILL_CLOSE) {
-            let safe_end2 = match safe_emit_idx(&self.pending[..safe_end], USE_SKILL_OPEN) {
+        // partial `</use_tool>` or `<use_tool` straddling chunks.
+        if let Some(safe_end) = safe_emit_idx(&self.pending, USE_TOOL_CLOSE) {
+            let safe_end2 = match safe_emit_idx(&self.pending[..safe_end], USE_TOOL_OPEN) {
                 Some(x) => x.min(safe_end),
                 None => safe_end,
             };
@@ -257,7 +257,7 @@ impl SkillCallParser {
 
 }
 
-impl Default for SkillCallParser {
+impl Default for ToolCallParser {
     fn default() -> Self {
         Self::new()
     }
@@ -284,12 +284,12 @@ fn safe_emit_idx(s: &str, marker: &str) -> Option<usize> {
     Some(s.len())
 }
 
-/// Parse `<use_skill name="X">` opening tag. Returns the name on success.
+/// Parse `<use_tool name="X">` opening tag. Returns the name on success.
 fn parse_opening_tag(tag: &str) -> Result<String, String> {
-    // Expected shape: `<use_skill name="<name>">` (allow whitespace).
+    // Expected shape: `<use_tool name="<name>">` (allow whitespace).
     let tag = tag.trim();
     let stripped = tag
-        .strip_prefix(USE_SKILL_OPEN)
+        .strip_prefix(USE_TOOL_OPEN)
         .and_then(|s| s.strip_suffix('>'))
         .ok_or_else(|| "malformed opening tag".to_string())?;
     let stripped = stripped.trim();
@@ -316,7 +316,7 @@ fn parse_opening_tag(tag: &str) -> Result<String, String> {
         .ok_or_else(|| "unterminated quoted name value".to_string())?;
     let name = &rest[..close];
     if name.is_empty() {
-        return Err("empty skill name".into());
+        return Err("empty tool name".into());
     }
     Ok(name.to_string())
 }
@@ -325,32 +325,32 @@ fn parse_opening_tag(tag: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn drain(p: &mut SkillCallParser, chunk: &str) -> Vec<ParserEvent> {
+    fn drain(p: &mut ToolCallParser, chunk: &str) -> Vec<ParserEvent> {
         p.feed(chunk)
     }
 
     #[test]
     fn t1_plain_text_emits_text_delta() {
-        let mut p = SkillCallParser::new();
+        let mut p = ToolCallParser::new();
         let evs = drain(&mut p, "hello world");
         assert_eq!(evs, vec![ParserEvent::TextDelta("hello world".into())]);
     }
 
     #[test]
-    fn t2_single_use_skill_complete_in_one_chunk() {
-        let mut p = SkillCallParser::new();
+    fn t2_single_use_tool_complete_in_one_chunk() {
+        let mut p = ToolCallParser::new();
         let evs = drain(
             &mut p,
-            r#"before <use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill> after"#,
+            r#"before <use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool> after"#,
         );
-        // expect: TextDelta("before "), UseSkill, TextDelta(" after")
+        // expect: TextDelta("before "), UseTool, TextDelta(" after")
         let mut iter = evs.into_iter();
         match iter.next().unwrap() {
             ParserEvent::TextDelta(s) => assert_eq!(s, "before "),
             x => panic!("unexpected {:?}", x),
         }
         match iter.next().unwrap() {
-            ParserEvent::UseSkill { name, input } => {
+            ParserEvent::UseTool { name, input } => {
                 assert_eq!(name, "fetch_quote");
                 assert_eq!(input["tsCode"], "600519.SH");
             }
@@ -364,17 +364,17 @@ mod tests {
 
     #[test]
     fn t3_chunk_split_in_middle_of_opening_tag() {
-        let mut p = SkillCallParser::new();
+        let mut p = ToolCallParser::new();
         let mut evs = vec![];
-        evs.extend(p.feed("Hi <use_sk"));
-        evs.extend(p.feed("ill name=\"fetch_quote\">{\"a\":1}</use_skill>!"));
-        // collect texts and useskill counts
+        evs.extend(p.feed("Hi <use_to"));
+        evs.extend(p.feed("ol name=\"fetch_quote\">{\"a\":1}</use_tool>!"));
+        // collect texts and usetool counts
         let mut text = String::new();
         let mut count_use = 0;
         for e in evs {
             match e {
                 ParserEvent::TextDelta(s) => text.push_str(&s),
-                ParserEvent::UseSkill { name, .. } => {
+                ParserEvent::UseTool { name, .. } => {
                     assert_eq!(name, "fetch_quote");
                     count_use += 1;
                 }
@@ -389,11 +389,11 @@ mod tests {
 
     #[test]
     fn t4_unclosed_tag_at_finalize_becomes_text() {
-        let mut p = SkillCallParser::new();
-        let evs = p.feed("hi <use_skill name=\"x\">{\"a\":1}");
-        // not closed yet — no UseSkill
+        let mut p = ToolCallParser::new();
+        let evs = p.feed("hi <use_tool name=\"x\">{\"a\":1}");
+        // not closed yet — no UseTool
         for e in &evs {
-            assert!(!matches!(e, ParserEvent::UseSkill { .. }));
+            assert!(!matches!(e, ParserEvent::UseTool { .. }));
         }
         let evs2 = p.finalize();
         // finalize should emit the unclosed content as text
@@ -403,14 +403,14 @@ mod tests {
                 got_text.push_str(&s);
             }
         }
-        assert!(got_text.contains("use_skill"));
+        assert!(got_text.contains("use_tool"));
     }
 
     #[test]
-    fn t5_nested_use_skill_is_parse_error() {
-        let mut p = SkillCallParser::new();
+    fn t5_nested_use_tool_is_parse_error() {
+        let mut p = ToolCallParser::new();
         let evs = p.feed(
-            r#"<use_skill name="a">{"x": <use_skill name="b">{}</use_skill>}</use_skill>"#,
+            r#"<use_tool name="a">{"x": <use_tool name="b">{}</use_tool>}</use_tool>"#,
         );
         let mut saw_err = false;
         for e in evs {
@@ -423,9 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn t6_invalid_json_inside_use_skill() {
-        let mut p = SkillCallParser::new();
-        let evs = p.feed(r#"<use_skill name="x">not json</use_skill>"#);
+    fn t6_invalid_json_inside_use_tool() {
+        let mut p = ToolCallParser::new();
+        let evs = p.feed(r#"<use_tool name="x">not json</use_tool>"#);
         let mut saw_err = false;
         for e in evs {
             if let ParserEvent::ParseError { reason, .. } = e {
@@ -437,15 +437,15 @@ mod tests {
     }
 
     #[test]
-    fn t7_multiple_use_skills_emit_in_order() {
-        let mut p = SkillCallParser::new();
+    fn t7_multiple_use_tools_emit_in_order() {
+        let mut p = ToolCallParser::new();
         let evs = p.feed(
-            r#"<use_skill name="a">{"i":1}</use_skill> mid <use_skill name="b">{"i":2}</use_skill>"#,
+            r#"<use_tool name="a">{"i":1}</use_tool> mid <use_tool name="b">{"i":2}</use_tool>"#,
         );
         let names: Vec<String> = evs
             .into_iter()
             .filter_map(|e| match e {
-                ParserEvent::UseSkill { name, input } => Some(format!("{}:{}", name, input["i"])),
+                ParserEvent::UseTool { name, input } => Some(format!("{}:{}", name, input["i"])),
                 _ => None,
             })
             .collect();
@@ -454,14 +454,14 @@ mod tests {
 
     #[test]
     fn t8_utf8_boundary_handled_correctly() {
-        let mut p = SkillCallParser::new();
-        // a Chinese sentence wrapping a use_skill
-        let evs = p.feed(r#"研究："茅台" <use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill> 完成"#);
+        let mut p = ToolCallParser::new();
+        // a Chinese sentence wrapping a use_tool
+        let evs = p.feed(r#"研究："茅台" <use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool> 完成"#);
         let mut saw_use = false;
         let mut text = String::new();
         for e in evs {
             match e {
-                ParserEvent::UseSkill { name, .. } => {
+                ParserEvent::UseTool { name, .. } => {
                     assert_eq!(name, "fetch_quote");
                     saw_use = true;
                 }
@@ -476,15 +476,15 @@ mod tests {
 
     #[test]
     fn t9_chunks_split_at_close_tag_boundary() {
-        let mut p = SkillCallParser::new();
+        let mut p = ToolCallParser::new();
         let mut evs = vec![];
-        evs.extend(p.feed(r#"<use_skill name="z">{"k":99}</use_sk"#));
-        evs.extend(p.feed("ill> done"));
+        evs.extend(p.feed(r#"<use_tool name="z">{"k":99}</use_to"#));
+        evs.extend(p.feed("ol> done"));
         let mut saw = false;
         let mut text = String::new();
         for e in evs {
             match e {
-                ParserEvent::UseSkill { name, input } => {
+                ParserEvent::UseTool { name, input } => {
                     assert_eq!(name, "z");
                     assert_eq!(input["k"], 99);
                     saw = true;
@@ -499,8 +499,8 @@ mod tests {
 
     #[test]
     fn t10_malformed_opening_tag_errors() {
-        let mut p = SkillCallParser::new();
-        let evs = p.feed("<use_skill no-name>");
+        let mut p = ToolCallParser::new();
+        let evs = p.feed("<use_tool no-name>");
         let mut saw_err = false;
         for e in evs {
             if let ParserEvent::ParseError { .. } = e {

@@ -60,6 +60,12 @@ pub enum ErrorCode {
     ArticleExtractFailed,
     ToolTimeout,
     ProviderContextTooLong,
+    /// 本地写 tool（write_file / edit_file）的 path 规范化后越界 <workspace>。
+    /// Spec: agent-runtime-module.md §4.2 本地通用 tool 契约（建议 A）。
+    PathOutsideWorkspace,
+    /// run_bash 命中危险命令门禁被拒（约定级，非强隔离）。
+    /// Spec: agent-runtime-module.md §2 run_bash 危险命令门禁 / §4.2。
+    CommandRejected,
 }
 
 /// Response 级 / item 级错误条目。

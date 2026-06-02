@@ -268,13 +268,13 @@ mod tests {
             msg(
                 AgentMessageRole::Assistant,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<use_skill name="x">{}</use_skill>"#.into(),
+                    text: r#"<use_tool name="x">{}</use_tool>"#.into(),
                 }],
             ),
             msg(
                 AgentMessageRole::User,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<skill_result name="x" call_id="sc_1">{"ok":true}</skill_result>"#.into(),
+                    text: r#"<tool_result name="x" call_id="tc_1">{"ok":true}</tool_result>"#.into(),
                 }],
             ),
         ];
@@ -282,24 +282,24 @@ mod tests {
         let arr = body["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[2]["role"], "user");
-        assert!(arr[2]["content"].as_str().unwrap().contains("<skill_result"));
+        assert!(arr[2]["content"].as_str().unwrap().contains("<tool_result"));
     }
 
     #[test]
-    fn assistant_skill_xml_passes_through_as_text() {
+    fn assistant_tool_xml_passes_through_as_text() {
         let ad = OpenAIChatAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![msg(
             AgentMessageRole::Assistant,
             vec![AgentMessageBlock::Text {
-                text: r#"thinking <use_skill name="x">{}</use_skill>"#.into(),
+                text: r#"thinking <use_tool name="x">{}</use_tool>"#.into(),
             }],
         )];
         let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         let m = &body["messages"][0];
         assert_eq!(m["role"], "assistant");
         let s = m["content"].as_str().unwrap();
-        assert!(s.contains("<use_skill"));
+        assert!(s.contains("<use_tool"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-//! Agent message / SkillCall 持久化。
+//! Agent message / ToolCall 持久化。
 //!
 //! Spec: docs/design/agent-infra-module.md §2 不变量
-//! - 所有 skill 调用必须先通过 `SkillRegistry` 校验。
-//! - 所有 skill 调用都必须记录 `SkillCall`。
+//! - 所有 tool 调用必须先通过 `ToolRegistry` 校验。
+//! - 所有 tool 调用都必须记录 `ToolCall`。
 
-use crate::domain::agent::{AgentMessage, MessageKind, SkillCall};
+use crate::domain::agent::{AgentMessage, MessageKind, ToolCall};
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::db::AppDb;
 use chrono::{DateTime, Utc};
@@ -138,7 +138,7 @@ impl AgentMessagesRepo {
         })
     }
 
-    pub fn upsert_skill_call(&self, call: &SkillCall) -> Result<(), RepoError> {
+    pub fn upsert_tool_call(&self, call: &ToolCall) -> Result<(), RepoError> {
         let input_summary = serde_json::to_string(&call.input_summary)?;
         let output_summary = match &call.output_summary {
             Some(v) => Some(serde_json::to_string(v)?),
@@ -155,14 +155,14 @@ impl AgentMessagesRepo {
         };
         self.db.with(|c| {
             c.execute(
-                "INSERT OR REPLACE INTO agent_skill_calls (
-                    skill_call_id, run_id, name,
+                "INSERT OR REPLACE INTO agent_tool_calls (
+                    tool_call_id, run_id, name,
                     input_summary_json, input_payload_ref,
                     output_summary_json, output_payload_ref,
                     is_error, error_code, started_at, ended_at, duration_ms
                  ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
-                    call.skill_call_id,
+                    call.tool_call_id,
                     call.run_id,
                     call.name,
                     input_summary,
@@ -180,17 +180,17 @@ impl AgentMessagesRepo {
         })
     }
 
-    pub fn load_skill_call(&self, skill_call_id: &str) -> Result<Option<SkillCall>, RepoError> {
+    pub fn load_tool_call(&self, tool_call_id: &str) -> Result<Option<ToolCall>, RepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT skill_call_id, run_id, name,
+                "SELECT tool_call_id, run_id, name,
                         input_summary_json, input_payload_ref,
                         output_summary_json, output_payload_ref,
                         is_error, error_code, started_at, ended_at, duration_ms
-                 FROM agent_skill_calls WHERE skill_call_id = ?1",
+                 FROM agent_tool_calls WHERE tool_call_id = ?1",
             )?;
             let row = stmt
-                .query_row(params![skill_call_id], row_to_skill_call)
+                .query_row(params![tool_call_id], row_to_tool_call)
                 .optional()?;
             Ok(row)
         })
@@ -235,8 +235,8 @@ fn row_to_message(row: &Row) -> rusqlite::Result<AgentMessage> {
     })
 }
 
-fn row_to_skill_call(row: &Row) -> rusqlite::Result<SkillCall> {
-    let skill_call_id: String = row.get(0)?;
+fn row_to_tool_call(row: &Row) -> rusqlite::Result<ToolCall> {
+    let tool_call_id: String = row.get(0)?;
     let run_id: String = row.get(1)?;
     let name: String = row.get(2)?;
     let input_summary_s: String = row.get(3)?;
@@ -283,8 +283,8 @@ fn row_to_skill_call(row: &Row) -> rusqlite::Result<SkillCall> {
         ),
         None => None,
     };
-    Ok(SkillCall {
-        skill_call_id,
+    Ok(ToolCall {
+        tool_call_id,
         run_id,
         name,
         input_summary,
@@ -405,11 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn skill_call_round_trip() {
+    fn tool_call_round_trip() {
         let db = fresh_db();
         let repo = AgentMessagesRepo::new(db);
-        let tc = SkillCall {
-            skill_call_id: "sc_1".into(),
+        let tc = ToolCall {
+            tool_call_id: "tc_1".into(),
             run_id: "r1".into(),
             name: "fetch_quote".into(),
             input_summary: serde_json::json!({"tsCode":"600519.SH"}),
@@ -422,19 +422,19 @@ mod tests {
             ended_at: Some(Utc::now()),
             duration_ms: Some(45),
         };
-        repo.upsert_skill_call(&tc).unwrap();
-        let loaded = repo.load_skill_call("sc_1").unwrap().unwrap();
+        repo.upsert_tool_call(&tc).unwrap();
+        let loaded = repo.load_tool_call("tc_1").unwrap().unwrap();
         assert_eq!(loaded.name, "fetch_quote");
         assert_eq!(loaded.is_error, false);
         assert_eq!(loaded.duration_ms, Some(45));
     }
 
     #[test]
-    fn skill_call_with_error_code_round_trip() {
+    fn tool_call_with_error_code_round_trip() {
         let db = fresh_db();
         let repo = AgentMessagesRepo::new(db);
-        let tc = SkillCall {
-            skill_call_id: "sc_2".into(),
+        let tc = ToolCall {
+            tool_call_id: "tc_2".into(),
             run_id: "r1".into(),
             name: "operate_account".into(),
             input_summary: serde_json::json!({}),
@@ -447,8 +447,8 @@ mod tests {
             ended_at: Some(Utc::now()),
             duration_ms: Some(7),
         };
-        repo.upsert_skill_call(&tc).unwrap();
-        let loaded = repo.load_skill_call("sc_2").unwrap().unwrap();
+        repo.upsert_tool_call(&tc).unwrap();
+        let loaded = repo.load_tool_call("tc_2").unwrap().unwrap();
         assert_eq!(loaded.error_code, Some(ErrorCode::InsufficientCash));
         assert_eq!(loaded.input_payload_ref.as_deref(), Some("pl_in"));
     }

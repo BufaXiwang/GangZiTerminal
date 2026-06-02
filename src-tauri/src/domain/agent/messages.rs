@@ -4,7 +4,7 @@
 //!
 //! 不变量：
 //! - role / block 组合必须按 spec §2 表格校验。
-//! - Skill 调用 / 结果以 XML 标签嵌在 `text` block 中，**不**作为独立 block type。
+//! - Tool 调用 / 结果以 XML 标签嵌在 `text` block 中，**不**作为独立 block type。
 //! - 图片 `dataRef` 是 PayloadStore URI（`payload://pl_xxx`）或 `file:///`；不是 base64 数据。
 //! - thinking 是否持久化取决于 provider；Anthropic 等需要保留 provider-specific metadata（signature）。
 
@@ -19,7 +19,7 @@ pub type JsonSummary = serde_json::Value;
 ///
 /// Spec: agent-infra-module.md §2
 ///
-/// 注：`tool` role 不存在；skill_result 以 `user` role + text block（含 `<skill_result>` XML）形式回写。
+/// 注：`tool` role 不存在；tool_result 以 `user` role + text block（含 `<tool_result>` XML）形式回写。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentMessageRole {
@@ -32,7 +32,7 @@ pub enum AgentMessageRole {
 ///
 /// Spec: agent-infra-module.md §2 `AgentMessageBlock`
 ///
-/// Skill 调用 / 结果（`<use_skill>` / `<skill_result>` / `<skill_error>`）嵌在 text block 中。
+/// Tool 调用 / 结果（`<use_tool>` / `<tool_result>` / `<tool_error>`）嵌在 text block 中。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessageBlock {
@@ -178,17 +178,17 @@ mod tests {
                     metadata: None,
                 },
                 AgentMessageBlock::Text {
-                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into()
+                    text: r#"<use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool>"#.into()
                 },
             ]
         )
         .validate_role_blocks()
         .is_ok());
-        // skill_result lives in user-role text block
+        // tool_result lives in user-role text block
         assert!(msg(
             AgentMessageRole::User,
             vec![AgentMessageBlock::Text {
-                text: r#"<skill_result name="fetch_quote" call_id="sc_1">{"price":"1.0"}</skill_result>"#.into()
+                text: r#"<tool_result name="fetch_quote" call_id="tc_1">{"price":"1.0"}</tool_result>"#.into()
             }]
         )
         .validate_role_blocks()

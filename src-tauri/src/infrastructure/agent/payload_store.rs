@@ -1,9 +1,9 @@
-//! PayloadStore — skill input / output / image 完整 payload 持久化。
+//! PayloadStore — tool input / output / image 完整 payload 持久化。
 //!
 //! Spec: docs/design/agent-infra-module.md §2 PayloadStore
 //!
 //! 写入触发（spec §2 规则）：
-//! - skill input / output JSON 序列化后超过 **8KB** 时；
+//! - tool input / output JSON 序列化后超过 **8KB** 时；
 //! - 图片 attachment（任何尺寸都进 PayloadStore）。
 //!
 //! 第一阶段不实现 GC / retention policy；payload 永久保留，用于 decision episode replay。
@@ -22,16 +22,16 @@ pub const PAYLOAD_INLINE_LIMIT_BYTES: usize = 8 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadKind {
-    SkillInput,
-    SkillOutput,
+    ToolInput,
+    ToolOutput,
     Image,
 }
 
 impl PayloadKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            PayloadKind::SkillInput => "skill_input",
-            PayloadKind::SkillOutput => "skill_output",
+            PayloadKind::ToolInput => "tool_input",
+            PayloadKind::ToolOutput => "tool_output",
             PayloadKind::Image => "image",
         }
     }
@@ -41,8 +41,8 @@ impl PayloadKind {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "skill_input" => Some(PayloadKind::SkillInput),
-            "skill_output" => Some(PayloadKind::SkillOutput),
+            "tool_input" => Some(PayloadKind::ToolInput),
+            "tool_output" => Some(PayloadKind::ToolOutput),
             "image" => Some(PayloadKind::Image),
             _ => None,
         }
@@ -235,10 +235,10 @@ mod tests {
     fn put_get_json_roundtrip() {
         let store = fresh_store();
         let v = serde_json::json!({"k": [1,2,3], "name": "x"});
-        let id = store.put_json(PayloadKind::SkillOutput, &v).unwrap();
+        let id = store.put_json(PayloadKind::ToolOutput, &v).unwrap();
         assert!(id.starts_with("pl_"));
         let got = store.get(&id).unwrap().unwrap();
-        assert_eq!(got.kind, PayloadKind::SkillOutput);
+        assert_eq!(got.kind, PayloadKind::ToolOutput);
         assert_eq!(got.content_json.unwrap(), v);
         assert!(got.byte_size > 0);
     }

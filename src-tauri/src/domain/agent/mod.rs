@@ -2,7 +2,7 @@
 //!
 //! Spec: docs/design/agent-infra-module.md §2
 //!
-//! 仅放 Agent **Infra** 概念（`AgentMessage` / `SkillSpec` / `SkillCall` / `AgentEvent` /
+//! 仅放 Agent **Infra** 概念（`AgentMessage` / `ToolSpec` / `ToolCall` / `AgentEvent` /
 //! `ProviderChannel` / `ContextBundle` / loop 请求 / `RunSummary`）。
 //!
 //! 不放 Runtime 概念（`AgentRun` / `AgentRunProfile` / `DecisionEpisode` /
@@ -14,7 +14,7 @@ pub mod context;
 pub mod events;
 pub mod loop_request;
 pub mod messages;
-pub mod skills;
+pub mod tools;
 
 pub use channel::{ProviderChannel, WireFormat};
 pub use context::{
@@ -29,4 +29,4 @@ pub use messages::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, JsonSummary, MessageKind,
     MessageRoleBlockError,
 };
-pub use skills::{SideEffect, SkillCall, SkillCallId, SkillCallResult, SkillSpec};
+pub use tools::{SideEffect, ToolCall, ToolCallId, ToolCallResult, ToolSpec};

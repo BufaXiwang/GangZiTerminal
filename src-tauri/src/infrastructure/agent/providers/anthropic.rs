@@ -7,7 +7,7 @@
 //! - 把 canonical `AgentMessage` 翻译成 Anthropic `/v1/messages` 请求 body。
 //! - 图片 `dataRef` 在 build wire 时从 PayloadStore dereference → base64 编码。
 //! - Thinking block 把 `metadata` 中的 `signature` / `redacted` 还原回 wire。
-//! - **不**传 tools 字段、**不**解析 tool_use block（skill 走文本协议）。
+//! - **不**传 tools 字段、**不**解析 tool_use block（tool 走文本协议）。
 
 use super::{dereference_image, ProviderAdapter, WireMappingError};
 use crate::domain::agent::{
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn build_request_body_reflects_multi_message_conversation() {
         // Regression: body must reflect the live growing messages slice passed by the loop,
-        // not a startup snapshot — incl <skill_result> user messages.
+        // not a startup snapshot — incl <tool_result> user messages.
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![
@@ -294,13 +294,13 @@ mod tests {
             msg(
                 AgentMessageRole::Assistant,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
+                    text: r#"<use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool>"#.into(),
                 }],
             ),
             msg(
                 AgentMessageRole::User,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<skill_result name="fetch_quote" call_id="sc_1">{"price":"1820"}</skill_result>"#.into(),
+                    text: r#"<tool_result name="fetch_quote" call_id="tc_1">{"price":"1820"}</tool_result>"#.into(),
                 }],
             ),
         ];
@@ -311,24 +311,24 @@ mod tests {
         assert_eq!(arr[1]["role"], "assistant");
         assert_eq!(arr[2]["role"], "user");
         let last = arr[2]["content"][0]["text"].as_str().unwrap();
-        assert!(last.contains("<skill_result"));
+        assert!(last.contains("<tool_result"));
     }
 
     #[test]
-    fn skill_call_xml_round_trips_as_text_block() {
+    fn tool_call_xml_round_trips_as_text_block() {
         let ad = AnthropicAdapter::new(make_channel(false, false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![msg(
             AgentMessageRole::Assistant,
             vec![AgentMessageBlock::Text {
-                text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
+                text: r#"<use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool>"#.into(),
             }],
         )];
         let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
         assert_eq!(body["messages"][0]["role"], "assistant");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         let s = body["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(s.contains("<use_skill"));
+        assert!(s.contains("<use_tool"));
     }
 
     #[test]

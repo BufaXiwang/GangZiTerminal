@@ -1,13 +1,13 @@
 //! LLM-as-Judge live test suite for Agent Infra.
 //!
-//! Spec: docs/design/agent-infra-module.md §2 (Skill 协议 / durable facts) /
+//! Spec: docs/design/agent-infra-module.md §2 (Tool 协议 / durable facts) /
 //!       §3 (Agent Loop) / §4 (上下文管理 / Summarize / compaction) / §5 (Infra Loop API).
 //!
 //! These tests are NOT deterministic script assertions. Each one drives a *real* agent-infra
 //! capability live (run_agent_turn over a real HttpProvider), then asks a
 //! separate JUDGE LLM to evaluate the produced output against a rubric, returning a structured
 //! `{pass, score, reason}` verdict. The judge semantically validates the agent's core behaviors:
-//! answer relevance, tool/skill faithfulness, multi-turn memory, summary faithfulness, and
+//! answer relevance, tool/tool faithfulness, multi-turn memory, summary faithfulness, and
 //! durable-fact preservation through context compaction.
 //!
 //! ALL tests are `#[ignore]` (live, env-creds) — they never run in a normal `cargo test`.
@@ -35,15 +35,15 @@ use tokio::sync::mpsc;
 
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest, AgentStopReason,
-    CompactionConfig, ContextBundle, MessageKind, ProviderChannel, SideEffect, SkillSpec,
+    CompactionConfig, ContextBundle, MessageKind, ProviderChannel, SideEffect, ToolSpec,
     WireFormat,
 };
 use crate::infrastructure::agent::http_provider::HttpProvider;
 use crate::infrastructure::agent::loop_executor::{run_agent_turn, ProviderStream};
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
-use crate::infrastructure::agent::skill_registry::{
-    FnSkillHandler, SkillHandler, SkillHandlerFuture, SkillHandlerOutput, SkillInvocation,
-    SkillRegistry,
+use crate::infrastructure::agent::tool_registry::{
+    FnToolHandler, ToolHandler, ToolHandlerFuture, ToolHandlerOutput, ToolInvocation,
+    ToolRegistry,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,20 +318,20 @@ fn assert_verdict(test: &str, label: &str, v: &Verdict) {
 }
 
 // ---------------------------------------------------------------------------
-// Run-loop helper: drive run_agent_turn and collect the streamed answer + skills
+// Run-loop helper: drive run_agent_turn and collect the streamed answer + tools
 // ---------------------------------------------------------------------------
 
 struct LoopRun {
     answer: String,
-    skills: Vec<(String, bool)>,
+    tools: Vec<(String, bool)>,
     stop_reason: AgentStopReason,
 }
 
 /// Run a single-shot loop (one user question) over the given channel + registry; pump the event
-/// stream and collect the streamed TextDelta answer + skill_end (name, is_error) pairs.
+/// stream and collect the streamed TextDelta answer + tool_end (name, is_error) pairs.
 async fn run_loop_collect(
     channel: ProviderChannel,
-    registry: Arc<SkillRegistry>,
+    registry: Arc<ToolRegistry>,
     user_text: &str,
     max_turns: u32,
 ) -> LoopRun {
@@ -350,21 +350,21 @@ async fn run_loop_collect(
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
         let mut text = String::new();
-        let mut skills: Vec<(String, bool)> = Vec::new();
+        let mut tools: Vec<(String, bool)> = Vec::new();
         while let Some(e) = rx.recv().await {
             match e {
                 AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
-                AgentEvent::SkillEnd { name, is_error, .. } => skills.push((name, is_error)),
+                AgentEvent::ToolEnd { name, is_error, .. } => tools.push((name, is_error)),
                 _ => {}
             }
         }
-        (text, skills)
+        (text, tools)
     });
     let summary = run_agent_turn(request, registry, ContextBundle::new("judge-run"), vec![provider], tx, None)
         .await
         .expect("loop run");
-    let (answer, skills) = pump.await.unwrap();
-    LoopRun { answer, skills, stop_reason: summary.stop_reason }
+    let (answer, tools) = pump.await.unwrap();
+    LoopRun { answer, tools, stop_reason: summary.stop_reason }
 }
 
 fn user_message(run: &str, text: &str) -> AgentMessage {
@@ -416,7 +416,7 @@ async fn judge_answer_relevance() {
     .into_iter()
     .flatten()
     {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let run = run_loop_collect(ch.channel, registry, question, 1).await;
         println!("[judge_answer_relevance][{}] answer={:?}", ch.label, run.answer);
         assert!(!run.answer.is_empty(), "[{}] empty answer", ch.label);
@@ -431,45 +431,45 @@ async fn judge_answer_relevance() {
 }
 
 // ===========================================================================
-// 2. skill_faithfulness — register get_quote returning a FIXED made-up price (1234.5);
+// 2. tool_faithfulness — register get_quote returning a FIXED made-up price (1234.5);
 //    prompt the model to use it + report the price; judge that the model reports 1234.5
 //    from the tool and did NOT invent a different number.
 // ===========================================================================
 #[tokio::test]
 #[ignore]
-async fn judge_skill_faithfulness() {
+async fn judge_tool_faithfulness() {
     let Some(judge_ch) = judge_channel() else {
-        println!("[judge_skill_faithfulness] skip: set JUDGE_*");
+        println!("[judge_tool_faithfulness] skip: set JUDGE_*");
         return;
     };
     let Some(ch) = pick_fast_agent_channel() else {
-        println!("[judge_skill_faithfulness] skip: set an agent channel (TEST_DS_*/TEST_ANT_*/TEST_OAI_*)");
+        println!("[judge_tool_faithfulness] skip: set an agent channel (TEST_DS_*/TEST_ANT_*/TEST_OAI_*)");
         return;
     };
 
-    let registry = Arc::new(SkillRegistry::new_without_persist());
-    let spec = SkillSpec::new(
+    let registry = Arc::new(ToolRegistry::new_without_persist());
+    let spec = ToolSpec::new(
         "get_quote",
-        "获取单只 A股标的的实时行情快照。需要报某标的现价时必须调用本 skill 获取，不要凭空编造价格。",
+        "获取单只 A股标的的实时行情快照。需要报某标的现价时必须调用本 tool 获取，不要凭空编造价格。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="get_quote">{"tsCode":"600519.SH"}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="get_quote">{"tsCode":"600519.SH"}</use_tool>"#.to_string()],
         5000,
         SideEffect::None,
     );
     // FIXED made-up price — the only correct number the model can report.
-    let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(|_inv: SkillInvocation| {
-        Box::pin(async move { SkillHandlerOutput::ok(json!({"price": "1234.5"})) }) as SkillHandlerFuture
+    let handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(|_inv: ToolInvocation| {
+        Box::pin(async move { ToolHandlerOutput::ok(json!({"price": "1234.5"})) }) as ToolHandlerFuture
     }));
-    registry.register_skill(spec, handler).unwrap();
+    registry.register_tool(spec, handler).unwrap();
 
     let question = "请调用 get_quote 获取 600519.SH 的现价，然后用一句话告诉我它现在多少钱。";
     let run = run_loop_collect(ch.channel, registry, question, 4).await;
     println!(
-        "[judge_skill_faithfulness][{}] stop={:?} skills={:?} answer={:?}",
-        ch.label, run.stop_reason, run.skills, run.answer
+        "[judge_tool_faithfulness][{}] stop={:?} tools={:?} answer={:?}",
+        ch.label, run.stop_reason, run.tools, run.answer
     );
     assert!(
-        run.skills.iter().any(|(n, err)| n == "get_quote" && !err),
+        run.tools.iter().any(|(n, err)| n == "get_quote" && !err),
         "[{}] get_quote was not dispatched successfully",
         ch.label
     );
@@ -482,7 +482,7 @@ async fn judge_skill_faithfulness() {
     let v = judge(&judge_ch, scenario, &run.answer, rubric)
         .await
         .unwrap_or_else(|e| panic!("judge error: {e}"));
-    assert_verdict("skill_faithfulness", ch.label, &v);
+    assert_verdict("tool_faithfulness", ch.label, &v);
 }
 
 // ===========================================================================
@@ -503,7 +503,7 @@ async fn judge_multiturn_memory() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-mem-conv".to_string();
 
     // Turn 1: user states the constraint. New contract: hand only the new user message; the
@@ -602,7 +602,7 @@ async fn judge_summary_faithfulness() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-sum-conv".to_string();
 
     // Concrete facts seeded as a multi-message conversation.
@@ -727,7 +727,7 @@ async fn judge_memory_through_compaction() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-compact-conv".to_string();
 
     // Earlier fact stated BEFORE the summary boundary: account number.
@@ -823,7 +823,7 @@ async fn judge_memory_through_compaction() {
 // 6. durable_fact_preserved — register place_order (SideEffect::TradingWrite) returning
 //    {orderId, fillPrice}; have the model call it; force compaction; ask for the order id;
 //    judge the answer still knows it. Also deterministically assert the trading_write
-//    skill_result survived inline in the conversation messages (not stubbed/dropped).
+//    tool_result survived inline in the conversation messages (not stubbed/dropped).
 // ===========================================================================
 #[tokio::test]
 #[ignore]
@@ -838,28 +838,28 @@ async fn judge_durable_fact_preserved() {
     };
 
     let repo = fresh_repo();
-    // SkillRegistry needs persistence for SkillCall audit; reuse the repo's db for a PayloadStore.
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    // ToolRegistry needs persistence for ToolCall audit; reuse the repo's db for a PayloadStore.
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let order_id = "ORD-55123";
     let fill_price = "1801.0";
-    let spec = SkillSpec::new(
+    let spec = ToolSpec::new(
         "place_order",
-        "在模拟账户下单买入某标的。下单后会返回订单号(orderId)和成交价(fillPrice)。当用户要求买入某标的时调用本 skill。",
+        "在模拟账户下单买入某标的。下单后会返回订单号(orderId)和成交价(fillPrice)。当用户要求买入某标的时调用本 tool。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"},"side":{"type":"string"},"qty":{"type":"integer"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="place_order">{"tsCode":"600519.SH","side":"buy","qty":100}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="place_order">{"tsCode":"600519.SH","side":"buy","qty":100}</use_tool>"#.to_string()],
         5000,
         SideEffect::TradingWrite,
     );
     let oid = order_id.to_string();
     let fp = fill_price.to_string();
-    let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+    let handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(move |_inv: ToolInvocation| {
         let oid = oid.clone();
         let fp = fp.clone();
         Box::pin(async move {
-            SkillHandlerOutput::ok(json!({"orderId": oid, "fillPrice": fp, "status": "filled"}))
-        }) as SkillHandlerFuture
+            ToolHandlerOutput::ok(json!({"orderId": oid, "fillPrice": fp, "status": "filled"}))
+        }) as ToolHandlerFuture
     }));
-    registry.register_skill(spec, handler).unwrap();
+    registry.register_tool(spec, handler).unwrap();
 
     let conversation_id = "judge-durable-conv".to_string();
 
@@ -883,13 +883,13 @@ async fn judge_durable_fact_preserved() {
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
-        let mut skills: Vec<(String, bool)> = Vec::new();
+        let mut tools: Vec<(String, bool)> = Vec::new();
         while let Some(e) = rx1.recv().await {
-            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
-                skills.push((name, is_error));
+            if let AgentEvent::ToolEnd { name, is_error, .. } = e {
+                tools.push((name, is_error));
             }
         }
-        skills
+        tools
     });
     let _ = run_agent_turn(
         req1,
@@ -901,10 +901,10 @@ async fn judge_durable_fact_preserved() {
     )
     .await
     .expect("turn 1 (place_order)");
-    let t1_skills = pump1.await.unwrap();
-    println!("[judge_durable_fact_preserved][{}] turn1 skills={:?}", ch.label, t1_skills);
+    let t1_tools = pump1.await.unwrap();
+    println!("[judge_durable_fact_preserved][{}] turn1 tools={:?}", ch.label, t1_tools);
     assert!(
-        t1_skills.iter().any(|(n, err)| n == "place_order" && !err),
+        t1_tools.iter().any(|(n, err)| n == "place_order" && !err),
         "[{}] place_order was not dispatched successfully",
         ch.label
     );
@@ -962,21 +962,21 @@ async fn judge_durable_fact_preserved() {
     );
     assert!(!answer.is_empty(), "empty answer");
 
-    // Deterministic guard (spec §2/§4): the trading_write skill_result must survive inline in the
+    // Deterministic guard (spec §2/§4): the trading_write tool_result must survive inline in the
     // persisted conversation — it is a durable fact that compaction must never stub/drop. The full
-    // <skill_result> text carrying the orderId must still be present in agent_messages.
+    // <tool_result> text carrying the orderId must still be present in agent_messages.
     let all = repo.load_conversation(&conversation_id).unwrap();
     let order_id_inline = all.iter().any(|m| {
         m.blocks.iter().any(|b| match b {
             AgentMessageBlock::Text { text } => {
-                text.contains("skill_result") && text.contains(order_id)
+                text.contains("tool_result") && text.contains(order_id)
             }
             _ => false,
         })
     });
     assert!(
         order_id_inline,
-        "trading_write skill_result with orderId {order_id} must survive inline (not stubbed/dropped) in persisted conversation"
+        "trading_write tool_result with orderId {order_id} must survive inline (not stubbed/dropped) in persisted conversation"
     );
 
     let scenario = format!(
@@ -1011,7 +1011,7 @@ async fn judge_rolling_summary_folds_prior() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-rolling-conv".to_string();
     let mk = |seq: i64, role: AgentMessageRole, kind: Option<MessageKind>, text: &str| AgentMessage {
         message_id: format!("roll-{seq}"),
@@ -1220,7 +1220,7 @@ async fn force_one_summarize_cycle(
     });
     let _ = run_agent_turn(
         req,
-        Arc::new(SkillRegistry::new_without_persist()),
+        Arc::new(ToolRegistry::new_without_persist()),
         ContextBundle::new(run_id),
         vec![provider],
         tx,
@@ -1275,7 +1275,7 @@ async fn run_turn_resilient(
         });
         let res = run_agent_turn(
             req,
-            Arc::new(SkillRegistry::new_without_persist()),
+            Arc::new(ToolRegistry::new_without_persist()),
             ContextBundle::new(run_id),
             vec![provider],
             tx,
@@ -1538,7 +1538,7 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
     });
     let _ = run_agent_turn(
         req,
-        Arc::new(SkillRegistry::new_without_persist()),
+        Arc::new(ToolRegistry::new_without_persist()),
         ContextBundle::new("lt-final"),
         vec![provider],
         tx,
@@ -1616,7 +1616,7 @@ async fn judge_accumulated_constraints() {
         });
         let _ = run_agent_turn(
             req,
-            Arc::new(SkillRegistry::new_without_persist()),
+            Arc::new(ToolRegistry::new_without_persist()),
             ContextBundle::new(run_id),
             vec![provider],
             tx,
@@ -1647,8 +1647,8 @@ async fn judge_accumulated_constraints() {
 //     (orderId/fillPrice) 经过压缩后逐字 inline 保留(且 judge 复述精确)，而同一会话里的
 //     droppable get_quote 行情快照被 MicroClear 折成 stub(允许被概述/重新拉取)。
 //     Deterministic guards:
-//       - 持久化会话里仍含完整 <skill_result ... orderId ... fillPrice>(durable 逐字)
-//       - get_quote 的原始 price 数值不再以 <skill_result> inline 形式存在(被 stub 化)
+//       - 持久化会话里仍含完整 <tool_result ... orderId ... fillPrice>(durable 逐字)
+//       - get_quote 的原始 price 数值不再以 <tool_result> inline 形式存在(被 stub 化)
 //     [矩阵 A3 + B1 的差异面]
 // ---------------------------------------------------------------------------
 #[tokio::test]
@@ -1664,47 +1664,47 @@ async fn judge_durable_verbatim_vs_droppable() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-durdrop-conv".to_string();
 
-    // Durable trading_write skill: place_order → orderId/fillPrice.
+    // Durable trading_write tool: place_order → orderId/fillPrice.
     let order_id = "ORD-90021";
     let fill_price = "1777.0";
-    let place_spec = SkillSpec::new(
+    let place_spec = ToolSpec::new(
         "place_order",
         "在模拟账户下单买入某标的。下单后返回订单号(orderId)和成交价(fillPrice)。当用户要求买入时调用。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"},"side":{"type":"string"},"qty":{"type":"integer"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="place_order">{"tsCode":"600519.SH","side":"buy","qty":100}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="place_order">{"tsCode":"600519.SH","side":"buy","qty":100}</use_tool>"#.to_string()],
         5000,
         SideEffect::TradingWrite,
     );
     let (oid, fp) = (order_id.to_string(), fill_price.to_string());
-    let place_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+    let place_handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(move |_inv: ToolInvocation| {
         let (oid, fp) = (oid.clone(), fp.clone());
         Box::pin(async move {
-            SkillHandlerOutput::ok(json!({"orderId": oid, "fillPrice": fp, "status": "filled"}))
-        }) as SkillHandlerFuture
+            ToolHandlerOutput::ok(json!({"orderId": oid, "fillPrice": fp, "status": "filled"}))
+        }) as ToolHandlerFuture
     }));
-    registry.register_skill(place_spec, place_handler).unwrap();
+    registry.register_tool(place_spec, place_handler).unwrap();
 
     // Droppable (SideEffect::None) get_quote → a snapshot price that may be compacted away.
     let quote_price = "1755.5";
-    let quote_spec = SkillSpec::new(
+    let quote_spec = ToolSpec::new(
         "get_quote",
         "获取某标的实时行情快照(droppable，可被压缩后重新拉取)。需要现价时调用。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="get_quote">{"tsCode":"600519.SH"}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="get_quote">{"tsCode":"600519.SH"}</use_tool>"#.to_string()],
         5000,
         SideEffect::None,
     );
     let qp = quote_price.to_string();
-    let quote_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+    let quote_handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(move |_inv: ToolInvocation| {
         let qp = qp.clone();
-        Box::pin(async move { SkillHandlerOutput::ok(json!({"price": qp})) }) as SkillHandlerFuture
+        Box::pin(async move { ToolHandlerOutput::ok(json!({"price": qp})) }) as ToolHandlerFuture
     }));
-    registry.register_skill(quote_spec, quote_handler).unwrap();
+    registry.register_tool(quote_spec, quote_handler).unwrap();
 
-    // Turn 1: fetch a quote (droppable) AND place an order (durable). Both skill_results land inline.
+    // Turn 1: fetch a quote (droppable) AND place an order (durable). Both tool_results land inline.
     // New contract: hand only the new user message; the engine persists it + the produced turn.
     let provider1 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
     let req1 = AgentRunRequest {
@@ -1723,13 +1723,13 @@ async fn judge_durable_verbatim_vs_droppable() {
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
-        let mut skills: Vec<(String, bool)> = Vec::new();
+        let mut tools: Vec<(String, bool)> = Vec::new();
         while let Some(e) = rx1.recv().await {
-            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
-                skills.push((name, is_error));
+            if let AgentEvent::ToolEnd { name, is_error, .. } = e {
+                tools.push((name, is_error));
             }
         }
-        skills
+        tools
     });
     let _ = run_agent_turn(
         req1,
@@ -1741,10 +1741,10 @@ async fn judge_durable_verbatim_vs_droppable() {
     )
     .await
     .expect("turn 1 (quote + order)");
-    let t1_skills = pump1.await.unwrap();
-    eprintln!("[judge_durable_verbatim_vs_droppable][{}] turn1 skills={:?}", ch.label, t1_skills);
+    let t1_tools = pump1.await.unwrap();
+    eprintln!("[judge_durable_verbatim_vs_droppable][{}] turn1 tools={:?}", ch.label, t1_tools);
     assert!(
-        t1_skills.iter().any(|(n, e)| n == "place_order" && !e),
+        t1_tools.iter().any(|(n, e)| n == "place_order" && !e),
         "[{}] place_order not dispatched", ch.label
     );
 
@@ -1787,16 +1787,16 @@ async fn judge_durable_verbatim_vs_droppable() {
     eprintln!("[judge_durable_verbatim_vs_droppable][{}] answer={:?}", ch.label, answer);
     assert!(!answer.is_empty(), "empty answer");
 
-    // Deterministic guard: durable trading_write skill_result must survive INLINE verbatim with
+    // Deterministic guard: durable trading_write tool_result must survive INLINE verbatim with
     // both orderId AND fillPrice (spec §4: trading_write results are never stubbed/dropped).
     let all = repo.load_conversation(&conversation_id).unwrap();
     let durable_inline = all.iter().any(|m| {
         m.blocks.iter().any(|b| matches!(b, AgentMessageBlock::Text { text }
-            if text.contains("skill_result") && text.contains(order_id) && text.contains(fill_price)))
+            if text.contains("tool_result") && text.contains(order_id) && text.contains(fill_price)))
     });
     assert!(
         durable_inline,
-        "durable place_order skill_result (orderId {order_id} + fillPrice {fill_price}) must survive inline verbatim after compaction"
+        "durable place_order tool_result (orderId {order_id} + fillPrice {fill_price}) must survive inline verbatim after compaction"
     );
 
     let scenario = format!(
@@ -1819,9 +1819,9 @@ async fn judge_durable_verbatim_vs_droppable() {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// B1. judge_microclear_then_answer_correct — 一个 droppable skill(get_news)返回较大数据 →
-//     压缩时被折成 stub → 后续问该数据 → agent 仍答对(要么 summary 保留要点，要么 re-use_skill
-//     重新拉取)。Deterministic guard: 该 skill_result 在持久化里已被 stub 化(<skill_result_stub）。
+// B1. judge_microclear_then_answer_correct — 一个 droppable tool(get_news)返回较大数据 →
+//     压缩时被折成 stub → 后续问该数据 → agent 仍答对(要么 summary 保留要点，要么 re-use_tool
+//     重新拉取)。Deterministic guard: 该 tool_result 在持久化里已被 stub 化(<tool_result_stub）。
 //     [矩阵 B1]
 // ---------------------------------------------------------------------------
 #[tokio::test]
@@ -1837,30 +1837,30 @@ async fn judge_microclear_then_answer_correct() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-microclear-conv".to_string();
 
-    // Droppable skill returning a sizeable payload whose key fact is a headline.
+    // Droppable tool returning a sizeable payload whose key fact is a headline.
     let headline = "比亚迪5月新能源车销量同比增长35%";
-    let news_spec = SkillSpec::new(
+    let news_spec = ToolSpec::new(
         "get_news",
         "拉取某标的的最新新闻(droppable，可被压缩后重新拉取)。需要新闻时调用，并可再次调用刷新。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="get_news">{"tsCode":"002594.SZ"}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="get_news">{"tsCode":"002594.SZ"}</use_tool>"#.to_string()],
         5000,
         SideEffect::None,
     );
     let hl = headline.to_string();
-    let news_handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+    let news_handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(move |_inv: ToolInvocation| {
         let hl = hl.clone();
         Box::pin(async move {
-            SkillHandlerOutput::ok(json!({
+            ToolHandlerOutput::ok(json!({
                 "headline": hl,
                 "body": "正文很长，仅作占位，反复重复以撑大体积。".repeat(8),
             }))
-        }) as SkillHandlerFuture
+        }) as ToolHandlerFuture
     }));
-    registry.register_skill(news_spec, news_handler).unwrap();
+    registry.register_tool(news_spec, news_handler).unwrap();
 
     // Turn 1: fetch the news (droppable big payload lands inline).
     // New contract: hand only the new user message; the engine persists it + the produced turn.
@@ -1881,13 +1881,13 @@ async fn judge_microclear_then_answer_correct() {
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
-        let mut skills: Vec<(String, bool)> = Vec::new();
+        let mut tools: Vec<(String, bool)> = Vec::new();
         while let Some(e) = rx1.recv().await {
-            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
-                skills.push((name, is_error));
+            if let AgentEvent::ToolEnd { name, is_error, .. } = e {
+                tools.push((name, is_error));
             }
         }
-        skills
+        tools
     });
     let _ = run_agent_turn(
         req1,
@@ -1902,7 +1902,7 @@ async fn judge_microclear_then_answer_correct() {
     let t1 = pump1.await.unwrap();
     assert!(t1.iter().any(|(n, e)| n == "get_news" && !e), "[{}] get_news not dispatched", ch.label);
 
-    // Turn 2: force MicroClear (keep_recent=1 so the older get_news skill_result is OUTSIDE the
+    // Turn 2: force MicroClear (keep_recent=1 so the older get_news tool_result is OUTSIDE the
     // tail window → stubbed), then ask about the headline again. New contract: hand only the
     // follow-up; engine persists + loads.
     let provider2 = Box::new(HttpProvider::new(ch.channel.clone()).unwrap());
@@ -1911,7 +1911,7 @@ async fn judge_microclear_then_answer_correct() {
         trigger: "user".into(),
         channel: ch.channel.clone(),
         max_turns: 4,
-        // No summarize_prompt: stay in MicroClear/Drop lane so the droppable skill_result is
+        // No summarize_prompt: stay in MicroClear/Drop lane so the droppable tool_result is
         // stubbed (not folded into a summary).
         input: vec![user_message("mc-2", "刚才那条新闻的头条标题是什么？如果需要可以再次拉取。")],
         conversation_id: Some(conversation_id.clone()),
@@ -1955,7 +1955,7 @@ async fn judge_microclear_then_answer_correct() {
 
     let scenario = format!(
         "A droppable news tool earlier returned a large payload whose headline was: '{headline}'. The \
-        context was compacted (MicroClear stubbed the bulky skill_result). The user asked for the \
+        context was compacted (MicroClear stubbed the bulky tool_result). The user asked for the \
         headline again — the agent may re-fetch via the tool. The answer must still convey the headline."
     );
     let rubric = format!(
@@ -2105,7 +2105,7 @@ async fn judge_keep_recent_verbatim() {
     });
     let _ = run_agent_turn(
         req,
-        Arc::new(SkillRegistry::new_without_persist()),
+        Arc::new(ToolRegistry::new_without_persist()),
         ContextBundle::new("kr-q"),
         vec![provider],
         tx,
@@ -2144,7 +2144,7 @@ async fn judge_keep_recent_verbatim() {
 // B4. judge_drop_degrade_preserves_durable — summarize_prompt=None 时压缩走 Drop-oldest；
 //     droppable 旧轮被丢弃，但 durable(trading_write 的 place_order 结果)仍保留 inline；
 //     最后提问 durable 订单号仍答对。Deterministic guard: 持久化里仍含完整 orderId 的
-//     <skill_result>，且无任何 <skill_result> 形式的 summary 检查点(确认没走 Summarize)。
+//     <tool_result>，且无任何 <tool_result> 形式的 summary 检查点(确认没走 Summarize)。
 //     [矩阵 B4]
 // ---------------------------------------------------------------------------
 #[tokio::test]
@@ -2160,25 +2160,25 @@ async fn judge_drop_degrade_preserves_durable() {
     };
 
     let repo = fresh_repo();
-    let registry = Arc::new(SkillRegistry::new_without_persist());
+    let registry = Arc::new(ToolRegistry::new_without_persist());
     let conversation_id = "judge-dropdeg-conv".to_string();
 
     let order_id = "ORD-44777";
-    let spec = SkillSpec::new(
+    let spec = ToolSpec::new(
         "place_order",
         "在模拟账户下单买入某标的。下单后返回订单号(orderId)。当用户要求买入时调用。",
         json!({"type":"object","properties":{"tsCode":{"type":"string"},"side":{"type":"string"},"qty":{"type":"integer"}},"required":["tsCode"]}),
-        vec![r#"<use_skill name="place_order">{"tsCode":"600036.SH","side":"buy","qty":200}</use_skill>"#.to_string()],
+        vec![r#"<use_tool name="place_order">{"tsCode":"600036.SH","side":"buy","qty":200}</use_tool>"#.to_string()],
         5000,
         SideEffect::TradingWrite,
     );
     let oid = order_id.to_string();
-    let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(move |_inv: SkillInvocation| {
+    let handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(move |_inv: ToolInvocation| {
         let oid = oid.clone();
-        Box::pin(async move { SkillHandlerOutput::ok(json!({"orderId": oid, "status": "filled"})) })
-            as SkillHandlerFuture
+        Box::pin(async move { ToolHandlerOutput::ok(json!({"orderId": oid, "status": "filled"})) })
+            as ToolHandlerFuture
     }));
-    registry.register_skill(spec, handler).unwrap();
+    registry.register_tool(spec, handler).unwrap();
 
     // Turn 1: some droppable chatter (persisted fixture) THEN place an order (durable). New
     // contract: the chatter above is the persisted fixture; hand only the new order request —
@@ -2204,13 +2204,13 @@ async fn judge_drop_degrade_preserves_durable() {
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
-        let mut skills: Vec<(String, bool)> = Vec::new();
+        let mut tools: Vec<(String, bool)> = Vec::new();
         while let Some(e) = rx1.recv().await {
-            if let AgentEvent::SkillEnd { name, is_error, .. } = e {
-                skills.push((name, is_error));
+            if let AgentEvent::ToolEnd { name, is_error, .. } = e {
+                tools.push((name, is_error));
             }
         }
-        skills
+        tools
     });
     let _ = run_agent_turn(
         req1,
@@ -2275,16 +2275,16 @@ async fn judge_drop_degrade_preserves_durable() {
     assert!(!answer.is_empty(), "empty answer");
     assert!(!saw_summarize, "summarize_prompt=None must NOT trigger a Summarize tier (should degrade to Drop)");
 
-    // Deterministic guard: durable trading_write skill_result with the orderId must survive inline
+    // Deterministic guard: durable trading_write tool_result with the orderId must survive inline
     // through the Drop-oldest degrade path (spec §4: Drop keeps durable items inline).
     let all = repo.load_conversation(&conversation_id).unwrap();
     let durable_inline = all.iter().any(|m| {
         m.blocks.iter().any(|b| matches!(b, AgentMessageBlock::Text { text }
-            if text.contains("skill_result") && text.contains(order_id)))
+            if text.contains("tool_result") && text.contains(order_id)))
     });
     assert!(
         durable_inline,
-        "durable place_order skill_result (orderId {order_id}) must survive inline through Drop-degrade"
+        "durable place_order tool_result (orderId {order_id}) must survive inline through Drop-degrade"
     );
     // And no summary checkpoint should have been produced (we never gave a summarize_prompt).
     assert_eq!(

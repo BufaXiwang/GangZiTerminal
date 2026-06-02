@@ -5,17 +5,17 @@
 //! 行为：
 //! 1. emit `run_start`
 //! 2. 调 provider stream（trait `ProviderStream`，便于注入 fake provider 测试）
-//! 3. （spec §2/§3）：`SkillCallParser` 现在跑在 **provider 内部**，clean `TextDelta`
-//!    由 provider 实时 emit（XML 抑制）。loop 只消费 `outcome.skill_events`：
-//!    - `UseSkill` → emit `skill_start` → `SkillRegistry::dispatch_skill_call` →
-//!      emit `skill_end` → 缓存 `<skill_result>` 文本
-//!    - `ParseError` → 把 `<skill_error code="parse_error">` 加到本轮回写文本
+//! 3. （spec §2/§3）：`ToolCallParser` 现在跑在 **provider 内部**，clean `TextDelta`
+//!    由 provider 实时 emit（XML 抑制）。loop 只消费 `outcome.tool_events`：
+//!    - `UseTool` → emit `tool_start` → `ToolRegistry::dispatch_tool_call` →
+//!      emit `tool_end` → 缓存 `<tool_result>` 文本
+//!    - `ParseError` → 把 `<tool_error code="parse_error">` 加到本轮回写文本
 //!
 //!    loop **不再** 自己跑 parser、**不再** re-emit `TextDelta`（避免重复）。
-//!    消息历史用 `outcome.text`（raw，含 `<use_skill>` XML）回写。
+//!    消息历史用 `outcome.text`（raw，含 `<use_tool>` XML）回写。
 //! 4. turn 结束：
 //!    - 若本 turn 触发了 ≥ 1 次 dispatch：构造新一轮 user message（按出现顺序串联
-//!      `<skill_result>` / `<skill_error>`），继续 loop。
+//!      `<tool_result>` / `<tool_error>`），继续 loop。
 //!    - 否则 finalize：emit usage / done。
 //! 5. Reactive retry：catch `ProviderContextTooLong` → `compact_context(ReactiveRetry)`
 //!    → 重发同一 turn（最多 1 次）→ 仍失败则 `stop_reason = context_limit`。
@@ -32,8 +32,8 @@ use crate::infrastructure::agent::context_compaction::{
 };
 use crate::infrastructure::agent::http_provider::HttpProvider;
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
-use crate::infrastructure::agent::skill_parser::ParserEvent;
-use crate::infrastructure::agent::skill_registry::{DispatchError, SkillRegistry};
+use crate::infrastructure::agent::tool_parser::ParserEvent;
+use crate::infrastructure::agent::tool_registry::{DispatchError, ToolRegistry};
 use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
 use std::collections::HashSet;
@@ -95,21 +95,21 @@ impl CompactionPlan {
 ///
 /// 本 trait 抽象掉具体 SSE 解码细节，让 loop 测试可以注入 mock。
 ///
-/// （spec §2/§3）：`SkillCallParser` 现在跑在 **streaming provider 内部**，
+/// （spec §2/§3）：`ToolCallParser` 现在跑在 **streaming provider 内部**，
 /// 所以 provider 在流式过程中已经 emit 过 clean（XML-suppressed）的 `TextDelta`。
-/// `skill_events` 携带本 turn 解析出的 `UseSkill` / `ParseError`（按出现顺序），供
+/// `tool_events` 携带本 turn 解析出的 `UseTool` / `ParseError`（按出现顺序），供
 /// loop dispatch；其中**不包含** `TextDelta`（已由 provider emit，loop 不再 re-emit）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderTurnOutcome {
-    /// provider 输出的 **raw** chat text（含 `<use_skill>` XML 标签），用于回写消息历史。
+    /// provider 输出的 **raw** chat text（含 `<use_tool>` XML 标签），用于回写消息历史。
     pub text: String,
     pub usage_input: u32,
     pub usage_output: u32,
     /// provider 原始 stop reason（adapter 归一化后值）。
     pub stop_reason: AgentStopReason,
-    /// 本 turn 解析出的 skill 事件（`UseSkill` / `ParseError`，按出现顺序）。
+    /// 本 turn 解析出的 tool 事件（`UseTool` / `ParseError`，按出现顺序）。
     /// TextDelta 已由 provider emit，**不**出现在此 vec。
-    pub skill_events: Vec<ParserEvent>,
+    pub tool_events: Vec<ParserEvent>,
 }
 
 /// Provider stream 抽象。Loop executor 在每个 turn 调用一次 `next_turn`。
@@ -230,7 +230,7 @@ async fn resilient_next_turn(
     }
 }
 
-/// 唯一 Agent loop 入口：推进一个会话 turn（一次 user→assistant，内部可多次 provider / skill 往返）。
+/// 唯一 Agent loop 入口：推进一个会话 turn（一次 user→assistant，内部可多次 provider / tool 往返）。
 ///
 /// **持久化与续接全归 Infra**（spec §4）。调用方只给 `request.input`（这一轮的新消息，通常一条 user）
 /// + 可选 `conversation_id` + 可选 `repo`：
@@ -243,7 +243,7 @@ async fn resilient_next_turn(
 /// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
 pub async fn run_agent_turn(
     mut request: AgentRunRequest,
-    registry: Arc<SkillRegistry>,
+    registry: Arc<ToolRegistry>,
     mut context: ContextBundle,
     mut providers: Vec<Box<dyn ProviderStream>>,
     event_tx: Sender<AgentEvent>,
@@ -280,9 +280,9 @@ pub async fn run_agent_turn(
     };
 
     // Spec §2 line 209-210, §5 line 533: 每次 Agent loop 启动时,Infra 用 `SystemPromptBuilder`
-    // 把 enabled `SkillSpec` 集合编译成 system prompt 前缀,自动 prepend 到 ContextBundle.systemParts。
+    // 把 enabled `ToolSpec` 集合编译成 system prompt 前缀,自动 prepend 到 ContextBundle.systemParts。
     // Runtime 不需要手动塞;这里在 emit run_start 之前一次性 prepend。
-    prepend_skill_list_to_system_parts(&mut context, &registry);
+    prepend_tool_list_to_system_parts(&mut context, &registry);
 
     send_event(
         &event_tx,
@@ -294,11 +294,11 @@ pub async fn run_agent_turn(
     )
     .await?;
 
-    let mut skill_call_ids: Vec<String> = Vec::new();
+    let mut tool_call_ids: Vec<String> = Vec::new();
     let mut usage_input: u32 = 0;
     let mut usage_output: u32 = 0;
     // Spec §4 generic durable signal: message_ids that must never be compacted/stubbed.
-    // The loop derives this set ONLY from SkillSpec.sideEffect == trading_write (Infra knows
+    // The loop derives this set ONLY from ToolSpec.sideEffect == trading_write (Infra knows
     // nothing about "trading" semantics — it just honours the generic side-effect flag) and from
     // kind=summary checkpoints. Seed summary messages are durable too.
     let mut durable_message_ids: HashSet<String> = messages
@@ -390,32 +390,32 @@ pub async fn run_agent_turn(
         usage_input = usage_input.saturating_add(outcome.usage_input);
         usage_output = usage_output.saturating_add(outcome.usage_output);
 
-        // ---- provider already ran SkillCallParser and emitted clean TextDelta.
-        // Loop consumes only the parsed skill events; it does NOT re-feed text and does
+        // ---- provider already ran ToolCallParser and emitted clean TextDelta.
+        // Loop consumes only the parsed tool events; it does NOT re-feed text and does
         // NOT re-emit TextDelta. Assistant message history uses outcome.text (raw XML).
-        let mut skill_results_for_next_turn: Vec<String> = Vec::new();
+        let mut tool_results_for_next_turn: Vec<String> = Vec::new();
         let mut any_dispatch = false;
-        // Spec §4: a turn whose skill_result message carries any trading_write skill result is
-        // durable (never compacted). Generic signal — Infra only reads SkillSpec.sideEffect.
+        // Spec §4: a turn whose tool_result message carries any trading_write tool result is
+        // durable (never compacted). Generic signal — Infra only reads ToolSpec.sideEffect.
         let mut turn_has_trading_write = false;
 
-        for ev in outcome.skill_events.iter().cloned() {
+        for ev in outcome.tool_events.iter().cloned() {
             match ev {
                 ParserEvent::TextDelta(_) => {
                     // Provider already emitted clean TextDelta; loop ignores any here.
                 }
-                ParserEvent::UseSkill { name, input } => {
+                ParserEvent::UseTool { name, input } => {
                     any_dispatch = true;
-                    if registry.skill_side_effect(&name) == Some(SideEffect::TradingWrite) {
+                    if registry.tool_side_effect(&name) == Some(SideEffect::TradingWrite) {
                         turn_has_trading_write = true;
                     }
-                    let call_id = SkillRegistry::new_skill_call_id();
+                    let call_id = ToolRegistry::new_tool_call_id();
 
                     send_event(
                         &event_tx,
-                        AgentEvent::SkillStart {
+                        AgentEvent::ToolStart {
                             run_id: run_id.clone(),
-                            skill_call_id: call_id.clone(),
+                            tool_call_id: call_id.clone(),
                             name: name.clone(),
                             input_summary: input.clone(),
                         },
@@ -423,7 +423,7 @@ pub async fn run_agent_turn(
                     .await?;
 
                     let dispatch_res = registry
-                        .dispatch_skill_call(&run_id, call_id.clone(), &name, input.clone())
+                        .dispatch_tool_call(&run_id, call_id.clone(), &name, input.clone())
                         .await;
 
                     let (out_summary, is_error, duration_ms, used_call_id, err_code) =
@@ -432,12 +432,12 @@ pub async fn run_agent_turn(
                                 r.output_summary,
                                 r.is_error,
                                 r.duration_ms,
-                                r.skill_call_id,
+                                r.tool_call_id,
                                 r.error_code,
                             ),
                             Err(DispatchError::NotRegistered(_)) => {
                                 let summary = serde_json::json!({
-                                    "message": format!("skill '{}' not registered", name),
+                                    "message": format!("tool '{}' not registered", name),
                                 });
                                 (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput))
                             }
@@ -451,12 +451,12 @@ pub async fn run_agent_turn(
                             }
                         };
 
-                    skill_call_ids.push(used_call_id.clone());
+                    tool_call_ids.push(used_call_id.clone());
                     send_event(
                         &event_tx,
-                        AgentEvent::SkillEnd {
+                        AgentEvent::ToolEnd {
                             run_id: run_id.clone(),
-                            skill_call_id: used_call_id.clone(),
+                            tool_call_id: used_call_id.clone(),
                             name: name.clone(),
                             output_summary: out_summary.clone(),
                             is_error,
@@ -465,41 +465,41 @@ pub async fn run_agent_turn(
                     )
                     .await?;
 
-                    // Format <skill_result> / <skill_error> for next turn user message.
+                    // Format <tool_result> / <tool_error> for next turn user message.
                     let payload_str = serde_json::to_string(&out_summary)
                         .unwrap_or_else(|_| "{}".into());
                     if is_error {
                         let code_str =
                             err_code.map(error_code_str).unwrap_or("parse_error");
-                        skill_results_for_next_turn.push(format!(
-                            r#"<skill_error name="{}" call_id="{}" code="{}">{}</skill_error>"#,
+                        tool_results_for_next_turn.push(format!(
+                            r#"<tool_error name="{}" call_id="{}" code="{}">{}</tool_error>"#,
                             name, used_call_id, code_str, payload_str
                         ));
                     } else {
-                        skill_results_for_next_turn.push(format!(
-                            r#"<skill_result name="{}" call_id="{}">{}</skill_result>"#,
+                        tool_results_for_next_turn.push(format!(
+                            r#"<tool_result name="{}" call_id="{}">{}</tool_result>"#,
                             name, used_call_id, payload_str
                         ));
                     }
                 }
                 ParserEvent::ParseError { reason, partial: _ } => {
-                    // Spec §2: 标签嵌套不合法 / JSON parse 错 → 返回 <skill_error code="parse_error">。
+                    // Spec §2: 标签嵌套不合法 / JSON parse 错 → 返回 <tool_error code="parse_error">。
                     // raw partial 已包含在 outcome.text 中（assistant 历史从 outcome.text 回写）。
                     any_dispatch = true;
-                    let call_id = SkillRegistry::new_skill_call_id();
-                    skill_call_ids.push(call_id.clone());
+                    let call_id = ToolRegistry::new_tool_call_id();
+                    tool_call_ids.push(call_id.clone());
                     let payload = serde_json::json!({"message": reason});
                     let payload_str =
                         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
-                    skill_results_for_next_turn.push(format!(
-                        r#"<skill_error name="_parser" call_id="{}" code="parse_error">{}</skill_error>"#,
+                    tool_results_for_next_turn.push(format!(
+                        r#"<tool_error name="_parser" call_id="{}" code="parse_error">{}</tool_error>"#,
                         call_id, payload_str
                     ));
                 }
             }
         }
 
-        // Persist assistant message (raw text, incl <use_skill> XML) for LLM history.
+        // Persist assistant message (raw text, incl <use_tool> XML) for LLM history.
         if !outcome.text.is_empty() {
             let msg = build_message(
                 AgentMessageRole::Assistant,
@@ -513,7 +513,7 @@ pub async fn run_agent_turn(
         }
 
         if !any_dispatch {
-            // No skill use → finalize.
+            // No tool use → finalize.
             stop_reason = match outcome.stop_reason {
                 AgentStopReason::MaxTurns => AgentStopReason::MaxTurns,
                 AgentStopReason::ProviderStop => AgentStopReason::ProviderStop,
@@ -522,8 +522,8 @@ pub async fn run_agent_turn(
             break;
         }
 
-        // Append next-turn user message carrying the <skill_result>s.
-        let user_text = skill_results_for_next_turn.join("\n");
+        // Append next-turn user message carrying the <tool_result>s.
+        let user_text = tool_results_for_next_turn.join("\n");
         let user_msg = build_message(
             AgentMessageRole::User,
             user_text,
@@ -531,7 +531,7 @@ pub async fn run_agent_turn(
             &conversation_id,
             repo.as_ref(),
         );
-        // Spec §4: trading_write skill_result message is durable (never compacted/stubbed).
+        // Spec §4: trading_write tool_result message is durable (never compacted/stubbed).
         if turn_has_trading_write {
             durable_message_ids.insert(user_msg.message_id.clone());
         }
@@ -576,7 +576,7 @@ pub async fn run_agent_turn(
         output_tokens: usage_output,
         cache_read_tokens: None,
         cache_write_tokens: None,
-        skill_call_ids,
+        tool_call_ids,
     })
 }
 
@@ -629,7 +629,7 @@ async fn persist_message(
 }
 
 /// Spec §4 主动压缩（每轮发请求前）：estimate(messages + context) →
-/// - `> soft_limit`：MicroClear（context 易腐 part 替 stub + messages 非 durable 旧 skill_result 替 stub）
+/// - `> soft_limit`：MicroClear（context 易腐 part 替 stub + messages 非 durable 旧 tool_result 替 stub）
 /// - 仍 `> summarize_threshold`：有 `summarize_prompt` → Summarize（模型调用）；否则 Drop 最旧一轮
 ///
 /// 只认通用信号：`ContextPart.droppable` + `durable_message_ids`。trading_write / summary 永不动。
@@ -964,6 +964,8 @@ fn error_code_str(c: ErrorCode) -> &'static str {
         ErrorCode::ArticleExtractFailed => "article_extract_failed",
         ErrorCode::ToolTimeout => "tool_timeout",
         ErrorCode::ProviderContextTooLong => "provider_context_too_long",
+        ErrorCode::PathOutsideWorkspace => "path_outside_workspace",
+        ErrorCode::CommandRejected => "command_rejected",
     }
 }
 
@@ -971,14 +973,14 @@ async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopEr
     tx.send(e).await.map_err(|_| LoopError::EventChannelClosed)
 }
 
-/// Spec §2 System Prompt Skill 清单 / §5 line 533:
-/// 用 `SystemPromptBuilder` 把已注册的 SkillSpec 列表编译成 markdown 前缀,
+/// Spec §2 System Prompt Tool 清单 / §5 line 533:
+/// 用 `SystemPromptBuilder` 把已注册的 ToolSpec 列表编译成 markdown 前缀,
 /// 作为 `kind = "system"` 的 ContextPart 自动 prepend 到 `systemParts`(droppable=false)。
 ///
-/// 注意:protocol_preamble 即便没有任何 skill 也注入,保证模型始终知道 `<use_skill>` 文本协议。
-fn prepend_skill_list_to_system_parts(context: &mut ContextBundle, registry: &SkillRegistry) {
-    let skills = registry.list_skills();
-    let prompt = build_system_prompt(&skills, "");
+/// 注意:protocol_preamble 即便没有任何 tool 也注入,保证模型始终知道 `<use_tool>` 文本协议。
+fn prepend_tool_list_to_system_parts(context: &mut ContextBundle, registry: &ToolRegistry) {
+    let tools = registry.list_tools();
+    let prompt = build_system_prompt(&tools, "");
     if prompt.is_empty() {
         return;
     }
@@ -997,11 +999,11 @@ fn prepend_skill_list_to_system_parts(context: &mut ContextBundle, registry: &Sk
 mod tests {
     use super::*;
     use crate::domain::agent::{
-        ProviderChannel, SideEffect, SkillSpec, WireFormat,
+        ProviderChannel, SideEffect, ToolSpec, WireFormat,
     };
-    use crate::infrastructure::agent::skill_parser::SkillCallParser;
-    use crate::infrastructure::agent::skill_registry::{
-        FnSkillHandler, SkillHandler, SkillHandlerFuture, SkillHandlerOutput, SkillInvocation,
+    use crate::infrastructure::agent::tool_parser::ToolCallParser;
+    use crate::infrastructure::agent::tool_registry::{
+        FnToolHandler, ToolHandler, ToolHandlerFuture, ToolHandlerOutput, ToolInvocation,
     };
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -1024,8 +1026,8 @@ mod tests {
         }
     }
 
-    /// Build a scripted outcome the way a real provider does: run SkillCallParser over the
-    /// scripted raw text, populate `skill_events` (TextDelta excluded). TextDelta would be
+    /// Build a scripted outcome the way a real provider does: run ToolCallParser over the
+    /// scripted raw text, populate `tool_events` (TextDelta excluded). TextDelta would be
     /// emitted by the provider during streaming; here we simply build the outcome.
     fn scripted_outcome(
         text: &str,
@@ -1033,10 +1035,10 @@ mod tests {
         usage_output: u32,
         stop_reason: AgentStopReason,
     ) -> ProviderTurnOutcome {
-        let mut parser = SkillCallParser::new();
+        let mut parser = ToolCallParser::new();
         let mut events = parser.feed(text);
         events.extend(parser.finalize());
-        let skill_events: Vec<ParserEvent> = events
+        let tool_events: Vec<ParserEvent> = events
             .into_iter()
             .filter(|e| !matches!(e, ParserEvent::TextDelta(_)))
             .collect();
@@ -1045,13 +1047,13 @@ mod tests {
             usage_input,
             usage_output,
             stop_reason,
-            skill_events,
+            tool_events,
         }
     }
 
     /// Fake provider — 按预设脚本输出 turns.
-    /// emit clean TextDelta from the SkillCallParser over the scripted text (mirrors
-    /// HttpProvider), and carry parsed skill_events in the outcome.
+    /// emit clean TextDelta from the ToolCallParser over the scripted text (mirrors
+    /// HttpProvider), and carry parsed tool_events in the outcome.
     struct ScriptedProvider {
         script: Vec<Result<ProviderTurnOutcome, LoopError>>,
         index: usize,
@@ -1076,7 +1078,7 @@ mod tests {
             self.index += 1;
             // Emit clean TextDelta in real time, as a streaming provider would.
             if let Ok(out) = &item {
-                let mut parser = SkillCallParser::new();
+                let mut parser = ToolCallParser::new();
                 let mut events = parser.feed(&out.text);
                 events.extend(parser.finalize());
                 for ev in events {
@@ -1096,20 +1098,20 @@ mod tests {
         }
     }
 
-    fn echo_handler() -> Arc<dyn SkillHandler> {
-        Arc::new(FnSkillHandler(|inv: SkillInvocation| {
+    fn echo_handler() -> Arc<dyn ToolHandler> {
+        Arc::new(FnToolHandler(|inv: ToolInvocation| {
             Box::pin(async move {
-                SkillHandlerOutput::ok(json!({"echoed": inv.input}))
-            }) as SkillHandlerFuture
+                ToolHandlerOutput::ok(json!({"echoed": inv.input}))
+            }) as ToolHandlerFuture
         }))
     }
 
-    fn spec(name: &str) -> SkillSpec {
-        SkillSpec::new(
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec::new(
             name,
             "test",
             json!({"type":"object"}),
-            vec![format!(r#"<use_skill name="{}">{{}}</use_skill>"#, name)],
+            vec![format!(r#"<use_tool name="{}">{{}}</use_tool>"#, name)],
             5000,
             SideEffect::None,
         )
@@ -1131,7 +1133,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_completes_on_text_only_turn() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![Ok(scripted_outcome(
                 "hello",
@@ -1160,13 +1162,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_dispatches_single_skill_then_completes() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
-        registry.register_skill(spec("echo"), echo_handler()).unwrap();
+    async fn loop_dispatches_single_tool_then_completes() {
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("echo"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Ok(scripted_outcome(
-                    r#"check: <use_skill name="echo">{"a":1}</use_skill>"#,
+                    r#"check: <use_tool name="echo">{"a":1}</use_tool>"#,
                     1,
                     1,
                     AgentStopReason::ProviderStop,
@@ -1182,10 +1184,10 @@ mod tests {
                 .unwrap();
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
         assert_eq!(summary.turns, 2);
-        assert_eq!(summary.skill_call_ids.len(), 1);
+        assert_eq!(summary.tool_call_ids.len(), 1);
 
-        // a `<use_skill>` turn emits clean TextDelta (raw XML suppressed) exactly
-        // once, and the skill still dispatches.
+        // a `<use_tool>` turn emits clean TextDelta (raw XML suppressed) exactly
+        // once, and the tool still dispatches.
         let mut text_deltas: Vec<String> = Vec::new();
         let mut starts2 = 0;
         let mut rx_events = Vec::new();
@@ -1195,14 +1197,14 @@ mod tests {
         for e in &rx_events {
             match e {
                 AgentEvent::TextDelta { delta, .. } => text_deltas.push(delta.clone()),
-                AgentEvent::SkillStart { .. } => starts2 += 1,
+                AgentEvent::ToolStart { .. } => starts2 += 1,
                 _ => {}
             }
         }
         let joined: String = text_deltas.concat();
         assert!(
-            !joined.contains("<use_skill"),
-            "raw <use_skill> XML leaked into TextDelta: {joined:?}"
+            !joined.contains("<use_tool"),
+            "raw <use_tool> XML leaked into TextDelta: {joined:?}"
         );
         assert!(joined.contains("check: "));
         // "check: " appears exactly once (no double-emit).
@@ -1211,21 +1213,21 @@ mod tests {
 
         let ends = rx_events
             .iter()
-            .filter(|e| matches!(e, AgentEvent::SkillEnd { .. }))
+            .filter(|e| matches!(e, AgentEvent::ToolEnd { .. }))
             .count();
         assert_eq!(starts2, 1);
         assert_eq!(ends, 1);
     }
 
     #[tokio::test]
-    async fn loop_handles_multiple_skills_in_one_turn_in_order() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
-        registry.register_skill(spec("a"), echo_handler()).unwrap();
-        registry.register_skill(spec("b"), echo_handler()).unwrap();
+    async fn loop_handles_multiple_tools_in_one_turn_in_order() {
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("a"), echo_handler()).unwrap();
+        registry.register_tool(spec("b"), echo_handler()).unwrap();
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Ok(scripted_outcome(
-                    r#"<use_skill name="a">{"i":1}</use_skill><use_skill name="b">{"i":2}</use_skill>"#,
+                    r#"<use_tool name="a">{"i":1}</use_tool><use_tool name="b">{"i":2}</use_tool>"#,
                     1,
                     1,
                     AgentStopReason::ProviderStop,
@@ -1239,10 +1241,10 @@ mod tests {
             run_agent_turn(req(), registry, ContextBundle::new("r1"), vec![provider], tx, None)
                 .await
                 .unwrap();
-        assert_eq!(summary.skill_call_ids.len(), 2);
+        assert_eq!(summary.tool_call_ids.len(), 2);
         let mut ordered_names: Vec<String> = Vec::new();
         while let Some(e) = rx.recv().await {
-            if let AgentEvent::SkillStart { name, .. } = e {
+            if let AgentEvent::ToolStart { name, .. } = e {
                 ordered_names.push(name);
             }
         }
@@ -1251,7 +1253,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_reactive_retry_recovers_on_first_failure() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Err(LoopError::ProviderContextTooLong),
@@ -1278,7 +1280,7 @@ mod tests {
 
     #[tokio::test]
     async fn loop_reactive_retry_fails_closed_on_second_context_too_long() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Err(LoopError::ProviderContextTooLong),
@@ -1364,7 +1366,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_succeeds_after_transient_errors() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let (provider, calls) = FlakyProvider::new(vec![
             Err(LoopError::ProviderTransient("upstream".into())),
             Err(LoopError::ProviderTransient("upstream".into())),
@@ -1390,7 +1392,7 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_to_second_channel_when_primary_exhausts() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let (primary, primary_calls) = FlakyProvider::new(vec![
             Err(LoopError::ProviderTransient("p1".into())),
             Err(LoopError::ProviderTransient("p1".into())),
@@ -1417,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn fatal_error_no_retry_no_fallback() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let (primary, primary_calls) =
             FlakyProvider::new(vec![Err(LoopError::Provider("400 bad request".into()))]);
         let (secondary, secondary_calls) = FlakyProvider::new(vec![ok_outcome()]);
@@ -1447,7 +1449,7 @@ mod tests {
         //   correct  → call#1 CTL → compact+resend → call#2 CTL → fail closed = EXACTLY 2 calls,
         //              stop_reason = ContextLimit.
         //   regressed (CTL treated as transient) → 3 backoff retries = 3 calls (then Err → panic).
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let (provider, calls) = FlakyProvider::new(vec![
             Err(LoopError::ProviderContextTooLong),
             Err(LoopError::ProviderContextTooLong),
@@ -1482,7 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_exhausted_all_channels_fails() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let (p1, p1_calls) = FlakyProvider::new(vec![
             Err(LoopError::ProviderTransient("p1".into())),
             Err(LoopError::ProviderTransient("p1".into())),
@@ -1513,11 +1515,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_prepends_skill_list_to_system_parts_on_start() {
-        // Spec §2 / §5 line 533: 每次 Agent loop 启动时,Infra 自动 prepend SkillSpec 清单
+    async fn loop_prepends_tool_list_to_system_parts_on_start() {
+        // Spec §2 / §5 line 533: 每次 Agent loop 启动时,Infra 自动 prepend ToolSpec 清单
         // 到 ContextBundle.systemParts;Runtime 不需要手动塞。
-        let registry = Arc::new(SkillRegistry::new_without_persist());
-        registry.register_skill(spec("echo"), echo_handler()).unwrap();
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("echo"), echo_handler()).unwrap();
 
         // Capture the systemParts via a custom provider that snapshots context.
         struct SnapshotProvider {
@@ -1538,7 +1540,7 @@ mod tests {
                     usage_input: 1,
                     usage_output: 1,
                     stop_reason: AgentStopReason::Completed,
-                    skill_events: Vec::new(),
+                    tool_events: Vec::new(),
                 })
             }
         }
@@ -1556,15 +1558,15 @@ mod tests {
             crate::domain::agent::ContextContent::Text(s) => s.clone(),
             _ => panic!("expected Text"),
         };
-        assert!(head.contains("## echo"), "system prompt missing skill section: {}", head);
-        assert!(head.contains("use_skill"), "missing protocol preamble: {}", head);
-        // droppable=false invariant (skill list is identity / system content)
+        assert!(head.contains("## echo"), "system prompt missing tool section: {}", head);
+        assert!(head.contains("use_tool"), "missing protocol preamble: {}", head);
+        // droppable=false invariant (tool list is identity / system content)
         assert!(!parts[0].droppable);
     }
 
     #[tokio::test]
     async fn loop_emits_run_start_with_model_from_channel() {
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![Ok(scripted_outcome("x", 0, 0, AgentStopReason::Completed))],
             index: 0,
@@ -1582,13 +1584,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_reports_unknown_skill_as_error_to_model() {
-        // 模型尝试调用未注册 skill → loop 不 panic；下一轮回写 <skill_error code="invalid_input">.
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+    async fn loop_reports_unknown_tool_as_error_to_model() {
+        // 模型尝试调用未注册 tool → loop 不 panic；下一轮回写 <tool_error code="invalid_input">.
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![
                 Ok(scripted_outcome(
-                    r#"<use_skill name="missing">{}</use_skill>"#,
+                    r#"<use_tool name="missing">{}</use_tool>"#,
                     1,
                     1,
                     AgentStopReason::ProviderStop,
@@ -1605,7 +1607,7 @@ mod tests {
         assert_eq!(summary.stop_reason, AgentStopReason::Completed);
         let mut saw_error_end = false;
         while let Some(e) = rx.recv().await {
-            if let AgentEvent::SkillEnd { is_error, .. } = e {
+            if let AgentEvent::ToolEnd { is_error, .. } = e {
                 if is_error {
                     saw_error_end = true;
                 }
@@ -1631,7 +1633,7 @@ mod tests {
     #[tokio::test]
     async fn run_agent_turn_persists_and_reloads_view() {
         let repo = fresh_repo();
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![Ok(scripted_outcome(
                 "first answer",
@@ -1730,7 +1732,7 @@ mod tests {
                     usage_input: 1,
                     usage_output: 1,
                     stop_reason: AgentStopReason::Completed,
-                    skill_events: Vec::new(),
+                    tool_events: Vec::new(),
                 })
             }
         }
@@ -1738,7 +1740,7 @@ mod tests {
         let provider = Box::new(SeedSnapshot {
             seen: Arc::clone(&seen),
         });
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let mut request = req();
         request.conversation_id = Some("c".into());
         // Only the new user input for this round — engine persists it, then loads the view.
@@ -1786,10 +1788,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proactive_compaction_micro_clears_old_skill_results_at_threshold() {
-        // Tiny window forces proactive compaction. Seed a large droppable realtime skill_result
+    async fn proactive_compaction_micro_clears_old_tool_results_at_threshold() {
+        // Tiny window forces proactive compaction. Seed a large droppable realtime tool_result
         // part; first turn's pre-compaction MicroClear should stub it.
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![Ok(scripted_outcome("done", 1, 1, AgentStopReason::Completed))],
             index: 0,
@@ -1801,7 +1803,7 @@ mod tests {
         ctx.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
-                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,
                 "q".repeat(2000)
             )),
             freshness: None,
@@ -1826,7 +1828,7 @@ mod tests {
     #[tokio::test]
     async fn proactive_compaction_drops_when_no_summarize_prompt() {
         // Above summarize threshold, with no summarize_prompt → Summarize degrades to Drop.
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(ScriptedProvider {
             script: vec![Ok(scripted_outcome("done", 1, 1, AgentStopReason::Completed))],
             index: 0,
@@ -1921,7 +1923,7 @@ mod tests {
     #[ignore]
     async fn loop_chat_live() {
         use crate::infrastructure::agent::http_provider::HttpProvider;
-        use crate::infrastructure::agent::skill_registry::SkillRegistry;
+        use crate::infrastructure::agent::tool_registry::ToolRegistry;
         use chrono::Utc;
 
         async fn one(label: &str, wire: WireFormat, base: String, key: String, model: String) {
@@ -1954,7 +1956,7 @@ mod tests {
                 fallback_channels: vec![],
                 retry: None,
             };
-            let registry = Arc::new(SkillRegistry::new_without_persist());
+            let registry = Arc::new(ToolRegistry::new_without_persist());
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
             let pump = tokio::spawn(async move {
                 let mut text = String::new();
@@ -1996,33 +1998,33 @@ mod tests {
         assert!(ran > 0, "no TEST_* env provided");
     }
 
-    /// 端到端实网 SKILL：注册一个 `get_secret` skill（只有工具知道答案），让真实模型
-    /// 通过 `<use_skill>` 文本协议调用它、拿到结果、再据此作答。验证整条 skill 回路
-    /// （SystemPromptBuilder 注入清单 → 模型发 use_skill → dispatch → skill_result 回灌 →
+    /// 端到端实网 SKILL：注册一个 `get_secret` tool（只有工具知道答案），让真实模型
+    /// 通过 `<use_tool>` 文本协议调用它、拿到结果、再据此作答。验证整条 tool 回路
+    /// （SystemPromptBuilder 注入清单 → 模型发 use_tool → dispatch → tool_result 回灌 →
     /// 模型用结果作答）。`#[ignore]`，凭证走 env。
     #[tokio::test]
     #[ignore]
-    async fn skill_loop_live() {
+    async fn tool_loop_live() {
         use crate::infrastructure::agent::http_provider::HttpProvider;
-        use crate::infrastructure::agent::skill_registry::SkillRegistry;
+        use crate::infrastructure::agent::tool_registry::ToolRegistry;
         use chrono::Utc;
         use serde_json::json;
 
         async fn one(label: &str, wire: WireFormat, base: String, key: String, model: String) {
-            let registry = Arc::new(SkillRegistry::new_without_persist());
-            let secret_spec = SkillSpec::new(
+            let registry = Arc::new(ToolRegistry::new_without_persist());
+            let secret_spec = ToolSpec::new(
                 "get_secret",
-                "返回今天的幸运数字（一个整数）。当用户问幸运数字时必须调用本 skill 获取，不要自己编。",
+                "返回今天的幸运数字（一个整数）。当用户问幸运数字时必须调用本 tool 获取，不要自己编。",
                 json!({"type":"object","properties":{}}),
-                vec![r#"<use_skill name="get_secret">{}</use_skill>"#.to_string()],
+                vec![r#"<use_tool name="get_secret">{}</use_tool>"#.to_string()],
                 5000,
                 SideEffect::None,
             );
-            let handler: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(|_inv: SkillInvocation| {
-                Box::pin(async move { SkillHandlerOutput::ok(json!({"secret": 4242})) })
-                    as SkillHandlerFuture
+            let handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(|_inv: ToolInvocation| {
+                Box::pin(async move { ToolHandlerOutput::ok(json!({"secret": 4242})) })
+                    as ToolHandlerFuture
             }));
-            registry.register_skill(secret_spec, handler).unwrap();
+            registry.register_tool(secret_spec, handler).unwrap();
 
             let mut ch = channel();
             ch.wire_format = wire;
@@ -2032,19 +2034,19 @@ mod tests {
             ch.max_output_tokens = Some(1024);
             let provider = Box::new(HttpProvider::new(ch.clone()).unwrap());
             let request = AgentRunRequest {
-                run_id: "skill".into(),
+                run_id: "tool".into(),
                 trigger: "user".into(),
                 channel: ch,
                 max_turns: 4,
                 input: vec![AgentMessage {
                     message_id: "m1".into(),
-                    run_id: Some("skill".into()),
+                    run_id: Some("tool".into()),
                     conversation_id: None,
                     seq: None,
                     kind: None,
                     role: AgentMessageRole::User,
                     blocks: vec![AgentMessageBlock::Text {
-                        text: "请调用 get_secret 这个 skill 获取今天的幸运数字，然后用一句话告诉我它是多少。".into(),
+                        text: "请调用 get_secret 这个 tool 获取今天的幸运数字，然后用一句话告诉我它是多少。".into(),
                     }],
                     created_at: Utc::now(),
                 }],
@@ -2056,34 +2058,34 @@ mod tests {
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
             let pump = tokio::spawn(async move {
                 let mut text = String::new();
-                let mut skills: Vec<(String, bool)> = Vec::new();
+                let mut tools: Vec<(String, bool)> = Vec::new();
                 while let Some(e) = rx.recv().await {
                     match e {
                         AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
-                        AgentEvent::SkillEnd { name, is_error, .. } => skills.push((name, is_error)),
+                        AgentEvent::ToolEnd { name, is_error, .. } => tools.push((name, is_error)),
                         _ => {}
                     }
                 }
-                (text, skills)
+                (text, tools)
             });
             let summary =
-                run_agent_turn(request, registry, ContextBundle::new("skill"), vec![provider], tx, None)
+                run_agent_turn(request, registry, ContextBundle::new("tool"), vec![provider], tx, None)
                     .await
                     .unwrap_or_else(|e| panic!("[{label}] loop failed: {e}"));
-            let (text, skills) = pump.await.unwrap();
+            let (text, tools) = pump.await.unwrap();
             println!(
-                "[skill-live][{label}] stop={:?} skills={:?} answer={:?}",
-                summary.stop_reason, skills, text
+                "[tool-live][{label}] stop={:?} tools={:?} answer={:?}",
+                summary.stop_reason, tools, text
             );
             assert!(
-                skills.iter().any(|(n, err)| n == "get_secret" && !err),
-                "[{label}] get_secret skill was not dispatched successfully"
+                tools.iter().any(|(n, err)| n == "get_secret" && !err),
+                "[{label}] get_secret tool was not dispatched successfully"
             );
-            assert!(text.contains("4242"), "[{label}] final answer didn't use the skill result");
+            assert!(text.contains("4242"), "[{label}] final answer didn't use the tool result");
         }
 
         let mut ran = 0;
-        // 用快的两家测 skill（deepseek + anthropic）；gpt-5 太慢，按需自行加 TEST_OAI_*。
+        // 用快的两家测 tool（deepseek + anthropic）；gpt-5 太慢，按需自行加 TEST_OAI_*。
         if let Ok(k) = std::env::var("TEST_DS_KEY") {
             let b = std::env::var("TEST_DS_BASE").unwrap_or_else(|_| "https://api.deepseek.com".into());
             let m = std::env::var("TEST_DS_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".into());
@@ -2101,7 +2103,7 @@ mod tests {
             one("responses", WireFormat::Responses, b, k, m).await;
             ran += 1;
         }
-        println!("[skill-live] ran {ran} skill-loop checks");
+        println!("[tool-live] ran {ran} tool-loop checks");
         assert!(ran > 0, "no TEST_* env provided");
     }
 
@@ -2171,7 +2173,7 @@ mod tests {
         // produced output under conversation_id itself.
         let input1 = user_seed(&conversation_id, "run-1", "我关注贵州茅台(600519.SH)，简单说说它。").await;
 
-        let registry = Arc::new(SkillRegistry::new_without_persist());
+        let registry = Arc::new(ToolRegistry::new_without_persist());
         let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
         let req1 = AgentRunRequest {
             run_id: "run-1".into(),

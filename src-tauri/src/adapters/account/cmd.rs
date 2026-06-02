@@ -5,8 +5,8 @@
 //!
 //! 注意：spec §4 — `operate_account` 写入口只对 Agent tool / 外部自动化决策运行时暴露，
 //! 不通过 Tauri command 注册供前端 invoke。`operate_account` 函数本身保留（带
-//! `#[allow(dead_code)]`），将在 Phase 3 由 Agent Runtime 通过 SkillRegistry
-//! 注册为 skill；写路径必须经过 Agent 决策链，不接受前端 UI 直发。
+//! `#[allow(dead_code)]`），将在 Phase 3 由 Agent Runtime 通过 ToolRegistry
+//! 注册为 tool；写路径必须经过 Agent 决策链，不接受前端 UI 直发。
 
 use crate::adapters::error::CommandError;
 use crate::domain::account::requests::{
@@ -32,7 +32,7 @@ pub fn fetch_account(
 /// Account 写入口。
 ///
 /// Spec: account-module.md §4 — 不通过 Tauri command 暴露；将由 Phase 3 Agent
-/// Runtime 通过 SkillRegistry 注册为 skill。保留函数签名以供后续注册和当前
+/// Runtime 通过 ToolRegistry 注册为 tool。保留函数签名以供后续注册和当前
 /// `service.operate_account` 的 adapter 风格统一。
 #[allow(dead_code)]
 pub fn operate_account(

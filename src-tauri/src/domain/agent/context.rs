@@ -16,9 +16,9 @@ pub enum ContextPartKind {
     Realtime,
     Chat,
     Memory,
-    /// Spec §2: 易腐 skill 结果被压缩成 stub 时，content 文本是
-    /// `<skill_result_stub name="..." call_id="..." ref="..." />`。
-    SkillResultStub,
+    /// Spec §2: 易腐 tool 结果被压缩成 stub 时，content 文本是
+    /// `<tool_result_stub name="..." call_id="..." ref="..." />`。
+    ToolResultStub,
 }
 
 /// Context content 多形态承载。
@@ -159,9 +159,9 @@ mod tests {
 
     #[test]
     fn context_part_kind_serde_snake() {
-        let p = part(ContextPartKind::SkillResultStub, "x", true);
+        let p = part(ContextPartKind::ToolResultStub, "x", true);
         let j = serde_json::to_value(&p).unwrap();
-        assert_eq!(j["kind"], "skill_result_stub");
+        assert_eq!(j["kind"], "tool_result_stub");
         assert_eq!(j["droppable"], true);
     }
 

@@ -1,17 +1,17 @@
-//! SkillRegistry — skill 注册 / 校验 / 分发 / 超时控制。
+//! ToolRegistry — tool 注册 / 校验 / 分发 / 超时控制。
 //!
-//! Spec: docs/design/agent-infra-module.md §3 / §5 Skill Registry API
+//! Spec: docs/design/agent-infra-module.md §3 / §5 Tool Registry API
 //!
 //! 关键约束：
-//! - 同名 skill 只能注册一次；重复注册 fail closed（§2 不变量）。
-//! - dispatch 必须按 `SkillSpec.timeout_ms` 超时（§3）。
-//! - dispatch 必须记录 `SkillCall` 开始和结束（§5）。
-//! - skill input 必须按 `inputSchema` 通过 caller 提供的校验函数验证；
-//!   失败作为 `<skill_error code="invalid_input">` 回传给模型，不调用 handler。
+//! - 同名 tool 只能注册一次；重复注册 fail closed（§2 不变量）。
+//! - dispatch 必须按 `ToolSpec.timeout_ms` 超时（§3）。
+//! - dispatch 必须记录 `ToolCall` 开始和结束（§5）。
+//! - tool input 必须按 `inputSchema` 通过 caller 提供的校验函数验证；
+//!   失败作为 `<tool_error code="invalid_input">` 回传给模型，不调用 handler。
 //! - PayloadStore 双层存储（spec §2）：input / output > 8KB 走 ref，summary 留截断摘要。
 
 use crate::domain::agent::{
-    JsonSummary, SkillCall, SkillCallId, SkillCallResult, SkillSpec,
+    JsonSummary, ToolCall, ToolCallId, ToolCallResult, ToolSpec,
 };
 use crate::domain::shared::{ErrorCode, OccurredAt};
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
@@ -28,29 +28,29 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Skill handler 的输入。
+/// Tool handler 的输入。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct SkillInvocation {
+pub struct ToolInvocation {
     pub run_id: String,
-    pub skill_call_id: SkillCallId,
+    pub tool_call_id: ToolCallId,
     pub name: String,
     pub input: JsonSummary,
 }
 
-/// Skill handler 的输出（Infra 视角）。
+/// Tool handler 的输出（Infra 视角）。
 ///
-/// `output_summary` 必须可摘要展示（spec §2 SkillSpec rules）。
+/// `output_summary` 必须可摘要展示（spec §2 ToolSpec rules）。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
-pub struct SkillHandlerOutput {
+pub struct ToolHandlerOutput {
     pub output_summary: JsonSummary,
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
 }
 
-impl SkillHandlerOutput {
+impl ToolHandlerOutput {
     pub fn ok(summary: JsonSummary) -> Self {
         Self {
             output_summary: summary,
@@ -68,50 +68,50 @@ impl SkillHandlerOutput {
 }
 
 /// Async handler future。
-pub type SkillHandlerFuture =
-    Pin<Box<dyn Future<Output = SkillHandlerOutput> + Send + 'static>>;
+pub type ToolHandlerFuture =
+    Pin<Box<dyn Future<Output = ToolHandlerOutput> + Send + 'static>>;
 
-/// Skill handler signature。Runtime / adapter 注册时提供。
+/// Tool handler signature。Runtime / adapter 注册时提供。
 ///
-/// 必须 `Send + Sync + 'static`，以便 `Arc<SkillRegistry>` 跨任务共享。
-pub trait SkillHandler: Send + Sync + 'static {
-    fn invoke(&self, inv: SkillInvocation) -> SkillHandlerFuture;
+/// 必须 `Send + Sync + 'static`，以便 `Arc<ToolRegistry>` 跨任务共享。
+pub trait ToolHandler: Send + Sync + 'static {
+    fn invoke(&self, inv: ToolInvocation) -> ToolHandlerFuture;
 }
 
-/// 函数 closure -> SkillHandler adapter。
-pub struct FnSkillHandler<F>(pub F);
+/// 函数 closure -> ToolHandler adapter。
+pub struct FnToolHandler<F>(pub F);
 
-impl<F> SkillHandler for FnSkillHandler<F>
+impl<F> ToolHandler for FnToolHandler<F>
 where
-    F: Fn(SkillInvocation) -> SkillHandlerFuture + Send + Sync + 'static,
+    F: Fn(ToolInvocation) -> ToolHandlerFuture + Send + Sync + 'static,
 {
-    fn invoke(&self, inv: SkillInvocation) -> SkillHandlerFuture {
+    fn invoke(&self, inv: ToolInvocation) -> ToolHandlerFuture {
         (self.0)(inv)
     }
 }
 
 /// Input 校验闭包；返回 None = 通过，返回 Some(message) = 拒绝。
 ///
-/// Spec §2: skill input 必须按 `inputSchema` 校验。Infra 默认行为是"接受任何 JSON"，
-/// 由调用方通过 `register_skill_with_validator` 注入实际 schema 校验器。
+/// Spec §2: tool input 必须按 `inputSchema` 校验。Infra 默认行为是"接受任何 JSON"，
+/// 由调用方通过 `register_tool_with_validator` 注入实际 schema 校验器。
 pub type InputValidator =
     Arc<dyn Fn(&JsonSummary) -> Option<String> + Send + Sync + 'static>;
 
-struct SkillEntry {
-    spec: SkillSpec,
-    handler: Arc<dyn SkillHandler>,
+struct ToolEntry {
+    spec: ToolSpec,
+    handler: Arc<dyn ToolHandler>,
     input_validator: Option<InputValidator>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegisterError {
-    #[error("skill name '{0}' already registered")]
+    #[error("tool name '{0}' already registered")]
     Duplicate(String),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum DispatchError {
-    #[error("skill '{0}' not registered")]
+    #[error("tool '{0}' not registered")]
     NotRegistered(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
@@ -123,18 +123,18 @@ pub enum DispatchError {
 
 /// 注册表实例。运行时持有为 Arc。
 ///
-/// Spec §3/§5: dispatch 时必须先验证 input，再调用 handler，再持久化 SkillCall。
-pub struct SkillRegistry {
-    skills: RwLock<HashMap<String, SkillEntry>>,
+/// Spec §3/§5: dispatch 时必须先验证 input，再调用 handler，再持久化 ToolCall。
+pub struct ToolRegistry {
+    tools: RwLock<HashMap<String, ToolEntry>>,
     repo: Option<AgentMessagesRepo>,
     payload_store: Option<PayloadStore>,
 }
 
-impl SkillRegistry {
+impl ToolRegistry {
     /// 创建不带持久化的注册表（仅用于测试 / 单元）。
     pub fn new_without_persist() -> Self {
         Self {
-            skills: RwLock::new(HashMap::new()),
+            tools: RwLock::new(HashMap::new()),
             repo: None,
             payload_store: None,
         }
@@ -143,37 +143,37 @@ impl SkillRegistry {
     /// 生产入口：注入持久化 repo 和 PayloadStore。
     pub fn new(repo: AgentMessagesRepo, payload_store: PayloadStore) -> Self {
         Self {
-            skills: RwLock::new(HashMap::new()),
+            tools: RwLock::new(HashMap::new()),
             repo: Some(repo),
             payload_store: Some(payload_store),
         }
     }
 
-    /// 注册 skill。
+    /// 注册 tool。
     ///
-    /// Spec §5 Skill Registry API: `register_skill(spec, handler) -> Result<()>`。
-    pub fn register_skill(
+    /// Spec §5 Tool Registry API: `register_tool(spec, handler) -> Result<()>`。
+    pub fn register_tool(
         &self,
-        spec: SkillSpec,
-        handler: Arc<dyn SkillHandler>,
+        spec: ToolSpec,
+        handler: Arc<dyn ToolHandler>,
     ) -> Result<(), RegisterError> {
-        self.register_skill_with_validator(spec, handler, None)
+        self.register_tool_with_validator(spec, handler, None)
     }
 
-    /// 注册 skill 并附带 input schema 校验器。
-    pub fn register_skill_with_validator(
+    /// 注册 tool 并附带 input schema 校验器。
+    pub fn register_tool_with_validator(
         &self,
-        spec: SkillSpec,
-        handler: Arc<dyn SkillHandler>,
+        spec: ToolSpec,
+        handler: Arc<dyn ToolHandler>,
         input_validator: Option<InputValidator>,
     ) -> Result<(), RegisterError> {
-        let mut g = self.skills.write().expect("SkillRegistry RwLock poisoned");
+        let mut g = self.tools.write().expect("ToolRegistry RwLock poisoned");
         if g.contains_key(&spec.name) {
             return Err(RegisterError::Duplicate(spec.name));
         }
         g.insert(
             spec.name.clone(),
-            SkillEntry {
+            ToolEntry {
                 spec,
                 handler,
                 input_validator,
@@ -182,27 +182,27 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// 是否注册了该 skill。
-    pub fn has_skill(&self, name: &str) -> bool {
-        self.skills
+    /// 是否注册了该 tool。
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools
             .read()
             .expect("RwLock poisoned")
             .contains_key(name)
     }
 
-    /// 返回某 skill 的 `sideEffect`（spec §4 通用压缩信号；`trading_write` = 结果不可丢）。
+    /// 返回某 tool 的 `sideEffect`（spec §4 通用压缩信号；`trading_write` = 结果不可丢）。
     /// 未注册返回 None。
-    pub fn skill_side_effect(&self, name: &str) -> Option<crate::domain::agent::SideEffect> {
-        self.skills
+    pub fn tool_side_effect(&self, name: &str) -> Option<crate::domain::agent::SideEffect> {
+        self.tools
             .read()
             .expect("RwLock poisoned")
             .get(name)
             .map(|e| e.spec.side_effect)
     }
 
-    /// 列出所有 SkillSpec — 喂 SystemPromptBuilder 用。
-    pub fn list_skills(&self) -> Vec<SkillSpec> {
-        self.skills
+    /// 列出所有 ToolSpec — 喂 SystemPromptBuilder 用。
+    pub fn list_tools(&self) -> Vec<ToolSpec> {
+        self.tools
             .read()
             .expect("RwLock poisoned")
             .values()
@@ -210,16 +210,16 @@ impl SkillRegistry {
             .collect()
     }
 
-    /// Spec §5: `validate_skill_input(skill_name, input)`。
-    pub fn validate_skill_input(
+    /// Spec §5: `validate_tool_input(tool_name, input)`。
+    pub fn validate_tool_input(
         &self,
-        skill_name: &str,
+        tool_name: &str,
         input: &JsonSummary,
     ) -> Result<(), DispatchError> {
-        let g = self.skills.read().expect("RwLock poisoned");
+        let g = self.tools.read().expect("RwLock poisoned");
         let entry = g
-            .get(skill_name)
-            .ok_or_else(|| DispatchError::NotRegistered(skill_name.into()))?;
+            .get(tool_name)
+            .ok_or_else(|| DispatchError::NotRegistered(tool_name.into()))?;
         if let Some(v) = &entry.input_validator {
             if let Some(msg) = v(input) {
                 return Err(DispatchError::InvalidInput(msg));
@@ -228,33 +228,33 @@ impl SkillRegistry {
         Ok(())
     }
 
-    /// 生成新的 skill_call_id（spec §2: `sc_<uuid>`）。
-    pub fn new_skill_call_id() -> SkillCallId {
-        format!("sc_{}", Uuid::new_v4())
+    /// 生成新的 tool_call_id（spec §2: `tc_<uuid>`）。
+    pub fn new_tool_call_id() -> ToolCallId {
+        format!("tc_{}", Uuid::new_v4())
     }
 
-    /// Spec §5: `dispatch_skill_call`。
+    /// Spec §5: `dispatch_tool_call`。
     ///
     /// 行为：
-    /// 1. 查表；未注册 → `NotRegistered`，作为 `<skill_error code="invalid_input">` 返回（caller 决定）。
+    /// 1. 查表；未注册 → `NotRegistered`，作为 `<tool_error code="invalid_input">` 返回（caller 决定）。
     /// 2. 校验 input；失败 → `InvalidInput`。
-    /// 3. 持久化 SkillCall 起始记录（input 大则走 PayloadStore ref + 截断 summary）。
+    /// 3. 持久化 ToolCall 起始记录（input 大则走 PayloadStore ref + 截断 summary）。
     /// 4. 按 spec `timeout_ms` 执行 handler；超时 → `tool_timeout`。
-    /// 5. 持久化 SkillCall 结束 + 写入 summary / payload_ref。
+    /// 5. 持久化 ToolCall 结束 + 写入 summary / payload_ref。
     ///
-    /// `skill_call_id` 由 caller 提供（loop_executor 在 parser 检测到 `<use_skill>` 闭合时生成）。
-    pub async fn dispatch_skill_call(
+    /// `tool_call_id` 由 caller 提供（loop_executor 在 parser 检测到 `<use_tool>` 闭合时生成）。
+    pub async fn dispatch_tool_call(
         &self,
         run_id: &str,
-        skill_call_id: SkillCallId,
-        skill_name: &str,
+        tool_call_id: ToolCallId,
+        tool_name: &str,
         input: JsonSummary,
-    ) -> Result<SkillCallResult, DispatchError> {
+    ) -> Result<ToolCallResult, DispatchError> {
         let (handler, spec, validator) = {
-            let g = self.skills.read().expect("RwLock poisoned");
+            let g = self.tools.read().expect("RwLock poisoned");
             let entry = g
-                .get(skill_name)
-                .ok_or_else(|| DispatchError::NotRegistered(skill_name.into()))?;
+                .get(tool_name)
+                .ok_or_else(|| DispatchError::NotRegistered(tool_name.into()))?;
             (
                 entry.handler.clone(),
                 entry.spec.clone(),
@@ -272,13 +272,13 @@ impl SkillRegistry {
 
         // PayloadStore 决策（input 端）
         let (input_summary, input_payload_ref) =
-            self.split_payload(PayloadKind::SkillInput, &input)?;
+            self.split_payload(PayloadKind::ToolInput, &input)?;
 
-        // Persist initial SkillCall row (no output yet).
-        let initial = SkillCall {
-            skill_call_id: skill_call_id.clone(),
+        // Persist initial ToolCall row (no output yet).
+        let initial = ToolCall {
+            tool_call_id: tool_call_id.clone(),
             run_id: run_id.to_string(),
-            name: skill_name.to_string(),
+            name: tool_name.to_string(),
             input_summary: input_summary.clone(),
             input_payload_ref: input_payload_ref.clone(),
             output_summary: None,
@@ -290,13 +290,13 @@ impl SkillRegistry {
             duration_ms: None,
         };
         if let Some(repo) = &self.repo {
-            repo.upsert_skill_call(&initial)?;
+            repo.upsert_tool_call(&initial)?;
         }
 
-        let invocation = SkillInvocation {
+        let invocation = ToolInvocation {
             run_id: run_id.to_string(),
-            skill_call_id: skill_call_id.clone(),
-            name: skill_name.to_string(),
+            tool_call_id: tool_call_id.clone(),
+            name: tool_name.to_string(),
             input: input.clone(),
         };
 
@@ -305,9 +305,9 @@ impl SkillRegistry {
         let result = tokio::time::timeout(timeout, handler.invoke(invocation)).await;
         let duration_ms = started_instant.elapsed().as_millis() as u64;
 
-        let output: SkillHandlerOutput = match result {
+        let output: ToolHandlerOutput = match result {
             Ok(out) => out,
-            Err(_) => SkillHandlerOutput::err(
+            Err(_) => ToolHandlerOutput::err(
                 serde_json::json!({ "reason": "tool_timeout", "timeoutMs": spec.timeout_ms }),
                 ErrorCode::ToolTimeout,
             ),
@@ -315,13 +315,13 @@ impl SkillRegistry {
 
         // PayloadStore 决策（output 端）
         let (output_summary, output_payload_ref) =
-            self.split_payload(PayloadKind::SkillOutput, &output.output_summary)?;
+            self.split_payload(PayloadKind::ToolOutput, &output.output_summary)?;
 
         let ended_at = Utc::now();
-        let final_call = SkillCall {
-            skill_call_id: skill_call_id.clone(),
+        let final_call = ToolCall {
+            tool_call_id: tool_call_id.clone(),
             run_id: run_id.to_string(),
-            name: skill_name.to_string(),
+            name: tool_name.to_string(),
             input_summary,
             input_payload_ref,
             output_summary: Some(output_summary.clone()),
@@ -333,11 +333,11 @@ impl SkillRegistry {
             duration_ms: Some(duration_ms),
         };
         if let Some(repo) = &self.repo {
-            repo.upsert_skill_call(&final_call)?;
+            repo.upsert_tool_call(&final_call)?;
         }
 
-        Ok(SkillCallResult {
-            skill_call_id,
+        Ok(ToolCallResult {
+            tool_call_id,
             output_summary: output.output_summary,
             output_payload_ref,
             is_error: output.is_error,
@@ -383,18 +383,18 @@ mod tests {
     use crate::infrastructure::agent::migrations::migrations as agent_migrations;
     use crate::infrastructure::db::{run_migrations, AppDb};
 
-    fn echo_handler() -> Arc<dyn SkillHandler> {
-        Arc::new(FnSkillHandler(|inv: SkillInvocation| {
-            Box::pin(async move { SkillHandlerOutput::ok(inv.input) }) as SkillHandlerFuture
+    fn echo_handler() -> Arc<dyn ToolHandler> {
+        Arc::new(FnToolHandler(|inv: ToolInvocation| {
+            Box::pin(async move { ToolHandlerOutput::ok(inv.input) }) as ToolHandlerFuture
         }))
     }
 
-    fn spec(name: &str, timeout_ms: u64) -> SkillSpec {
-        SkillSpec::new(
+    fn spec(name: &str, timeout_ms: u64) -> ToolSpec {
+        ToolSpec::new(
             name,
             "test",
             serde_json::json!({"type":"object"}),
-            vec![format!(r#"<use_skill name="{}">{{}}</use_skill>"#, name)],
+            vec![format!(r#"<use_tool name="{}">{{}}</use_tool>"#, name)],
             timeout_ms,
             SideEffect::None,
         )
@@ -402,19 +402,19 @@ mod tests {
 
     #[test]
     fn register_rejects_duplicate() {
-        let r = SkillRegistry::new_without_persist();
-        r.register_skill(spec("echo", 5000), echo_handler()).unwrap();
+        let r = ToolRegistry::new_without_persist();
+        r.register_tool(spec("echo", 5000), echo_handler()).unwrap();
         let err = r
-            .register_skill(spec("echo", 5000), echo_handler())
+            .register_tool(spec("echo", 5000), echo_handler())
             .expect_err("dup must error");
         assert!(matches!(err, RegisterError::Duplicate(_)));
     }
 
     #[tokio::test]
-    async fn dispatch_unknown_skill_errors() {
-        let r = SkillRegistry::new_without_persist();
+    async fn dispatch_unknown_tool_errors() {
+        let r = ToolRegistry::new_without_persist();
         let err = r
-            .dispatch_skill_call("r1", "sc_1".into(), "missing", serde_json::json!({}))
+            .dispatch_tool_call("r1", "tc_1".into(), "missing", serde_json::json!({}))
             .await
             .expect_err("unknown");
         assert!(matches!(err, DispatchError::NotRegistered(_)));
@@ -422,10 +422,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_runs_handler() {
-        let r = SkillRegistry::new_without_persist();
-        r.register_skill(spec("echo", 5000), echo_handler()).unwrap();
+        let r = ToolRegistry::new_without_persist();
+        r.register_tool(spec("echo", 5000), echo_handler()).unwrap();
         let out = r
-            .dispatch_skill_call("r1", "sc_1".into(), "echo", serde_json::json!({"a":1}))
+            .dispatch_tool_call("r1", "tc_1".into(), "echo", serde_json::json!({"a":1}))
             .await
             .unwrap();
         assert_eq!(out.output_summary["a"], 1);
@@ -434,16 +434,16 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_enforces_timeout() {
-        let r = SkillRegistry::new_without_persist();
-        let slow: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(|_inv| {
+        let r = ToolRegistry::new_without_persist();
+        let slow: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(|_inv| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                SkillHandlerOutput::ok(serde_json::json!({"never":true}))
-            }) as SkillHandlerFuture
+                ToolHandlerOutput::ok(serde_json::json!({"never":true}))
+            }) as ToolHandlerFuture
         }));
-        r.register_skill(spec("slow", 50), slow).unwrap();
+        r.register_tool(spec("slow", 50), slow).unwrap();
         let out = r
-            .dispatch_skill_call("r1", "sc_slow".into(), "slow", serde_json::json!({}))
+            .dispatch_tool_call("r1", "tc_slow".into(), "slow", serde_json::json!({}))
             .await
             .unwrap();
         assert!(out.is_error);
@@ -452,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_validates_input_when_validator_registered() {
-        let r = SkillRegistry::new_without_persist();
+        let r = ToolRegistry::new_without_persist();
         let validator: InputValidator = Arc::new(|v: &JsonSummary| -> Option<String> {
             if v.is_object() {
                 None
@@ -460,39 +460,39 @@ mod tests {
                 Some("expected object".into())
             }
         });
-        r.register_skill_with_validator(spec("needs_obj", 5000), echo_handler(), Some(validator))
+        r.register_tool_with_validator(spec("needs_obj", 5000), echo_handler(), Some(validator))
             .unwrap();
         let err = r
-            .dispatch_skill_call("r1", "sc_x".into(), "needs_obj", serde_json::json!("not-obj"))
+            .dispatch_tool_call("r1", "tc_x".into(), "needs_obj", serde_json::json!("not-obj"))
             .await
             .expect_err("must reject");
         assert!(matches!(err, DispatchError::InvalidInput(_)));
         let err = r
-            .validate_skill_input("needs_obj", &serde_json::json!(123))
+            .validate_tool_input("needs_obj", &serde_json::json!(123))
             .expect_err("must reject");
         assert!(matches!(err, DispatchError::InvalidInput(_)));
     }
 
     #[tokio::test]
-    async fn dispatch_preserves_caller_skill_call_id() {
-        let r = SkillRegistry::new_without_persist();
-        r.register_skill(spec("echo", 5000), echo_handler()).unwrap();
+    async fn dispatch_preserves_caller_tool_call_id() {
+        let r = ToolRegistry::new_without_persist();
+        r.register_tool(spec("echo", 5000), echo_handler()).unwrap();
         let out = r
-            .dispatch_skill_call("r1", "sc_specific".into(), "echo", serde_json::json!({}))
+            .dispatch_tool_call("r1", "tc_specific".into(), "echo", serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(out.skill_call_id, "sc_specific");
+        assert_eq!(out.tool_call_id, "tc_specific");
     }
 
     #[tokio::test]
-    async fn list_skills_returns_registered() {
-        let r = SkillRegistry::new_without_persist();
-        r.register_skill(spec("a", 1000), echo_handler()).unwrap();
-        let specs = r.list_skills();
+    async fn list_tools_returns_registered() {
+        let r = ToolRegistry::new_without_persist();
+        r.register_tool(spec("a", 1000), echo_handler()).unwrap();
+        let specs = r.list_tools();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].name, "a");
-        assert!(r.has_skill("a"));
-        assert!(!r.has_skill("b"));
+        assert!(r.has_tool("a"));
+        assert!(!r.has_tool("b"));
     }
 
     #[tokio::test]
@@ -502,23 +502,23 @@ mod tests {
         db.with(|c| run_migrations(c, agent_migrations()).unwrap());
         let repo = AgentMessagesRepo::new(db.clone());
         let store = PayloadStore::new(db);
-        let r = SkillRegistry::new(repo.clone(), store.clone());
+        let r = ToolRegistry::new(repo.clone(), store.clone());
         // Big handler returns > 8KB
-        let big: Arc<dyn SkillHandler> = Arc::new(FnSkillHandler(|_inv| {
+        let big: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(|_inv| {
             Box::pin(async move {
                 let big_text = "x".repeat(10 * 1024); // 10KB
-                SkillHandlerOutput::ok(serde_json::json!({"big": big_text}))
-            }) as SkillHandlerFuture
+                ToolHandlerOutput::ok(serde_json::json!({"big": big_text}))
+            }) as ToolHandlerFuture
         }));
-        r.register_skill(spec("big", 5000), big).unwrap();
+        r.register_tool(spec("big", 5000), big).unwrap();
         let out = r
-            .dispatch_skill_call("r1", "sc_big".into(), "big", serde_json::json!({}))
+            .dispatch_tool_call("r1", "tc_big".into(), "big", serde_json::json!({}))
             .await
             .unwrap();
-        // SkillCallResult always has full output_summary (LLM 视野 inline 全文)
+        // ToolCallResult always has full output_summary (LLM 视野 inline 全文)
         assert!(out.output_summary["big"].as_str().unwrap().len() >= 10 * 1024);
-        // But the persisted SkillCall row's summary is the truncated stub, and payload_ref is set
-        let persisted = repo.load_skill_call("sc_big").unwrap().unwrap();
+        // But the persisted ToolCall row's summary is the truncated stub, and payload_ref is set
+        let persisted = repo.load_tool_call("tc_big").unwrap().unwrap();
         assert!(persisted.output_payload_ref.is_some());
         let ref_id = persisted.output_payload_ref.unwrap();
         let payload = store.get(&ref_id).unwrap().unwrap();
@@ -532,13 +532,13 @@ mod tests {
         db.with(|c| run_migrations(c, agent_migrations()).unwrap());
         let repo = AgentMessagesRepo::new(db.clone());
         let store = PayloadStore::new(db);
-        let r = SkillRegistry::new(repo.clone(), store);
-        r.register_skill(spec("echo", 5000), echo_handler()).unwrap();
+        let r = ToolRegistry::new(repo.clone(), store);
+        r.register_tool(spec("echo", 5000), echo_handler()).unwrap();
         let _ = r
-            .dispatch_skill_call("r1", "sc_small".into(), "echo", serde_json::json!({"a":1}))
+            .dispatch_tool_call("r1", "tc_small".into(), "echo", serde_json::json!({"a":1}))
             .await
             .unwrap();
-        let persisted = repo.load_skill_call("sc_small").unwrap().unwrap();
+        let persisted = repo.load_tool_call("tc_small").unwrap().unwrap();
         assert!(persisted.output_payload_ref.is_none());
         assert!(persisted.input_payload_ref.is_none());
     }

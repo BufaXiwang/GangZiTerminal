@@ -162,7 +162,9 @@ type ErrorCode =
   | "version_conflict"
   | "article_extract_failed"
   | "tool_timeout"
-  | "provider_context_too_long";
+  | "provider_context_too_long"
+  | "path_outside_workspace"
+  | "command_rejected";
 ```
 
 规则：
@@ -172,6 +174,7 @@ type ErrorCode =
 - 模块不能临时发明新的机器可读 code；provider 原始错误、调试信息放入 `message` / `details` / `payload`。
 - 批量读取使用 item 级 `warnings` / `errors`。
 - 写接口失败必须返回单一主 `reason` code，可附带 details。
+- `path_outside_workspace` / `command_rejected` 是 Agent 本地通用 tool（`write_file` / `edit_file` / `run_bash`）的约定级沙箱错误码，见 [agent-runtime-module.md](agent-runtime-module.md) §4.2；其余本地 tool 失败复用 `invalid_input` / `not_found` / `parse_error` / `tool_timeout`。
 
 ---
 

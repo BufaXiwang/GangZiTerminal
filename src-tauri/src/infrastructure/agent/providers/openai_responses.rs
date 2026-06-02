@@ -208,13 +208,13 @@ mod tests {
             msg(
                 AgentMessageRole::Assistant,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<use_skill name="x">{}</use_skill>"#.into(),
+                    text: r#"<use_tool name="x">{}</use_tool>"#.into(),
                 }],
             ),
             msg(
                 AgentMessageRole::User,
                 vec![AgentMessageBlock::Text {
-                    text: r#"<skill_result name="x" call_id="sc_1">{"ok":true}</skill_result>"#.into(),
+                    text: r#"<tool_result name="x" call_id="tc_1">{"ok":true}</tool_result>"#.into(),
                 }],
             ),
         ];
@@ -230,17 +230,17 @@ mod tests {
         assert_eq!(arr[2]["role"], "user");
         assert_eq!(arr[2]["content"][0]["type"], "input_text");
         let last = arr[2]["content"][0]["text"].as_str().unwrap();
-        assert!(last.contains("<skill_result"));
+        assert!(last.contains("<tool_result"));
     }
 
     #[test]
-    fn skill_xml_in_assistant_text_passes_through() {
+    fn tool_xml_in_assistant_text_passes_through() {
         let ad = OpenAIResponsesAdapter::new(ch(false));
         let ctx = ContextBundle::new("r1");
         let msgs = vec![msg(
             AgentMessageRole::Assistant,
             vec![AgentMessageBlock::Text {
-                text: r#"<use_skill name="fetch_quote">{"tsCode":"600519.SH"}</use_skill>"#.into(),
+                text: r#"<use_tool name="fetch_quote">{"tsCode":"600519.SH"}</use_tool>"#.into(),
             }],
         )];
         let body = ad.build_request_body(&msgs, &ctx, None).unwrap();
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(item["role"], "assistant");
         assert_eq!(item["content"][0]["type"], "output_text");
         let t = item["content"][0]["text"].as_str().unwrap();
-        assert!(t.contains("<use_skill"));
+        assert!(t.contains("<use_tool"));
     }
 
     #[test]

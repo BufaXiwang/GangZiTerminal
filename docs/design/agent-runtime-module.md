@@ -100,13 +100,20 @@ Agent Runtime 不负责：
 
 ```ts
 type AgentToolName =
+  // 领域读（in-process，结构化）
   | "fetch_quotes"
   | "fetch_news"
   | "fetch_account"
+  // 领域写（in-process，必经校验 + 审计；绝不经 shell）
   | "operate_account"
   | "update_watchlist"
   | "record_decision_episode"
-  | "record_decision_review";
+  | "record_decision_review"
+  // 通用本地（约定级沙箱，见「本地通用 tool 与工作区沙箱」）
+  | "read_file"
+  | "write_file"
+  | "edit_file"
+  | "run_bash";
 
 type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
   name: AgentToolName;
@@ -115,10 +122,101 @@ type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
 
 规则：
 
-- `AgentToolName` 是本产品的 canonical local tool name union。
+- `AgentToolName` 是本产品的 canonical local tool name union（= Infra `ToolRegistry` 注册的 tool 名）。
 - `AgentRunProfile.allowedTools` 和 Runtime 注册给 Infra 的 `AgentRuntimeToolSpec.name` 必须使用 `AgentToolName`。
 - 新增 Agent local tool 必须先扩展本 union 和本 spec，不能只在实现里注册自由字符串。
 - `record_decision_episode` / `record_decision_review` 是 Agent 业务审计写工具，归 Agent Runtime 拥有，不调用 Quotes / News / Account。
+- **领域能力分读 / 写**：读（`fetch_*`）无副作用；写（`operate_account` / `update_watchlist` / `record_decision_*`）必须走 in-process 结构化 tool（校验 + 审计），**不得经 `run_bash` / CLI 拼文本完成**。
+- **写交易仍受 `allowTradingWrite` 与 episode 前置约束**（见 `AgentRunProfile`）；本 union 只定义"有哪些 tool"，不放宽权限。
+
+### 本地通用 tool 与工作区沙箱（约定级）
+
+Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱**收敛（非 OS 级强隔离；威胁模型是「引导 agent + 防手滑」，不是「防恶意 / 防被攻破」）：
+
+| tool | 路径范围 | 说明 |
+|---|---|---|
+| `read_file` | **任意 path（只读）** | 读工作区外的数据 / 资料，供 skill 处理 |
+| `run_bash` | **任意 path** | 默认 `cwd = 工作区`；**危险命令**（`rm` / `curl\|sh` / `sudo` / 重定向到工作区外等）必须走确认或 allowlist |
+| `write_file` | **仅工作区** | 工作区外写入一律拒绝 |
+| `edit_file` | **仅工作区** | 定向 `old→new` 替换；工作区外拒绝 |
+
+- **工作区** = 软件指定目录（实现取 `<appData>/gangzi/workspace/`，由 adapter 注入绝对路径，domain 不感知）。本 spec 用 `<workspace>` 指代这个注入的绝对根。
+- **Agent 产物 = 工作区文件**（研究笔记 / 处理后的数据等），**不落 DB**；UI 直接读工作区目录展示。审计靠 `ToolCall` 记录 + 工作区文件本身。
+- **诚实边界**：`run_bash` 不限路径 = 可绕过 `write_file` 的工作区限制（bash 本身能写任意路径）。约定级沙箱接受这一点——写限制是「结构化写工具的约定」+ 危险命令确认，不是强制不可逾越的边界。要强隔离需另上 OS 沙箱（macOS seatbelt / Linux landlock，Codex 那种），列为后续可选项。
+
+#### 工作区路径强制规则（write_file / edit_file）
+
+写工具（`write_file` / `edit_file`）的 `path` 必须落在 `<workspace>` 内，校验在调用 handler **之前**完成：
+
+1. **规范化**：把 `path`（绝对或相对）解析为规范绝对路径——相对 path 以 `<workspace>` 为基拼接；展开 `.` / `..`；折叠重复分隔符。规范化**纯字符串层**先做一遍。
+2. **前缀校验**：规范化后的绝对路径必须以 `<workspace>` + 路径分隔符为前缀（或正好等于 `<workspace>` 下某文件）。任何 `..` 逃逸出工作区（如 `<workspace>/../secret`）一律拒绝 → `path_outside_workspace`。
+3. **symlink**：若目标 path 或其任一父目录是指向工作区外的 symlink，按「解析后真实路径仍须在 `<workspace>` 内」判定；解析后逃逸 → `path_outside_workspace`。约定级实现可在写入前对已存在的父链做一次 `realpath` 校验；**诚实写明**：约定级不保证防 TOCTOU（检查后被替换 symlink）这类对抗手法，强隔离需 OS 沙箱。
+4. `read_file` **不**受工作区限制（设计上允许读任意 path）；但同样要做路径规范化，避免把畸形 path 直接交给 OS。
+
+#### run_bash 危险命令门禁（约定级）
+
+`run_bash` 默认 `cwd = <workspace>`，路径不受限（见诚实边界）。危险命令通过**门禁回调**收敛，而非强隔离：
+
+- **判定方式**：Runtime 为 `run_bash` 注入一个门禁策略，对 `command` 做模式匹配，命中「危险模式」时要么**拒绝**（返回 `command_rejected`），要么**要求人工确认**（前台 run 走 UI 确认回调；无人确认的后台 run 默认拒绝）。门禁是 deny-pattern + 可选 allowlist 的组合，具体模式集是 `Spec-anchored`（实现可调），但至少必须拦下面这些。
+- **必拦例子**（非穷举）：
+  - `rm -rf` / `rm -r` 递归删除（尤其指向 `/`、`~`、工作区外）
+  - 管道执行远端脚本：`curl ... | sh`、`wget ... | bash`、`... | sh -c`
+  - 提权：`sudo`、`su`
+  - 重定向 / 写到工作区外：`> /etc/...`、`>> ~/...`、`tee /...`（目标在 `<workspace>` 外）
+  - 包管理 / 系统改动：`brew`、`apt`、`npm i -g`、`launchctl`、改 shell rc 等（按策略）
+- **门禁是约定级**：它降低「手滑 / 被诱导」的概率，**不是**不可逾越的安全边界（命令可混淆绕过模式匹配）。真要强隔离仍需 OS 沙箱。
+- `run_bash` 有 `timeoutMs`（缺省由 `ToolSpec.timeoutMs` 给）；超时 → 终止子进程、回传 `tool_timeout`。
+- **写动作分流不变**：领域写（下单 / 改自选 / 记判断）**绝不经 `run_bash`**，只走 in-process 结构化 tool（§4）。门禁拦的是「本地系统破坏」，与「领域写必经校验审计」是两条独立纪律。
+
+#### profile × 本地 tool 授权
+
+本地 tool 是否暴露由 `AgentRunProfile.allowedTools` 决定（见 §2「`AgentRunProfile` 默认 profile」表已补本地 tool 列）。原则：
+
+- `read_file` 副作用最小，可较宽松地给交互 / 分析类 profile。
+- `write_file` / `edit_file` 给需要产出研究笔记 / 处理数据的 profile（`user_chat` / `news_analysis` / `scheduled_review` / `manual_replay`）。
+- `run_bash` 因危险面最大，默认只给前台可确认的 `user_chat`；后台 profile 默认不给（即使给，危险命令在无人确认时一律拒绝）。
+- 本地 tool 与 `allowTradingWrite` **正交**：给本地 tool 不放宽交易写权限；写交易仍受 `allowTradingWrite` + episode 前置约束（§2 / §4）。
+
+### Skills（playbook，初始为空）
+
+- **Skill = 模型驱动的 playbook**（`SKILL.md`），描述「为完成某研究 / 决策任务，如何编排上面这些 tool」。Skill 本身不执行、不是注册的 handler；它是注入上下文的说明书，由模型据此发起 tool 调用。
+- **Tool（原语）与 Skill（playbook）是两个正交概念**：tool 是「手」，skill 是「剧本」。
+- **初始不内置任何 skill**，全部走裸 tool；skill 后续按需补（产品负责人手写 `SKILL.md`）。
+- Skill 编排 tool 时走 **in-process tool 调用**，不让模型经 `run_bash` 去调领域能力。
+
+### 只读 CLI（可选 / 后续；人用旁路，不在 agent 关键路径）
+
+> **强度：`Spec-anchored`，标注为可选 / 后续**——不是 Phase 3 必须项。下文规约的是「若实现，必须满足的边界」，不是「现在就要做」。
+
+`gangzi` 是一个**只读**命令行，给**人 / 外部脚本**用来快速查行情 / 新闻 / 账户，不参与 agent 的任何关键路径。
+
+**子命令集（全部只读，输出 JSON）**：
+
+| 子命令 | 含义 | 背后只读 facade |
+|---|---|---|
+| `gangzi quote <ts_code>...` | 查一只或多只标的行情 / 详情 | Quotes `fetch_data` |
+| `gangzi scan [filters]` | 按 `scan_market` DSL 扫描候选标的 | Quotes `scan_market` |
+| `gangzi news [query]` | 查 / 搜新闻列表 | News `fetch_news` |
+| `gangzi account` | 查账户总览 / 持仓 / 挂单 / 自选 | Account 只读 facade |
+
+- 输出默认 JSON（机器可读 + 可 `jq`）；可选加 `--pretty` 给人看。
+- 子命令的查询参数语义与对应只读 facade 一致（如 `scan` 复用 `ScanMarketRequest` DSL、`news` 复用 `fetch_news` 的 `query` / `sources` / 时间窗），CLI 不另发明 filter 语法。
+
+**瘦客户端机制**：
+
+- CLI 必须连到**正在运行的 app** 暴露的**本地只读端点**（unix socket 或 `127.0.0.1` loopback，背后是同一套 pipeline 只读服务）；CLI 只负责「拼请求 → 转发 → 打印响应」。
+- CLI **不冷起独立进程重做 I/O**——不自己开 SQLite、不自己冷连 TDX、不绕开 app 的实时缓存。否则会与 GUI 抢 SQLite 写锁、冷连 TDX 拉慢、读到绕过缓存的陈旧 / 重复数据。
+- app 未运行时，CLI 应明确报「app 未运行」错误并退出，而**不是**退化成自起后端。
+
+**只读边界（有意的安全设计）**：
+
+- CLI **无任何写子命令**：下单 / 改自选 / 记录判断 / 改策略全部**只**走 in-process 结构化 tool（§4），不经 CLI。这条边界是有意的——人用旁路只能观察，不能改账户 / 审计。
+- 本地只读端点只暴露读 facade，不路由任何 `operate_account` / `update_watchlist` / `record_decision_*`。
+
+**与 agent 的关系**：
+
+- Agent **不**经 CLI 取领域数据——它用 in-process 领域 tool（`fetch_quotes` / `fetch_news` / `fetch_account`，§4）。
+- CLI 与 agent tool 是**两条独立路径**：agent tool 走 in-process handler，CLI 走本地 socket；二者都最终落到同一套 pipeline 只读 facade，但互不依赖、互不复用对方的调用栈。
 
 ### `AgentRun`
 
@@ -175,15 +273,30 @@ type AgentRunProfile = {
 };
 ```
 
-默认 profile：
+默认 profile（领域 tool）：
 
-| Profile | Trigger | allowed tools | 交易写 |
+| Profile | Trigger | allowed 领域 tools | 交易写 |
 |---|---|---|---|
 | `user_chat` | 用户消息 | `fetch_quotes`、`fetch_news`、`fetch_account`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许，但必须先记录 episode 并通过 Account 校验 |
 | `news_analysis` | news batch | `fetch_news`、`fetch_quotes`、`fetch_account`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许，但必须有 episode 和新鲜行情 |
 | `account_trigger_response` | account trigger | `fetch_account`、`fetch_quotes`、`fetch_news`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、`operate_account` | 允许 |
 | `scheduled_review` | 定时巡检 | `fetch_account`、`fetch_quotes`、`fetch_news`、`update_watchlist`、`record_decision_episode`、`record_decision_review`、按配置 `operate_account` | 默认关闭，可配置开启 |
 | `manual_replay` | 人工复盘 | `fetch_account`、`fetch_quotes`、`fetch_news`、`record_decision_review` | 禁止 |
+
+默认 profile（本地通用 tool，见「本地通用 tool 与工作区沙箱」）：
+
+| Profile | `read_file` | `write_file` | `edit_file` | `run_bash` |
+|---|:---:|:---:|:---:|:---:|
+| `user_chat` | ✓ | ✓ | ✓ | ✓（危险命令走 UI 确认） |
+| `news_analysis` | ✓ | ✓ | ✓ | ✗ |
+| `account_trigger_response` | ✓ | ✗ | ✗ | ✗ |
+| `scheduled_review` | ✓ | ✓ | ✓ | ✗ |
+| `manual_replay` | ✓ | ✗ | ✗ | ✗ |
+
+- `read_file` 副作用最小（只读、可读工作区外），所有 profile 默认给。
+- `write_file` / `edit_file` 给需要产出研究笔记 / 处理数据的 profile；`account_trigger_response`（应快速响应、不产文件）和 `manual_replay`（纯复盘、不改工作区）默认不给。
+- `run_bash` 危险面最大，默认**只**给可人工确认的前台 `user_chat`；后台 profile 默认不给。即使某 profile 被配置开启 `run_bash`，危险命令在无人确认时一律拒绝（`command_rejected`）。
+- 本地 tool 授权与 `allowTradingWrite` **正交**：给本地 tool 不放宽交易写权限。
 
 默认 required packet sections：
 
@@ -768,6 +881,12 @@ Agent 消费其他模块时，Runtime 将工具收敛为少数高层工具，并
 | `update_watchlist` | Account | 添加 / 删除自选、更新自选备注 | non_trading_write |
 | `record_decision_episode` | Agent Runtime | 记录一次可复盘投资判断 | non_trading_write |
 | `record_decision_review` | Agent Runtime | 记录一次决策 / 交易 / 触发复盘 | non_trading_write |
+| `read_file` | 本地（约定级沙箱） | 读任意 path 文件（只读） | none |
+| `write_file` | 本地（约定级沙箱） | 写文件（仅工作区内） | non_trading_write |
+| `edit_file` | 本地（约定级沙箱） | 定向替换文件内容（仅工作区内） | non_trading_write |
+| `run_bash` | 本地（约定级沙箱） | 执行 shell 命令（cwd 默认工作区，危险命令门禁） | non_trading_write |
+
+> `side effect` 列对齐 Infra `ToolSpec.sideEffect`（`none` / `non_trading_write` / `trading_write`，[agent-infra-module.md](agent-infra-module.md) §2）。本地写 tool 标 `non_trading_write`：其结果不是不可逆交易事实，context 压缩时可被 MicroClear / 替 stub（产物真源是工作区文件本身，模型可用 `read_file` 重新拉回）。`run_bash` 标 `non_trading_write` 是从「会改本地状态」角度归类；它**不**承载任何领域写（领域写只走结构化领域 tool）。
 
 规则：
 
@@ -904,6 +1023,101 @@ type OperateAccountToolOutput = {
 - Account 接受 / 拒绝后，Runtime 根据工具结果更新 `TradeIntent.status` 和 `accountResultRef`。
 - `operate_account` 返回 `accepted = false` 时，Runtime 必须把对应 episode 推进到 `actionStatus = "blocked"`，并设置 `blockedReason = OperateAccountToolOutput.reason`；模型不需要、也不应通过再次调用 `record_decision_episode` 覆盖同一 episode。
 - 只有一个模拟账户时，`operate_account` 必须按账户全局串行执行；未来支持多账户时，串行粒度改为 `accountId`。
+
+### 4.1 领域 tool 契约一览
+
+每个领域 tool 的 input / output **不重新发明 schema**，直接引用对应模块的 canonical DTO（上方 schema 块已给字段定义），下表点明它包了哪个 use-case、错误码、幂等性、副作用：
+
+| tool | 包的 use-case | input / output 引用 | 主要错误码 | 副作用 | 幂等性 |
+|---|---|---|---|---|---|
+| `fetch_quotes` | Quotes [`fetch_data`](quotes-module.md#fetch_data) / [`scan_market`](quotes-module.md#scan_market) | `FetchQuotesToolInput` / `FetchQuotesToolOutput`（= `PacketQuotes` + warnings/errors） | `invalid_input`（`tsCodes` 与 `scan` 未二选一）；缺数据走 item 级 `warnings`/`errors`（`quote_missing` / `quote_stale` / …） | none | 幂等（纯读本地 snapshot，不触发远端 refresh） |
+| `fetch_news` | News [`fetch_news`](news-module.md#fetch_news) | `FetchNewsToolInput`（= `FetchNewsRequest`）/ `FetchNewsToolOutput`（= `PacketNews` + warnings/errors） | `invalid_input`（未知 `sources`）；缺正文走 `article_missing` warning | none | 幂等（只读本地 DB / article cache） |
+| `fetch_account` | Account 只读 facade（账户总览 / 持仓 / 订单 / 自选 / 事件 / 触发） | `FetchAccountToolInput` / `FetchAccountToolOutput`（= `PacketAccount`） | `invalid_input` | none | 幂等（只读读模型） |
+| `operate_account` | Account [`operate_account`](account-module.md#operate_account)（actor=agent） | `OperateAccountToolInput`{ `episodeId`, `accountInput: OperateAccountInput` } / `OperateAccountToolOutput` | Account 拒单 reason（`insufficient_cash` / `quote_stale` / `risk_limit_exceeded` / `order_not_pending` / …）；前置校验失败（episode 不存在 / actionStatus 非法）→ tool 直接 rejected 不调 Account | **trading_write** | **非幂等**：每次调用 = 一次新订单意图。按账户全局串行；重试由 Runtime 依 `toolCallId` + Account 审计 ID 做恢复核对（§`TradeIntent` 恢复规则），不靠 tool 层自动重发 |
+| `update_watchlist` | Account [`update_watchlist`](account-module.md)（actor=agent） | `UpdateWatchlistToolInput`{ `episodeId?`, `accountInput: UpdateWatchlistInput` } / `UpdateWatchlistToolOutput` | `invalid_input`；Account 侧业务 reason | non_trading_write | 自然幂等（add 已存在 / remove 不存在按 Account 语义无害） |
+| `record_decision_episode` | Agent Runtime 自有写（[`DecisionEpisode`](#decisionepisode)） | `RecordDecisionEpisodeToolInput`（= `DecisionEpisode` 去派生字段 + `evidenceSelectors`）/ `RecordDecisionEpisodeToolOutput` | `invalid_input`（evidence selector 校验失败 / action×actionStatus 非法组合） | non_trading_write | **非幂等**：每次调用创建一条新 episode；不能用它修改已有 episode（§`DecisionEpisode`） |
+| `record_decision_review` | Agent Runtime 自有写（[`DecisionReview`](#decisionreview)） | `RecordDecisionReviewToolInput`（= `DecisionReview` 去派生字段 + `evidenceSelectors`）/ `RecordDecisionReviewToolOutput` | `invalid_input`（selector 校验失败 / 找不到 episode 映射→带 `mapping_missing`） | non_trading_write | 非幂等：每次创建一条新 review |
+
+- 错误码必须取 [shared-types.md](shared-types.md) §5 的封闭 `ErrorCode` 集合；领域读的「缺数据」用 item 级 `warnings` / `errors`，写的「失败」用单一主 `reason` code（对齐 shared-types 写接口规则）。
+- 领域读 tool 全部幂等、只读本地、**不触发远端 provider**；要刷新走 Runtime 的显式 refresh / 后台任务（§5）。
+- 领域写 tool 全部 in-process、必经校验 + 审计（episode 前置 / Account fail-closed / evidence hydrate），**绝不经 `run_bash` 或 CLI** 拼文本完成。
+
+### 4.2 本地通用 tool 契约
+
+本地 tool 是全新契约（不复用模块 DTO）。所有路径在 handler 前做规范化 + 工作区校验（见 §2「工作区路径强制规则」）。
+
+```ts
+// read_file —— 读任意 path（只读，不受工作区限制）
+type ReadFileToolInput = {
+  path: string;            // 绝对或相对（相对以 <workspace> 为基）
+  offset?: number;         // 起始行（可选，按行读）
+  limit?: number;          // 读取行数上限（可选）
+};
+type ReadFileToolOutput = {
+  content: string;
+  truncated?: boolean;     // 文件超过单次读取上限被截断时为 true
+};
+// 错误：not_found（路径不存在）/ invalid_input（不可读：是目录 / 权限不足 / 非文本）/ parse_error（超大且无法截断读取）
+
+// write_file —— 写文件（path 必须在 <workspace> 内）
+type WriteFileToolInput = {
+  path: string;            // 规范化后必须落在 <workspace> 内
+  content: string;
+};
+type WriteFileToolOutput = {
+  bytesWritten: number;
+};
+// 错误：path_outside_workspace（越界 / .. 逃逸 / symlink 逃逸）/ invalid_input（父目录不可建等）
+
+// edit_file —— 定向替换（path 必须在 <workspace> 内）
+type EditFileToolInput = {
+  path: string;            // 规范化后必须落在 <workspace> 内
+  oldString: string;       // 待替换的原文
+  newString: string;       // 替换为
+  replaceAll?: boolean;    // 默认 false：oldString 必须在文件中唯一命中
+};
+type EditFileToolOutput = {
+  replaced: number;        // 实际替换的次数
+};
+// 错误：path_outside_workspace / not_found（文件不存在）/
+//       invalid_input（oldString 未命中；或 replaceAll=false 时 oldString 非唯一）
+
+// run_bash —— 执行命令（cwd 默认 <workspace>，危险命令门禁）
+type RunBashToolInput = {
+  command: string;
+  cwd?: string;            // 缺省 = <workspace>；可指向工作区外（路径不受限，见诚实边界）
+  timeoutMs?: number;      // 缺省取 ToolSpec.timeoutMs
+};
+type RunBashToolOutput = {
+  stdout: string;
+  stderr: string;
+  exitCode: number;        // 子进程退出码
+  truncated?: boolean;     // stdout/stderr 超出捕获上限被截断时为 true
+};
+// 错误：command_rejected（命中危险模式且被拒 / 无人确认）/ tool_timeout（超 timeoutMs，子进程被终止）/
+//       invalid_input（cwd 不存在等）
+```
+
+副作用 / 幂等性：
+
+| tool | 副作用 | 幂等性 |
+|---|---|---|
+| `read_file` | none | 幂等（纯读） |
+| `write_file` | non_trading_write（覆盖写工作区文件） | **非幂等**（覆盖；同 content 重写结果相同但 `bytesWritten` 是观测值） |
+| `edit_file` | non_trading_write | **非幂等**（替换后再次执行同一 `oldString` 通常 `invalid_input` 未命中） |
+| `run_bash` | non_trading_write（取决于命令；可改本地状态） | **非幂等**（任意命令，副作用不可假定） |
+
+- 所有本地 tool 的 `path` / `cwd` 在 handler 前**规范化 + 工作区校验**（write/edit 强制在 `<workspace>` 内，read/run 路径不受限但仍规范化）。
+- `run_bash` 危险命令门禁见 §2「run_bash 危险命令门禁」；门禁 / 工作区校验是约定级，不是强隔离。
+- 本地 tool 的产物（工作区文件）**不落 DB**；审计靠 `ToolCall` 记录 + 工作区文件本身（§2）。
+
+> ✅ **错误码（已定，采用方案 A）**：`path_outside_workspace` / `command_rejected` 已加入 [shared-types.md](shared-types.md) §5 的封闭 `ErrorCode` 集合（语义清晰、前端 / 审计可稳定识别）。本地 tool 越界 / 被拒一律用这两个 code，不复用 `invalid_input`。
+
+### 4.3 所有 ToolCall 的审计与 payload
+
+- **每一次** tool 调用（领域 + 本地）都由 Infra 记一条 `ToolCall` 审计（`agent_tool_calls` 表）：`toolCallId`、`name`、input/output summary、`isError` / `errorCode`、起止时间（[agent-infra-module.md](agent-infra-module.md) §2 `ToolCall`）。
+- input / output 完整 payload 进 `PayloadStore`（`agent_payloads`）：序列化 > 8KB 时 summary 截断 + `ref` 指向 payload；≤ 8KB 时 summary = 完整 payload（Infra §2 PayloadStore 规则）。本地 tool 的大输出（`run_bash` 长 stdout、`read_file` 大 content）同样走该 8KB 阈值。
+- `ToolCall` 是审计真源；模型决定把哪些 tool 调用作为 episode / review 证据时，通过 `EvidenceSelector{ kind: "tool_call" }` 显式声明，Runtime hydrate 成 `ToolCallEvidenceSnapshot`（§2 `EvidenceRef`）——Runtime 不自动把全部 tool calls 挂上 episode。
 
 ---
 

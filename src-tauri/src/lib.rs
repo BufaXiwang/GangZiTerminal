@@ -26,7 +26,7 @@ use crate::adapters::quotes::events::{
 use crate::domain::shared::Money;
 use crate::infrastructure::account::migrations as account_migrations;
 use crate::infrastructure::agent::{
-    bootstrap as bootstrap_agent_infra, migrations as agent_migrations,
+    bootstrap as bootstrap_agent_infra, default_workspace_dir, migrations as agent_migrations,
 };
 use crate::infrastructure::db::{run_migrations, AppDb};
 use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
@@ -69,7 +69,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::quotes::cmd::fetch_kline_page,
         adapters::quotes::cmd::set_quote_hotset,
         adapters::quotes::cmd::forward_log,
-        adapters::agent::cmd::agent_list_skills,
+        adapters::agent::cmd::agent_list_tools,
         adapters::agent::cmd::agent_channel_presets,
         adapters::agent::cmd::agent_discover_models,
         adapters::agent::cmd::agent_add_channel,
@@ -81,7 +81,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         // Spec: account-module.md §4 — operate_account 写入口只对 Agent tool /
         // 外部自动化决策运行时暴露，不能注册为 Tauri command 供前端直接 invoke。
         // 函数实现保留为 #[allow(dead_code)]，将由 Phase 3 Agent Runtime
-        // 通过 SkillRegistry 注册为 skill。
+        // 通过 ToolRegistry 注册为 tool。
         adapters::account::cmd::update_watchlist,
         adapters::account::cmd::mark_trigger_handled,
         adapters::account::cmd::rebuild_account_snapshot,
@@ -323,10 +323,20 @@ pub fn run() {
             }
 
             // -- Agent Infra bootstrap（Phase 1）
-            // Spec: docs/design/agent-infra-module.md §5（SkillRegistry / 持久化）。
-            // Runtime（Phase 3）会通过 `AgentInfra.registry.register_skill(...)` 注入
-            // Quotes / News / Account facade skill，并新增 run_agent / send_user_message command。
-            let agent_infra = bootstrap_agent_infra(db.clone());
+            // Spec: docs/design/agent-infra-module.md §5（ToolRegistry / 持久化）。
+            // Runtime（Phase 3）会通过 `AgentInfra.registry.register_tool(...)` 注入
+            // Quotes / News / Account facade tool，并新增 run_agent / send_user_message command。
+            //
+            // 本地通用 tool（read/write/edit/run_bash）的约定级沙箱工作区根：
+            // Spec: docs/design/agent-runtime-module.md §4.2。取 `<appData>/gangzi/workspace`；
+            // 解析不到 appData 时退到占位默认（Phase 3 adapter 可进一步定制注入）。
+            let workspace_dir = app
+                .handle()
+                .path()
+                .app_data_dir()
+                .map(|d| d.join("gangzi").join("workspace"))
+                .unwrap_or_else(|_| default_workspace_dir());
+            let agent_infra = bootstrap_agent_infra(db.clone(), workspace_dir);
             app.manage(agent_infra);
 
             // -- Account BC bootstrap（Phase 2）

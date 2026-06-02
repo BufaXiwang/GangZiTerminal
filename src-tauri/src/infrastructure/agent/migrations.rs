@@ -1,12 +1,12 @@
 //! Agent Infra schema migrations。
 //!
-//! Spec: docs/design/agent-infra-module.md §2（不变量：SkillCall 审计、message 持久化）
+//! Spec: docs/design/agent-infra-module.md §2（不变量：ToolCall 审计、message 持久化）
 //!
 //! 表前缀 `agent_*`（AGENTS.md 分区约束）。
 //!
 //! 真源表：
 //! - `agent_messages`           — `AgentMessage` 持久化对话 / context 消息（spec §2）
-//! - `agent_skill_calls`        — `SkillCall` 审计（spec §2 `SkillCall` 不变量）
+//! - `agent_tool_calls`        — `ToolCall` 审计（spec §2 `ToolCall` 不变量）
 //! - `agent_provider_channels`  — `ProviderChannel` 配置（spec §2 `ProviderChannel`）
 //! - `agent_payloads`           — PayloadStore 完整 payload（spec §2 PayloadStore）
 
@@ -37,9 +37,9 @@ CREATE TABLE agent_messages (
 CREATE INDEX idx_agent_messages_run_created
     ON agent_messages (run_id, created_at);
 
--- agent_skill_calls: SkillCall 审计
-CREATE TABLE agent_skill_calls (
-    skill_call_id       TEXT PRIMARY KEY,
+-- agent_tool_calls: ToolCall 审计
+CREATE TABLE agent_tool_calls (
+    tool_call_id       TEXT PRIMARY KEY,
     run_id              TEXT NOT NULL,
     name                TEXT NOT NULL,
     input_summary_json  TEXT NOT NULL,
@@ -53,8 +53,8 @@ CREATE TABLE agent_skill_calls (
     duration_ms         INTEGER
 );
 
-CREATE INDEX idx_agent_skill_calls_run
-    ON agent_skill_calls (run_id, started_at);
+CREATE INDEX idx_agent_tool_calls_run
+    ON agent_tool_calls (run_id, started_at);
 
 -- agent_provider_channels: ProviderChannel 配置
 CREATE TABLE agent_provider_channels (
@@ -73,12 +73,12 @@ CREATE TABLE agent_provider_channels (
 );
 
 -- agent_payloads: PayloadStore 完整 input / output / image 副本
--- 写入触发：skill input/output > 8KB；image 任何尺寸
+-- 写入触发：tool input/output > 8KB；image 任何尺寸
 -- 第一阶段不实现 GC，永久保留供 decision episode replay。
 CREATE TABLE agent_payloads (
     payload_id   TEXT PRIMARY KEY,                -- pl_<uuid>
-    kind         TEXT NOT NULL,                   -- skill_input | skill_output | image
-    content_json TEXT,                            -- JSON payload (kind = skill_input|skill_output)
+    kind         TEXT NOT NULL,                   -- tool_input | tool_output | image
+    content_json TEXT,                            -- JSON payload (kind = tool_input|tool_output)
     content_bytes BLOB,                           -- image bytes (kind = image)
     content_type TEXT,                            -- mime (kind = image)
     byte_size    INTEGER NOT NULL,
@@ -126,9 +126,9 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO agent_skill_calls
-              (skill_call_id, run_id, name, input_summary_json, is_error, started_at)
-             VALUES ('sc_1', 'r1', 'fetch_quote', '{}', 0, '2026-05-27T01:00:00Z')",
+            "INSERT INTO agent_tool_calls
+              (tool_call_id, run_id, name, input_summary_json, is_error, started_at)
+             VALUES ('tc_1', 'r1', 'fetch_quote', '{}', 0, '2026-05-27T01:00:00Z')",
             [],
         )
         .unwrap();
@@ -143,7 +143,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO agent_payloads (payload_id, kind, content_json, byte_size, created_at)
-             VALUES ('pl_1', 'skill_output', '{\"k\":1}', 7, '2026-05-27T01:00:00Z')",
+             VALUES ('pl_1', 'tool_output', '{\"k\":1}', 7, '2026-05-27T01:00:00Z')",
             [],
         )
         .unwrap();

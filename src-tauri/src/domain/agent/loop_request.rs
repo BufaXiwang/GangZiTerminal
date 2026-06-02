@@ -43,7 +43,7 @@ pub struct CompactionConfig {
 /// Spec: agent-infra-module.md §5 Infra Loop API
 ///
 /// 注：spec §5 明确"request 不含 server-side tool 字段"——所有 chat-completable provider
-/// 都通过 Skill 文本协议提供工具能力。
+/// 都通过 Tool 文本协议提供工具能力。
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRunRequest {
@@ -104,9 +104,9 @@ pub struct RunSummary {
     pub cache_read_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
-    /// 本次产生的 skill_call_id 列表（Runtime 据此找审计）。
+    /// 本次产生的 tool_call_id 列表（Runtime 据此找审计）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skill_call_ids: Vec<String>,
+    pub tool_call_ids: Vec<String>,
 }
 
 impl RunSummary {
@@ -119,7 +119,7 @@ impl RunSummary {
             output_tokens: 0,
             cache_read_tokens: None,
             cache_write_tokens: None,
-            skill_call_ids: vec![],
+            tool_call_ids: vec![],
         }
     }
 }

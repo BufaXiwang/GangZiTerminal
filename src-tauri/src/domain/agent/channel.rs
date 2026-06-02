@@ -5,7 +5,7 @@
 //! 抽象轴是 wire format，不是厂商。新增兼容厂商通常只新增 channel config。
 //!
 //! 不再有 `supportsTools` / `supportsServerSideTools` 字段：所有 chat-completable provider 都通过
-//! Skill 文本协议（`<use_skill>`）提供工具能力，没有 provider 差异。
+//! Tool 文本协议（`<use_tool>`）提供工具能力，没有 provider 差异。
 
 use serde::{Deserialize, Serialize};
 use specta::Type;

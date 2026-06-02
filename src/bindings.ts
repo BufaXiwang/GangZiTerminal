@@ -194,13 +194,13 @@ async forwardLog(level: string, message: string) : Promise<Result<null, CommandE
 }
 },
 /**
- * 列出当前 SkillRegistry 已注册的 skill。
+ * 列出当前 ToolRegistry 已注册的 tool。
  * 
- * Spec: agent-infra-module.md §5 Skill Registry API（snapshot）
+ * Spec: agent-infra-module.md §5 Tool Registry API（snapshot）
  */
-async agentListSkills() : Promise<Result<SkillSpec[], CommandError>> {
+async agentListTools() : Promise<Result<ToolSpec[], CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("agent_list_skills") };
+    return { status: "ok", data: await TAURI_INVOKE("agent_list_tools") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -399,7 +399,17 @@ export type DailyBasic = { tsCode: TsCode; tradeDate: string; pe?: number | null
  * 发现到的单个可用模型。
  */
 export type DiscoveredModel = { id: string; displayName?: string | null }
-export type ErrorCode = "invalid_input" | "not_found" | "provider_unavailable" | "rate_limited" | "db_error" | "parse_error" | "quote_missing" | "quote_stale" | "quote_price_missing" | "depth_missing" | "outside_trading_session" | "instrument_not_tradable" | "instrument_suspended" | "limit_up_down_blocked" | "insufficient_cash" | "insufficient_sellable_quantity" | "invalid_lot_size" | "order_not_pending" | "risk_limit_exceeded" | "strategy_required" | "duplicate_event" | "version_conflict" | "article_extract_failed" | "tool_timeout" | "provider_context_too_long"
+export type ErrorCode = "invalid_input" | "not_found" | "provider_unavailable" | "rate_limited" | "db_error" | "parse_error" | "quote_missing" | "quote_stale" | "quote_price_missing" | "depth_missing" | "outside_trading_session" | "instrument_not_tradable" | "instrument_suspended" | "limit_up_down_blocked" | "insufficient_cash" | "insufficient_sellable_quantity" | "invalid_lot_size" | "order_not_pending" | "risk_limit_exceeded" | "strategy_required" | "duplicate_event" | "version_conflict" | "article_extract_failed" | "tool_timeout" | "provider_context_too_long" | 
+/**
+ * 本地写 tool（write_file / edit_file）的 path 规范化后越界 <workspace>。
+ * Spec: agent-runtime-module.md §4.2 本地通用 tool 契约（建议 A）。
+ */
+"path_outside_workspace" | 
+/**
+ * run_bash 命中危险命令门禁被拒（约定级，非强隔离）。
+ * Spec: agent-runtime-module.md §2 run_bash 危险命令门禁 / §4.2。
+ */
+"command_rejected"
 export type FetchAccountInclude = { snapshot?: boolean | null; positions?: boolean | null; orders?: boolean | null; watchlist?: boolean | null; events?: boolean | null; triggers?: boolean | null }
 export type FetchAccountRequest = { include?: FetchAccountInclude | null; positionStatus?: PositionStatusFilter | null; orderActive?: boolean | null; orderStatusIn?: OrderStatus[] | null; triggerHandled?: TriggerHandledFilter | null; limit?: number | null; offset?: number | null }
 export type FetchAccountResponse = { snapshot?: AccountSnapshot | null; positions?: Position[] | null; orders?: Order[] | null; watchlist?: WatchlistItemView[] | null; events?: AccountEvent[] | null; triggers?: AccountTrigger[] | null; warnings?: WarningCode[] }
@@ -635,24 +645,9 @@ export type ScanUniverse = { category?: InstrumentCategory | null; total: number
  */
 export type Shares = number
 /**
- * Skill 副作用分类（spec §2 `SideEffect`）。
+ * Tool 副作用分类（spec §2 `SideEffect`）。
  */
 export type SideEffect = "none" | "non_trading_write" | "trading_write"
-/**
- * 一个 Skill 的协议描述。
- * 
- * Spec: agent-infra-module.md §2 `SkillSpec`
- * 
- * 规则（来自 spec §2）：
- * - 同名 skill 只能注册一次；重复注册必须 fail closed。
- * - `examples` 至少 1 个完整 `<use_skill ...>{...}</use_skill>` 示例字符串。
- * - description 应当能被产品负责人手写为 markdown。
- */
-export type SkillSpec = { name: string; description: string; 
-/**
- * JSON Schema（dispatch 前校验）。
- */
-inputSchema: JsonValue; examples: string[]; sideEffect: SideEffect; timeoutMs: number }
 /**
  * Spec: quotes-module.md §2 — fetch_data profile 投影。
  */
@@ -661,6 +656,21 @@ export type StockProfile = { tsCode: TsCode; name: string; category: InstrumentC
  * Spec: quotes-module.md §2 StockQuote
  */
 export type StockQuote = { tsCode: TsCode; name?: string | null; category: InstrumentCategory; tradeDate: string; price?: Price | null; previousClose?: Price | null; open?: Price | null; high?: Price | null; low?: Price | null; change?: Price | null; changePercent?: number | null; volume?: Volume | null; amount?: Amount | null; turnoverRate?: number | null; volumeRatio?: number | null; limitUp?: Price | null; limitDown?: Price | null; bid?: QuoteDepthLevel[]; ask?: QuoteDepthLevel[]; tradeStatus: TradeStatus; source: QuoteSource; capturedAt: string; exchangeTime?: string | null; freshness: Freshness; warnings?: WarningCode[] }
+/**
+ * 一个 Tool 的协议描述。
+ * 
+ * Spec: agent-infra-module.md §2 `ToolSpec`
+ * 
+ * 规则（来自 spec §2）：
+ * - 同名 tool 只能注册一次；重复注册必须 fail closed。
+ * - `examples` 至少 1 个完整 `<use_tool ...>{...}</use_tool>` 示例字符串。
+ * - description 应当能被产品负责人手写为 markdown。
+ */
+export type ToolSpec = { name: string; description: string; 
+/**
+ * JSON Schema（dispatch 前校验）。
+ */
+inputSchema: JsonValue; examples: string[]; sideEffect: SideEffect; timeoutMs: number }
 /**
  * Spec: quotes-module.md §2 — query facade 派生 trade status。
  */

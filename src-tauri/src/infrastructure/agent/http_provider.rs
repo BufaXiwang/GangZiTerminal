@@ -8,9 +8,9 @@
 //!
 //! - SSE 解析器手写（不引入新 crate）：buffer bytes → split on `\n`；`data: {json}` /
 //!   `event: <type>`；空行 = event 边界；`:`-comment / ping 忽略。
-//! - skill 调用走 §2 文本协议：`SkillCallParser` 跑在本层内部——每段 chat 文本
-//!   fragment 喂 parser，clean（XML 抑制）`TextDelta` 实时 emit 一次；`UseSkill` /
-//!   `ParseError` 收集进 `ProviderTurnOutcome.skill_events` 交给 loop dispatch。
+//! - tool 调用走 §2 文本协议：`ToolCallParser` 跑在本层内部——每段 chat 文本
+//!   fragment 喂 parser，clean（XML 抑制）`TextDelta` 实时 emit 一次；`UseTool` /
+//!   `ParseError` 收集进 `ProviderTurnOutcome.tool_events` 交给 loop dispatch。
 //! - Image dataRef 用注入的 `PayloadStore` deref 成 base64（`None` = chat-only）。
 //!
 //! Error mapping（spec §4，三类）：
@@ -27,7 +27,7 @@ use crate::domain::agent::{
 use crate::infrastructure::agent::loop_executor::{LoopError, ProviderStream, ProviderTurnOutcome};
 use crate::infrastructure::agent::payload_store::PayloadStore;
 use crate::infrastructure::agent::providers::{ProviderAdapter, WireMappingError};
-use crate::infrastructure::agent::skill_parser::{ParserEvent, SkillCallParser};
+use crate::infrastructure::agent::tool_parser::{ParserEvent, ToolCallParser};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
@@ -233,7 +233,7 @@ impl HttpProvider {
         run_id: &str,
     ) -> Result<ProviderTurnOutcome, LoopError> {
         // flush any text the parser was still buffering (clean TextDelta, XML
-        // suppressed). UseSkill/ParseError go to state.skill_events.
+        // suppressed). UseTool/ParseError go to state.tool_events.
         let tail = state.parser.finalize();
         drain_parser_events(&mut state, tail, event_tx, run_id).await?;
 
@@ -262,7 +262,7 @@ impl HttpProvider {
             usage_input: state.usage_input,
             usage_output: state.usage_output,
             stop_reason,
-            skill_events: state.skill_events,
+            tool_events: state.tool_events,
         })
     }
 }
@@ -277,13 +277,13 @@ async fn send_event(tx: &Sender<AgentEvent>, e: AgentEvent) -> Result<(), LoopEr
 
 /// 跨 SSE event 累积的解码状态。
 ///
-/// `SkillCallParser` 在 provider 内部跑——每段 chat 文本 fragment 喂 `parser`，
+/// `ToolCallParser` 在 provider 内部跑——每段 chat 文本 fragment 喂 `parser`，
 /// 对 `ParserEvent::TextDelta` emit clean（XML 抑制）`AgentEvent::TextDelta`，把
-/// `UseSkill` / `ParseError` 收集到 `skill_events`。`raw_text` 单独累积（含 `<use_skill>`
+/// `UseTool` / `ParseError` 收集到 `tool_events`。`raw_text` 单独累积（含 `<use_tool>`
 /// XML）供消息历史回写。
 #[derive(Default)]
 struct StreamState {
-    /// raw chat text，含 `<use_skill>` XML（用于消息历史）。
+    /// raw chat text，含 `<use_tool>` XML（用于消息历史）。
     raw_text: String,
     usage_input: u32,
     usage_output: u32,
@@ -292,14 +292,14 @@ struct StreamState {
     /// Anthropic cache_creation_input_tokens。
     cache_write_tokens: Option<u32>,
     raw_stop_reason: Option<String>,
-    /// provider 内部的 skill 调用文本协议解析器。
-    parser: SkillCallParser,
-    /// 解析出的 `UseSkill` / `ParseError`（按出现顺序；不含 TextDelta）。
-    skill_events: Vec<ParserEvent>,
+    /// provider 内部的 tool 调用文本协议解析器。
+    parser: ToolCallParser,
+    /// 解析出的 `UseTool` / `ParseError`（按出现顺序；不含 TextDelta）。
+    tool_events: Vec<ParserEvent>,
 }
 
 /// 把一段 chat 文本 fragment 喂 parser；clean `TextDelta` 实时 emit（XML 抑制），
-/// `UseSkill` / `ParseError` 收集到 `state.skill_events`。raw fragment 累积到 `raw_text`。
+/// `UseTool` / `ParseError` 收集到 `state.tool_events`。raw fragment 累积到 `raw_text`。
 async fn feed_chat_text(
     state: &mut StreamState,
     fragment: &str,
@@ -320,11 +320,11 @@ async fn drain_parser_events(
     for ev in events {
         match ev {
             ParserEvent::TextDelta(s) => {
-                // 最佳实践（spec §2/§3）：工具调用是本轮文本的逻辑终点。首个 `<use_skill>`
+                // 最佳实践（spec §2/§3）：工具调用是本轮文本的逻辑终点。首个 `<use_tool>`
                 // 出现后的文本是模型在「无工具结果」下的推测续写（幻觉），**抑制不 emit**；
-                // 只有首个 skill 之前的 preamble/推理文本 emit 给 UI。这样 emit 顺序天然是
-                // `text… → skill_start/end`，无需交错。同一轮多个 skill 仍按序收集 + dispatch。
-                if !s.is_empty() && state.skill_events.is_empty() {
+                // 只有首个 tool 之前的 preamble/推理文本 emit 给 UI。这样 emit 顺序天然是
+                // `text… → tool_start/end`，无需交错。同一轮多个 tool 仍按序收集 + dispatch。
+                if !s.is_empty() && state.tool_events.is_empty() {
                     send_event(
                         event_tx,
                         AgentEvent::TextDelta {
@@ -335,7 +335,7 @@ async fn drain_parser_events(
                     .await?;
                 }
             }
-            other => state.skill_events.push(other),
+            other => state.tool_events.push(other),
         }
     }
     Ok(())
@@ -510,7 +510,7 @@ async fn handle_messages_event(
             match delta_type {
                 "text_delta" => {
                     if let Some(t) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
-                        // feed through SkillCallParser (suppresses <use_skill> XML).
+                        // feed through ToolCallParser (suppresses <use_tool> XML).
                         feed_chat_text(state, t, event_tx, run_id).await?;
                     }
                 }
@@ -603,7 +603,7 @@ async fn handle_chat_event(
         .and_then(|t| t.as_str())
     {
         if !t.is_empty() {
-            // feed through SkillCallParser (suppresses <use_skill> XML).
+            // feed through ToolCallParser (suppresses <use_tool> XML).
             feed_chat_text(state, t, event_tx, run_id).await?;
         }
     }
@@ -647,7 +647,7 @@ async fn handle_responses_event(
     match typ {
         "response.output_text.delta" => {
             if let Some(t) = v.get("delta").and_then(|t| t.as_str()) {
-                // feed through SkillCallParser (suppresses <use_skill> XML).
+                // feed through ToolCallParser (suppresses <use_tool> XML).
                 feed_chat_text(state, t, event_tx, run_id).await?;
             }
         }
@@ -892,16 +892,16 @@ mod tests {
         assert_eq!(usage.1, Some(2048));
     }
 
-    // best-practice: a <use_skill> turn emits clean TextDelta (no raw XML) for the
-    // preamble BEFORE the first skill only; text AFTER the first <use_skill> is the model's
-    // speculative continuation (no tool result yet) and is SUPPRESSED (not emitted). The skill
-    // is parsed into outcome.skill_events for the loop to dispatch; raw text keeps the XML for
+    // best-practice: a <use_tool> turn emits clean TextDelta (no raw XML) for the
+    // preamble BEFORE the first tool only; text AFTER the first <use_tool> is the model's
+    // speculative continuation (no tool result yet) and is SUPPRESSED (not emitted). The tool
+    // is parsed into outcome.tool_events for the loop to dispatch; raw text keeps the XML for
     // message history.
     #[tokio::test]
-    async fn parse_messages_stream_suppresses_use_skill_xml() {
+    async fn parse_messages_stream_suppresses_use_tool_xml() {
         let canned = concat!(
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"check: <use_skill name=\\\"echo\\\">{\\\"a\\\":1}</use_skill> done\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"check: <use_tool name=\\\"echo\\\">{\\\"a\\\":1}</use_tool> done\"}}\n\n",
             "event: message_delta\n",
             "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
             "event: message_stop\n",
@@ -909,12 +909,12 @@ mod tests {
         );
         let (outcome, events) = run_canned(WireFormat::Messages, canned.as_bytes()).await;
         // raw text retains the XML for message history.
-        assert!(outcome.text.contains("<use_skill"));
-        // skill_events carries exactly one UseSkill, no TextDelta.
-        assert_eq!(outcome.skill_events.len(), 1);
+        assert!(outcome.text.contains("<use_tool"));
+        // tool_events carries exactly one UseTool, no TextDelta.
+        assert_eq!(outcome.tool_events.len(), 1);
         assert!(matches!(
-            &outcome.skill_events[0],
-            ParserEvent::UseSkill { name, .. } if name == "echo"
+            &outcome.tool_events[0],
+            ParserEvent::UseTool { name, .. } if name == "echo"
         ));
         // Emitted TextDelta must be clean (no raw XML) and "check: " appears once.
         let joined: String = events
@@ -924,10 +924,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!joined.contains("<use_skill"), "leaked XML: {joined:?}");
+        assert!(!joined.contains("<use_tool"), "leaked XML: {joined:?}");
         assert_eq!(joined.matches("check: ").count(), 1);
-        // best practice: text AFTER the first <use_skill> ("done") is suppressed, not emitted.
-        assert!(!joined.contains("done"), "post-skill text must be suppressed: {joined:?}");
+        // best practice: text AFTER the first <use_tool> ("done") is suppressed, not emitted.
+        assert!(!joined.contains("done"), "post-tool text must be suppressed: {joined:?}");
         // raw history still retains the trailing text + XML.
         assert!(outcome.text.contains("done"));
     }
@@ -1164,7 +1164,7 @@ mod tests {
                 while let Some(e) = rx.recv().await {
                     match e {
                         AgentEvent::TextDelta { delta, .. } => {
-                            if delta.contains("<use_skill") {
+                            if delta.contains("<use_tool") {
                                 saw_raw_xml = true;
                             }
                             collected.push_str(&delta);
@@ -1199,8 +1199,8 @@ mod tests {
             );
             assert!(!outcome.text.is_empty(), "[{label}] returned empty text");
             assert!(outcome.usage_output > 0, "[{label}] usage_output == 0");
-            // no raw <use_skill XML in emitted TextDelta.
-            assert!(!saw_raw_xml, "[{label}] raw <use_skill XML leaked into TextDelta");
+            // no raw <use_tool XML in emitted TextDelta.
+            assert!(!saw_raw_xml, "[{label}] raw <use_tool XML leaked into TextDelta");
         }
 
         let mut ran = 0;

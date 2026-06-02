@@ -9,7 +9,7 @@
 //! - `openai_chat`         — OpenAI-compatible `/v1/chat/completions`
 //!
 //! 本目录只实现 **纯 chat request mapping**（text / image / thinking / usage / stop_reason）。
-//! Skill 调用走 §2 定义的 `<use_skill>` 文本协议，**不**通过 provider 原生 tool_use / function_calling。
+//! Tool 调用走 §2 定义的 `<use_tool>` 文本协议，**不**通过 provider 原生 tool_use / function_calling。
 //! Provider request 中**不**传 `tools` 字段、**不**解析 `tool_use` / `function_call` block。
 
 pub mod anthropic;
@@ -44,7 +44,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 把**当前 live messages** + context 转成 provider 可接受的 JSON body。
     ///
-    /// Spec §3 Agent Loop：body 必须反映 loop 累积的每一轮消息（含 `<skill_result>` user
+    /// Spec §3 Agent Loop：body 必须反映 loop 累积的每一轮消息（含 `<tool_result>` user
     /// 消息），而不是启动时的消息快照。loop_executor 维护 growing
     /// `messages: Vec<AgentMessage>` 并在每个 turn 把整个 slice 传进来。
     ///

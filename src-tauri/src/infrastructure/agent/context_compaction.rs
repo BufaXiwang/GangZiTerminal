@@ -1,9 +1,9 @@
-//! Context compaction — 易腐 skill 结果清理 / 上下文裁剪。
+//! Context compaction — 易腐 tool 结果清理 / 上下文裁剪。
 //!
 //! Spec: docs/design/agent-infra-module.md §4 上下文管理 + 压缩策略
 //!
 //! 压缩顺序（spec §4 丢弃 / 压缩顺序）：
-//!   1. MicroClear 易腐 skill 结果（替换为 `<skill_result_stub />`）
+//!   1. MicroClear 易腐 tool 结果（替换为 `<tool_result_stub />`）
 //!   2. Summarize 尾窗外历史对话
 //!   3. Drop 最旧 API round
 //!   4. Reactive retry（一次压缩 + 一次重发；retry 控制在 loop_executor）
@@ -19,7 +19,7 @@
 //!
 //! **边界（spec §4）**：Infra 只提供压缩「机制」，不内置业务保留策略。压缩只认两个通用信号：
 //! - `ContextPart.droppable`（Runtime 注入时自己标）
-//! - 消息 durable 标记（loop 从 dispatched skill 的 `SkillSpec.sideEffect == trading_write` 派生，
+//! - 消息 durable 标记（loop 从 dispatched tool 的 `ToolSpec.sideEffect == trading_write` 派生，
 //!   或 `kind=summary` 检查点）—— 以 `durable_message_ids: &HashSet<String>` 传入，保持通用。
 
 use crate::domain::agent::{
@@ -37,7 +37,7 @@ pub enum CompactPolicy {
     Summarize,
     /// Drop：丢弃最旧 chat part。
     Drop,
-    /// ReactiveRetry：spec §4 — 比 Summarize 更激进，直接 Drop 最老一轮 API round（包括其 chat history + skill_results）。
+    /// ReactiveRetry：spec §4 — 比 Summarize 更激进，直接 Drop 最老一轮 API round（包括其 chat history + tool_results）。
     ReactiveRetry,
 }
 
@@ -48,20 +48,20 @@ pub struct MicroClearReport {
     pub estimated_tokens_saved: u32,
 }
 
-/// 给易腐 skill 结果替换 stub。
+/// 给易腐 tool 结果替换 stub。
 ///
-/// Spec §2 line 261：stub 文本格式必须为 `<skill_result_stub name="..." call_id="..." ref="..." />`，
+/// Spec §2 line 261：stub 文本格式必须为 `<tool_result_stub name="..." call_id="..." ref="..." />`，
 /// **必须**含 attrs，让 replay 能通过 PayloadStore 拉回。因此只对内容形如
-/// `<skill_result name="X" call_id="Y" ref="Z">...</skill_result>` 的 wrapper 做 stub；
+/// `<tool_result name="X" call_id="Y" ref="Z">...</tool_result>` 的 wrapper 做 stub；
 /// 非 wrapper 的 droppable parts 无 attrs 可填，不该走 stub 路径。
 ///
 /// **Realtime lane**（spec §4 line 322）：trigger / 账户 / 行情 / 新闻 / 策略——这些不一定是
-/// skill_result wrapper。处理策略：
-///   - 是 `<skill_result>` wrapper → stub 化（保留 name + call_id + ref）
+/// tool_result wrapper。处理策略：
+///   - 是 `<tool_result>` wrapper → stub 化（保留 name + call_id + ref）
 ///   - 不是 wrapper 但 droppable → 直接移除（drop，不 stub）。realtime lane 是 fresh data，过期就该 drop。
 ///   - `droppable = false` 的 part 保留不动（spec §2 line 332 invariant）。
 ///
-/// **Chat lane**（spec §4 line 442）：历史 skill_result。只对 wrapper 做 stub，纯用户 / 助理对话留给
+/// **Chat lane**（spec §4 line 442）：历史 tool_result。只对 wrapper 做 stub，纯用户 / 助理对话留给
 /// Drop / Summarize 处理。
 pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
     let mut report = MicroClearReport {
@@ -69,14 +69,14 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
         estimated_tokens_saved: 0,
     };
     // Realtime parts:
-    //   - droppable + skill_result wrapper → stub 化（attrs 完整）
+    //   - droppable + tool_result wrapper → stub 化（attrs 完整）
     //   - droppable + 非 wrapper → 直接移除（无 attrs 可填，不能走 stub）
     //   - 非 droppable → 保留
     bundle.realtime_parts.retain_mut(|p| {
         if !p.droppable || is_stub(p) {
             return true;
         }
-        if content_is_skill_result(&p.content) {
+        if content_is_tool_result(&p.content) {
             report.estimated_tokens_saved += p.estimated_tokens();
             stub_in_place(p);
             report.stubbed_parts += 1;
@@ -89,10 +89,10 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
         }
     });
     // Chat parts: only stub-replace droppable parts whose content is itself a
-    // <skill_result ...> wrapper (historical skill_results migrated into chat history).
+    // <tool_result ...> wrapper (historical tool_results migrated into chat history).
     // Pure user / assistant chat is left untouched — Drop / Summarize handle that lane.
     for p in bundle.chat_parts.iter_mut() {
-        if p.droppable && !is_stub(p) && content_is_skill_result(&p.content) {
+        if p.droppable && !is_stub(p) && content_is_tool_result(&p.content) {
             report.estimated_tokens_saved += p.estimated_tokens();
             stub_in_place(p);
             report.stubbed_parts += 1;
@@ -101,41 +101,41 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
     report
 }
 
-/// True iff the part's content body contains a `<skill_result ...>` opening tag with
+/// True iff the part's content body contains a `<tool_result ...>` opening tag with
 /// at least one of the canonical attributes (name / call_id / ref).
-fn content_is_skill_result(content: &ContextContent) -> bool {
+fn content_is_tool_result(content: &ContextContent) -> bool {
     let body = match content {
         ContextContent::Text(s) => s.clone(),
         ContextContent::Json(v) => v.to_string(),
     };
-    parse_skill_result_attrs(&body).is_some()
+    parse_tool_result_attrs(&body).is_some()
 }
 
 fn stub_in_place(p: &mut ContextPart) {
     let text = render_stub(&p.content);
     p.token_estimate = Some(text.chars().count().div_ceil(4) as u32);
     p.content = ContextContent::Text(text);
-    p.kind = ContextPartKind::SkillResultStub;
+    p.kind = ContextPartKind::ToolResultStub;
 }
 
-/// 把一段 part 内容（必须含 `<skill_result name=".." call_id=".." ref="..">...</skill_result>` wrapper）
-/// 渲染成对应的 `<skill_result_stub name=".." call_id=".." ref=".." />`。
+/// 把一段 part 内容（必须含 `<tool_result name=".." call_id=".." ref="..">...</tool_result>` wrapper）
+/// 渲染成对应的 `<tool_result_stub name=".." call_id=".." ref=".." />`。
 ///
-/// Spec §2 line 261: stub 文本格式必须为 `<skill_result_stub name="..." call_id="..." ref="..." />`，
-/// **必须**含 attrs。caller 必须先用 `content_is_skill_result` 校验 wrapper 存在；非 wrapper part
+/// Spec §2 line 261: stub 文本格式必须为 `<tool_result_stub name="..." call_id="..." ref="..." />`，
+/// **必须**含 attrs。caller 必须先用 `content_is_tool_result` 校验 wrapper 存在；非 wrapper part
 /// 应在 caller 层被 drop 而不是 stub。
 ///
-/// Spec invariant: stub 只对 skill_result wrapper 调用 —— 否则 panic。
+/// Spec invariant: stub 只对 tool_result wrapper 调用 —— 否则 panic。
 fn render_stub(content: &ContextContent) -> String {
     let body = match content {
         ContextContent::Text(s) => s.clone(),
         ContextContent::Json(v) => v.to_string(),
     };
-    let attrs = parse_skill_result_attrs(&body).expect(
-        "render_stub spec invariant violated: caller must guarantee skill_result wrapper present \
+    let attrs = parse_tool_result_attrs(&body).expect(
+        "render_stub spec invariant violated: caller must guarantee tool_result wrapper present \
          (spec §2 line 261 — stub must have name/call_id/ref attrs)",
     );
-    let mut s = String::from("<skill_result_stub");
+    let mut s = String::from("<tool_result_stub");
     if let Some(name) = attrs.name {
         s.push_str(&format!(r#" name="{}""#, escape_attr(&name)));
     }
@@ -150,25 +150,25 @@ fn render_stub(content: &ContextContent) -> String {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct SkillResultAttrs {
+struct ToolResultAttrs {
     name: Option<String>,
     call_id: Option<String>,
     payload_ref: Option<String>,
 }
 
-/// 从 `<skill_result ...>...</skill_result>` 或 `<skill_result ... />` 头部提取
+/// 从 `<tool_result ...>...</tool_result>` 或 `<tool_result ... />` 头部提取
 /// `name` / `call_id` / `ref` 属性。任何属性缺失返回 None；标签不存在也返回 None。
-fn parse_skill_result_attrs(s: &str) -> Option<SkillResultAttrs> {
-    let open_pos = s.find("<skill_result")?;
-    let rest = &s[open_pos + "<skill_result".len()..];
+fn parse_tool_result_attrs(s: &str) -> Option<ToolResultAttrs> {
+    let open_pos = s.find("<tool_result")?;
+    let rest = &s[open_pos + "<tool_result".len()..];
     let close_gt = rest.find('>')?;
     let attrs_str = &rest[..close_gt];
-    let attrs = SkillResultAttrs {
+    let attrs = ToolResultAttrs {
         name: read_attr(attrs_str, "name"),
         call_id: read_attr(attrs_str, "call_id"),
         payload_ref: read_attr(attrs_str, "ref"),
     };
-    // Heuristic: must look like a real skill_result tag (i.e. have at least name).
+    // Heuristic: must look like a real tool_result tag (i.e. have at least name).
     if attrs.name.is_none() && attrs.call_id.is_none() && attrs.payload_ref.is_none() {
         return None;
     }
@@ -209,7 +209,7 @@ fn escape_attr(s: &str) -> String {
 }
 
 fn is_stub(p: &ContextPart) -> bool {
-    matches!(p.kind, ContextPartKind::SkillResultStub)
+    matches!(p.kind, ContextPartKind::ToolResultStub)
 }
 
 /// Drop 最旧 chat parts，直到落到 soft limit 以下。
@@ -356,25 +356,25 @@ pub fn compact_context(
 
 /// 一条消息是否 durable（永不压缩 / 替 stub）。通用信号，不感知业务：
 /// - `kind == Summary`（§4 压缩检查点）；
-/// - `message_id ∈ durable_message_ids`（loop 从 dispatched skill 的 `sideEffect == trading_write`
+/// - `message_id ∈ durable_message_ids`（loop 从 dispatched tool 的 `sideEffect == trading_write`
 ///   派生；Infra 不知道"交易"含义，只消费 id 集合）。
 pub fn message_is_durable(msg: &AgentMessage, durable_message_ids: &HashSet<String>) -> bool {
     msg.kind == Some(MessageKind::Summary) || durable_message_ids.contains(&msg.message_id)
 }
 
-/// 一条消息体是否含 `<skill_result ...>` wrapper（可被 MicroClear 替 stub）。
-fn message_is_skill_result(msg: &AgentMessage) -> bool {
+/// 一条消息体是否含 `<tool_result ...>` wrapper（可被 MicroClear 替 stub）。
+fn message_is_tool_result(msg: &AgentMessage) -> bool {
     msg.blocks.iter().any(|b| match b {
-        AgentMessageBlock::Text { text } => parse_skill_result_attrs(text).is_some(),
+        AgentMessageBlock::Text { text } => parse_tool_result_attrs(text).is_some(),
         _ => false,
     })
 }
 
-/// 把一条 skill_result 消息的 text block 替换为 `<skill_result_stub .. />`（保留 name/call_id/ref）。
+/// 把一条 tool_result 消息的 text block 替换为 `<tool_result_stub .. />`（保留 name/call_id/ref）。
 fn stub_message_in_place(msg: &mut AgentMessage) {
     for b in msg.blocks.iter_mut() {
         if let AgentMessageBlock::Text { text } = b {
-            if parse_skill_result_attrs(text).is_some() {
+            if parse_tool_result_attrs(text).is_some() {
                 *text = render_stub(&ContextContent::Text(text.clone()));
             }
         }
@@ -382,10 +382,10 @@ fn stub_message_in_place(msg: &mut AgentMessage) {
 }
 
 /// MicroClear（messages lane）：把尾窗（最近 `keep_recent` 条）**之外**的非 durable
-/// skill_result 消息替换为 stub（保留 name/call_id/ref）。durable / summary / 非 skill_result
+/// tool_result 消息替换为 stub（保留 name/call_id/ref）。durable / summary / 非 tool_result
 /// 消息原样保留。返回被 stub 化的消息数。
 ///
-/// Spec §4：可清理内容替 stub，LLM 仍可通过 `<use_skill>` 重新拉取；不可清理项（trading_write /
+/// Spec §4：可清理内容替 stub，LLM 仍可通过 `<use_tool>` 重新拉取；不可清理项（trading_write /
 /// summary）永远 inline 保留。
 pub fn micro_clear_messages(
     messages: &mut [AgentMessage],
@@ -402,11 +402,11 @@ pub fn micro_clear_messages(
         if message_is_durable(msg, durable_message_ids) {
             continue;
         }
-        if message_is_skill_result(msg) {
-            // already a stub? parse_skill_result_attrs matches stub too (it has name/call_id/ref),
-            // but stub tag is `<skill_result_stub`. Guard: skip if already stubbed.
+        if message_is_tool_result(msg) {
+            // already a stub? parse_tool_result_attrs matches stub too (it has name/call_id/ref),
+            // but stub tag is `<tool_result_stub`. Guard: skip if already stubbed.
             let already_stub = msg.blocks.iter().any(|b| {
-                matches!(b, AgentMessageBlock::Text { text } if text.contains("<skill_result_stub"))
+                matches!(b, AgentMessageBlock::Text { text } if text.contains("<tool_result_stub"))
             });
             if !already_stub {
                 stub_message_in_place(msg);
@@ -426,20 +426,20 @@ pub fn drop_oldest_round_messages(
     keep_recent: usize,
 ) -> u32 {
     let cutoff = messages.len().saturating_sub(keep_recent);
-    // 找尾窗外第一条非 durable 消息移除（一轮的近似：最旧 assistant + 紧随 skill_result user）。
+    // 找尾窗外第一条非 durable 消息移除（一轮的近似：最旧 assistant + 紧随 tool_result user）。
     let mut removed = 0u32;
     let mut i = 0usize;
     while i < messages.len() && i < cutoff {
         if !message_is_durable(&messages[i], durable_message_ids) {
             messages.remove(i);
             removed += 1;
-            // remove at most one "round" worth: the assistant turn + its following skill_result.
+            // remove at most one "round" worth: the assistant turn + its following tool_result.
             // After removing one assistant message, also remove a following non-durable
-            // skill_result user message if present (same logical round).
+            // tool_result user message if present (same logical round).
             if i < messages.len()
                 && i < messages.len().saturating_sub(keep_recent.saturating_sub(removed as usize))
                 && !message_is_durable(&messages[i], durable_message_ids)
-                && message_is_skill_result(&messages[i])
+                && message_is_tool_result(&messages[i])
             {
                 messages.remove(i);
                 removed += 1;
@@ -466,13 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_replaces_realtime_skill_result_wrappers_with_stubs() {
-        // Spec §2 line 261: realtime droppable skill_result wrappers → stub with attrs.
+    fn micro_clear_replaces_realtime_tool_result_wrappers_with_stubs() {
+        // Spec §2 line 261: realtime droppable tool_result wrappers → stub with attrs.
         let mut b = ContextBundle::new("r1");
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
-                r#"<skill_result name="q1" call_id="sc_a" ref="pl_a">{}</skill_result>"#,
+                r#"<tool_result name="q1" call_id="tc_a" ref="pl_a">{}</tool_result>"#,
                 "q".repeat(400)
             )),
             freshness: None,
@@ -482,7 +482,7 @@ mod tests {
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
-                r#"<skill_result name="q2" call_id="sc_b" ref="pl_b">{}</skill_result>"#,
+                r#"<tool_result name="q2" call_id="tc_b" ref="pl_b">{}</tool_result>"#,
                 "r".repeat(400)
             )),
             freshness: None,
@@ -547,7 +547,7 @@ mod tests {
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
-                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,
                 "q".repeat(400)
             )),
             freshness: None,
@@ -561,7 +561,7 @@ mod tests {
         // realtime wrapper stubbed (survives as stub)
         assert_eq!(out.realtime_parts.len(), 1);
         for p in &out.realtime_parts {
-            assert!(matches!(p.kind, ContextPartKind::SkillResultStub));
+            assert!(matches!(p.kind, ContextPartKind::ToolResultStub));
         }
         // most chat parts removed
         assert!(out.chat_parts.len() <= 1);
@@ -569,12 +569,12 @@ mod tests {
 
     #[test]
     fn micro_clear_preserves_name_call_id_ref_in_stub() {
-        // Spec §4 line 511: 易腐 skill 结果替换 stub 时，必须保留 name + call_id + ref。
+        // Spec §4 line 511: 易腐 tool 结果替换 stub 时，必须保留 name + call_id + ref。
         let mut b = ContextBundle::new("r1");
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(
-                r#"<skill_result name="fetch_quote" call_id="sc_abc" ref="pl_xyz">{"price":"1.0"}</skill_result>"#
+                r#"<tool_result name="fetch_quote" call_id="tc_abc" ref="pl_xyz">{"price":"1.0"}</tool_result>"#
                     .into(),
             ),
             freshness: None,
@@ -588,21 +588,21 @@ mod tests {
             _ => panic!("expected text"),
         };
         assert!(rendered.contains(r#"name="fetch_quote""#), "{}", rendered);
-        assert!(rendered.contains(r#"call_id="sc_abc""#), "{}", rendered);
+        assert!(rendered.contains(r#"call_id="tc_abc""#), "{}", rendered);
         assert!(rendered.contains(r#"ref="pl_xyz""#), "{}", rendered);
-        assert!(rendered.starts_with("<skill_result_stub"));
+        assert!(rendered.starts_with("<tool_result_stub"));
         assert!(rendered.ends_with("/>"));
     }
 
     #[test]
-    fn micro_clear_stubs_chat_skill_results_but_leaves_plain_chat_alone() {
-        // Spec §4: chat history that contains historical skill_result must be stub-replaced
+    fn micro_clear_stubs_chat_tool_results_but_leaves_plain_chat_alone() {
+        // Spec §4: chat history that contains historical tool_result must be stub-replaced
         // by MicroClear (preserves replay link); plain user / assistant chat is left untouched.
         let mut b = ContextBundle::new("r1");
         b.chat_parts.push(ContextPart {
             kind: ContextPartKind::Chat,
             content: ContextContent::Text(
-                r#"<skill_result name="news_search" call_id="sc_news" ref="pl_news">{"items":[]}</skill_result>"#
+                r#"<tool_result name="news_search" call_id="tc_news" ref="pl_news">{"items":[]}</tool_result>"#
                     .into(),
             ),
             freshness: None,
@@ -623,7 +623,7 @@ mod tests {
             ContextContent::Text(s) => s.clone(),
             _ => panic!("text"),
         };
-        assert!(head.starts_with("<skill_result_stub"));
+        assert!(head.starts_with("<tool_result_stub"));
         assert!(head.contains(r#"name="news_search""#));
         assert!(head.contains(r#"ref="pl_news""#));
         // Second chat part left as-is:
@@ -636,14 +636,14 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_drops_non_skill_result_realtime_parts() {
+    fn micro_clear_drops_non_tool_result_realtime_parts() {
         // Spec §2 line 261: stub must have name/call_id/ref attrs — non-wrapper realtime parts
         // have no attrs to fill, so they're dropped entirely instead of stubbed.
         // (Spec §4 line 322: realtime lane is fresh data; expired non-wrapper data should drop.)
         let mut b = ContextBundle::new("r1");
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
-            content: ContextContent::Text("plain realtime data with no skill_result tag".into()),
+            content: ContextContent::Text("plain realtime data with no tool_result tag".into()),
             freshness: None,
             token_estimate: None,
             droppable: true,
@@ -651,7 +651,7 @@ mod tests {
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(
-                r#"<skill_result name="quote" call_id="sc_q" ref="pl_q">{"px":"1"}</skill_result>"#
+                r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#
                     .into(),
             ),
             freshness: None,
@@ -663,14 +663,14 @@ mod tests {
         // Only the wrapper part survives, as a stub with attrs:
         assert_eq!(b.realtime_parts.len(), 1);
         let surviving = &b.realtime_parts[0];
-        assert!(matches!(surviving.kind, ContextPartKind::SkillResultStub));
+        assert!(matches!(surviving.kind, ContextPartKind::ToolResultStub));
         let rendered = match &surviving.content {
             ContextContent::Text(s) => s.clone(),
             _ => panic!("expected text"),
         };
-        assert!(rendered.starts_with("<skill_result_stub"), "{}", rendered);
+        assert!(rendered.starts_with("<tool_result_stub"), "{}", rendered);
         assert!(rendered.contains(r#"name="quote""#), "{}", rendered);
-        assert!(rendered.contains(r#"call_id="sc_q""#), "{}", rendered);
+        assert!(rendered.contains(r#"call_id="tc_q""#), "{}", rendered);
         assert!(rendered.contains(r#"ref="pl_q""#), "{}", rendered);
         assert!(rendered.ends_with("/>"), "{}", rendered);
     }
@@ -690,7 +690,7 @@ mod tests {
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(
-                r#"<skill_result name="quote" call_id="sc_q" ref="pl_q">{"px":"1"}</skill_result>"#
+                r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#
                     .into(),
             ),
             freshness: None,
@@ -711,18 +711,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_skill_result_attrs_handles_quoted_values() {
+    fn parse_tool_result_attrs_handles_quoted_values() {
         let out =
-            parse_skill_result_attrs(r#"<skill_result name="a" call_id="sc_1" ref="pl_2">x</skill_result>"#)
+            parse_tool_result_attrs(r#"<tool_result name="a" call_id="tc_1" ref="pl_2">x</tool_result>"#)
                 .unwrap();
         assert_eq!(out.name.as_deref(), Some("a"));
-        assert_eq!(out.call_id.as_deref(), Some("sc_1"));
+        assert_eq!(out.call_id.as_deref(), Some("tc_1"));
         assert_eq!(out.payload_ref.as_deref(), Some("pl_2"));
     }
 
     #[test]
-    fn parse_skill_result_attrs_returns_none_when_no_tag() {
-        assert!(parse_skill_result_attrs("hello world").is_none());
+    fn parse_tool_result_attrs_returns_none_when_no_tag() {
+        assert!(parse_tool_result_attrs("hello world").is_none());
     }
 
     #[test]
@@ -804,7 +804,7 @@ mod tests {
         b.realtime_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
-                r#"<skill_result name="q" call_id="sc_q" ref="pl_q">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,
                 "q".repeat(400)
             )),
             freshness: None,
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(n, 1);
         assert!(matches!(
             out.realtime_parts[0].kind,
-            ContextPartKind::SkillResultStub
+            ContextPartKind::ToolResultStub
         ));
         // chat untouched
         assert_eq!(out.chat_parts.len(), 1);
@@ -838,32 +838,32 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_messages_stubs_non_durable_old_skill_results() {
+    fn micro_clear_messages_stubs_non_durable_old_tool_results() {
         use crate::domain::agent::AgentMessageRole;
         let mut msgs = vec![
             amsg("a0", AgentMessageRole::Assistant, "thinking"),
             amsg(
                 "u1",
                 AgentMessageRole::User,
-                r#"<skill_result name="fetch_quote" call_id="sc_1" ref="pl_1">{"px":"1"}</skill_result>"#,
+                r#"<tool_result name="fetch_quote" call_id="tc_1" ref="pl_1">{"px":"1"}</tool_result>"#,
             ),
             amsg(
                 "u2",
                 AgentMessageRole::User,
-                r#"<skill_result name="operate_account" call_id="sc_2" ref="pl_2">{"orderId":"o1"}</skill_result>"#,
+                r#"<tool_result name="operate_account" call_id="tc_2" ref="pl_2">{"orderId":"o1"}</tool_result>"#,
             ),
             amsg("a3", AgentMessageRole::Assistant, "recent"),
         ];
         // u2 is durable (trading_write); keep_recent=0 so all are candidates.
         let durable: HashSet<String> = ["u2".to_string()].into_iter().collect();
         let n = micro_clear_messages(&mut msgs, &durable, 0);
-        assert_eq!(n, 1, "only u1 (non-durable skill_result) stubbed");
+        assert_eq!(n, 1, "only u1 (non-durable tool_result) stubbed");
         // u1 stubbed, preserves name/call_id/ref
         let u1 = match &msgs[1].blocks[0] {
             AgentMessageBlock::Text { text } => text.clone(),
             _ => panic!(),
         };
-        assert!(u1.starts_with("<skill_result_stub"));
+        assert!(u1.starts_with("<tool_result_stub"));
         assert!(u1.contains(r#"name="fetch_quote""#));
         assert!(u1.contains(r#"ref="pl_1""#));
         // u2 (durable trading_write) untouched
@@ -871,7 +871,7 @@ mod tests {
             AgentMessageBlock::Text { text } => text.clone(),
             _ => panic!(),
         };
-        assert!(u2.contains("<skill_result name="), "durable trading_write must stay inline");
+        assert!(u2.contains("<tool_result name="), "durable trading_write must stay inline");
         assert!(u2.contains("orderId"));
     }
 
@@ -882,12 +882,12 @@ mod tests {
             amsg(
                 "u0",
                 AgentMessageRole::User,
-                r#"<skill_result name="q" call_id="sc_0" ref="pl_0">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_0" ref="pl_0">{}</tool_result>"#,
             ),
             amsg(
                 "u1",
                 AgentMessageRole::User,
-                r#"<skill_result name="q" call_id="sc_1" ref="pl_1">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_1" ref="pl_1">{}</tool_result>"#,
             ),
         ];
         // keep_recent=1 → only u0 eligible.
@@ -897,7 +897,7 @@ mod tests {
             AgentMessageBlock::Text { text } => text.clone(),
             _ => panic!(),
         };
-        assert!(u1.contains("<skill_result name="), "recent window kept inline");
+        assert!(u1.contains("<tool_result name="), "recent window kept inline");
     }
 
     #[test]
@@ -906,7 +906,7 @@ mod tests {
         let mut summary = amsg(
             "s0",
             AgentMessageRole::Assistant,
-            r#"<skill_result name="q" call_id="sc" ref="pl">{}</skill_result>"#,
+            r#"<tool_result name="q" call_id="sc" ref="pl">{}</tool_result>"#,
         );
         summary.kind = Some(MessageKind::Summary);
         let mut msgs = vec![summary, amsg("a1", AgentMessageRole::Assistant, "x")];
@@ -922,7 +922,7 @@ mod tests {
             amsg(
                 "u1",
                 AgentMessageRole::User,
-                r#"<skill_result name="q" call_id="sc_1" ref="pl_1">{}</skill_result>"#,
+                r#"<tool_result name="q" call_id="tc_1" ref="pl_1">{}</tool_result>"#,
             ),
             amsg("a2", AgentMessageRole::Assistant, "recent"),
         ];
