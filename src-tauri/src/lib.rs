@@ -26,7 +26,8 @@ use crate::adapters::quotes::events::{
 use crate::domain::shared::Money;
 use crate::infrastructure::account::migrations as account_migrations;
 use crate::infrastructure::agent::{
-    bootstrap as bootstrap_agent_infra, default_workspace_dir, migrations as agent_migrations,
+    bootstrap as bootstrap_agent_infra, default_skills_dir, default_workspace_dir,
+    migrations as agent_migrations,
 };
 use crate::infrastructure::db::{run_migrations, AppDb};
 use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
@@ -336,7 +337,15 @@ pub fn run() {
                 .app_data_dir()
                 .map(|d| d.join("gangzi").join("workspace"))
                 .unwrap_or_else(|_| default_workspace_dir());
-            let agent_infra = bootstrap_agent_infra(db.clone(), workspace_dir);
+            // Skill（playbook）存盘根 `<appData>/gangzi/skills`，独立于 workspace。
+            // Spec: docs/design/agent-runtime-module.md §Skills（渐进披露）。
+            let skills_dir = app
+                .handle()
+                .path()
+                .app_data_dir()
+                .map(|d| d.join("gangzi").join("skills"))
+                .unwrap_or_else(|_| default_skills_dir());
+            let agent_infra = bootstrap_agent_infra(db.clone(), workspace_dir, skills_dir);
             app.manage(agent_infra);
 
             // -- Account BC bootstrap（Phase 2）

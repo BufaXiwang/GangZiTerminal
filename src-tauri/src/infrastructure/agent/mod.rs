@@ -25,6 +25,8 @@ pub mod migrations;
 pub mod payload_store;
 pub mod presets;
 pub mod providers;
+pub mod skill_store;
+pub mod skill_tools;
 pub mod tool_parser;
 pub mod tool_registry;
 pub mod system_prompt;
@@ -44,6 +46,8 @@ pub use context_compaction::{
     CompactPolicy,
 };
 pub use local_tools::register_local_tools;
+pub use skill_store::{parse_frontmatter, render_skill_md, SkillIndexEntry, SkillStore};
+pub use skill_tools::register_skill_tools;
 pub use loop_executor::{run_agent_turn, LoopError, ProviderStream};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
@@ -53,7 +57,7 @@ pub use tool_registry::{
     DispatchError, FnToolHandler, InputValidator, ToolHandler, ToolHandlerFuture,
     ToolHandlerOutput, ToolInvocation, ToolRegistry,
 };
-pub use system_prompt::{build_system_prompt, PROTOCOL_PREAMBLE};
+pub use system_prompt::{build_system_prompt, build_system_prompt_with_skills, PROTOCOL_PREAMBLE};
 
 use std::sync::Arc;
 
@@ -65,7 +69,15 @@ use std::sync::Arc;
 /// `workspace_dir` 是 Agent 本地通用 tool（read/write/edit/run_bash）的约定级沙箱根
 /// （Spec: agent-runtime-module.md §4.2）。bootstrap 时默认注册这 4 个本地 tool。
 /// Phase 3 / adapter 应注入 `<appData>/gangzi/workspace` 作为绝对路径；此处给占位默认。
-pub fn bootstrap(db: crate::infrastructure::db::AppDb, workspace_dir: std::path::PathBuf) -> AgentInfra {
+///
+/// `skills_dir` 是 Skill（playbook）存盘根（Spec: agent-runtime-module.md §Skills），独立于 workspace：
+/// `<appData>/gangzi/skills/<name>/SKILL.md`。bootstrap 时默认注册 create_skill / load_skill 两个编排 tool。
+/// skills 初始为空（没有 SKILL.md → 索引为空）。
+pub fn bootstrap(
+    db: crate::infrastructure::db::AppDb,
+    workspace_dir: std::path::PathBuf,
+    skills_dir: std::path::PathBuf,
+) -> AgentInfra {
     let repo = AgentMessagesRepo::new(db.clone());
     let payload_store = PayloadStore::new(db.clone());
     let channels_repo = ProviderChannelsRepo::new(db);
@@ -74,11 +86,17 @@ pub fn bootstrap(db: crate::infrastructure::db::AppDb, workspace_dir: std::path:
     if let Err(e) = register_local_tools(&registry, workspace_dir) {
         tracing::warn!("register_local_tools failed: {e}");
     }
+    // 默认注册 skill 编排 tool（create_skill / load_skill）。
+    if let Err(e) = register_skill_tools(&registry, skills_dir.clone()) {
+        tracing::warn!("register_skill_tools failed: {e}");
+    }
+    let skill_store = SkillStore::new(skills_dir);
     AgentInfra {
         repo,
         registry,
         payload_store,
         channels_repo,
+        skill_store,
     }
 }
 
@@ -89,6 +107,13 @@ pub fn default_workspace_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("gangzi-workspace")
 }
 
+/// Skill 存盘的占位默认根。
+///
+/// Phase 3 / adapter 接线时应替换为 `<appData>/gangzi/skills`（由 adapter 注入绝对路径）。
+pub fn default_skills_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("gangzi-skills")
+}
+
 /// Agent Infra 容器，由 setup 持有。
 #[derive(Clone)]
 pub struct AgentInfra {
@@ -96,4 +121,7 @@ pub struct AgentInfra {
     pub registry: Arc<ToolRegistry>,
     pub payload_store: PayloadStore,
     pub channels_repo: ProviderChannelsRepo,
+    /// Skill（playbook）存盘访问。Runtime 构建 system prompt 时用 `skill_store.list_index()`
+    /// 注入 skill 索引（渐进披露，Spec: agent-runtime-module.md §Skills）。
+    pub skill_store: SkillStore,
 }

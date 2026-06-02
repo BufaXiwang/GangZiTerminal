@@ -113,7 +113,10 @@ type AgentToolName =
   | "read_file"
   | "write_file"
   | "edit_file"
-  | "run_bash";
+  | "run_bash"
+  // Skill 编排（playbook，见「Skills」）
+  | "create_skill"
+  | "load_skill";
 
 type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
   name: AgentToolName;
@@ -177,12 +180,69 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 - `run_bash` 因危险面最大，默认只给前台可确认的 `user_chat`；后台 profile 默认不给（即使给，危险命令在无人确认时一律拒绝）。
 - 本地 tool 与 `allowTradingWrite` **正交**：给本地 tool 不放宽交易写权限；写交易仍受 `allowTradingWrite` + episode 前置约束（§2 / §4）。
 
-### Skills（playbook，初始为空）
+### Skills（playbook，渐进披露，初始为空）
 
 - **Skill = 模型驱动的 playbook**（`SKILL.md`），描述「为完成某研究 / 决策任务，如何编排上面这些 tool」。Skill 本身不执行、不是注册的 handler；它是注入上下文的说明书，由模型据此发起 tool 调用。
 - **Tool（原语）与 Skill（playbook）是两个正交概念**：tool 是「手」，skill 是「剧本」。
-- **初始不内置任何 skill**，全部走裸 tool；skill 后续按需补（产品负责人手写 `SKILL.md`）。
+- **初始不内置任何 skill**，全部走裸 tool；skill 后续按需补（模型用 `create_skill` 沉淀 / 产品负责人手写 `SKILL.md`）。
 - Skill 编排 tool 时走 **in-process tool 调用**，不让模型经 `run_bash` 去调领域能力。
+
+#### SKILL.md 格式与存盘
+
+- 每个 skill 一个 `SKILL.md`：**YAML frontmatter**（`name` + `description` 两个 string 字段）+ markdown 正文（body）。
+  ```markdown
+  ---
+  name: momentum-scan
+  description: 扫动量候选并形成判断
+  ---
+
+  # 动量扫描
+  1. fetch_quotes scan ...
+  ```
+- 存盘目录：`<skills_dir>/<name>/SKILL.md`，`<skills_dir>` = `<appData>/gangzi/skills/`（**独立于 workspace**，由 adapter / bootstrap 注入绝对路径，domain 不感知）。
+- `name` 必须是 **slug**（`^[a-z0-9][a-z0-9-]*$`），既作目录名也作 frontmatter `name`，**防路径穿越**（拒绝 `/`、`..`、大写、空、前导 `-`）。
+- frontmatter 解析用最小 YAML 子集（仅 `name` / `description` 两个 string 标量；实现手写，无 serde_yaml 依赖）；解析失败 / 缺字段的 SKILL.md 在索引中跳过，不拖垮整个索引。
+
+#### 渐进披露机制
+
+> 对齐 Claude Code skill 的渐进披露最佳实践：**只把索引放进 system prompt，正文按需加载**，避免无关 playbook 正文长期占用上下文 / token。
+
+1. **索引进 prompt**：Runtime 构建 system prompt 时，扫描 `<skills_dir>` 下所有 `SKILL.md`，解析出 `(name, description)`，在 tool 清单之后追加「## 可用 Skill（playbook）」索引段——每条 `- <name>: <description>`，并附一句协议说明「要按某 skill 行事，先调用 `load_skill` 取其完整说明」。索引按 `name` 字典序（prompt cache 稳定）；**为空时省略整段**。
+2. **正文按需 load**：system prompt **不含任何 skill 正文**；模型按 description 自选要用哪个 skill，调 `load_skill` 把该 skill 的完整 `SKILL.md`（frontmatter + body）拉进上下文，再据此发起 tool 调用。
+3. system prompt 的「tool 清单 + skill 索引」由 Runtime 注入后只读，LLM 不可改 / 看不见构建逻辑。
+
+#### `create_skill` / `load_skill` 契约
+
+这两个是 skill 的**编排 tool**（注册进 `ToolRegistry`，经 `<use_tool>` 调用），不是领域能力：
+
+```ts
+// create_skill —— 把一段可复用 playbook 沉淀成 <skills_dir>/<name>/SKILL.md
+type CreateSkillToolInput = {
+  name: string;          // slug，^[a-z0-9][a-z0-9-]*$（既是目录名也是 frontmatter name）
+  description: string;   // 一句话说明（进 system prompt 索引，非空）
+  body: string;          // markdown 正文：完成任务时如何编排 tool
+};
+type CreateSkillToolOutput = {
+  path: string;          // 写入的 SKILL.md 绝对路径
+  created: boolean;      // true=新建；false=覆盖更新（同名已存在）
+};
+// 错误：invalid_input（name 非 slug / 越出 skills 目录 / description 空 / 写盘失败）
+// 语义：同名覆盖更新（report created=false）；name 校验在写盘前，非法 name 不落任何文件。
+
+// load_skill —— 取某 skill 的完整 SKILL.md 正文（含 frontmatter）进上下文
+type LoadSkillToolInput = {
+  name: string;          // skill slug（见 system prompt 的可用 Skill 索引）
+};
+type LoadSkillToolOutput = {
+  name: string;
+  content: string;       // SKILL.md 全文（frontmatter + body），让模型看到完整 playbook
+};
+// 错误：not_found（skill 不存在）/ invalid_input（name 非 slug）
+```
+
+- `load_skill` 返回**全文含 frontmatter**（不剥），让模型看到完整 playbook 上下文。
+- 副作用 / 幂等性：`create_skill` = `non_trading_write`，非幂等（覆盖写，`created` 是观测值）；`load_skill` = `none`，幂等（纯读）。
+- 这两个 tool 是「sink/source skill 文件」，不调用任何领域能力（Quotes / News / Account），也不经 `run_bash`。
 
 ### 只读 CLI（可选 / 后续；人用旁路，不在 agent 关键路径）
 
@@ -1098,6 +1158,8 @@ type RunBashToolOutput = {
 //       invalid_input（cwd 不存在等）
 ```
 
+Skill 编排 tool（`create_skill` / `load_skill`）的 input / output / 错误见 §「Skills（playbook，渐进披露）」的 `CreateSkillToolInput` / `LoadSkillToolInput`。它们读写 `<skills_dir>`（独立于 `<workspace>`），不读写工作区，不调领域能力。
+
 副作用 / 幂等性：
 
 | tool | 副作用 | 幂等性 |
@@ -1106,6 +1168,8 @@ type RunBashToolOutput = {
 | `write_file` | non_trading_write（覆盖写工作区文件） | **非幂等**（覆盖；同 content 重写结果相同但 `bytesWritten` 是观测值） |
 | `edit_file` | non_trading_write | **非幂等**（替换后再次执行同一 `oldString` 通常 `invalid_input` 未命中） |
 | `run_bash` | non_trading_write（取决于命令；可改本地状态） | **非幂等**（任意命令，副作用不可假定） |
+| `create_skill` | non_trading_write（写 `<skills_dir>/<name>/SKILL.md`） | **非幂等**（覆盖写；`created` 是观测值） |
+| `load_skill` | none | 幂等（纯读 SKILL.md） |
 
 - 所有本地 tool 的 `path` / `cwd` 在 handler 前**规范化 + 工作区校验**（write/edit 强制在 `<workspace>` 内，read/run 路径不受限但仍规范化）。
 - `run_bash` 危险命令门禁见 §2「run_bash 危险命令门禁」；门禁 / 工作区校验是约定级，不是强隔离。

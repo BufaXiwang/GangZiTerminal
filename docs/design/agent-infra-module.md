@@ -259,9 +259,10 @@ Example: <use_tool name="fetch_quote">{"tsCode": "600519.SH"}</use_tool>
 
 规则：
 
-- 注入顺序：固定 protocol 说明 → tool 列表（按 name 字典序，保证 prompt cache hit 一致）。
+- 注入顺序：固定 protocol 说明 → tool 列表（按 name 字典序，保证 prompt cache hit 一致）→ **skill 索引段**（可选）。
 - 每个 tool 段：`## <name>` + description + `Input:` schema 摘要 + 至少 1 个 example。
-- system prompt 中的 tool 清单部分**不允许由 LLM 修改 / 看不见**；Runtime 注入后只读。
+- **skill 索引（渐进披露）**：tool 清单之后可追加「## 可用 Skill（playbook）」索引段——每条 `- <name>: <description>`（按 name 字典序），只放索引、不放 skill 正文；正文由模型按需经 `load_skill` 拉取。索引为空时省略整段。索引来源由 Runtime 从 skill 存盘目录扫描后传入（Builder 仍是纯计算，无 I/O）。详见 [agent-runtime-module.md](agent-runtime-module.md) §Skills。
+- system prompt 中的 tool 清单 + skill 索引部分**不允许由 LLM 修改 / 看不见**；Runtime 注入后只读。
 
 ### `ToolCall`
 
