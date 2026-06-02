@@ -98,26 +98,22 @@ Agent Runtime 不负责：
 
 ### `AgentToolName`
 
+> **Runtime 的职责很窄**：触发 Agent run、**注入领域 tool**、联合不同 domain（Quotes/News/Account）。下面这个 union 是「本产品全部 tool 名的目录」，但**只有领域 7 个由 Runtime 拥有/注入**；通用部分（local file/bash、run_subagent、create_skill、run_skill）+ skill 子系统 + fork **全是 Infra 默认提供**（定义/契约归属见 [agent-infra-module.md](agent-infra-module.md) §3.5 / §3.6），列在此处只为目录 + profile `allowedTools` 授权完整。
+
 ```ts
 type AgentToolName =
-  // 领域读（in-process，结构化）
-  | "fetch_quotes"
-  | "fetch_news"
-  | "fetch_account"
-  // 领域写（in-process，必经校验 + 审计；绝不经 shell）
-  | "operate_account"
-  | "update_watchlist"
-  | "record_decision_episode"
-  | "record_decision_review"
-  // 通用本地（约定级沙箱，见「本地通用 tool 与工作区沙箱」）
-  | "read_file"
-  | "write_file"
-  | "edit_file"
-  | "run_bash"
-  // 子 agent / skill（fork 隔离执行，见「子 Agent」「Skills」）
-  | "run_subagent"
-  | "create_skill"
-  | "run_skill";
+  // ── Runtime 注入（领域，in-process，必经校验+审计）────────────
+  | "fetch_quotes"   // 读
+  | "fetch_news"     // 读
+  | "fetch_account"  // 读
+  | "operate_account"           // 写（绝不经 shell）
+  | "update_watchlist"          // 写
+  | "record_decision_episode"   // 写
+  | "record_decision_review"    // 写
+  // ── Infra 默认提供（业务无关；定义见 agent-infra §3.5/§3.6）──
+  | "read_file" | "write_file" | "edit_file" | "run_bash"  // 通用本地
+  | "run_subagent"              // fork 子 agent
+  | "create_skill" | "run_skill"; // skill 管理（fork 执行）
 
 type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
   name: AgentToolName;

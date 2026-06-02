@@ -248,12 +248,13 @@ type ToolRegistrySnapshot = {
 `<use_tool name="...">{...}</use_tool>`，内容是符合该 tool input schema 的 JSON。
 每次调用后会以 `<tool_result name="..." call_id="...">` 形式回复给你。
 
-## fetch_quote
-获取单只标的实时行情快照。
-Input: {"tsCode": "string，6位+.SH/.SZ/.BJ"}
-Example: <use_tool name="fetch_quote">{"tsCode": "600519.SH"}</use_tool>
+## read_file
+读取文件内容（任意路径，只读）。
+Input: {"path": "string", "offset?": number, "limit?": number}
+Example: <use_tool name="read_file">{"path": "/tmp/notes.md"}</use_tool>
 
-## news_search
+## fetch_quotes
+（领域 tool 示例——由 Runtime 注入，非 Infra 自带）获取标的实时行情。
 ...
 ```
 
@@ -498,11 +499,75 @@ Runtime builds AgentRunRequest
 | **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧）| 专门子任务 / 跑 skill，父只收结果 |
 | **隐式 fork**（可选，后续）| **继承父完整上下文 + system prompt + 精确工具池** | 全继承（`inherit`）| "在当前上下文分叉继续干" |
 
+### 子 Agent 任务管理（注册表 + 生命周期，对齐 CC `LocalAgentTask`）
+
+主 Agent 通过 Infra 的**子 agent 任务注册表**管理所有 spawn 出来的子 run。每条任务：
+
+```ts
+type SubAgentTask = {
+  agentId: string;                 // 子 run 标识
+  parentRunId: string;             // 关联父
+  description: string;             // 一句话任务描述
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'killed';
+  progress: { tokens: number; toolUses: number; durationMs: number };  // 从子 run 消息累计
+  abort: AbortHandle;              // 用于 stop
+  notified: boolean;               // 防重复通知
+};
+```
+
+**生命周期**：`spawn`（注册→running）→ `update_progress`（按子 run 的 turn 累计 token/tool_uses）→ 终态 `complete` / `fail` / `kill`（abort）。
+
+**三种执行模式**：
+| 模式 | 行为 | 父侧拿到 |
+|---|---|---|
+| **前台**（默认）| 阻塞——主 agent 等子 run 跑完 | 子结果作为 `run_subagent`/`run_skill` 的 `<tool_result>` |
+| **后台**（`run_in_background`）| 异步并发跑 | 立即拿 `agentId`；完成时收一条 **`<task-notification>`**（含 `<status>` + `<usage>`）；中途可读进度 / 停 |
+| **并行** | 一轮内发多个 spawn → 并发执行 | 各自的结果 / 通知 |
+
+**管理 API（Infra 提供给父 agent / Runtime）**：
+- `run_subagent` / `run_skill`（前台或后台，§3.6 工具）—— spawn。
+- `subagent_output(agentId)` —— 读后台任务的中间进度 / 已产出。
+- `stop_subagent(agentId)` —— abort 一个运行中的子 run。
+- 完成通知：Infra 在子 run 终态时 emit `AgentEvent`（`<task-notification>`），父 loop 收到后注入下一轮。
+
 ### 不变量
 
 - **递归限深**：子 agent 也能再 fork，但按 `query_depth` 限深 + 检测 fork 标记防无限递归。
-- **只回结果**：父对话只拿子 run 的最终结果，看不到子的中间过程（上下文卫生 = fork 的核心价值）。
+- **只回结果**：父对话只拿子 run 的最终结果（+ 后台通知 + 可选进度），看不到子的中间过程（上下文卫生 = fork 的核心价值）。
+- **审计独立**：每个子 run 全量消息按自己的 `conversation_id` + `parentRunId` 落 `agent_messages`，可单独 replay。
 - skill 执行复用本机制：`run_skill` = 以 `SKILL.md` 全文为 `prompt` 调 `run_forked_agent`（见 [agent-runtime-module.md](agent-runtime-module.md) §Skills）。
+
+### 暂不做（CC 有，本项目用不上 / 后续）
+
+- **`worktree` / `remote` 隔离**：CC 给编码场景（独立 git 工作树 / 远端 CCR）；本项目（A 股研究，不在工作树改代码）不需要。
+- **`SendMessage` / teams / swarms**：多 agent 互发消息协作；本项目 fan-out + 汇总即可，过重，不做。
+
+---
+
+## 3.6 Infra 默认 Tools + Skill 子系统（业务无关，Infra 注册）
+
+> **归属澄清**：以下通用 tool 与 skill 子系统**全部由 Infra 默认注册、属 Infra 层**（业务无关，代码在 `infrastructure/agent/`，bootstrap 时注册）。**Runtime 不拥有、不重复定义**——Runtime 只负责：触发 Agent、**注入领域 tool**（fetch_quotes / operate_account 等）、联合不同 domain。`AgentToolName` 那个 union（[agent-runtime-module.md](agent-runtime-module.md) §4）是「本产品全部 tool 名的目录」，其中**通用部分来自这里，领域部分由 Runtime 注入**。
+
+Infra 默认注册的通用 tool：
+
+| tool | 作用 | 契约要点 |
+|---|---|---|
+| `read_file` | 任意路径只读 | `{path, offset?, limit?}` → `{content, truncated}` |
+| `write_file` / `edit_file` | **仅工作区**写 / 定向改 | 越界 → `path_outside_workspace`；edit 未命中/不唯一 → `invalid_input` |
+| `run_bash` | 任意路径跑命令，cwd 默认工作区 | 危险命令 denylist → `command_rejected`；约定级沙箱 |
+| `run_subagent` | fork 隔离子 agent 跑子任务 | 见 §3.5；只回结果 |
+| `create_skill` | 写 `<skills_dir>/<name>/SKILL.md` | `{name(slug), description, body}` → `{path, created}` |
+| `run_skill` | fork 子 agent 跑某 skill | `{name, args?}` → `{name, result}`；以 SKILL.md 为 prompt（§3.5）|
+
+**约定级沙箱**：write/edit 锁工作区（`<appData>/gangzi/workspace/`，路径规范化防 `..` 逃逸）；read/bash 不限路径；危险命令门禁。`run_bash` 不限路径可绕过写限制——约定级接受（强隔离需 OS sandbox，后续可选）。
+
+**Skill 子系统**（`SkillStore`，Infra）：
+- skill = `<skills_dir>/<name>/SKILL.md`（YAML frontmatter `name`+`description` + markdown body；可选随附 `scripts/`/`references/`/`assets/`，当前只支持单 SKILL.md）。`skills_dir` = `<appData>/gangzi/skills/`，adapter 注入。
+- **三级渐进披露**：① 索引（name+description）由 Infra 扫描后注入 system prompt（见 §System Prompt Tool 清单的 skill 索引段）；② `run_skill` fork 子 agent、以 SKILL.md 全文为 prompt（正文不进父上下文）；③ 子 agent 按 SKILL.md 用 `read_file`/`run_bash` 读 references / 跑 scripts。
+- skill 不依赖、不编排领域 tool；正文不写 `<use_tool>` 标签。
+- **简化（适配本项目）**：不支持 per-skill model/effort 覆盖（继承父）；`allowed-tools` frontmatter 可选（默认继承父工具集，写了收紧）。
+
+详细 input/output schema 见 [agent-runtime-module.md](agent-runtime-module.md) §4.2 / §Skills（那里是「目录 + 契约」的集中呈现，**归属仍是 Infra**）。
 
 ---
 
