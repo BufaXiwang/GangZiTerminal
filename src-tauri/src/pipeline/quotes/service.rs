@@ -1680,15 +1680,14 @@ impl QuotesService {
     /// Spec: docs/design/quotes-module.md §5 "全量历史" + §4 ensure_chart_data。
     ///
     /// 与 `refresh_klines_extended` 的区别：
-    /// - 后者按 `history_days` 取一段（受 TDX 单次 800 根限制 + TuShare 长历史扩展）；
+    /// - 后者按 `history_days` 取**一段**（受 TDX 单次 800 根限制）；
     /// - 本方法走 `tdx.fetch_kline_paginated` 分页 loop（`start = 0, 800, ...`）直到 TDX
     ///   返回空 / 不足 800 / 命中硬上限 50_000。结果是该 ts_code + period 的**全量**历史。
     ///
     /// 用途：`ensure_chart_data` 首次访问触发 — 一次性把全部历史拉好落 DB；后续访问从 DB 命中。
     /// DB 已覆盖时 upsert 幂等（PK = ts_code + period + adjust + trade_date）。
     ///
-    /// 不调 TuShare 长历史扩展：TDX 全量分页本身已覆盖所有可获取的历史段；TuShare 仅作为
-    /// "TDX 单次 800 根限制 + 调用方按 days 窗口请求" 的补救路径，全量分页场景无意义。
+    /// K 线全程 **TDX-only**（不依赖 TuShare）：TDX 全量分页已覆盖可获取的全部历史段。
     ///
     /// 失败处理：单一 (ts, period) 失败 → 计入 failed，其他继续；BJ 直接 failed + warning。
     /// 中间 batch 失败由底层 `fetch_kline_paginated` 整体 abort（partial 落库无意义）。
@@ -1830,20 +1829,17 @@ impl QuotesService {
         self.refresh_klines_extended(scope, periods, None).await
     }
 
-    /// 拉取 K 线 — 同 `refresh_klines`，但允许指定 `history_days` 触发 TuShare 长历史扩展。
+    /// 拉取 K 线 — 同 `refresh_klines`，`history_days` 用于加深初始 TDX 单次拉取根数（≤800）。
     ///
-    /// Spec: docs/design/quotes-module.md §5 "K 线" + 修订记录 "D2.5 TuShare 长历史 K 线扩展"。
+    /// Spec: docs/design/quotes-module.md §5 "K 线"。
     ///
-    /// 路径：
+    /// 路径（**TDX-only**，TuShare 不再补 K 线段，2026-06-02 决策）：
     /// 1. 查 `max(trade_date)` from `quote_klines_daily` WHERE `adjust='none'`；
-    ///    无数据 → 拉 365 天；有数据 → 从 `max+1` 开始（增量）。
+    ///    无数据 → 拉 365 天（或 `history_days` cap 800）；有数据 → 从 `max+1` 开始（增量）。
     /// 2. TDX `fetch_kline(period, count)` 拉 unadjusted Bar (受 ~800 根单次限制)。
     /// 3. 失败 → EM `fetch_daily_kline` fallback（仅 Day period；EM 不提供 W/M）。
-    /// 4. **TuShare 长历史扩展**（D2.5）：当 `history_days > TDX 单次根数限制` 且
-    ///    `TushareHealthState.is_available = true` 时，调 `tushare.fetch_kline(...)`
-    ///    补拉早于 DB `min(trade_date)` 的段；落 `adjust='none'`，复权统一走本地算法。
-    ///    长历史段失败不影响 TDX 段；series 仍可用，附 `data_partial` warning。
-    /// 5. 写入 unadjusted 后，invalidate 该 ts_code 的 qfq/hfq cache。
+    /// 4. 写入 unadjusted 后，invalidate 该 ts_code 的 qfq/hfq cache。
+    ///    更深历史走 `refresh_klines_full`（TDX 分页 start=0,800,1600,… 覆盖全量）。
     pub async fn refresh_klines_extended(
         &self,
         scope: RefreshDataScope,
@@ -1951,32 +1947,10 @@ impl QuotesService {
                     }
                 }
 
-                // ⑥ TuShare 长历史扩展（spec §5 line 805 + 修订记录 D2.5）。
-                //    触发条件：调用方请求回溯 > TDX 单次根数限制 (~800) 且 TuShare 健康。
-                //    长历史段失败不影响 TDX 段；series 仍可用，附 data_partial warning。
-                const TDX_SINGLE_FETCH_LIMIT: u32 = 800;
-                if let Some(hist_days) = history_days {
-                    if hist_days > TDX_SINGLE_FETCH_LIMIT && self.health.is_available() {
-                        // 找当前 DB 中该 ts_code+period 的 min(trade_date)；TuShare 拉它之前的段。
-                        match self.fetch_tushare_history(ts, *period, hist_days, now).await {
-                            Ok(filled) if filled > 0 => {
-                                self.adjust_cache.invalidate(ts);
-                            }
-                            Ok(_) => {} // TuShare 返回 0 行：可能 listing 早于回溯窗口，无 warning。
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "quotes.refresh.kline",
-                                    ts = ts.as_str(),
-                                    error = %e,
-                                    "tushare long-history fetch failed; tdx segment still ok"
-                                );
-                                if !warnings.contains(&WarningCode::DataPartial) {
-                                    warnings.push(WarningCode::DataPartial);
-                                }
-                            }
-                        }
-                    }
-                }
+                // K 线为 TDX-only（+ EM 日线兜底）。TuShare 不再补 K 线段（2026-06-02 决策）：
+                // TDX 全量分页（`refresh_klines_full`）已覆盖可获取的全部历史；TuShare 仅作 enrich
+                // 层（universe / daily_basic / 公司事件 / 交易日历）。`history_days` 现仅用于 ① 处
+                // cap 初始 TDX 单次根数（≤800）。`TushareClient::fetch_kline` 保留作准确性测试 oracle。
             }
         }
 
@@ -1992,57 +1966,6 @@ impl QuotesService {
             warnings,
             affected_ts_codes: ts_codes,
         })
-    }
-
-    /// TuShare 长历史拉取（D2.5）：补 DB `min(trade_date)` 之前的 unadjusted 段。
-    ///
-    /// Spec: quotes-module.md §5 "K 线" + 修订记录 D2.5。
-    ///
-    /// 返回新落库的行数；0 表示无可补段（TuShare 未返回早期数据或区间已覆盖）。
-    async fn fetch_tushare_history(
-        &self,
-        ts: &TsCode,
-        period: KlinePeriod,
-        history_days: u32,
-        now: chrono::DateTime<Utc>,
-    ) -> Result<usize, String> {
-        // ① 目标窗口：今日 - history_days .. 今日 - TDX 段已覆盖起点。
-        let today = now.date_naive();
-        let target_start = today - chrono::Duration::days(history_days as i64);
-        let repo = self.repo();
-        let min_existing = repo
-            .min_kline_trade_date(ts, period)
-            .ok()
-            .flatten()
-            .map(|td| td.as_naive());
-        let end = match min_existing {
-            Some(d) => d - chrono::Duration::days(1), // 早于 DB 最早一根
-            None => today,
-        };
-        if end <= target_start {
-            return Ok(0); // 已覆盖
-        }
-        // ② TuShare 拉取：buffer 30 天避免边界 race。
-        let s_buffer = target_start - chrono::Duration::days(30);
-        let s_str = s_buffer.format("%Y%m%d").to_string();
-        let e_str = end.format("%Y%m%d").to_string();
-        match self.tushare.fetch_kline(ts, period, &s_str, &e_str).await {
-            Ok(pts) if !pts.is_empty() => {
-                let n = pts.len();
-                // ③ 落 unadjusted；upsert 处理重叠区间。
-                let _ = repo.upsert_daily_klines(ts, period, AdjEnum::None, &pts, "tushare", now);
-                self.health.record_success();
-                Ok(n)
-            }
-            Ok(_) => {
-                self.health.record_success(); // 调用成功，只是无数据
-                Ok(0)
-            }
-            Err(e) => {
-                self.health.record_failure(e.to_string());
-                Err(e.to_string())
-            }
-        }
     }
 
     // ====================================================================== refresh_xdxr_events

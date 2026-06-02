@@ -6,7 +6,7 @@
 
 ## 一句话定位
 
-**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，**腾讯**作为 TDX 实时行情 fallback（兼 BJ 实时主路径），**Eastmoney** 作 BJ universe 枚举 + K 线 / 分时 / 日线兜底（不参与实时报价）；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（长历史 K 线、`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
+**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，**腾讯**作为 TDX 实时行情 fallback（兼 BJ 实时主路径），**Eastmoney** 作 BJ universe 枚举 + K 线 / 分时 / 日线兜底（不参与实时报价）；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
 
 远端 provider 是 Quotes 内部实现细节，不暴露给对外读取 API。
 
@@ -14,7 +14,7 @@
 
 1. **TDX 是 Quotes 数据的主源**：universe / 实时行情 / 日 K / 周 K / 月 K / 分钟 K / 分时 / xdxr 除权数据 全部从 TDX 直接获取。
 2. **本地基于 TDX xdxr 自算复权**：日 / 周 / 月 K 在本地存 unadjusted；`qfq` / `hfq` 由本地 xdxr 事件按需 in-memory 计算，不依赖 TuShare adj_factor。
-3. **TuShare 是 enrich，不是主源**：仅当 token 配置且 `TushareHealthState.is_available = true` 时，才向 TuShare 拉取 universe enrich（行业 / 上市状态 / 基金分类等）、超出 TDX 单次根数限制的长历史 K 线、`daily_basic`、公司事件、交易日历校准。
+3. **TuShare 是 enrich，不是主源**：仅当 token 配置且 `TushareHealthState.is_available = true` 时，才向 TuShare 拉取 universe enrich（行业 / 上市状态 / 基金分类等）、`daily_basic`、公司事件、交易日历校准。
 4. **TuShare 不可用必须降级而非失败**：token 缺失或健康检查失败时，Quotes 仍能正常提供 TDX 路径的全部能力；只是对应 enrich 字段为空，相应 series 带 freshness warning。
 
 契约强度：
@@ -256,7 +256,7 @@ K 线和分时是 Quotes 的本地读模型，不是 provider 原始数据直出
   - **状态 B · 该标的天然无除权事件**：xdxr 已刷新过（有 `kind = "xdxr"` 完成记录）但目标 `tsCode` 的 `quote_xdxr_events` 行数为 0。可能是指数 / 基金（无除权概念）或股票从未除权；此时 `qfq` / `hfq` 自然等同 unadjusted，**不**返回 warning（这是合理终态，不是数据缺失）。
   - **状态 C · 该标的部分历史缺失**：xdxr 已刷新但 events 数量不能完整覆盖 unadjusted K 线时间段（例如 events 起点晚于 K 线起点）。按现有 events 计算复权 factor，series 整体仍可用，返回 `using_unadjusted_kline` warning（语义："复权数据可能不完整"）。
   - 区分方法：`refresh_xdxr_events` 完成后写 `quote_refresh_state` 一行 `kind = "xdxr"`；读 qfq 时联合查 "xdxr refresh state 是否存在 + 目标 ts_code events 行数" 判 A/B/C。
-- 长历史 K 线（超出 TDX 单次拉取根数限制的部分）由 TuShare 补充时，仍以 `adjust = "none"` 落本地，复权统一走本地算法，确保 qfq/hfq 在 TDX 段和 TuShare 段连续一致。
+- K 线为 **TDX-only**：`refresh_klines_full` 用 TDX 分页（`start=0,800,1600,…`）覆盖可获取的全部历史，落本地 `adjust = "none"`，复权统一走本地 xdxr 算法。TuShare **不再**补 K 线段（2026-06-02 决策）。
 
 对外点位模型：
 
@@ -524,7 +524,7 @@ type TushareHealthState = {
 - **启动 ping**：进程启动时，如果配置了 TuShare token，调用一次轻量 API（默认 `trade_cal` 单交易日查询）作为健康探针。成功 → `isAvailable = true`；超时 / HTTP 错误 / 鉴权失败 / rate limited → `isAvailable = false`，`lastError` 记录原因。启动 ping 单次超时默认 5 s，避免阻塞 setup。
 - **定期重试**：`isAvailable = false` 时，按可配置间隔（默认 `recheck_interval = 1 小时`）重新 ping；探针成功 → `isAvailable = true`，连续失败计数器立即归零，恢复业务调用。
 - **熔断**：维护进程内连续失败计数器，规则：
-  - 每次 TuShare API 业务调用（含 universe enrich、长历史 K 线、`daily_basic`、公司事件、`trade_cal` 校准）失败时累加 1；任何一次业务调用成功立即重置为 0。
+  - 每次 TuShare API 业务调用（含 universe enrich、`daily_basic`、公司事件、`trade_cal` 校准）失败时累加 1；任何一次业务调用成功立即重置为 0。
   - 计数器达到 `max_consecutive_failures`（默认 3）时主动把 `isAvailable` 翻回 `false`，进入定期重试循环。
   - 计数器**不持久化**：进程重启 / 跨日都从 0 重新计数，避免因历史失败导致的假性熔断。
   - 熔断态下不发起任何业务 API；仅 `recheck_if_due()` 用 `trade_cal` 单日 ping 探针。探针绕过计数器，不计为业务失败。
@@ -532,7 +532,7 @@ type TushareHealthState = {
 
 规则：
 
-- 所有 TuShare 路径（universe enrich、长历史 K 线、`daily_basic`、公司事件、交易日历校准）调用前必须 check `isAvailable`；为 `false` 时跳过 TuShare 调用，走本地 / TDX 路径并在对应 series / item 返回适用 warning。
+- 所有 TuShare 路径（universe enrich、`daily_basic`、公司事件、交易日历校准）调用前必须 check `isAvailable`；为 `false` 时跳过 TuShare 调用，走本地 / TDX 路径并在对应 series / item 返回适用 warning。
 - 健康状态变更（`true ↔ false`）应该向外 emit 事件，便于运维 / UI 提示（事件名 / payload 由 [agent-runtime-module.md](agent-runtime-module.md) 协调）；本 spec 不强制 event 名称。
 - 健康检查失败不得影响 TDX / 腾讯 / Eastmoney（universe + K线/分时）任何路径的可用性。
 
@@ -837,7 +837,7 @@ extend_chart_history(ts_code: TsCode, period: "day" | "week" | "month", target_d
 
 行为：
 - `target_days ≤ 800` → 走 TDX 主路径（单次 fetch 上限 ~800 根，约 3 年日 K）。
-- `target_days > 800` 且 `TushareHealthState.isAvailable = true` → 调用 `refresh_klines_extended` 内 TuShare 长历史扩展段，落库 `adjust = none`。
+- `target_days > 800` → 走 `refresh_klines_full`（TDX 分页 `start=0,800,…`）补全更深历史，落库 `adjust = none`。（K 线 TDX-only，不调 TuShare。）
 - 否则（token 缺失或 health 不可用）silent skip 长历史段，只返回 TDX 已拉的部分。
 - 分钟 K / 分时**不**走此命令（分钟 K 一天 240 根，单次 fetch 已足够；不需要"更深历史"语义）。
 
@@ -950,12 +950,11 @@ TDX > 腾讯
 - **首屏单页（`fetch_kline_page`）**：`ensure_chart_data` 的默认路径只同步拉 `start=0` 的最新 ~800 根（首屏），落 DB 立即返回；更早历史由前端 background loop 调 `fetch_kline_page(start=800, 1600, ...)` 渐进 prepend 补全（见 §4 `ensure_chart_data`）。`start` 是从最新往回跳过的根数，更早 batch prepend 到累计 Vec 前，最终升序。
 - **全量历史（`refresh_klines_full`）**：保留实现，走分页 loop —— TDX `security_bars(start=0, 800, 1600, ...)` 直到返回空 / 不足 800 根 / 命中硬上限 50 000 根，一次性同步把全量历史落 DB。供需要"同步落全量"的显式补段调用方使用；**不是** `ensure_chart_data` 的默认路径（首屏速度优先，见上）。
 - **增量回溯（`refresh_klines` / `refresh_klines_extended`）**：每只 (ts_code, period) 先查 `max(trade_date) FROM quote_klines_daily WHERE adjust='none'`：
-  - DB 空 → 初始拉过去 ~365 天（受 TDX 单次根数限制约束，超出部分留给 TuShare 长历史扩展）。
+  - DB 空 → 初始拉过去 ~365 天（`history_days` 可加深，cap 至 TDX 单次上限 ~800 根）。
   - 有数据 → 从 `max+1` 拉到 today，幂等 upsert。
   - 用途：盘后调度补当日新 bar，不为 `ensure_chart_data` 的全量场景。
 - **本地复权**：`qfq` / `hfq` 由 Quotes 基于本地 unadjusted K 线 + TDX xdxr 事件现算（见 §2 "本地复权计算"）；不依赖 TuShare adj_factor。
-- **长历史扩展**：当调用方请求的回溯窗口超出 TDX 单次拉取根数限制（~800 根 ≈ 一年），且 `TushareHealthState.isAvailable = true` 时，可使用 TuShare 补拉更早的 unadjusted 历史段，落本地后统一走本地复权算法。当前 TuShare 长历史段补拉为 D2.5 后续实现；尚未上线时，调用方若回看超出 TDX 单次根数限制，超出部分返回空 + `KlineSeries.warnings` 含 `data_partial`。
-  - 注：`refresh_klines_full` 通过 TDX 分页（`start=0, 800, 1600, ...`）已覆盖 TDX 可获取的全部历史段，不再依赖 TuShare 长历史扩展。TuShare 长历史扩展仅在 `refresh_klines_extended(history_days > 800)` 路径下触发（盘后调度 / 显式补段场景）。
+- **更深历史 = TDX 全量分页**（**不调 TuShare**，2026-06-02 决策）：回溯超出 TDX 单次 ~800 根时，走 `refresh_klines_full` 的分页 loop（`start=0,800,1600,…`）覆盖 TDX 可获取的全部历史段。TuShare K 线（`fetch_kline`）仅保留作**准确性测试 oracle**，不在产品 K 线路径。
 - **Eastmoney fallback**：TDX 失败时可用 Eastmoney 补 SH / SZ 当日 / 近期段；BJ 没有日 / 周 / 月 K 备源，按 per-item warning / error 返回。
 - 股票趋势 / 技术指标优先使用 `qfq`；只能用 `none` 时返回 `using_unadjusted_kline` warning。
 
@@ -1150,7 +1149,7 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 
 - universe / 实时行情 / 日 / 周 / 月 K / 分钟 K / 分时 / xdxr / 复权 全部以 TDX 为主源（TDX 协议层已具备 xdxr `0x000f` 和 minute_time `0x0fb4` 能力）。
 - 新增 `TushareHealthState` 机制：启动 ping + 每 1 小时重试 + 连续失败熔断；所有 TuShare 路径调用前 gate 在 `isAvailable` flag 上。
-- TuShare 改为可选 enrich：仅在 token 配置且健康检查通过时拉 universe enrich、长历史 K 线扩展段、`daily_basic`、公司事件、交易日历校准。
+- TuShare 改为可选 enrich：仅在 token 配置且健康检查通过时拉 universe enrich、`daily_basic`、公司事件、交易日历校准。（**K 线已于 2026-06-02 移出 TuShare** —— 全程 TDX-only 分页；`fetch_kline` 仅留作准确性测试 oracle。）
 - 复权计算改为本地基于 TDX xdxr 现算（unadjusted K 线 + xdxr 事件），不再依赖 TuShare `adj_factor`。
 - 新增 cold-start seed：启动时把内置 `BUILTIN_INSTRUMENTS` upsert 入 `quote_instruments`，保证 UI 第一帧非空。
 - 交易日历改为本地推算 default + TuShare 校准 optional。
@@ -1168,5 +1167,5 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 - §5 universe step 0：把 cold-start seed 描述从一行扩成完整段落，落字段构成、source = "tdx"、覆盖窗口 ~5–10 s、size 下限 60 runtime 断言、ts_code 覆盖规则。
 - §5 后台刷新：新增 "refresh_state 读写契约" 段，列出 `refresh_kind` 枚举、启动 catch-up 流程、diagnostics 用途。
 - §5 实时行情 fallback：补 "可用性判定与候选选取" 4 步流程；明确 `is_quote_complete` 与 `is_display_complete` 各自的准入语义和取舍顺序，挂实现锚 `pipeline/quotes/service.rs::pick_fallback_quote`。
-- §5 日 / 周 / 月 K：补增量回溯路径（`max(trade_date)` + 1 → today；空 DB 拉 ~365 天）；当前 TuShare 长历史段未实现，超窗回返 `data_partial`。
+- §5 日 / 周 / 月 K：补增量回溯路径（`max(trade_date)` + 1 → today；空 DB 拉 ~365 天）；更深历史走 `refresh_klines_full` TDX 全量分页（K 线 TDX-only，不调 TuShare）。
 - §5 分钟 K：补 trading-session 感知的增量回溯（盘内直拉、盘后查 `max_minute_kline_ts_ms` 决定 skip / catch-up；skip 不计 total）。

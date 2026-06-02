@@ -4,24 +4,24 @@
 
 ## 定位
 
-TuShare 是 Quotes 的历史、复权、基本面、公司事件和 universe enrich 主源。
+TuShare 是 Quotes 的 **enrich 层**（基本面 / 公司事件 / 交易日历 / universe enrich），**不是** K 线 / 复权 / 实时报价主源。
 
-TuShare 不作为盘中实时报价主路径；盘中交易判断依赖 `MARKET_SNAPSHOT` 中的 fresh quote。
+- **K 线主源是 TDX**（全量分页覆盖历史）；TuShare **不再**提供产品 K 线（2026-06-02 决策）。`fetch_kline` 仅保留作**准确性测试 oracle**（跨源校验 TDX 日 K），不进产品路径。
+- **复权（qfq/hfq）走本地 TDX xdxr 算法**，不用 TuShare `adj_factor`。
+- TuShare 不作为盘中实时报价主路径；盘中交易判断依赖 `MARKET_SNAPSHOT` 中的 fresh quote。
 
-## 能力范围
+## 能力范围（enrich-only）
 
 | 数据 | TuShare 接口语义 | 输出 |
 |---|---|---|
-| 股票 universe | `stock_basic` | `market_instruments(category=stock)` |
-| 指数 universe | `index_basic` | `market_instruments(category=index)` |
-| 基金 universe | `fund_basic` | `market_instruments(category=fund)` |
-| 股票日 / 周 / 月 K | `daily` / `weekly` / `monthly` | `KlineSeries(adjust=none)` |
-| 指数 K | `index_daily` / `index_weekly` / `index_monthly` | `KlineSeries(adjust=none)` |
-| 基金 K | `fund_daily` | `KlineSeries(adjust=none)` |
-| 复权因子 | `adj_factor` | 生成 `qfq` / `hfq` |
-| 每日基础指标 | `daily_basic` | `DailyBasic` |
+| 股票 universe enrich | `stock_basic` | `market_instruments(category=stock)` 行业/状态/上市日期 |
+| 指数 universe enrich | `index_basic` | `market_instruments(category=index)` |
+| 基金 universe enrich | `fund_basic` | `market_instruments(category=fund)` 基金分类/管理人 |
+| 每日基础指标 | `daily_basic` | `DailyBasic`（PE/PB/换手/市值） |
 | 公司事件 | `dividend` / `suspend_d` / `namechange` / `forecast` / `share_float` | `CompanyEvent` |
 | 交易日历 | `trade_cal` | Shared trading calendar |
+| ~~K 线 / 复权因子~~ | ~~已移除~~ | K 线走 TDX 全量分页；复权走本地 xdxr |
+| （仅测试 oracle）日 K | `daily` (`fetch_kline`) | 跨源校验 TDX 日 K，不进产品 |
 
 能力清单来源见 [tushare-capabilities.md](tushare-capabilities.md)。
 
@@ -52,21 +52,16 @@ TuShare 不作为盘中实时报价主路径；盘中交易判断依赖 `MARKET_
 - TuShare 数量和金额单位必须转换为 shared canonical 单位。
 - 原始 payload 可保留在 provider cache / debug，不进入对外 DTO。
 
-K 线：
+K 线（仅 `fetch_kline` 测试 oracle 用；产品 K 线在 TDX）：
 
 | TuShare 字段 | Canonical 字段 |
 |---|---|
 | `open` / `close` / `high` / `low` | `open` / `close` / `high` / `low` |
-| `vol` | `volume`，normalize 为股 / 份 |
-| `amount` | `amount`，normalize 为 CNY |
+| `vol` | `volume`，normalize 为股 / 份（`vol` 手 × 100） |
+| `amount` | `amount`，normalize 为 CNY（千元 × 1000） |
 | `trade_date` | `date` |
 
-复权：
-
-- `adjust = none` 来自原始 K。
-- `qfq` / `hfq` 由 `adj_factor` 和原始 K 派生。
-- 复权结果必须保持 `source = "tushare"`。
-- 复权计算失败时，不能写入错误 qfq；返回 `qfq_missing` 或 `using_unadjusted_kline`。
+复权：**不在 TuShare**。`qfq` / `hfq` 由本地 TDX xdxr 事件现算（见 quotes-module.md §2 本地复权）；TuShare `adj_factor` / `apply_adjust` 已移除。
 
 DailyBasic：
 

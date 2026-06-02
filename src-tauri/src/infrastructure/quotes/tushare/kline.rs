@@ -3,7 +3,7 @@
 //! Spec: docs/design/quotes-module.md §5；docs/design/references/quotes/tushare.md
 
 use super::client::{pick_f64, pick_str, TushareClient, TushareError};
-use crate::domain::quotes::{Adjust, DailyBasic, KlinePeriod, KlinePoint};
+use crate::domain::quotes::{DailyBasic, KlinePeriod, KlinePoint};
 use crate::domain::shared::{Amount, Money, Percent, Price, TradeDate, TsCode, Volume};
 use chrono::Utc;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
@@ -75,77 +75,10 @@ impl TushareClient {
         Ok(out)
     }
 
-    /// 复权因子（与日 K 同 ts_code 对齐）。返回 `(trade_date, adj_factor)` 升序。
-    pub async fn fetch_adj_factor(
-        &self,
-        ts_code: &TsCode,
-        start_date: &str,
-        end_date: &str,
-    ) -> Result<Vec<(TradeDate, f64)>, TushareError> {
-        let params = json!({
-            "ts_code": ts_code.as_str(),
-            "start_date": start_date,
-            "end_date": end_date,
-        });
-        let data = self
-            .call("adj_factor", params, "ts_code,trade_date,adj_factor")
-            .await?;
-        let mut out = Vec::with_capacity(data.items.len());
-        for row in data.items.iter() {
-            let Some(td) = pick_str(&data.fields, row, "trade_date") else {
-                continue;
-            };
-            let Ok(date) = TradeDate::parse(&td) else {
-                continue;
-            };
-            let Some(adj) = pick_f64(&data.fields, row, "adj_factor") else {
-                continue;
-            };
-            out.push((date, adj));
-        }
-        out.reverse();
-        Ok(out)
-    }
-
-    /// 把不复权日 K + 复权因子转为指定 adjust 模式的 K。
-    /// 公式：qfq = close * adj / latest_adj；hfq = close * adj。
-    pub fn apply_adjust(
-        bars: &[KlinePoint],
-        factors: &[(TradeDate, f64)],
-        adjust: Adjust,
-    ) -> Vec<KlinePoint> {
-        if matches!(adjust, Adjust::None) || factors.is_empty() {
-            return bars.to_vec();
-        }
-        use std::collections::HashMap;
-        let map: HashMap<TradeDate, f64> = factors.iter().copied().collect();
-        let latest_adj = factors.last().map(|t| t.1).unwrap_or(1.0);
-        bars.iter()
-            .map(|p| {
-                let Some(adj) = map.get(&p.date).copied() else {
-                    return p.clone();
-                };
-                let factor = match adjust {
-                    Adjust::Qfq => adj / latest_adj,
-                    Adjust::Hfq => adj,
-                    Adjust::None => 1.0,
-                };
-                let scale = |x: Price| -> Price {
-                    let v = Decimal::from_f64(factor).unwrap_or(Decimal::ONE);
-                    Price((x.0 * v).round_dp(4))
-                };
-                KlinePoint {
-                    date: p.date,
-                    open: scale(p.open),
-                    close: scale(p.close),
-                    high: scale(p.high),
-                    low: scale(p.low),
-                    volume: p.volume,
-                    amount: p.amount,
-                }
-            })
-            .collect()
-    }
+    // 注：TuShare 的 `adj_factor` / `apply_adjust` 已移除——复权统一走本地 TDX xdxr
+    // （`domain::quotes::apply_adjust`，service.rs）；K 线也不再由 TuShare 补段（2026-06-02 决策）。
+    // TuShare 仅保留 enrich 角色（universe / daily_basic / 公司事件 / 交易日历）+ `fetch_kline`
+    // 作准确性测试 oracle。
 
     /// `daily_basic` — 每日基础指标。
     pub async fn fetch_daily_basic(
@@ -208,62 +141,3 @@ impl TushareClient {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal::prelude::FromPrimitive;
-
-    fn pt(date: &str, close: f64) -> KlinePoint {
-        KlinePoint {
-            date: TradeDate::parse(date).unwrap(),
-            open: Price(Decimal::from_f64(close).unwrap()),
-            close: Price(Decimal::from_f64(close).unwrap()),
-            high: Price(Decimal::from_f64(close).unwrap()),
-            low: Price(Decimal::from_f64(close).unwrap()),
-            volume: Some(Volume(100)),
-            amount: None,
-        }
-    }
-
-    #[test]
-    fn apply_adjust_none_returns_clone() {
-        let bars = vec![pt("20260520", 100.0), pt("20260521", 110.0)];
-        let factors = vec![(TradeDate::parse("20260521").unwrap(), 1.0)];
-        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::None);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].close.0, Decimal::from_f64(100.0).unwrap());
-    }
-
-    fn dec(x: f64) -> Decimal {
-        Decimal::from_f64(x).unwrap()
-    }
-
-    #[test]
-    fn apply_adjust_qfq_scales_history_by_factor_ratio() {
-        // factor 0.5 -> latest_adj 1.0 → qfq scale = 0.5；history close 100 → 50。
-        let bars = vec![pt("20260520", 100.0), pt("20260521", 110.0)];
-        let factors = vec![
-            (TradeDate::parse("20260520").unwrap(), 0.5),
-            (TradeDate::parse("20260521").unwrap(), 1.0),
-        ];
-        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Qfq);
-        assert_eq!(out[0].close.0, dec(50.0));
-        assert_eq!(out[1].close.0, dec(110.0));
-    }
-
-    #[test]
-    fn apply_adjust_hfq_uses_factor_directly() {
-        let bars = vec![pt("20260520", 100.0)];
-        let factors = vec![(TradeDate::parse("20260520").unwrap(), 2.0)];
-        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Hfq);
-        assert_eq!(out[0].close.0, dec(200.0));
-    }
-
-    #[test]
-    fn apply_adjust_missing_factor_keeps_bar_unchanged() {
-        let bars = vec![pt("20260520", 100.0)];
-        let factors = vec![(TradeDate::parse("20260521").unwrap(), 0.5)];
-        let out = TushareClient::apply_adjust(&bars, &factors, Adjust::Qfq);
-        assert_eq!(out[0].close.0, dec(100.0));
-    }
-}
