@@ -478,6 +478,34 @@ Runtime builds AgentRunRequest
 
 ---
 
+## 3.5 子 Agent / Fork（execution 底座，**Infra 层**）
+
+> **fork 子 agent 是 Infra 的执行能力，不是 Runtime。** 它就是「在隔离上下文里再跑一遍 loop、跑完只把结果带回父」——纯执行机制，与业务无关（参考 Claude Code 的 `runAgent`）。Runtime 只决定「用哪个 agent 定义 / 哪些 skill / 什么权限」，**怎么 fork、怎么隔离、怎么回灌结果都在 Infra**。
+
+### 机制
+
+- Infra 提供 **`run_forked_agent`**（内部 API）：给定 `{ prompt, system_prompt, tools, channel, token_budget, parent_run_id }` → **起一个子 run**（复用同一套 `run_agent_turn` loop），跑完返回**最终结果文本**。
+  - **隔离上下文**：子 run 用**全新 `conversation_id`**（带 `parent_run_id` 关联），不与父共享消息历史；子的中间 tool 调用 / 试错**不进父上下文**。
+  - **独立 token 预算**：子从父预算里领一份；子超限只失败子 run，不拖垮父。
+  - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。
+  - **审计**：子 run 全量消息照常落 `agent_messages`（自己的 `conversation_id` + `parent_run_id`），可单独 replay。
+- 父对话侧：fork 表现为一次 **tool 调用**（`run_subagent` / `run_skill`，§5 工具），其 `<tool_result>` = 子 run 的结果文本。
+
+### 两种模式（对齐 CC）
+
+| 模式 | 上下文 | system prompt / 工具 / model | 用途 |
+|---|---|---|---|
+| **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧）| 专门子任务 / 跑 skill，父只收结果 |
+| **隐式 fork**（可选，后续）| **继承父完整上下文 + system prompt + 精确工具池** | 全继承（`inherit`）| "在当前上下文分叉继续干" |
+
+### 不变量
+
+- **递归限深**：子 agent 也能再 fork，但按 `query_depth` 限深 + 检测 fork 标记防无限递归。
+- **只回结果**：父对话只拿子 run 的最终结果，看不到子的中间过程（上下文卫生 = fork 的核心价值）。
+- skill 执行复用本机制：`run_skill` = 以 `SKILL.md` 全文为 `prompt` 调 `run_forked_agent`（见 [agent-runtime-module.md](agent-runtime-module.md) §Skills）。
+
+---
+
 ## 4. 上下文管理
 
 上下文由四类内容构成：

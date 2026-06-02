@@ -181,18 +181,14 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 - `run_bash` 因危险面最大，默认只给前台可确认的 `user_chat`；后台 profile 默认不给（即使给，危险命令在无人确认时一律拒绝）。
 - 本地 tool 与 `allowTradingWrite` **正交**：给本地 tool 不放宽交易写权限；写交易仍受 `allowTradingWrite` + episode 前置约束（§2 / §4）。
 
-### 子 Agent（fork 隔离执行）
+### 子 Agent（fork）—— 机制在 Infra，Runtime 只用
 
-> 对齐 Claude Code：一个 run 可以 **fork 出隔离子 agent** 执行一段子任务，跑完只把**结果**带回父对话。复用 Infra 的同一套 loop。
+> ⚠️ **fork 子 agent 的执行机制属 Agent Infra 层**（隔离上下文 + 独立预算 + 继承/收紧 + 只回结果 + 限深），定义见 [agent-infra-module.md](agent-infra-module.md) §3.5「子 Agent / Fork」。本节只说 Runtime 怎么**用**它。
 
-- **`run_subagent{prompt, contextHint?, allowedTools?}` tool**：父 agent 调它 → Infra 起一个**子 run**：
-  - **独立上下文**（子 agent 自己的会话/消息，不与父共享历史）；
-  - **独立 token 预算**（父的预算扣减，子超限不拖垮父）；
-  - **继承父的渠道 / 模型**（**不**支持 per-skill/子 model 覆盖——本项目用统一渠道）；
-  - **工具集**：默认继承父的；`allowedTools` 给了就收紧到子集（可选）。
-  - 子 run 跑完，**只把最终结果文本**作为 `run_subagent` 的 tool 结果回灌父对话——中间过程（子的 tool 调用 / 试错）**不进父上下文**。
-- **嵌套**：子 agent 也能 `run_subagent` / `run_skill`，按 `queryDepth` 限深防失控。
-- 审计：子 run 的全量消息照常落 `agent_messages`（带自己的 conversationId + `parentRunId` 关联），可单独 replay。
+- **`run_subagent` tool**（Infra 默认提供）：父 agent 调它 → Infra `run_forked_agent` 起隔离子 run，跑完只把结果回灌。Runtime 侧关心的是：哪些 profile 允许它（`allowedTools`）、是否传工具子集收紧。
+- **`run_skill` tool**：调某 skill = 以其 `SKILL.md` 为 prompt 调同一 fork 机制（见下 §Skills）。
+- model / effort / 渠道：子 agent **一律继承父**（本项目不做 per-子覆盖）；工具集默认继承、可用 `allowedTools` 收紧。
+- 嵌套按 `query_depth` 限深（Infra 保证）。
 
 ### Skills（playbook，CC 式 fork 执行，初始为空）
 
