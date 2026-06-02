@@ -95,6 +95,26 @@ pub fn classify(market: Market, code6: &str) -> Option<UniverseClass> {
     }
 }
 
+/// 该 6 位 code 是否是债券（国债 / 可转债 / 企业债）。**不进 universe**（`classify` 仍丢弃它们），
+/// 仅用于按需取债券行情时的**价格小数位判定**（债券 3 位小数，否则会 10× 错，同 ETF）。
+///
+/// 判定靠市场内编码段：SH 股票=6xx/688，基金=51/56/58，指数=000/999，**1xxxxx 段即债券**；
+/// SZ 股票=00x/30x，基金=159，指数=399，**1xxxxx 段（除 159 ETF）即债券**。逆回购（SH 204xxx /
+/// SZ 1318xx）按利率报价、非价格，不在此列（2 开头不命中 SH；SZ 131 命中但取逆回购行情无意义，
+/// 调用方不应取）。BJ 不走 TDX。
+pub fn is_bond(market: Market, code6: &str) -> bool {
+    if code6.len() < 6 {
+        return false;
+    }
+    match market {
+        // SH：基金 5x、股票 6x、指数 000/999 都不以 '1' 开头，故 1xxxxx 段即债券。
+        Market::SH => code6.starts_with('1'),
+        // SZ：159 是 ETF（由 category=Fund 处理 3 位），其余 1xxxxx 段为债券。
+        Market::SZ => code6.starts_with('1') && !code6.starts_with("159"),
+        Market::BJ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +171,29 @@ mod tests {
         assert_eq!(classify_sh("000001").unwrap().category, InstrumentCategory::Index);
         assert_eq!(classify_sh("000300").unwrap().category, InstrumentCategory::Index);
         assert_eq!(classify_sh("999999").unwrap().category, InstrumentCategory::Index);
+    }
+
+    #[test]
+    fn is_bond_detects_bonds_not_universe_securities() {
+        use crate::domain::shared::Market;
+        // SH 债券（国债/可转债/企业债）= 1xxxxx
+        for c in ["100303", "110059", "113537", "120201", "127001"] {
+            assert!(is_bond(Market::SH, c), "{c} 应判为 SH 债券");
+        }
+        // SZ 可转债/企业债 = 1xxxxx（除 159 ETF）
+        for c in ["123456", "127010", "128095", "112233"] {
+            assert!(is_bond(Market::SZ, c), "{c} 应判为 SZ 债券");
+        }
+        // 非债券：股票/指数/基金都不命中
+        assert!(!is_bond(Market::SH, "600519")); // 茅台
+        assert!(!is_bond(Market::SH, "510300")); // 沪深300ETF
+        assert!(!is_bond(Market::SH, "000001")); // 上证指数
+        assert!(!is_bond(Market::SH, "688981")); // 中芯国际
+        assert!(!is_bond(Market::SZ, "000001")); // 平安银行
+        assert!(!is_bond(Market::SZ, "300750")); // 宁德时代
+        assert!(!is_bond(Market::SZ, "159915")); // 创业板ETF（159 → 非债券，由 Fund 处理）
+        assert!(!is_bond(Market::SZ, "399006")); // 创业板指
+        assert!(!is_bond(Market::BJ, "430047")); // BJ 不走 TDX
     }
 
     #[test]

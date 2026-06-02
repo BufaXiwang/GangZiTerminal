@@ -1,7 +1,13 @@
-# TODO（延后）：Quotes 债券一等公民支持（可转债 / 国债 / 企业债）
+# TODO（部分完成）：Quotes 债券支持（可转债 / 国债 / 企业债）
 
-> 状态：**延后（deferred）**，本次不做。决策日 2026-06-01。
 > 关联 spec：[docs/design/quotes-module.md](../docs/design/quotes-module.md) §2 统一标的模型。
+>
+> **✅ 已完成（2026-06-02，commit 待填）：按需取债券的价格处理**。底层 provider 方法本就 category-无关，
+> 现把 `map_security_quote` 的价格缩放改成 **decimal-driven**：`universe::is_bond(market, code)` 识别债券
+> （3 位小数）→ 正确 `/10` 校正，不再 10× 错。**universe 仍不收债券**。债券无复权（xdxr 空 → none）。
+> 即「按代码取债券行情」开箱即用且报价正确。
+>
+> **⏳ 仍延后：债券一等公民**（下面「真要做时的清单」里除价格处理外的部分）。决策日 2026-06-01。
 
 ## 背景
 

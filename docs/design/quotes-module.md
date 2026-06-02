@@ -82,9 +82,14 @@ Quotes 不负责：
 > 注意分层：**底层 TDX provider 方法（`fetch_quote`/`fetch_kline_*` 等）是 category-无关的**——`TsCode` 只校验
 > 「6 位数字 + 市场后缀」，传入债券代码（如 `110059.SH`）TDX 同样会返回数据。所以「不取债券」是 universe
 > 策展层（`classify` + 读路径只遍历 curated universe）的约束，**不是 provider 方法的硬限制**。
-> **债券作为一等公民（可转债等）暂不支持，延后**——见 [issues/quotes-bond-support-todo.md](../../issues/quotes-bond-support-todo.md)。
-> 真要支持需：新增 `InstrumentCategory::Bond` + 债券 3 位小数缩放（否则报价 10× 错，同 ETF 那个 bug 类）+
-> 放开 `classify` 债券前缀 + universe 纳入 + 本 spec 落点。
+> **按需取债券已可正确处理（universe 仍不收）**：底层 provider 方法 category-无关，按代码取债券时
+> `map_security_quote` 的价格缩放是 **decimal-driven** 的——`is_bond(market, code)` 识别债券（3 位小数）
+> 并正确 `/10` 校正（否则同 ETF 那样 10× 错）。所以「取债券行情」开箱即用且报价正确，但债券**不进
+> universe**（list_market / 扫描 / 详情遍历 curated universe，看不到债券）。债券**无复权**：xdxr 为空
+> → adjust 自然退化为 none。
+> **债券作为一等公民**（纳入 universe 展示 / 可转债交易 / 专属类目）**仍延后**——见
+> [issues/quotes-bond-support-todo.md](../../issues/quotes-bond-support-todo.md)（届时需 `InstrumentCategory::Bond`
+> + 放开 `classify` + universe 纳入 + Account 交易规则配合）。
 
 ```ts
 type MarketInstrument = {
