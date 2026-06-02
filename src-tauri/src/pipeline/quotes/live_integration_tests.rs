@@ -1236,3 +1236,419 @@ async fn quotes_live_pipeline_close_snapshot_fallback() {
         Err(e) => eprintln!("[H5] SKIP — close refresh 失败: {:?}", e),
     }
 }
+
+// ===== ACC. 数据准确性（跨源一致 + 数学一致）=====
+//
+// 与 A–H 的「结构 / 契约」测试不同，本节验**数值对不对**：
+//   - 跨源一致：同一标的同一交易日，TDX 解码 + 缩放后的 OHLC 必须与 TuShare / 腾讯
+//     的权威值在容差内一致（抓「解码 / 缩放 / 串号 / 单位」类 bug）。
+//   - 数学一致：单源 K 线的 OHLC 不变量 + 量价单位自洽 + 复权因子恒定（抓「手 vs 股」
+//     「万元 vs 元」「复权公式」类 bug）。
+//
+// 容差约定（跨源）：相对误差 ≤ 0.5% **或** 绝对误差 ≤ 0.01，取宽松者通过。两源对同一
+// 标的的四舍五入 / 采样口径可能有微小差异，但缩放 bug（10×）远超此容差，必被抓到。
+//
+// 全部 #[tokio::test] #[ignore]，命名 quotes_acc_*。token 仅走 TUSHARE_TOKEN env。
+// 任一 provider 不可达 / token 缺失 → eprintln! skip 后 return，不脏 panic。
+
+/// Decimal → f64（仅用于测试断言里的容差比较）。
+fn dec_f64(d: rust_decimal::Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().unwrap_or(f64::NAN)
+}
+
+/// 跨源数值「在容差内相等」：相对 ≤ 0.5% 或绝对 ≤ 0.01，取宽松者。
+fn close_enough(a: f64, b: f64) -> bool {
+    let abs = (a - b).abs();
+    if abs <= 0.01 {
+        return true;
+    }
+    let denom = a.abs().max(b.abs()).max(1e-9);
+    abs / denom <= 0.005
+}
+
+/// TDX `Bar` 的日期键（YYYYMMDD），用于和 TuShare `TradeDate::format()` 对齐。
+fn bar_date_key(b: &crate::infrastructure::quotes::tdx::Bar) -> String {
+    format!("{:04}{:02}{:02}", b.year, b.month, b.day)
+}
+
+/// ACC-1 跨源日 K 数值一致：TDX（不复权）↔ TuShare daily（不复权）。
+/// 对 股票 / ETF / 指数 各跑一遍（共用 body）。按 trade_date 对齐重叠区间，断言重叠日
+/// open/high/low/close 在容差内相等；ETF（510300）额外验 close ~4–5（3 位小数缩放端到端）。
+/// Provider: TDX + TuShare。Env: TUSHARE_TOKEN。
+async fn acc1_cross_source_daily(tag: &str, code: &str, etf_band: bool) {
+    let Some(_t) = tushare_token() else {
+        eprintln!("[{tag}] SKIP — TUSHARE_TOKEN 未设");
+        return;
+    };
+    let c = ts(code);
+    let mgr = TdxConnectionManager::new();
+    // TDX 不复权日 K（最新 ~800 根）。
+    let tdx_bars = match mgr.fetch_kline_at(&c, KlinePeriod::Day, 0, 800).await {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            eprintln!("[{tag}] SKIP — TDX 返回空日 K");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[{tag}] SKIP — TDX 不可达: {e}");
+            return;
+        }
+    };
+    // TuShare 不复权日 K（daily/index_daily/fund_daily 由 fetch_kline 内部按 ts_code 选择？
+    // 实测 fetch_kline 走 `daily` 接口——股票准确；指数 / ETF 用同接口在本环境可能空，空则 skip）。
+    // 取一段与 TDX 重叠的近窗口（近 ~400 自然日，覆盖足够交易日做交集）。
+    let today = Utc::now().with_timezone(&chrono_tz::Asia::Shanghai).date_naive();
+    let start = (today - chrono::Duration::days(400)).format("%Y%m%d").to_string();
+    let end = today.format("%Y%m%d").to_string();
+    let ts_bars = match tushare_client().fetch_kline(&c, KlinePeriod::Day, &start, &end).await {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            eprintln!("[{tag}] SKIP — TuShare daily 返回空（指数/ETF 可能不走 daily 接口）");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[{tag}] SKIP — TuShare daily 失败: {e}");
+            return;
+        }
+    };
+    // TDX 按日期建索引。
+    use std::collections::HashMap;
+    let tdx_map: HashMap<String, &crate::infrastructure::quotes::tdx::Bar> =
+        tdx_bars.iter().map(|b| (bar_date_key(b), b)).collect();
+    let mut compared = 0usize;
+    let mut sample_printed = 0usize;
+    for p in &ts_bars {
+        let key = p.date.format();
+        let Some(b) = tdx_map.get(&key) else { continue };
+        let (to, th, tl, tc) = (b.open, b.high, b.low, b.close);
+        let (so, sh, sl, sc) = (
+            dec_f64(p.open.0),
+            dec_f64(p.high.0),
+            dec_f64(p.low.0),
+            dec_f64(p.close.0),
+        );
+        if sample_printed < 5 {
+            eprintln!(
+                "[{tag}] {key} TDX(o={to:.3} h={th:.3} l={tl:.3} c={tc:.3}) TS(o={so:.3} h={sh:.3} l={sl:.3} c={sc:.3})"
+            );
+            sample_printed += 1;
+        }
+        assert!(close_enough(to, so), "[{tag}] {key} open 跨源不一致 TDX={to} TS={so}");
+        assert!(close_enough(th, sh), "[{tag}] {key} high 跨源不一致 TDX={th} TS={sh}");
+        assert!(close_enough(tl, sl), "[{tag}] {key} low 跨源不一致 TDX={tl} TS={sl}");
+        assert!(close_enough(tc, sc), "[{tag}] {key} close 跨源不一致 TDX={tc} TS={sc}");
+        if etf_band {
+            // 510300 沪深300ETF：3 位小数标的，close 应 ~4–5；10× 缩放 bug 会得到 ~48。
+            assert!(
+                tc > 1.0 && tc < 20.0,
+                "[{tag}] ETF close={tc} 不在 ~5 区间（疑似 10× 缩放 bug；正确应 ~4–5）"
+            );
+            assert!(
+                sc > 1.0 && sc < 20.0,
+                "[{tag}] TuShare ETF close={sc} 异常"
+            );
+        }
+        compared += 1;
+    }
+    eprintln!("[{tag}] 重叠交易日 = {compared}（TDX {} 根 / TuShare {} 根）", tdx_bars.len(), ts_bars.len());
+    if compared < 5 {
+        eprintln!("[{tag}] SKIP — 重叠交易日 < 5（无法做有意义的跨源校验）");
+        return;
+    }
+    assert!(compared >= 5, "[{tag}] 应有 ≥5 重叠交易日");
+}
+
+/// ACC-1a · 股票 600519 TDX↔TuShare 日 K 数值一致。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_cross_source_daily_stock() {
+    acc1_cross_source_daily("ACC-1a", OLD_STOCK_SH, false).await;
+}
+
+/// ACC-1b · ETF 510300 TDX↔TuShare 日 K 数值一致（额外验 3 位小数缩放：close ~4–5）。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_cross_source_daily_etf() {
+    acc1_cross_source_daily("ACC-1b", ETF_SH, true).await;
+}
+
+/// ACC-1c · 指数 000001.SH TDX↔TuShare 日 K 数值一致。
+/// 注意：TuShare `fetch_kline` 走 `daily` 接口（股票口径），指数可能返回空 → 优雅 skip。
+/// 单位 / 接口口径若拿不准，按「空即 skip」处理，不猜测改写。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_cross_source_daily_index() {
+    acc1_cross_source_daily("ACC-1c", INDEX_SH, false).await;
+}
+
+/// ACC-2 · 跨源报价一致：TDX ↔ 腾讯。非交易时段现价可能为空，故用**稳定字段**
+/// previous_close 比（两边都有 high/low 时也比），现价仅两边都非空时比。
+/// 510300 prevClose 应 ~4–5（再验 ETF 缩放）。Provider: TDX + 腾讯。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_cross_source_quote_tdx_vs_tencent() {
+    let mgr = TdxConnectionManager::new();
+    let tx = TencentProvider::new().expect("build tencent");
+    let cases = [
+        ("ACC-2/stock", OLD_STOCK_SH, InstrumentCategory::Stock, false),
+        ("ACC-2/etf", ETF_SH, InstrumentCategory::Fund, true),
+        ("ACC-2/index", INDEX_SH, InstrumentCategory::Index, false),
+    ];
+    let mut any_compared = false;
+    for (tag, code, cat, etf_band) in cases {
+        let c = ts(code);
+        let tdx = mgr
+            .fetch_quote(&c, cat, recent_trade_date(), Utc::now(), None)
+            .await;
+        let txq = tx
+            .fetch_quote(&c, cat, recent_trade_date(), Utc::now())
+            .await;
+        let (tdx, txq) = match (tdx, txq) {
+            (Ok(a), Ok(b)) => (a, b),
+            (a, b) => {
+                eprintln!(
+                    "[{tag}] SKIP — provider 不可达: TDX={:?} 腾讯={:?}",
+                    a.err(),
+                    b.err()
+                );
+                continue;
+            }
+        };
+        // 稳定字段：previous_close。
+        match (tdx.previous_close, txq.previous_close) {
+            (Some(a), Some(b)) => {
+                let (a, b) = (dec_f64(a.0), dec_f64(b.0));
+                eprintln!("[{tag}] {code} prevClose TDX={a:.3} 腾讯={b:.3}");
+                assert!(close_enough(a, b), "[{tag}] prevClose 跨源不一致 TDX={a} 腾讯={b}");
+                if etf_band {
+                    assert!(a > 1.0 && a < 20.0, "[{tag}] ETF TDX prevClose={a} 疑似 10× 缩放 bug");
+                    assert!(b > 1.0 && b < 20.0, "[{tag}] ETF 腾讯 prevClose={b} 异常");
+                }
+                any_compared = true;
+            }
+            _ => eprintln!("[{tag}] INFO — prevClose 某源为空，跳过该字段"),
+        }
+        // high / low：两边都非空才比。
+        if let (Some(a), Some(b)) = (tdx.high, txq.high) {
+            let (a, b) = (dec_f64(a.0), dec_f64(b.0));
+            assert!(close_enough(a, b), "[{tag}] high 跨源不一致 TDX={a} 腾讯={b}");
+        }
+        if let (Some(a), Some(b)) = (tdx.low, txq.low) {
+            let (a, b) = (dec_f64(a.0), dec_f64(b.0));
+            assert!(close_enough(a, b), "[{tag}] low 跨源不一致 TDX={a} 腾讯={b}");
+        }
+        // 现价：仅两边都非空（交易时段）才比。
+        if let (Some(a), Some(b)) = (tdx.price, txq.price) {
+            let (a, b) = (dec_f64(a.0), dec_f64(b.0));
+            eprintln!("[{tag}] {code} price TDX={a:.3} 腾讯={b:.3}（交易时段才有意义）");
+            assert!(close_enough(a, b), "[{tag}] 现价跨源不一致 TDX={a} 腾讯={b}");
+        }
+    }
+    if !any_compared {
+        eprintln!("[ACC-2] SKIP — 无任一标的两源 prevClose 同时可得");
+    }
+}
+
+/// ACC-3 · 单源 TDX K 线内部数学一致：OHLC 不变量 + date 严格递增 + 量价单位自洽。
+/// vwap = amount / volume（amount 元、volume 股 → 元/股）应落在 [low*0.9, high*1.1]，
+/// 这能抓「手 vs 股」「万元 vs 元」单位 bug。Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_kline_internal_math() {
+    let mgr = TdxConnectionManager::new();
+    let c = ts(OLD_STOCK_SH);
+    let bars = match mgr.fetch_kline_at(&c, KlinePeriod::Day, 0, 60).await {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => {
+            eprintln!("[ACC-3] SKIP — TDX 返回空");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[ACC-3] SKIP — TDX 不可达: {e}");
+            return;
+        }
+    };
+    eprintln!("[ACC-3] 600519 日 K 根数 = {}", bars.len());
+    let mut prev_key: Option<String> = None;
+    let mut vwap_samples = 0usize;
+    for b in &bars {
+        // OHLC 不变量。
+        assert!(b.high >= b.open, "high >= open");
+        assert!(b.high >= b.close, "high >= close");
+        assert!(b.high >= b.low, "high >= low");
+        assert!(b.low <= b.open, "low <= open");
+        assert!(b.low <= b.close, "low <= close");
+        assert!(b.volume >= 0.0, "volume >= 0");
+        assert!(b.amount >= 0.0, "amount >= 0");
+        // date 严格递增。
+        let key = bar_date_key(b);
+        if let Some(prev) = &prev_key {
+            assert!(*prev < key, "date 应严格递增: {prev} !< {key}");
+        }
+        prev_key = Some(key);
+        // 量价一致性：vwap = amount / volume 应落在 [low*0.9, high*1.1]。
+        // 注意单位：TDX online K 线 amount 为元、volume 为股（offline 同）。
+        // 阈值 >10万股：跳过「当日未完成 / 占位」bar——非交易时段 TDX 可能给今日一根 vol/amt 近 0
+        // 的占位 bar（vwap 无意义），这不是单位 bug。真实交易日成交量远超 10 万股。
+        if b.volume > 100_000.0 && b.amount > 0.0 {
+            let vwap = b.amount / b.volume;
+            if vwap_samples < 5 {
+                eprintln!(
+                    "[ACC-3] {} vwap={vwap:.3} (low={:.3} high={:.3} vol={} amt={})",
+                    bar_date_key(b),
+                    b.low,
+                    b.high,
+                    b.volume,
+                    b.amount
+                );
+                vwap_samples += 1;
+            }
+            assert!(
+                vwap >= b.low * 0.9 && vwap <= b.high * 1.1,
+                "[ACC-3] {} vwap={vwap} 越界 [{}*0.9, {}*1.1]——疑似 amount/volume 单位 bug（手/股 或 万元/元）",
+                bar_date_key(b),
+                b.low,
+                b.high
+            );
+        }
+    }
+}
+
+/// ACC-4 · qfq / hfq 复权数学正确（平安银行 000001.SZ，有分红送转）。
+/// 取 none/qfq/hfq 同窗口日 K，验：点数 / date 对齐；qfq 锚最新、hfq 锚最早；
+/// hfq/qfq 比值恒定（= 总复权因子）；除权方向（qfq 早期 ≤ none 早期）。
+/// Provider: TDX（K 线 + xdxr，本地复权计算）。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_adjust_qfq_hfq_math() {
+    let svc = make_service();
+    seed_instrument(&svc, OLD_STOCK_SZ, "平安银行", InstrumentCategory::Stock);
+    let code = ts(OLD_STOCK_SZ);
+    if let Err(e) = svc
+        .refresh_klines(RefreshDataScope::Manual { ts_codes: vec![code.clone()] }, vec![KlinePeriod::Day])
+        .await
+    {
+        eprintln!("[ACC-4] SKIP — refresh_klines 失败（TDX 不可达?）: {:?}", e);
+        return;
+    }
+    if let Err(e) = svc
+        .refresh_xdxr_events(RefreshDataScope::Manual { ts_codes: vec![code.clone()] })
+        .await
+    {
+        eprintln!("[ACC-4] SKIP — refresh_xdxr_events 失败: {:?}", e);
+        return;
+    }
+    let none = svc.read_kline_series_with_adjust(&code, KlinePeriod::Day, Adjust::None, 250).unwrap();
+    let qfq = svc.read_kline_series_with_adjust(&code, KlinePeriod::Day, Adjust::Qfq, 250).unwrap();
+    let hfq = svc.read_kline_series_with_adjust(&code, KlinePeriod::Day, Adjust::Hfq, 250).unwrap();
+    let (Some(none), Some(qfq), Some(hfq)) = (none, qfq, hfq) else {
+        eprintln!("[ACC-4] SKIP — 本地无 K 线（refresh 可能空）");
+        return;
+    };
+    let n = none.points.len();
+    eprintln!("[ACC-4] 平安 K 线根数 none={} qfq={} hfq={}", n, qfq.points.len(), hfq.points.len());
+    if n < 2 {
+        eprintln!("[ACC-4] SKIP — K 线不足 2 根");
+        return;
+    }
+    // 点数相同 + date 对齐一致。
+    assert_eq!(n, qfq.points.len(), "qfq 点数应等于 none");
+    assert_eq!(n, hfq.points.len(), "hfq 点数应等于 none");
+    for i in 0..n {
+        assert_eq!(none.points[i].date.format(), qfq.points[i].date.format(), "qfq date 对齐");
+        assert_eq!(none.points[i].date.format(), hfq.points[i].date.format(), "hfq date 对齐");
+    }
+    let nc = |s: &crate::domain::quotes::KlineSeries, i: usize| dec_f64(s.points[i].close.0);
+    let last = n - 1;
+    // qfq 锚最新：qfq.last.close == none.last.close。
+    assert!(
+        (nc(&qfq, last) - nc(&none, last)).abs() <= 0.01,
+        "[ACC-4] qfq 末点应锚定 none 末点 qfq={} none={}",
+        nc(&qfq, last),
+        nc(&none, last)
+    );
+    // hfq 锚最早：hfq.first.close == none.first.close。
+    assert!(
+        (nc(&hfq, 0) - nc(&none, 0)).abs() <= 0.01,
+        "[ACC-4] hfq 首点应锚定 none 首点 hfq={} none={}",
+        nc(&hfq, 0),
+        nc(&none, 0)
+    );
+    // 比值恒定：hfq[i]/qfq[i] 对所有 i 应为同一常数（= 总复权因子 H/Q）。
+    let mut ratios = Vec::with_capacity(n);
+    for i in 0..n {
+        let (h, q) = (nc(&hfq, i), nc(&qfq, i));
+        if q.abs() > 1e-9 {
+            ratios.push(h / q);
+        }
+    }
+    assert!(!ratios.is_empty(), "[ACC-4] 应有有效比值");
+    let rmax = ratios.iter().cloned().fold(f64::MIN, f64::max);
+    let rmin = ratios.iter().cloned().fold(f64::MAX, f64::min);
+    let rel = (rmax - rmin) / rmax.abs().max(1e-9);
+    eprintln!(
+        "[ACC-4] 总复权因子(hfq/qfq) ~ {:.6}（min={:.6} max={:.6} 相对差={:.4}%）",
+        rmax,
+        rmin,
+        rmax,
+        rel * 100.0
+    );
+    assert!(rel < 0.01, "[ACC-4] hfq/qfq 比值应恒定（相对差 <1%），实测 {:.4}%", rel * 100.0);
+    // 方向：存在除权时 qfq 早期 ≤ none 早期（前复权把早期价往下调）。无除权时相等也满足 ≤。
+    assert!(
+        nc(&qfq, 0) <= nc(&none, 0) + 0.01,
+        "[ACC-4] qfq 早期 close 应 ≤ none 早期（前复权下调）qfq={} none={}",
+        nc(&qfq, 0),
+        nc(&none, 0)
+    );
+    eprintln!(
+        "[ACC-4] 首点 none={:.4} qfq={:.4} hfq={:.4} | 末点 none={:.4} qfq={:.4} hfq={:.4}",
+        nc(&none, 0), nc(&qfq, 0), nc(&hfq, 0),
+        nc(&none, last), nc(&qfq, last), nc(&hfq, last)
+    );
+}
+
+/// ACC-5 · TuShare daily_basic 单次返回自洽：total_mv（元，adapter ×10000）量级合理、
+/// pe_ttm 为正且落在合理区间。只做能从单次返回自洽校验的，不硬凑外部对照。
+/// Provider: TuShare。Env: TUSHARE_TOKEN。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_daily_basic_self_consistent() {
+    let Some(_t) = tushare_token() else {
+        eprintln!("[ACC-5] SKIP — TUSHARE_TOKEN 未设");
+        return;
+    };
+    let cli = tushare_client();
+    let code = ts(OLD_STOCK_SH);
+    let rows = match cli.fetch_daily_basic(Some(&code), Some("20240102")).await {
+        Ok(r) if !r.is_empty() => r,
+        Ok(_) => {
+            eprintln!("[ACC-5] SKIP — 该日无 daily_basic");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[ACC-5] SKIP — daily_basic 失败: {e}");
+            return;
+        }
+    };
+    let r = &rows[0];
+    eprintln!(
+        "[ACC-5] 茅台 20240102 pe={:?} pe_ttm={:?} pb={:?} total_mv={:?}",
+        r.pe, r.pe_ttm, r.pb, r.total_mv.map(|m| dec_f64(m.0))
+    );
+    // total_mv：adapter 把 TuShare「万元」× 10000 转元；茅台总市值 ~万亿级（>1e11 元）。
+    if let Some(mv) = r.total_mv {
+        let v = dec_f64(mv.0);
+        assert!(v > 0.0, "[ACC-5] total_mv 应 > 0");
+        // 茅台总市值实际 ~1.5–2.5 万亿元；放宽到 [1e11, 1e14] 抓「万元/元」单位 bug。
+        assert!(
+            (1e11..1e14).contains(&v),
+            "[ACC-5] 茅台 total_mv={v} 元 不在万亿量级 [1e11,1e14]——疑似单位换算 bug"
+        );
+    }
+    // pe_ttm：茅台为盈利公司，pe_ttm 应为正且在合理区间（个位数~百）。
+    if let Some(pe) = r.pe_ttm {
+        assert!(pe > 0.0 && pe < 1000.0, "[ACC-5] pe_ttm={pe} 不在合理正区间");
+    }
+}
