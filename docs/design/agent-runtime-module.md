@@ -182,37 +182,40 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 
 ### Skills（playbook，渐进披露，初始为空）
 
-> **定位对齐 Anthropic Agent Skills**（参考 Claude Code 的 skill 定义）：skill 是**自包含、可移植的「专长包」**（一份 `SKILL.md`：何时用 + 怎么做的说明），**不依赖、也不编排宿主 infra 的注册 tool**。模型按 description 自选某 skill、`load_skill` 取回正文后，**用自己已有的通用 tool（主要是 `run_bash`，以及文件 tool）按说明执行**。
+> **定位对齐 Anthropic Agent Skills**（参考 Claude Code 实际的 skill 定义）：skill 是**自包含、可移植的「专长包」**——一份 `SKILL.md`（何时用 + 怎么做）+（可选）随附资源。它**不依赖、也不编排宿主 infra 的注册 tool**；模型按 `description` 自选、`load_skill` 取回正文后，**用自己已有的通用能力按说明行事**。
 
-- **Skill = 模型驱动的自包含 playbook**（`SKILL.md`）：何时用（`description`）+ 怎么做（body 自然语言 / shell 步骤）。Skill 本身不执行、不是注册 handler；正文里**不写 `<use_tool>` 标签、不点名 infra/领域 tool**，而是描述「用 shell 跑什么、产出什么」。
-- **Tool（原语）与 Skill（playbook）是两个正交概念**：tool 是「手」，skill 是「剧本」。skill 不耦合具体 tool 集，换个宿主照样可用。
-- **执行手段**：agent 读完 skill 正文后，用自己的**通用 tool（`run_bash` / 文件）**去做；**不**要求 skill 去编排 `fetch_quotes` 这类领域 tool（领域 tool 是 agent 直接推理时用，不是 skill 的依赖）。
-- **初始不内置任何 skill**，全部走裸 tool；skill 后续按需补（模型用 `create_skill` 沉淀 / 产品负责人手写 `SKILL.md`）。**打包资源 / 脚本、`allowed-tools` 暂不做**（保持单 `SKILL.md`）。
+- **Skill = 模型驱动的自包含 playbook**：`SKILL.md` = frontmatter（`name` + `description`〔何时用，驱动选取〕）+ markdown body。body 是**专长 / 流程 / 规范 / 知识**，形态不限：可以是**纯交互流程**（如「文档协作三阶段」，全程不调任何工具）、**领域规范**（如表格的公式/数字格式约定）、带代码片段的步骤、或创作流程。
+- **不以 shell 为核心**：执行手段**因 skill 而异、不限定**——可能完全不用工具（纯流程），可能读写文件，可能跑随附脚本（经 `run_bash` / 执行工具）。shell 只是「跑随附脚本」时的一种手段，不是 skill 的定义要点。
+- 正文**不写 `<use_tool>` 标签、不点名宿主的 infra/领域 tool**（写死会耦合 skill，也会污染文本协议解析）；要用能力就用自然语言说「读取…/运行随附的 X 脚本/按这个流程做」，由模型用自己的通用 tool 落地。
+- **Tool（原语）与 Skill（playbook）正交**：tool 是「手」，skill 是「专长/剧本」；skill 不耦合具体 tool 集，换宿主照样可用。
+- **初始不内置任何 skill**；后续按需补（模型用 `create_skill` 沉淀 / 人手写 `SKILL.md`）。
 
 #### SKILL.md 格式与存盘
 
-- 每个 skill 一个 `SKILL.md`：**YAML frontmatter**（`name` + `description` 两个 string 字段）+ markdown 正文（body）。
+- 每个 skill 一个 `SKILL.md`：**YAML frontmatter**（`name` + `description` 两个 string 字段）+ markdown 正文（body）。正文是流程 / 规范 / 知识，**不写 `<use_tool>` 标签、不点名宿主 tool**：
   ```markdown
   ---
-  name: momentum-scan
-  description: 用 shell 计算并产出动量候选清单的固定流程
+  name: stock-research
+  description: 个股研究的标准流程与产出格式；当用户要求研究 / 分析某只股票时使用
   ---
 
-  # 动量扫描
-  自然语言 / shell 步骤（不写 <use_tool> 标签、不点名 infra tool）：
-  1. 用 run_bash 跑数据处理脚本，把候选写到工作区文件 …
-  2. 读回结果、按规则筛 …
+  # 个股研究流程
+  1. 先确认标的、时间范围与研究目的。
+  2. 按「估值 / 基本面 / 资金面 / 催化剂」四块组织分析。
+  3. 产出格式：结论先行 → 关键证据 → 风险 → 操作建议。
   ```
 - 存盘目录：`<skills_dir>/<name>/SKILL.md`，`<skills_dir>` = `<appData>/gangzi/skills/`（**独立于 workspace**，由 adapter / bootstrap 注入绝对路径，domain 不感知）。
 - `name` 必须是 **slug**（`^[a-z0-9][a-z0-9-]*$`），既作目录名也作 frontmatter `name`，**防路径穿越**（拒绝 `/`、`..`、大写、空、前导 `-`）。
 - frontmatter 解析用最小 YAML 子集（仅 `name` / `description` 两个 string 标量；实现手写，无 serde_yaml 依赖）；解析失败 / 缺字段的 SKILL.md 在索引中跳过，不拖垮整个索引。
+
+> **随附资源 / 脚本（第三级渐进披露，当前未做，后续可补）**：Anthropic 原版 skill 是个**文件夹**——`SKILL.md` 旁可放脚本（如 `scripts/*.py`）、参考文档（`reference.md`，正文用到时才 `load`）、模板（`templates/*`）。正文引用它们（"运行 `scripts/x.py`"/"详见 `reference.md`"），agent 用 `read_file` / `run_bash` 按需读 / 跑。这是 skill 真正强大的地方（pdf/xlsx 类 skill 靠它）。**当前实现只支持单个 `SKILL.md`（无随附文件）**，即只能做"纯流程 / 规范"型 skill；带脚本/资源的 skill 留作后续扩展。
 
 #### 渐进披露机制
 
 > 对齐 Claude Code skill 的渐进披露最佳实践：**只把索引放进 system prompt，正文按需加载**，避免无关 playbook 正文长期占用上下文 / token。
 
 1. **索引进 prompt**：Runtime 构建 system prompt 时，扫描 `<skills_dir>` 下所有 `SKILL.md`，解析出 `(name, description)`，在 tool 清单之后追加「## 可用 Skill（playbook）」索引段——每条 `- <name>: <description>`，并附一句协议说明「要按某 skill 行事，先调用 `load_skill` 取其完整说明」。索引按 `name` 字典序（prompt cache 稳定）；**为空时省略整段**。
-2. **正文按需 load**：system prompt **不含任何 skill 正文**；模型按 description 自选要用哪个 skill，调 `load_skill` 把该 skill 的完整 `SKILL.md`（frontmatter + body）拉进上下文，再据此**用自己的通用 tool（`run_bash` / 文件）执行**。
+2. **正文按需 load**：system prompt **不含任何 skill 正文**；模型按 description 自选要用哪个 skill，调 `load_skill` 把该 skill 的完整 `SKILL.md`（frontmatter + body）拉进上下文，再**据此行事**——用什么手段由 skill 内容决定（可能纯按流程对话、可能读写文件、可能跑随附脚本），不限定 shell。
 3. system prompt 的「tool 清单 + skill 索引」由 Runtime 注入后只读，LLM 不可改 / 看不见构建逻辑。
 
 #### `create_skill` / `load_skill` 契约
