@@ -114,9 +114,10 @@ type AgentToolName =
   | "write_file"
   | "edit_file"
   | "run_bash"
-  // Skill 编排（playbook，见「Skills」）
+  // 子 agent / skill（fork 隔离执行，见「子 Agent」「Skills」）
+  | "run_subagent"
   | "create_skill"
-  | "load_skill";
+  | "run_skill";
 
 type AgentRuntimeToolSpec = Omit<ToolSpec, "name"> & {
   name: AgentToolName;
@@ -180,9 +181,22 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 - `run_bash` 因危险面最大，默认只给前台可确认的 `user_chat`；后台 profile 默认不给（即使给，危险命令在无人确认时一律拒绝）。
 - 本地 tool 与 `allowTradingWrite` **正交**：给本地 tool 不放宽交易写权限；写交易仍受 `allowTradingWrite` + episode 前置约束（§2 / §4）。
 
-### Skills（playbook，渐进披露，初始为空）
+### 子 Agent（fork 隔离执行）
 
-> **定位对齐 Anthropic Agent Skills**（参考 Claude Code 实际的 skill 定义）：skill 是**自包含、可移植的「专长包」**——一份 `SKILL.md`（何时用 + 怎么做）+（可选）随附资源。它**不依赖、也不编排宿主 infra 的注册 tool**；模型按 `description` 自选、`load_skill` 取回正文后，**用自己已有的通用能力按说明行事**。
+> 对齐 Claude Code：一个 run 可以 **fork 出隔离子 agent** 执行一段子任务，跑完只把**结果**带回父对话。复用 Infra 的同一套 loop。
+
+- **`run_subagent{prompt, contextHint?, allowedTools?}` tool**：父 agent 调它 → Infra 起一个**子 run**：
+  - **独立上下文**（子 agent 自己的会话/消息，不与父共享历史）；
+  - **独立 token 预算**（父的预算扣减，子超限不拖垮父）；
+  - **继承父的渠道 / 模型**（**不**支持 per-skill/子 model 覆盖——本项目用统一渠道）；
+  - **工具集**：默认继承父的；`allowedTools` 给了就收紧到子集（可选）。
+  - 子 run 跑完，**只把最终结果文本**作为 `run_subagent` 的 tool 结果回灌父对话——中间过程（子的 tool 调用 / 试错）**不进父上下文**。
+- **嵌套**：子 agent 也能 `run_subagent` / `run_skill`，按 `queryDepth` 限深防失控。
+- 审计：子 run 的全量消息照常落 `agent_messages`（带自己的 conversationId + `parentRunId` 关联），可单独 replay。
+
+### Skills（playbook，CC 式 fork 执行，初始为空）
+
+> **定位对齐 Anthropic Agent Skills**（参考 Claude Code 实际实现）：skill 是**自包含、可移植的「专长包」**（一份 `SKILL.md`：何时用 + 怎么做 +（可选）随附资源）。**调用一个 skill = fork 一个子 agent 来跑它**（prompt = SKILL.md 正文 + args），跑完把结果带回——和 `run_subagent` 同一套机制。它**不依赖、也不编排宿主 infra 的注册 tool**；模型按 `description` 自选。
 
 - **Skill = 模型驱动的自包含 playbook**：`SKILL.md` = frontmatter（`name` + `description`〔何时用，驱动选取〕）+ markdown body。body 是**专长 / 流程 / 规范 / 知识**，形态不限：可以是**纯交互流程**（如「文档协作三阶段」，全程不调任何工具）、**领域规范**（如表格的公式/数字格式约定）、带代码片段的步骤、或创作流程。
 - **不以 shell 为核心**：执行手段**因 skill 而异、不限定**——可能完全不用工具（纯流程），可能读写文件，可能跑随附脚本（经 `run_bash` / 执行工具）。shell 只是「跑随附脚本」时的一种手段，不是 skill 的定义要点。
@@ -212,22 +226,23 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 
 #### 渐进披露机制
 
-> 对齐 Claude Code skill 的渐进披露最佳实践：**只把索引放进 system prompt，正文按需加载**，避免无关 playbook 正文长期占用上下文 / token。
+> 对齐 Claude Code 三级渐进披露：**只把索引放进 system prompt（父上下文）；正文只在 fork 出的子 agent 里加载**——父上下文永远看不到 skill 正文，只看到结果。
 
-1. **索引进 prompt**：Runtime 构建 system prompt 时，扫描 `<skills_dir>` 下所有 `SKILL.md`，解析出 `(name, description)`，在 tool 清单之后追加「## 可用 Skill（playbook）」索引段——每条 `- <name>: <description>`，并附一句协议说明「要按某 skill 行事，先调用 `load_skill` 取其完整说明」。索引按 `name` 字典序（prompt cache 稳定）；**为空时省略整段**。
-2. **正文按需 load**：system prompt **不含任何 skill 正文**；模型按 description 自选要用哪个 skill，调 `load_skill` 把该 skill 的完整 `SKILL.md`（frontmatter + body）拉进上下文，再**据此行事**——用什么手段由 skill 内容决定（可能纯按流程对话、可能读写文件、可能跑随附脚本），不限定 shell。
-3. system prompt 的「tool 清单 + skill 索引」由 Runtime 注入后只读，LLM 不可改 / 看不见构建逻辑。
+1. **一级·索引进 prompt**：Runtime 构建 system prompt 时，扫描 `<skills_dir>` 下所有 `SKILL.md`，解析出 `(name, description)`，在 tool 清单之后追加「## 可用 Skill」索引段——每条 `- <name>: <description>`，附一句说明「要用某 skill，调 `run_skill` 触发」。索引按 `name` 字典序（prompt cache 稳定）；**为空时省略整段**。token 成本只算 frontmatter（正文不进父上下文）。
+2. **二级·fork 执行**：模型按 description 自选，调 `run_skill{name, args?}` → Infra **fork 子 agent**：把该 `SKILL.md` 全文作为子 agent 的 prompt（+ 注入 skill 目录路径），继承父渠道/模型、（可选 frontmatter `allowed-tools` 收紧的）工具集跑；跑完**只把结果**作为 `run_skill` 的 tool 结果回灌父对话。skill 正文 + 子 agent 中间过程都**不进父上下文**。
+3. **三级·随附资源**：子 agent 按 SKILL.md 用自己的 `read_file` 读 `references/`、`run_bash` 跑 `scripts/`、用 `assets/` 产出（当前只支持单 SKILL.md，随附资源后续补）。
+4. system prompt 的「tool 清单 + skill 索引」由 Runtime 注入后只读，LLM 不可改 / 看不见构建逻辑。
 
-#### `create_skill` / `load_skill` 契约
+#### `create_skill` / `run_skill` 契约
 
-这两个是 skill 的**管理 tool**（注册进 `ToolRegistry`，经 `<use_tool>` 调用），不是领域能力：
+这两个是 skill 的**管理 / 触发 tool**（注册进 `ToolRegistry`，经 `<use_tool>` 调用）：
 
 ```ts
 // create_skill —— 把一段可复用 playbook 沉淀成 <skills_dir>/<name>/SKILL.md
 type CreateSkillToolInput = {
   name: string;          // slug，^[a-z0-9][a-z0-9-]*$（既是目录名也是 frontmatter name）
   description: string;   // 一句话说明（进 system prompt 索引，非空）
-  body: string;          // markdown 正文：完成任务时如何编排 tool
+  body: string;          // markdown 正文：完成任务的流程 / 规范 / 知识（不写 <use_tool> 标签）
 };
 type CreateSkillToolOutput = {
   path: string;          // 写入的 SKILL.md 绝对路径
@@ -236,20 +251,22 @@ type CreateSkillToolOutput = {
 // 错误：invalid_input（name 非 slug / 越出 skills 目录 / description 空 / 写盘失败）
 // 语义：同名覆盖更新（report created=false）；name 校验在写盘前，非法 name 不落任何文件。
 
-// load_skill —— 取某 skill 的完整 SKILL.md 正文（含 frontmatter）进上下文
-type LoadSkillToolInput = {
+// run_skill —— fork 一个子 agent 执行该 skill，返回结果（CC 式；不把正文灌进父上下文）
+type RunSkillToolInput = {
   name: string;          // skill slug（见 system prompt 的可用 Skill 索引）
+  args?: string;         // 传给 skill 的参数 / 任务输入
 };
-type LoadSkillToolOutput = {
+type RunSkillToolOutput = {
   name: string;
-  content: string;       // SKILL.md 全文（frontmatter + body），让模型看到完整 playbook
+  result: string;        // 子 agent 跑完该 skill 的最终结果文本（中间过程不回灌）
 };
-// 错误：not_found（skill 不存在）/ invalid_input（name 非 slug）
+// 错误：not_found（skill 不存在）/ invalid_input（name 非 slug）/ 子 run 失败透传
 ```
 
-- `load_skill` 返回**全文含 frontmatter**（不剥），让模型看到完整 playbook 上下文。
-- 副作用 / 幂等性：`create_skill` = `non_trading_write`，非幂等（覆盖写，`created` 是观测值）；`load_skill` = `none`，幂等（纯读）。
-- 这两个 tool 是「sink/source skill 文件」，不调用任何领域能力（Quotes / News / Account），也不经 `run_bash`。
+- **`run_skill` = fork 执行**：以该 `SKILL.md` 全文为子 agent 的 prompt（+ skill 目录路径 + args），继承父渠道/模型、（可选 `allowed-tools` 收紧的）工具集；只回灌结果。复用「子 Agent」机制。
+- **不支持 per-skill model 覆盖**（本项目统一渠道）；`allowed-tools` frontmatter **可选**（不写则继承父工具集；写了收紧到子集——对模拟交易是安全开关，如研究类 skill 不给 `operate_account`）。
+- 副作用 / 幂等性：`create_skill` = `non_trading_write`，非幂等（覆盖写）；`run_skill` 的副作用 = 子 agent 实际做了什么（取决于 skill 内容），非幂等。
+- `create_skill` 不调任何领域能力、不经 `run_bash`；`run_skill` 本身只 fork，子 agent 用什么工具由 skill 决定。
 
 ### 只读 CLI（可选 / 后续；人用旁路，不在 agent 关键路径）
 
@@ -1165,7 +1182,7 @@ type RunBashToolOutput = {
 //       invalid_input（cwd 不存在等）
 ```
 
-Skill 编排 tool（`create_skill` / `load_skill`）的 input / output / 错误见 §「Skills（playbook，渐进披露）」的 `CreateSkillToolInput` / `LoadSkillToolInput`。它们读写 `<skills_dir>`（独立于 `<workspace>`），不读写工作区，不调领域能力。
+Skill tool（`create_skill` / `run_skill`）的 input / output / 错误见 §「Skills（CC 式 fork 执行）」的 `CreateSkillToolInput` / `RunSkillToolInput`。`create_skill` 读写 `<skills_dir>`（独立于 `<workspace>`）；`run_skill` 不直接读写，而是 fork 一个子 agent 跑该 skill（子 agent 继承父的渠道/模型/effort/工具集，可选 `allowed-tools` 收紧）。
 
 副作用 / 幂等性：
 
@@ -1176,7 +1193,8 @@ Skill 编排 tool（`create_skill` / `load_skill`）的 input / output / 错误�
 | `edit_file` | non_trading_write | **非幂等**（替换后再次执行同一 `oldString` 通常 `invalid_input` 未命中） |
 | `run_bash` | non_trading_write（取决于命令；可改本地状态） | **非幂等**（任意命令，副作用不可假定） |
 | `create_skill` | non_trading_write（写 `<skills_dir>/<name>/SKILL.md`） | **非幂等**（覆盖写；`created` 是观测值） |
-| `load_skill` | none | 幂等（纯读 SKILL.md） |
+| `run_skill` | fork 子 agent（副作用 = 子 agent 实际所为，取决于 skill 内容） | **非幂等** |
+| `run_subagent` | fork 子 agent（副作用 = 子 agent 实际所为） | **非幂等** |
 
 - 所有本地 tool 的 `path` / `cwd` 在 handler 前**规范化 + 工作区校验**（write/edit 强制在 `<workspace>` 内，read/run 路径不受限但仍规范化）。
 - `run_bash` 危险命令门禁见 §2「run_bash 危险命令门禁」；门禁 / 工作区校验是约定级，不是强隔离。
