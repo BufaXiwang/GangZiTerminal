@@ -9,6 +9,11 @@ pub mod scheduler;
 pub mod service;
 pub mod snapshot;
 
+/// 实网集成测试（#[ignore]，不在普通 cargo test 运行）。
+/// Account ↔ Quotes 集成：真实行情驱动成交 / 估值。
+#[cfg(test)]
+mod live_integration_tests;
+
 pub use eval::{evaluate_account_triggers, EvalDeps};
 pub use quote_gateway::{AccountQuoteGateway, QuotesFacadeGateway};
 pub use scheduler::{spawn_account_eval_scheduler, AccountSchedulerHandle};

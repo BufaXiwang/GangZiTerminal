@@ -24,7 +24,7 @@ export function Sidebar() {
           <NavLink
             key={to}
             to={to}
-            end={to === ROUTES.market}
+            end={to === ROUTES.news}
             className={({ isActive }) =>
               `sidebar-link${isActive ? " active" : ""}`
             }

@@ -27,15 +27,20 @@ NewsNow 是高频聚合资讯来源，用于补充实时新闻列表。NewsNow a
 
 ### 默认 channel（compile-time）
 
+> 与 `infrastructure/news/registry.rs::DEFAULT_SOURCES` 顺序一一对应（真源是 registry，本表是镜像）。
+
 | source_id | display_name | channel |
 |---|---|---|
 | `newsnow:cls-telegraph` | 财联社电报 | `cls-telegraph` |
-| `newsnow:wallstreetcn-quick` | 华尔街见闻快讯 | `wallstreetcn-quick` |
 | `newsnow:jin10` | 金十数据 | `jin10` |
 | `newsnow:zaobao` | 联合早报 | `zaobao` |
 | `newsnow:36kr-quick` | 36氪快讯 | `36kr-quick` |
 | `newsnow:gelonghui` | 格隆汇 | `gelonghui` |
 | `newsnow:cls-depth` | 财联社深度 | `cls-depth` |
+| `newsnow:wallstreetcn` | 华尔街见闻 | `wallstreetcn` |
+| `newsnow:fastbull-news` | 法布财经 | `fastbull-news` |
+| `newsnow:cankaoxiaoxi` | 参考消息 | `cankaoxiaoxi` |
+| `newsnow:sputniknewscn` | 卫星通讯社 | `sputniknewscn` |
 
 支持的全量 channel 见 NewsNow upstream `getters.ts`，覆盖财联社 / 华尔街见闻 / 金十 / 36 氪快讯 / 格隆汇 / 知乎 / V2EX / 微博 / 抖音 等。新增默认 source 须改 `infrastructure/news/registry.rs::DEFAULT_SOURCES` 并同步更新这张表。
 
@@ -64,7 +69,7 @@ NewsNow 不同 channel 的发布时间字段位置和格式不同，adapter 按�
 |---|---|---|---|
 | `cls-telegraph` | 顶层 `pubDate` | 数字毫秒 | 直接 `ms_to_dt` |
 | `jin10` | 顶层 `pubDate` | 北京时间裸字符串 `YYYY-MM-DD HH:MM:SS`（无时区） | 按 UTC+8 解释，减 8h 得 UTC |
-| `wallstreetcn-quick` | 嵌套 `extra.date` | 数字毫秒 | 直接 `ms_to_dt` |
+| `wallstreetcn` | 嵌套 `extra.date` | 数字毫秒 | 直接 `ms_to_dt` |
 
 探测顺序：先查顶层 `["publishedAt", "time", "pubDate", "published"]`，未命中再查 `extra.{date,time}`。裸字符串一律视为北京时间（NewsNow 聚合的国内财经源默认 Beijing）。新增 channel 若有新的时间字段位置 / 格式，必须扩展 `pick_time` 探测列表并更新此表。
 

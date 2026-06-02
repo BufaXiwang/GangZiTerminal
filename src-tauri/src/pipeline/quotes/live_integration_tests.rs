@@ -635,6 +635,7 @@ async fn quotes_live_tdx_minute_kline() {
 #[tokio::test]
 #[ignore]
 async fn quotes_live_em_minute_kline() {
+    use crate::infrastructure::quotes::eastmoney::client::EmError;
     let em = EastmoneyProvider::new().expect("build em");
     let code = ts(OLD_STOCK_SH);
     match em.fetch_minute_kline(&code, MinuteKlinePeriod::M5, 240).await {
@@ -642,7 +643,10 @@ async fn quotes_live_em_minute_kline() {
             eprintln!("[C6] EM 茅台 5m 分钟 K 根数 = {}", pts.len());
             assert!(!pts.is_empty(), "EM 应返回分钟 K");
         }
-        Err(e) => eprintln!("[C6] SKIP — EM 不可达（本环境实测 000）: {e}"),
+        // 按 error 类型区分：连接级失败（000/超时/限流断连）= 真不可达 → skip；
+        // server 有响应但 data:null（Empty）/ 解析失败 = 可达但坏 → fail（这正是缺 end 参数的 bug）。
+        Err(EmError::Http(e)) => eprintln!("[C6] SKIP — EM 网络不可达/限流: {e}"),
+        Err(e) => panic!("[C6] EM 有响应但分钟 K 空/解析失败 —— 应修不应 skip: {e}"),
     }
 }
 
@@ -654,6 +658,7 @@ async fn quotes_live_em_minute_kline() {
 #[tokio::test]
 #[ignore]
 async fn quotes_live_em_daily_kline() {
+    use crate::infrastructure::quotes::eastmoney::client::EmError;
     let em = EastmoneyProvider::new().expect("build em");
     let code = ts(OLD_STOCK_SH);
     match em.fetch_daily_kline(&code, 120).await {
@@ -677,8 +682,28 @@ async fn quotes_live_em_daily_kline() {
             if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
                 eprintln!("[C7]   日期区间 {} .. {}", first.date.format(), last.date.format());
             }
+            // 量价单位自洽（EM volume 手×100→股、amount 元）：取一根高量 bar，
+            // vwap = amount/volume 应落在 [low*0.9, high*1.1]，否则疑似手/股 或 万元/元 单位 bug。
+            if let Some(p) = pts
+                .iter()
+                .rfind(|p| p.volume.map(|v| v.0 > 100_000).unwrap_or(false) && p.amount.is_some())
+            {
+                let vol = p.volume.unwrap().0 as f64;
+                let amt = dec_f64(p.amount.unwrap().0);
+                let vwap = amt / vol;
+                let (lo, hi) = (dec_f64(p.low.0), dec_f64(p.high.0));
+                eprintln!("[C7]   量价自洽 vwap={vwap:.2} low={lo:.2} high={hi:.2} (vol={vol} amt={amt})");
+                assert!(
+                    vwap > lo * 0.9 && vwap < hi * 1.1,
+                    "[C7] vwap={vwap} 越界 [{}*0.9,{}*1.1]——疑似 EM 量/额单位 bug（手/股 或 万元/元）",
+                    lo,
+                    hi
+                );
+            }
         }
-        Err(e) => eprintln!("[C7] SKIP — EM 不可达（本环境实测 000）: {e}"),
+        // 连接级失败 = 真不可达 → skip；有响应但 data:null（Empty）/解析失败 = 可达但坏 → fail。
+        Err(EmError::Http(e)) => eprintln!("[C7] SKIP — EM 网络不可达/限流: {e}"),
+        Err(e) => panic!("[C7] EM 有响应但日线 K 空/解析失败 —— 应修不应 skip: {e}"),
     }
 }
 
@@ -1571,6 +1596,47 @@ async fn quotes_acc_cross_source_quote_tdx_vs_tencent() {
             let (a, b) = (dec_f64(a.0), dec_f64(b.0));
             eprintln!("[{tag}] {code} price TDX={a:.3} 腾讯={b:.3}（交易时段才有意义）");
             assert!(close_enough(a, b), "[{tag}] 现价跨源不一致 TDX={a} 腾讯={b}");
+        }
+        // 成交量跨源单位一致性（捕捉 手/股 normalize bug）：
+        // 腾讯已知 ×100 转股（shared-types §Volume：盘口/成交量统一为股，不用手），TDX 必须同单位。
+        // 总成交量是当日累计、两源同一交易日 → 数量级必须一致（ratio≈1，绝不应差 ~100×）。
+        if let (Some(a), Some(b)) = (tdx.volume, txq.volume) {
+            let (a, b) = (a.0 as f64, b.0 as f64);
+            if a > 0.0 && b > 0.0 {
+                let ratio = a / b;
+                eprintln!("[{tag}] {code} 总成交量 TDX={a:.0} 腾讯={b:.0} ratio={ratio:.4}");
+                assert!(
+                    ratio > 0.5 && ratio < 2.0,
+                    "[{tag}] 总成交量跨源比 {ratio:.4} 偏离 1（疑似 手/股 单位 bug）TDX={a} 腾讯={b}"
+                );
+            }
+        }
+        // 卖一盘口量跨源（depth 交易时段变化快，只查不差 ~100× 数量级）。
+        if let (Some(a), Some(b)) = (
+            tdx.ask.first().and_then(|l| l.volume),
+            txq.ask.first().and_then(|l| l.volume),
+        ) {
+            let (a, b) = (a.0 as f64, b.0 as f64);
+            if a > 0.0 && b > 0.0 {
+                let ratio = a / b;
+                eprintln!("[{tag}] {code} 卖一量 TDX={a:.0} 腾讯={b:.0} ratio={ratio:.4}");
+                assert!(
+                    ratio > 0.1 && ratio < 10.0,
+                    "[{tag}] 卖一盘口量跨源差 ~100×（疑似 手/股 单位 bug）TDX={a} 腾讯={b}"
+                );
+            }
+        }
+        // 成交额跨源单位一致性（元）：腾讯 ×10000（万元→元），TDX 须同为元（shared-types §Amount）。
+        if let (Some(a), Some(b)) = (tdx.amount, txq.amount) {
+            let (a, b) = (dec_f64(a.0), dec_f64(b.0));
+            if a > 0.0 && b > 0.0 {
+                let ratio = a / b;
+                eprintln!("[{tag}] {code} 成交额 TDX={a:.0} 腾讯={b:.0} ratio={ratio:.4}");
+                assert!(
+                    ratio > 0.5 && ratio < 2.0,
+                    "[{tag}] 成交额跨源比 {ratio:.4} 偏离 1（疑似 万元/元 单位 bug）TDX={a} 腾讯={b}"
+                );
+            }
         }
     }
     if !any_compared {

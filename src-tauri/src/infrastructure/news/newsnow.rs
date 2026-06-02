@@ -411,4 +411,144 @@ mod tests {
         assert!(items[0].url.as_deref() == Some("https://a.com/x"));
         assert!(warnings.iter().any(|w| w.skipped_count == Some(1)));
     }
+
+    /// Spec references/news/newsnow.md: 同一 channel payload 重复 normalize 不生成重复主记录
+    /// （稳定 ID 去重）。这里 normalize 同一 payload 两次，断言 ID 完全一致。
+    #[test]
+    fn normalize_is_stable_id_dedup() {
+        let p = serde_json::json!({
+            "items": [
+                {"id": "1", "title": "财联社快讯", "url": "https://www.cls.cn/detail/123", "pubDate": 1735689600000_i64 },
+            ]
+        });
+        let (a, _) = normalize_payload("newsnow:cls-telegraph", &p);
+        let (b, _) = normalize_payload("newsnow:cls-telegraph", &p);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].id, b[0].id, "same payload → same stable id");
+        // URL 路径优先：ID 以 source:url: 前缀
+        assert!(a[0].id.starts_with("newsnow:cls-telegraph:url:"));
+    }
+
+    /// Spec references/news/newsnow.md: 无 title 的 item 跳过并计入 skipped_count；
+    /// 标题即全文(jin10)的裸北京时间字符串能解析。
+    #[test]
+    fn normalize_jin10_naive_beijing_time() {
+        let p = serde_json::json!({
+            "items": [
+                {"id": "j1", "title": "金十快讯", "pubDate": "2026-05-29 11:31:24" },
+            ]
+        });
+        let (items, _) = normalize_payload("newsnow:jin10", &p);
+        assert_eq!(items.len(), 1);
+        // 11:31:24 北京 = 03:31:24 UTC
+        let pa = items[0].published_at.expect("published_at");
+        assert_eq!(pa.to_rfc3339(), "2026-05-29T03:31:24+00:00");
+        // 无 URL 且有 provider_item_id → id 走 item 路径
+        assert!(items[0].id.starts_with("newsnow:jin10:item:"));
+    }
+
+    // ======================================================================
+    // 实网 live 测试 —— 打真实 newsnow.busiyi.world。默认 #[ignore]。
+    // 运行：cargo test --manifest-path src-tauri/Cargo.toml \
+    //   infrastructure::news::newsnow::tests::news_live_ -- --ignored --nocapture
+    // 不可达时优雅 skip（打印原因），不 panic。
+    // ======================================================================
+
+    fn live_source(channel: &str) -> NewsSourceRef {
+        NewsSourceRef {
+            source_id: format!("newsnow:{channel}"),
+            provider: "newsnow".to_string(),
+            feed_url: Some(format!(
+                "https://newsnow.busiyi.world/api/s?id={channel}&latest"
+            )),
+            display_name: None,
+            enabled: true,
+        }
+    }
+
+    /// 真实拉取 NewsNow 多个 channel，验内容准确性：
+    /// - 返回非空、每条有 title、source == newsnow:<channel>
+    /// - 时间字段（若有）可解析且在合理范围（2020..now+1d）
+    /// - 去重生效（无重复 id）
+    /// - 整源成功时 failure = None
+    #[tokio::test]
+    #[ignore]
+    async fn news_live_newsnow_fetch_content_accuracy() {
+        let provider = match NewsNowProvider::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[skip] cannot build NewsNowProvider: {e}");
+                return;
+            }
+        };
+        let lower = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let upper = Utc::now() + chrono::Duration::days(1);
+        let mut any_reached = false;
+
+        for channel in ["cls-telegraph", "wallstreetcn", "jin10"] {
+            let src = live_source(channel);
+            let (items, warnings, failure) = provider.fetch(&src).await;
+            if let Some(f) = failure {
+                eprintln!("[skip] {channel}: provider failure {:?}: {:?}", f.code, f.message);
+                continue;
+            }
+            any_reached = true;
+            assert!(!items.is_empty(), "{channel}: expected non-empty items");
+            println!("[{channel}] fetched {} items, {} warnings", items.len(), warnings.len());
+
+            let mut ids = std::collections::HashSet::new();
+            for it in &items {
+                assert!(!it.title.trim().is_empty(), "{channel}: every item must have title");
+                assert_eq!(it.source, format!("newsnow:{channel}"), "{channel}: source must match");
+                assert!(
+                    ids.insert(it.id.clone()),
+                    "{channel}: duplicate id {} (dedup must hold)",
+                    it.id
+                );
+                if let Some(pa) = it.published_at {
+                    assert!(
+                        pa >= lower && pa <= upper,
+                        "{channel}: published_at {pa} out of sane range [{lower}, {upper}]"
+                    );
+                }
+                // payload 必须保存 provider 原始信息
+                assert!(it.payload.get("provider").is_some(), "payload.provider must exist");
+            }
+            // 打印一条样本
+            let sample = &items[0];
+            println!(
+                "    sample: title={:?} url={:?} published_at={:?}",
+                sample.title, sample.url, sample.published_at
+            );
+        }
+        if !any_reached {
+            eprintln!("[skip] no NewsNow channel reachable; treated as skip");
+        }
+    }
+
+    /// provider_unavailable 优雅降级：打一个不可达 host，断言映射为 provider_unavailable
+    /// 且不 panic。该测试不依赖外网内容，但走真实 DNS/连接（标 ignore 避免 CI 抖动）。
+    #[tokio::test]
+    #[ignore]
+    async fn news_live_newsnow_unreachable_maps_provider_unavailable() {
+        let provider = NewsNowProvider::new().unwrap();
+        let src = NewsSourceRef {
+            source_id: "newsnow:unreachable".to_string(),
+            provider: "newsnow".to_string(),
+            feed_url: Some("https://newsnow-bc-test.invalid/api/s?id=x".to_string()),
+            display_name: None,
+            enabled: true,
+        };
+        let (items, _warnings, failure) = provider.fetch(&src).await;
+        assert!(items.is_empty());
+        let f = failure.expect("unreachable host must produce a failure");
+        assert_eq!(
+            f.code,
+            ErrorCode::ProviderUnavailable,
+            "unreachable host → provider_unavailable, got {:?}: {:?}",
+            f.code, f.message
+        );
+        assert_eq!(f.provider, "newsnow");
+        println!("[ok] unreachable mapped to {:?}", f.code);
+    }
 }

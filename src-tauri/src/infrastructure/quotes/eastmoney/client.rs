@@ -57,8 +57,10 @@ impl EastmoneyProvider {
             MinuteKlinePeriod::M30 => 30,
             MinuteKlinePeriod::M60 => 60,
         };
+        // EM kline/get 现在**必须带 `end`**（否则 rc:102 / data:null）；用远期 end + lmt
+        // 返回「最近 N 根」。注意：一旦带 `beg=0` EM 会忽略 lmt 倒灌全量历史，所以只给 end+lmt、不给 beg。
         let url = format!(
-            "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt={}&fqt=0&lmt={}",
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt={}&fqt=0&end=20500101&lmt={}",
             secid, klt, count
         );
         #[derive(Deserialize)]
@@ -214,8 +216,9 @@ impl EastmoneyProvider {
         count: u32,
     ) -> Result<Vec<KlinePoint>, EmError> {
         let secid = secid_of(ts_code);
+        // 见 fetch_minute_kline 注释：EM kline/get 必须带 `end`，只给 end+lmt 取「最近 N 根」。
         let url = format!(
-            "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=0&lmt={}",
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=0&end=20500101&lmt={}",
             secid, count
         );
         #[derive(Deserialize)]
@@ -370,8 +373,8 @@ fn parse_bj_universe(body: &str) -> Result<Vec<(String, String)>, EmError> {
 ///
 /// BJ 前缀证据（Spec finding #2）：EM push2 对北交所使用 market=0 前缀（与 SZ 同），
 /// `2.<code>` 实测无数据。审计在可用环境（2026-05-30）下用 `0.<code>` 拿到了 payload。
-/// 故保留 BJ → `0.`。注意：此前缀无法在当前沙箱内复测（EM /api/qt/* 出口被屏蔽，
-/// HTTP 层无响应），如未来 EM 改规则需重新 live 验证 920 系新代码。
+/// 故保留 BJ → `0.`。复测（2026-06-02）：EM 可达，BJ universe `0.` 前缀拿到 100 标的；
+/// 如未来 EM 改规则需重新 live 验证 920 系新代码。
 /// EM 已退出实时报价路径（spec §5），secid 仅用于 K 线 / 分时 / 日线 / universe。
 pub(crate) fn secid_of(ts_code: &TsCode) -> String {
     let market = match ts_code.market() {

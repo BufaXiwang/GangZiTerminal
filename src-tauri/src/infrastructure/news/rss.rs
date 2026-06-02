@@ -286,6 +286,8 @@ fn first_or_none(authors: &[feed_rs::model::Person]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
+    use chrono::TimeZone;
 
     #[test]
     fn strip_html_basic() {
@@ -305,5 +307,113 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(items[0].id.starts_with("rss:t:url:"));
         assert!(warnings.iter().any(|w| w.skipped_count == Some(1)));
+    }
+
+    /// Spec rss.md: 同一 RSS item 重复刷新不生成重复 news_items（稳定 ID）；
+    /// URL tracking query / fragment 不影响稳定 ID。
+    #[test]
+    fn normalize_feed_stable_id_strips_tracking_and_fragment() {
+        let raw1 = br#"<?xml version="1.0"?>
+        <rss version="2.0"><channel><title>t</title>
+            <item><title>Headline</title><link>https://a.com/post?utm_source=x&amp;b=2#frag</link><guid>g1</guid></item>
+        </channel></rss>"#;
+        let raw2 = br#"<?xml version="1.0"?>
+        <rss version="2.0"><channel><title>t</title>
+            <item><title>Headline</title><link>https://a.com/post?b=2</link><guid>g1</guid></item>
+        </channel></rss>"#;
+        let f1 = feed_parser::parse(&raw1[..]).unwrap();
+        let f2 = feed_parser::parse(&raw2[..]).unwrap();
+        let (i1, _) = normalize_feed("rss:t", &f1);
+        let (i2, _) = normalize_feed("rss:t", &f2);
+        assert_eq!(i1.len(), 1);
+        assert_eq!(i2.len(), 1);
+        assert_eq!(
+            i1[0].id, i2[0].id,
+            "tracking query + fragment must not change stable id"
+        );
+        // canonical URL 已去 tracking / fragment
+        assert_eq!(i1[0].url.as_deref(), Some("https://a.com/post?b=2"));
+    }
+
+    // ======================================================================
+    // 实网 live 测试 —— 打真实公开 RSS feed。默认 #[ignore]。
+    // 运行：cargo test --manifest-path src-tauri/Cargo.toml \
+    //   infrastructure::news::rss::tests::news_live_ -- --ignored --nocapture
+    // 不可达时优雅 skip（打印原因），不 panic。
+    // env: NEWS_RSS_LIVE_FEED 可覆盖默认 feed_url。
+    // ======================================================================
+
+    /// 真实拉一个公开 RSS feed，验内容准确性：
+    /// - items 非空、每条有 title、source == rss:<id>
+    /// - 时间字段（若有）可解析且在合理范围
+    /// - 去重（无重复 id）
+    /// - 整源成功时 failure = None
+    #[tokio::test]
+    #[ignore]
+    async fn news_live_rss_fetch_content_accuracy() {
+        use crate::domain::news::source::NewsSourceRef;
+        // 默认用一个稳定的公开 feed；可用 env 覆盖。
+        let feed_url = std::env::var("NEWS_RSS_LIVE_FEED")
+            .unwrap_or_else(|_| "https://feeds.bbci.co.uk/news/world/rss.xml".to_string());
+        let provider = match RssProvider::new() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[skip] cannot build RssProvider: {e}");
+                return;
+            }
+        };
+        let src = NewsSourceRef {
+            source_id: "rss:live-test".to_string(),
+            provider: "rss".to_string(),
+            feed_url: Some(feed_url.clone()),
+            display_name: None,
+            enabled: true,
+        };
+        let (items, warnings, failure) = provider.fetch(&src).await;
+        if let Some(f) = failure {
+            eprintln!("[skip] rss feed {feed_url} failure {:?}: {:?}", f.code, f.message);
+            return;
+        }
+        assert!(!items.is_empty(), "expected non-empty RSS items from {feed_url}");
+        println!("[rss] {feed_url}: {} items, {} warnings", items.len(), warnings.len());
+
+        let lower = Utc.with_ymd_and_hms(2010, 1, 1, 0, 0, 0).unwrap();
+        let upper = Utc::now() + chrono::Duration::days(2);
+        let mut ids = std::collections::HashSet::new();
+        for it in &items {
+            assert!(!it.title.trim().is_empty(), "every item must have title");
+            assert_eq!(it.source, "rss:live-test");
+            assert!(ids.insert(it.id.clone()), "duplicate id {} in RSS feed", it.id);
+            if let Some(pa) = it.published_at {
+                assert!(pa >= lower && pa <= upper, "published_at {pa} out of range");
+            }
+        }
+        let sample = &items[0];
+        println!(
+            "    sample: title={:?} url={:?} published_at={:?}",
+            sample.title, sample.url, sample.published_at
+        );
+    }
+
+    /// provider_unavailable：不可达 host 映射为 provider_unavailable（retryable），不 panic。
+    #[tokio::test]
+    #[ignore]
+    async fn news_live_rss_unreachable_maps_provider_unavailable() {
+        use crate::domain::news::source::NewsSourceRef;
+        let provider = RssProvider::new().unwrap();
+        let src = NewsSourceRef {
+            source_id: "rss:unreachable".to_string(),
+            provider: "rss".to_string(),
+            feed_url: Some("https://rss-bc-test.invalid/feed.xml".to_string()),
+            display_name: None,
+            enabled: true,
+        };
+        let (items, _w, failure) = provider.fetch(&src).await;
+        assert!(items.is_empty());
+        let f = failure.expect("unreachable host must produce failure");
+        assert_eq!(f.code, ErrorCode::ProviderUnavailable);
+        assert_eq!(f.provider, "rss");
+        assert_eq!(f.retryable, Some(true));
+        println!("[ok] rss unreachable → {:?}", f.code);
     }
 }

@@ -772,8 +772,12 @@ fn map_security_quote(
     let open = scaled_price(raw.open);
     let high = scaled_price(raw.high);
     let low = scaled_price(raw.low);
+    // TDX security_quotes 的成交量 / 盘口量单位是「手」；canonical `Volume` 统一为「股」
+    // （shared-types.md §Volume：盘口/成交量统一为股，不使用手；quotes-module.md §盘口 line 215）。
+    // ×100 转股，与腾讯 adapter（mod.rs ×100）保持同一单位。
+    // 注：K 线 security_bars 的 volume 已是股（走 map_daily_bar），不经此路径，不要 ×100。
     let volume = if raw.vol > 0.0 {
-        Some(Volume(raw.vol as i64))
+        Some(Volume((raw.vol * 100.0) as i64))
     } else {
         None
     };
@@ -796,10 +800,11 @@ fn map_security_quote(
     let mut bid: Vec<crate::domain::quotes::QuoteDepthLevel> = Vec::with_capacity(5);
     let mut ask: Vec<crate::domain::quotes::QuoteDepthLevel> = Vec::with_capacity(5);
     for level in raw.book.iter() {
+        // 盘口量同样「手」→「股」×100（见上方 volume 注释）。
         bid.push(crate::domain::quotes::QuoteDepthLevel {
             price: scaled_price(level.bid),
             volume: if level.bid_vol > 0.0 {
-                Some(Volume(level.bid_vol as i64))
+                Some(Volume((level.bid_vol * 100.0) as i64))
             } else {
                 None
             },
@@ -807,7 +812,7 @@ fn map_security_quote(
         ask.push(crate::domain::quotes::QuoteDepthLevel {
             price: scaled_price(level.ask),
             volume: if level.ask_vol > 0.0 {
-                Some(Volume(level.ask_vol as i64))
+                Some(Volume((level.ask_vol * 100.0) as i64))
             } else {
                 None
             },
@@ -1049,6 +1054,22 @@ mod tests {
         // adapter 不派生 warning
         assert!(q.warnings.is_empty());
         assert!(q.freshness.warning.is_none());
+    }
+
+    /// 回归：security_quotes 的成交量 / 盘口量是「手」，必须 ×100 转「股」
+    /// （shared-types §Volume / quotes-module §盘口）。曾漏转，导致 account 成交模拟
+    /// 把 2 手当 2 股、现实只成交极少量 + UI 量 100× 偏低。
+    #[test]
+    fn map_security_quote_volume_and_depth_scaled_hand_to_shares() {
+        let raw = sample_raw(); // vol=1234567 手, bid_vol[0]=500 手, ask_vol[0]=600 手
+        let code = TsCode::parse("600519.SH").unwrap();
+        let td = TradeDate::parse("20260526").unwrap();
+        let q = map_security_quote(&raw, code, InstrumentCategory::Stock, None, td, Utc::now());
+        assert_eq!(q.volume.unwrap().0, 123_456_700, "总成交量 手×100 → 股");
+        assert_eq!(q.bid[0].volume.unwrap().0, 50_000, "买一量 500 手 → 50000 股");
+        assert_eq!(q.ask[0].volume.unwrap().0, 60_000, "卖一量 600 手 → 60000 股");
+        // 盘口量在股单位下应为 100 整数倍（手×100 必然成立）。
+        assert_eq!(q.bid[0].volume.unwrap().0 % 100, 0);
     }
 
     #[test]

@@ -7,14 +7,8 @@
 //! - 失败后丢弃 client；下次重连（spec §5 reference 规则）。
 
 use super::{Bar, BarCategory, MinuteTimePoint, TdxHqClient, TdxMarket};
-use crate::domain::quotes::{
-    KlinePeriod, KlinePoint, MinuteKlinePeriod, MinuteKlinePoint, QuoteDepthLevel, QuoteSource,
-    StockQuote, TradeStatus,
-};
-use crate::domain::shared::{
-    Amount, FreshnessStatus, InstrumentCategory, Market, OccurredAt, Price, TimestampMs, TradeDate,
-    TsCode, Volume,
-};
+use crate::domain::quotes::{KlinePeriod, KlinePoint, MinuteKlinePeriod, MinuteKlinePoint};
+use crate::domain::shared::{Amount, Market, Price, TimestampMs, TradeDate, TsCode, Volume};
 use chrono::{NaiveDate, TimeZone, Utc};
 use chrono_tz::Asia::Shanghai;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
@@ -32,108 +26,6 @@ pub fn tdx_market_for(ts_code: &TsCode) -> Option<TdxMarket> {
 /// 把 6 位代码切出来。
 fn code6(ts_code: &TsCode) -> &str {
     &ts_code.as_str()[..6]
-}
-
-/// 把 TDX `SecurityQuote` 翻译成 canonical `StockQuote`。
-///
-/// 调用方负责：
-/// - 已知 `TsCode` 和 `InstrumentCategory`（不从 TDX 推断）。
-/// - 已知请求时刻 `now`（用于 `capturedAt`）。
-/// - 已知 eligible `tradeDate`（由 `MarketTimeContext` 派生）。
-///
-/// 输出 freshness 仅填 `source = "tdx"` 占位；最终 freshness 由 query facade 派生。
-pub fn map_security_quote(
-    raw: &super::SecurityQuote,
-    ts_code: TsCode,
-    category: InstrumentCategory,
-    name: Option<String>,
-    trade_date: TradeDate,
-    now: OccurredAt,
-) -> StockQuote {
-    let price = f64_to_price(raw.price);
-    let prev = f64_to_price(raw.last_close);
-    let open = f64_to_price(raw.open);
-    let high = f64_to_price(raw.high);
-    let low = f64_to_price(raw.low);
-    let volume = if raw.vol > 0.0 {
-        Some(Volume(raw.vol as i64))
-    } else {
-        None
-    };
-    let amount = if raw.amount > 0.0 {
-        f64_to_amount(raw.amount)
-    } else {
-        None
-    };
-    let change = match (price, prev) {
-        (Some(p), Some(pc)) => Some(Price(p.0 - pc.0)),
-        _ => None,
-    };
-    let change_percent = match (price, prev) {
-        (Some(p), Some(pc)) if pc.0 > Decimal::ZERO => {
-            let pct = ((p.0 - pc.0) / pc.0 * Decimal::from(100)).round_dp(4);
-            pct.to_string().parse::<f64>().ok()
-        }
-        _ => None,
-    };
-
-    // 五档盘口
-    let mut bid: Vec<QuoteDepthLevel> = Vec::with_capacity(5);
-    let mut ask: Vec<QuoteDepthLevel> = Vec::with_capacity(5);
-    for level in raw.book.iter() {
-        bid.push(QuoteDepthLevel {
-            price: f64_to_price(level.bid),
-            volume: if level.bid_vol > 0.0 {
-                Some(Volume(level.bid_vol as i64))
-            } else {
-                None
-            },
-        });
-        ask.push(QuoteDepthLevel {
-            price: f64_to_price(level.ask),
-            volume: if level.ask_vol > 0.0 {
-                Some(Volume(level.ask_vol as i64))
-            } else {
-                None
-            },
-        });
-    }
-
-    StockQuote {
-        ts_code,
-        name,
-        category,
-        trade_date,
-        price,
-        previous_close: prev,
-        open,
-        high,
-        low,
-        change,
-        change_percent,
-        volume,
-        amount,
-        turnover_rate: None,
-        volume_ratio: None,
-        limit_up: None,
-        limit_down: None,
-        bid,
-        ask,
-        // adapter 不派生 tradeStatus（spec §2/§5：query facade 派生）；先标 Unknown。
-        trade_status: TradeStatus::Unknown,
-        source: QuoteSource::Tdx,
-        captured_at: now,
-        exchange_time: None,
-        freshness: crate::domain::shared::Freshness {
-            status: FreshnessStatus::Fresh,
-            captured_at: Some(now),
-            exchange_time: None,
-            age_ms: Some(0),
-            source: Some("tdx".to_string()),
-            warning: None,
-        },
-        warnings: Vec::new(),
-    }
 }
 
 fn f64_to_price(v: f64) -> Option<Price> {

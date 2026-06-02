@@ -5,8 +5,9 @@
 // 使用 HashRouter（详见 main.tsx 注释），路径不带 `#` 前缀。
 
 export const ROUTES = {
-  market: "/",
-  news: "/news",
+  // 默认落地页 = 资讯（news 占根路径 "/"）。市场页移到 "/market"。
+  news: "/",
+  market: "/market",
   account: "/account",
   settings: "/settings",
 } as const;

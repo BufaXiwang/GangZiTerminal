@@ -104,6 +104,8 @@ TDX HQ market 只支持：
 - 不能用昨收、开盘价或 0 值伪造 `price`。
 - 盘口缺失时返回 `depth_missing` warning。
 - 成交量 / 成交额单位必须 normalize 到 [shared-types.md](../../shared-types.md)。
+  - **成交量 / 盘口量单位（关键）**：TDX `security_quotes`（实时报价）的总成交量 `vol` 和五档 `bid_vol` / `ask_vol` 单位是**手**，canonical `Volume` 统一为**股**（shared-types §Volume：不使用手）。adapter `map_security_quote` 必须 **×100 转股**（与腾讯 adapter ×100 一致；实测 600519 TDX `vol`≈腾讯/100）。漏转会让 account 成交模拟把「2 手」当「2 股」、现实只成交极少量，且 UI 盘口/成交量 100× 偏低。注：`security_bars`（K 线）的 `volume` 已是股，不经此路径、**不要** ×100。
+  - 成交额 `amount` 单位是**元**（与腾讯 ×10000 后同为元），不需缩放。
 - TDX 不直接给出可靠 `tradeStatus`；adapter 只 normalize 可用原始状态，最终对外 `tradeStatus` 由 Quotes query facade 按 `MarketTimeContext`、instrument status 和 quote eligibility 派生。
 - TDX `SecurityQuote` 不包含可靠名称时，`name` 可为空；展示层必须从 `MarketInstrument` 补名。
 - TDX 价格、盘口、成交量字段为 0 或非法值时按 missing 处理，不能转成有效 0。

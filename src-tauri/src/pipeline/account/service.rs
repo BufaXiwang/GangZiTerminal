@@ -5166,6 +5166,456 @@ mod tests {
     // Spec §2 Position.reasoning: 开仓理由 traceable to AccountEvent
     // ------------------------------------------------------------------
 
+    // ====================================================================
+    // 本次迭代新增：spec-driven 覆盖补齐（hermetic）。
+    // 命名前缀 account_spec_*，对应 spec §2 / §5。
+    // 覆盖：T+1 次日可卖、FIFO 多 lot 卖出冻结、限价卖冻结/撤单释放、
+    //       限价买过期释放现金、一致性 clean-account 正路径、cancel 部分成交只释放剩余。
+    // ====================================================================
+
+    /// 直接 seed 一个 open position + 一个已可卖（sellable_from 在过去）的 lot。
+    /// 用于绕过 T+1 锁仓，测试可卖路径（卖出 / 限价卖冻结 / FIFO）。
+    fn seed_position_with_lot(
+        db: &AppDb,
+        code: &TsCode,
+        position_id: &str,
+        lot_id: &str,
+        qty: i64,
+        avg_cost: i64,
+        sellable_from: &str,
+    ) {
+        let repo = AccountRepository::new(db);
+        repo.tx(|tx| {
+            let pos = Position {
+                position_id: position_id.into(),
+                ts_code: code.clone(),
+                name: "Test".into(),
+                status: PositionStatus::Open,
+                quantity: Shares(qty),
+                sellable_quantity: Shares(qty),
+                avg_cost: Price(Decimal::from(avg_cost)),
+                market_price: None,
+                market_value: None,
+                quote_freshness: None,
+                realized_pnl: Money(Decimal::ZERO),
+                unrealized_pnl: None,
+                opened_at: Utc::now(),
+                closed_at: None,
+                protection: None,
+                actor: TradingActor::Agent,
+                reasoning: None,
+                warnings: vec![],
+            };
+            AccountRepository::upsert_position(tx, &pos)?;
+            let lot = PositionLot {
+                lot_id: lot_id.into(),
+                position_id: position_id.into(),
+                ts_code: code.clone(),
+                source_fill_id: format!("fill_{lot_id}"),
+                trade_date: TradeDate::parse(sellable_from).unwrap(),
+                quantity: Shares(qty),
+                remaining_quantity: Shares(qty),
+                frozen_quantity: Shares(0),
+                sellable_from: TradeDate::parse(sellable_from).unwrap(),
+                created_at: Utc::now(),
+            };
+            AccountRepository::insert_lot(tx, &lot)?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // T+1 — lot 在 sellable_from 到达后可卖（次日可卖）。
+    // Spec §2 持仓批次模型 + §5 交易规则 T+1 + §6 「次一交易日才可卖」。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_t_plus_one_lot_sellable_after_sellable_from() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // 用过去日期作为 sellable_from → 视为已过 T+1，可卖。
+        seed_position_with_lot(&db, &code, "pos_t1", "lot_t1", 1000, 90, "20200101");
+        // 限价卖（不依赖交易时段）— sellable 充足应被接受并冻结。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: "pos_t1".into(),
+                    quantity: Some(Shares(1000)),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::from(120))),
+                    expires_at: None,
+                    reason: "sell next day".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(
+            resp.accepted,
+            "lot past sellable_from must be sellable, got {:?}",
+            resp
+        );
+        let repo = AccountRepository::new(&db);
+        let lot = repo
+            .list_lots_by_position("pos_t1")
+            .unwrap()
+            .into_iter()
+            .find(|l| l.lot_id == "lot_t1")
+            .unwrap();
+        assert_eq!(lot.frozen_quantity.0, 1000, "全量卖单应冻结整个 lot");
+    }
+
+    // ------------------------------------------------------------------
+    // T+1 — 同日买入 lot（sellable_from = 次日）不可卖。
+    // Spec §6「当日买入 lot 的 sellableQuantity 为 0」。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_t_plus_one_same_day_lot_not_sellable() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // open_position_via_buy_fill 用 now → sellable_from = 次日 → 当日不可卖。
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: pos_id,
+                    quantity: Some(Shares(1000)),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::from(120))),
+                    expires_at: None,
+                    reason: "same day sell".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted, "same-day lot must not be sellable");
+        assert_eq!(resp.reason, Some(ErrorCode::InsufficientSellableQuantity));
+    }
+
+    // ------------------------------------------------------------------
+    // FIFO — 限价卖冻结按可卖 lot FIFO 分配（最老 lot 先冻结）。
+    // Spec §2 持仓批次模型「挂卖单冻结同样按可卖 lot FIFO 分配」+ 排序
+    // sellableFrom asc, createdAt asc, lotId asc。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_limit_sell_freezes_lots_fifo_oldest_first() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // 两个可卖 lot：older(sellable_from=2020) 100 股，newer(2021) 200 股。
+        // 同一 position 下两个 lot。
+        let repo = AccountRepository::new(&db);
+        repo.tx(|tx| {
+            let pos = Position {
+                position_id: "pos_fifo".into(),
+                ts_code: code.clone(),
+                name: "Test".into(),
+                status: PositionStatus::Open,
+                quantity: Shares(300),
+                sellable_quantity: Shares(300),
+                avg_cost: Price(Decimal::from(90)),
+                market_price: None,
+                market_value: None,
+                quote_freshness: None,
+                realized_pnl: Money(Decimal::ZERO),
+                unrealized_pnl: None,
+                opened_at: Utc::now(),
+                closed_at: None,
+                protection: None,
+                actor: TradingActor::Agent,
+                reasoning: None,
+                warnings: vec![],
+            };
+            AccountRepository::upsert_position(tx, &pos)?;
+            for (lot_id, q, sf) in
+                [("lot_old", 100i64, "20200101"), ("lot_new", 200i64, "20210101")]
+            {
+                let lot = PositionLot {
+                    lot_id: lot_id.into(),
+                    position_id: "pos_fifo".into(),
+                    ts_code: code.clone(),
+                    source_fill_id: format!("f_{lot_id}"),
+                    trade_date: TradeDate::parse(sf).unwrap(),
+                    quantity: Shares(q),
+                    remaining_quantity: Shares(q),
+                    frozen_quantity: Shares(0),
+                    sellable_from: TradeDate::parse(sf).unwrap(),
+                    created_at: Utc::now(),
+                };
+                AccountRepository::insert_lot(tx, &lot)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        // 卖 200 股（整手）→ FIFO 跨 lot 边界：old 全冻结 100，new 冻结剩余 100。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ScalePosition {
+                    position_id: "pos_fifo".into(),
+                    side: ScaleSide::Decrease,
+                    quantity: Shares(200),
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::from(120))),
+                    expires_at: None,
+                    reason: "fifo sell".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "fifo sell should accept: {:?}", resp);
+        let lots = repo.list_lots_by_position("pos_fifo").unwrap();
+        let old = lots.iter().find(|l| l.lot_id == "lot_old").unwrap();
+        let new = lots.iter().find(|l| l.lot_id == "lot_new").unwrap();
+        assert_eq!(old.frozen_quantity.0, 100, "最老 lot 应被先冻结满（FIFO）");
+        assert_eq!(new.frozen_quantity.0, 100, "次老 lot 冻结剩余 100");
+    }
+
+    // ------------------------------------------------------------------
+    // 冻结 — 限价卖挂单冻结持仓；撤单释放冻结。
+    // Spec §2 冻结和重建规则「卖单撤单 / 过期时，释放该订单剩余未成交数量对应的 frozen lot」。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_limit_sell_freeze_then_cancel_releases_shares() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        seed_position_with_lot(&db, &code, "pos_sf", "lot_sf", 1000, 90, "20200101");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code.clone(),
+                    side: OrderSide::Sell,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(120))),
+                    quantity: Shares(600),
+                    expires_at: None,
+                    reason: "freeze".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "limit sell should accept: {:?}", resp);
+        let order_id = resp.order_id.clone().unwrap();
+        let repo = AccountRepository::new(&db);
+        // 冻结后 frozen_quantity = 600。
+        let lot = repo
+            .list_lots_by_position("pos_sf")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(lot.frozen_quantity.0, 600, "挂卖单应冻结 600 股");
+        // shares_frozen 事件存在。
+        let events = repo.list_events(100, 0).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.event_type, AccountEventType::SharesFrozen)
+                && e.order_id.as_deref() == Some(order_id.as_str())));
+        // 撤单 → 释放冻结。
+        let c = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::CancelOrder {
+                    order_id: order_id.clone(),
+                    reason: "stop".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(c.accepted);
+        let lot_after = repo
+            .list_lots_by_position("pos_sf")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(lot_after.frozen_quantity.0, 0, "撤单必须释放全部冻结持仓");
+        // 释放后无悬空 freeze 记录。
+        assert!(repo.get_freeze(&order_id).unwrap().is_none(), "撤单后 freeze 记录应被清除");
+        // shares_released 事件存在。
+        let events2 = repo.list_events(200, 0).unwrap();
+        assert!(events2
+            .iter()
+            .any(|e| matches!(e.event_type, AccountEventType::SharesReleased)));
+    }
+
+    // ------------------------------------------------------------------
+    // 冻结 — 限价买挂单冻结现金；过期后释放冻结现金（via evaluate_account_triggers）。
+    // Spec §2「买单撤单 / 过期时，释放该订单剩余未成交数量对应的冻结现金」+
+    //   §5「过期订单变为 expired，并释放冻结现金 / 冻结持仓」。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_limit_buy_expiry_releases_frozen_cash() {
+        use crate::pipeline::account::eval::{evaluate_account_triggers, EvalDeps, EvalInput};
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // 用一个已过期的 expiresAt 直接创建 pending limit buy（写路径不校验 expiresAt < now? 见下）。
+        // place_order 要求 expiresAt 晚于 now；故先正常下单冻结，再用 eval 的 now 推到过期之后。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(1000),
+                    expires_at: Some(Utc::now() + chrono::Duration::seconds(30)),
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "limit buy should accept: {:?}", resp);
+        let order_id = resp.order_id.clone().unwrap();
+        assert!(resp.snapshot.frozen_cash.0 >= Decimal::from(100_000), "下单后应冻结现金");
+
+        // 用 now = 过期后 → eval 将订单标记 expired 并释放冻结。
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: svc.gateway.clone(),
+            fee_policy: svc.config.fee_policy.clone(),
+        };
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now: future,
+            batch_size: 10,
+            cursor: None,
+        });
+        // 订单终态 order_expired → 产生 OrderExpired trigger。
+        assert!(
+            r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::OrderExpired)),
+            "expired limit order must produce OrderExpired trigger"
+        );
+        let repo = AccountRepository::new(&db);
+        let order = repo.get_order(&order_id).unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::Expired, "订单应转为 expired");
+        // 冻结现金已释放。
+        let snap = svc.rebuild_account_snapshot().unwrap();
+        assert_eq!(snap.frozen_cash.0, Decimal::ZERO, "过期必须释放全部冻结现金");
+        assert!(repo.get_freeze(&order_id).unwrap().is_none(), "过期后 freeze 记录应清除");
+    }
+
+    // ------------------------------------------------------------------
+    // 一致性 — clean account（含 pending 限价卖冻结）必须判定一致（正路径）。
+    // Spec §2 冻结和重建规则：per-lot frozen 派生一致 → check 返回 None。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_consistency_clean_with_sell_freeze_is_consistent() {
+        use crate::pipeline::account::snapshot::check_account_consistency;
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        seed_position_with_lot(&db, &code, "pos_ck", "lot_ck", 1000, 90, "20200101");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Sell,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(120))),
+                    quantity: Shares(400),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "{:?}", resp);
+        let repo = AccountRepository::new(&db);
+        // 冻结记录 frozen_lots 与 lot.frozen_quantity 派生一致 → consistent。
+        assert!(
+            check_account_consistency(&repo).unwrap().is_none(),
+            "干净账户（含卖单冻结）必须判定一致"
+        );
+        // rebuild 不应 fail closed。
+        assert!(svc.rebuild_account_snapshot().is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // cancel 部分成交（limit）只释放剩余未成交数量的冻结，不回滚已成交部分。
+    // Spec §4「撤销部分成交订单只释放剩余未成交数量对应的冻结现金 / 持仓，不回滚已成交部分」。
+    // 通过 eval 部分成交一笔 limit buy → 再 cancel → 验证冻结只剩 0、持仓保留已成交。
+    // ------------------------------------------------------------------
+    #[test]
+    fn account_spec_cancel_partially_filled_limit_buy_releases_only_remainder() {
+        use crate::pipeline::account::eval::{evaluate_account_triggers, EvalDeps, EvalInput};
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        // pending limit buy 1000 @ 100。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(1000),
+                    expires_at: Some(Utc::now() + chrono::Duration::days(1)),
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "{:?}", resp);
+        let order_id = resp.order_id.clone().unwrap();
+        let frozen_before = resp.snapshot.frozen_cash.0;
+        assert!(frozen_before >= Decimal::from(100_000));
+
+        // fresh quote：ask 99 ≤ limit 100，但盘口量只有 300 → 部分成交 300，剩 700 pending。
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(98.0, 10_000)],
+                vec![(99.0, 300)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: svc.gateway.clone(),
+            fee_policy: svc.config.fee_policy.clone(),
+        };
+        // 固定一个交易时段 now（周一上午盘中），否则 simulate_limit 在盘外（午休/盘后/周末）
+        // 因 is_trading_time=false 不撮合 → 订单停在 Pending，断言会随墙钟时间偶发失败。
+        // resolve_market_time 仅看工作日 + 09:30-11:30/13:00-15:00，无节假日表；pending 查询只按 status，
+        // 故固定过去某个交易工作日即可（eval 不按 created_at 过滤）。
+        let trading_now = Shanghai
+            .with_ymd_and_hms(2026, 6, 1, 10, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let _ = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now: trading_now,
+            batch_size: 10,
+            cursor: None,
+        });
+        let repo = AccountRepository::new(&db);
+        let order = repo.get_order(&order_id).unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::PartiallyFilled, "limit 部分成交应仍为中间态");
+        assert_eq!(order.filled_quantity.0, 300);
+        // 仓位已建立 300 股（已成交部分）。
+        let pos = repo.find_open_position_by_ts_code(&code).unwrap().unwrap();
+        assert_eq!(pos.quantity.0, 300, "已成交部分应建仓 300");
+
+        // cancel 剩余 700 → 释放剩余冻结，不回滚已成交的 300。
+        let c = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::CancelOrder {
+                    order_id: order_id.clone(),
+                    reason: "stop".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(c.accepted, "cancel partially_filled limit should accept: {:?}", c);
+        // 撤单后该订单不再冻结现金。
+        assert!(repo.get_freeze(&order_id).unwrap().is_none(), "撤单后剩余冻结应清除");
+        // 已成交 300 仓位仍在（未被回滚）。
+        let pos_after = repo.find_open_position_by_ts_code(&code).unwrap().unwrap();
+        assert_eq!(pos_after.quantity.0, 300, "已成交部分不得因撤单被回滚");
+    }
+
     #[test]
     fn position_opened_via_market_fill_persists_reasoning() {
         let (db, svc, _gw) = setup_account(10_000_000);
