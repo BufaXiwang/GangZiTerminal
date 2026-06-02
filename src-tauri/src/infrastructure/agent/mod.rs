@@ -43,6 +43,13 @@ mod llm_judge_tests;
 #[cfg(test)]
 mod judge_tools_tests;
 
+/// Stress suite for the text-protocol `<use_tool>` tool-use reliability under pressure
+/// (multi-turn tool chains, skill→multi-tool orchestration, 12+ tool selection, mid-session error
+/// recovery). Live tests `#[ignore]`; hermetic protocol-health-accounting checks run normally.
+/// Spec: agent-infra-module.md §2/§3/§5 + agent-runtime-module.md §4.2/§Skills.
+#[cfg(test)]
+mod judge_stress_tests;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
