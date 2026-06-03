@@ -701,6 +701,14 @@ impl QuotesService {
     /// 数据源优先级：`MARKET_SNAPSHOT` in-memory → 非交易时段 fallback 至 `quote_close_snapshot`。
     ///
     /// Spec: docs/design/quotes-module.md §4 `market_breadth`
+    /// 并行探测全部 TDX 行情站点延时（给前端延时 popup）。
+    ///
+    /// Spec: docs/design/quotes-module.md §TDX 连接池与并发。
+    /// 阻塞（内部起线程并行探测、join）；调用方（adapter）须在 `spawn_blocking` 里跑。
+    pub fn probe_tdx_hosts(&self) -> Vec<crate::domain::quotes::HostProbe> {
+        self.tdx.probe_all_hosts()
+    }
+
     pub fn market_breadth(&self) -> MarketBreadth {
         let ctx = self.market_time_now();
         let now = ctx.now;
@@ -1158,7 +1166,8 @@ impl QuotesService {
             // 完成一批即 write + emit progress，UI 持续流式填充。
             use futures_util::StreamExt;
             const TDX_CHUNK: usize = 80;
-            const FETCH_CONCURRENCY: usize = 4; // = TDX 连接池 POOL_SIZE
+            // spec §5：并发度 = 动态连接池 active_count（低延时台数 clamp[2,12]），非硬编码。
+            let fetch_concurrency = self.tdx.active_connections().max(1);
             let mut completed: u32 = 0;
             let mut affected_in_batch: Vec<TsCode> = Vec::new();
             let mut fallback_queue: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
@@ -1173,7 +1182,7 @@ impl QuotesService {
                         (chunk, results)
                     }
                 })
-                .buffer_unordered(FETCH_CONCURRENCY);
+                .buffer_unordered(fetch_concurrency);
 
             while let Some((chunk, results)) = fetch_stream.next().await {
                 for ((ts, cat, name), res) in chunk.into_iter().zip(results.into_iter()) {
@@ -1389,7 +1398,6 @@ impl QuotesService {
     ) -> (u32, u32, Vec<TsCode>) {
         use futures_util::StreamExt;
         const TDX_CHUNK: usize = 80;
-        const FETCH_CONCURRENCY: usize = 8; // = TDX 连接池 POOL_SIZE
 
         let ctx = self.market_time_now();
         let now = ctx.now;
@@ -1448,6 +1456,9 @@ impl QuotesService {
         let mut affected: Vec<TsCode> = Vec::new();
 
         // 3. 80/批 + 并发 buffer_unordered 跑连接池（同 universe 路径）。
+        // spec §5：并发度 = 动态连接池 active_count（低延时台数 clamp[2,12]），非硬编码。
+        // 在确有 fetch 目标后才读（首次会触发一次性 host 探测），避免全跳过路径白白探测。
+        let fetch_concurrency = self.tdx.active_connections().max(1);
         let chunks: Vec<Vec<(TsCode, InstrumentCategory, Option<String>)>> =
             tdx_input.chunks(TDX_CHUNK).map(|c| c.to_vec()).collect();
         let mut fetch_stream = futures_util::stream::iter(chunks)
@@ -1458,7 +1469,7 @@ impl QuotesService {
                     (chunk, results)
                 }
             })
-            .buffer_unordered(FETCH_CONCURRENCY);
+            .buffer_unordered(fetch_concurrency);
 
         let mut affected_in_batch: Vec<TsCode> = Vec::new();
         while let Some((chunk, results)) = fetch_stream.next().await {

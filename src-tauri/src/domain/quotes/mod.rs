@@ -9,6 +9,7 @@ pub mod breadth;
 pub mod errors;
 pub mod events;
 pub mod freshness_rules;
+pub mod host_probe;
 pub mod indicators;
 pub mod instrument;
 pub mod kline;
@@ -28,6 +29,7 @@ pub use events::{
     RefreshMarketQuotesScope, RefreshPurpose, RefreshScope, RefreshScopeKind,
     MARKET_QUOTES_REFRESHED_EVENT, MARKET_QUOTES_REFRESH_PROGRESS_EVENT,
 };
+pub use host_probe::HostProbe;
 pub use freshness_rules::{
     derive_freshness, eligible_trade_date, EligibleTradeDate, FreshnessIntent,
     DETAIL_STALE_THRESHOLD_SECS, HARD_EXPIRE_SECS, UNIVERSE_STALE_THRESHOLD_SECS,

@@ -15,7 +15,7 @@ use super::{
     Bar, BarCategory, MinuteTimePoint, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket,
     XdxrRecord,
 };
-use crate::domain::quotes::{MinuteKlinePoint, QuoteSource, StockQuote, TradeStatus};
+use crate::domain::quotes::{HostProbe, MinuteKlinePoint, QuoteSource, StockQuote, TradeStatus};
 use crate::domain::shared::{
     Amount, Freshness, FreshnessStatus, InstrumentCategory, OccurredAt, Price, TradeDate, TsCode,
     Volume,
@@ -31,8 +31,14 @@ const MIN_CALL_INTERVAL: Duration = Duration::from_millis(80);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const QUOTE_BATCH_MAX: usize = 80;
 const BARS_MAX: u16 = 800;
-/// TDX 连接池大小（spec §5「TDX 连接池与并发」：默认 N = 8，分散到 16 台 host → 每台 ≤1 连接）。
-const POOL_SIZE: usize = 8;
+/// 连接槽 Vec 物理上限（spec §5「TDX 连接池与并发」：池大小动态、由低延时台数决定，
+/// 但 slot Vec 不超过该值，有效并发 = `active_count` ≤ MAX_POOL）。
+const MAX_POOL: usize = 12;
+/// 动态并发下界：可达台数 ≥ 该值时至少开这么多连接（不足则有几台用几台，≥1）。
+const MIN_POOL: usize = 2;
+/// 低延时子集带宽（spec §5）：可达台里只选 `latency ≤ 最快台 + LATENCY_BAND` 的进池，
+/// 自然排除「可达但慢」的站点。
+const LATENCY_BAND: Duration = Duration::from_millis(250);
 /// 探测单台 host 延迟用的超时（短于建连超时——只为排序，连不上的排到队尾）。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -53,14 +59,25 @@ struct State {
     host_idx: usize,
 }
 
+/// 一次性探测后定下的「动态池」：低延时子集 host 列表 + 有效并发数。
+///
+/// `active_hosts` = 选中的低延时台（每台 1 连接、各 slot pin 一台不同的），长度即 `active_count`。
+/// slot Vec 物理上预分配 `MAX_POOL` 条，但只有前 `active_count` 条参与 round-robin。
+struct Pool {
+    /// 被选进池的低延时 host（已按延迟升序），槽 i 默认 pin 到 `active_hosts[i]`。
+    active_hosts: Arc<Vec<(String, u16)>>,
+    /// 有效并发数 = 选中台数 = `active_hosts.len()`（≥1）。
+    active_count: usize,
+}
+
 #[derive(Clone)]
 pub struct TdxConnectionManager {
-    /// N 条独立连接槽；round-robin 取用，最多 N 个调用并发。
+    /// 最多 `MAX_POOL` 条独立连接槽（物理上限）；只有前 `active_count` 条参与 round-robin。
     slots: Arc<Vec<Arc<Mutex<State>>>>,
     next: Arc<AtomicUsize>,
-    /// 按延迟排序的 host 列表（`(host, port)`），首次需要连接时探测一次并缓存。
-    /// 槽 i 默认 pin 到 `ranked[i % len]`（spec §5：N 个槽分散到延迟最低的 N 台不同 host）。
-    ranked_hosts: Arc<Mutex<Option<Arc<Vec<(String, u16)>>>>>,
+    /// 动态池：首次需要连接时**并行**探测全部 `HQ_HOSTS`、选低延时子集，算一次并缓存
+    /// （spec §5：并发数 N = 低延时台数 clamp[2,12]，每连接 pin 一台不同 host）。
+    pool: Arc<Mutex<Option<Arc<Pool>>>>,
 }
 
 /// 为某个槽（依据其 `State.host_idx`）连一台 host。失败则前进到排序列表下一台（wrap）重试，
@@ -98,9 +115,9 @@ fn connect_slot(
     ))
 }
 
-/// 把槽下标映射到排序后 host 列表的初始下标：`slot_idx % ranked.len()`。
+/// 把槽下标映射到选中低延时子集的初始下标：`slot_idx % active_hosts.len()`。
 ///
-/// N = 8 / 16 台 → 8 个槽分别 pin 到延迟最低的前 8 台不同 host，每台 ≤1 连接。
+/// 动态池下 active_count = 低延时台数 → 槽 i (i<active_count) pin 到选中第 i 台不同 host，每台 ≤1 连接。
 /// 纯函数，无 I/O，便于单测。`ranked_len` 为 0 时返回 0（调用方需另行保证非空）。
 fn assign_host(slot_idx: usize, ranked_len: usize) -> usize {
     if ranked_len == 0 {
@@ -110,26 +127,91 @@ fn assign_host(slot_idx: usize, ranked_len: usize) -> usize {
     }
 }
 
-/// 对 `HQ_HOSTS` 全部探测一遍连接延迟，返回按延迟升序排序的 `(host, port)` 列表。
+/// 单台探测结果（内部用）：延迟 + 可达 + 站点元信息。`latency` 仅在 `ok` 时有意义。
+#[derive(Clone)]
+struct Probe {
+    name: &'static str,
+    host: String,
+    port: u16,
+    latency: Duration,
+    ok: bool,
+}
+
+/// **并行**探测全部 `HQ_HOSTS`（每台一线程，`PROBE_TIMEOUT` 上限），返回按
+/// 「成功优先 → 延迟升序」排序的结果列表。
 ///
 /// 复用 [`TdxHqClient::connect`] 的「connect + handshake」语义做一次性 probe：每台单独计时，
-/// 连不上 / 握手失败的排到队尾（用 `Err` 标记）。**会联网**——只在首次需要建连时调用一次。
-fn rank_hosts_by_latency() -> Vec<(String, u16)> {
-    let mut timed: Vec<(Duration, bool, String, u16)> = Vec::with_capacity(HQ_HOSTS.len());
-    for (_name, host, port) in HQ_HOSTS {
-        let t0 = Instant::now();
-        let ok = TdxHqClient::connect((*host, *port), PROBE_TIMEOUT).is_ok();
-        let dt = t0.elapsed();
-        // 失败的标 ok=false，排序时排到所有成功之后（仍保留为候选，供 wrap 换台兜底）。
-        timed.push((dt, ok, host.to_string(), *port));
-    }
+/// 连不上 / 握手失败标 `ok=false` 排到队尾。**会联网**。串行探测 ~sum(timeout)：部分 host
+/// 慢/死时每台 3s 累加 → 首次建连阻塞数十秒。并行后墙钟 ≈ 最慢一台 ~PROBE_TIMEOUT。
+fn probe_all_latency() -> Vec<Probe> {
+    let handles: Vec<_> = HQ_HOSTS
+        .iter()
+        .map(|(name, host, port)| {
+            let name = *name;
+            let host = host.to_string();
+            let port = *port;
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                let ok = TdxHqClient::connect((host.as_str(), port), PROBE_TIMEOUT).is_ok();
+                Probe {
+                    name,
+                    host,
+                    port,
+                    latency: t0.elapsed(),
+                    ok,
+                }
+            })
+        })
+        .collect();
+    let mut probes: Vec<Probe> = handles.into_iter().filter_map(|h| h.join().ok()).collect();
     // 成功优先，其次按延迟升序。
-    timed.sort_by(|a, b| match (a.1, b.1) {
+    probes.sort_by(|a, b| match (a.ok, b.ok) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
-        _ => a.0.cmp(&b.0),
+        _ => a.latency.cmp(&b.latency),
     });
-    timed.into_iter().map(|(_, _, h, p)| (h, p)).collect()
+    probes
+}
+
+/// 从「已按成功优先 + 延迟升序排好的」候选中选低延时子集做并发（spec §5）。**纯函数**，便于单测。
+///
+/// 规则：
+/// 1. 只看可达（`ok`）台；按延迟取 `latency ≤ 最快台 + band` 的那些（自然排除「可达但慢」）。
+/// 2. 并发数 N = 该子集大小，clamp 到 `[min, max]`：
+///    - 子集 > max → 截到 max（取最快的 max 台）。
+///    - 子集 < min → 用全部可达台兜底（不足 min 则有几台用几台，≥1）。
+/// 3. 返回选中台的 `(host, port)` 列表（即各 slot pin 的 host）。
+///
+/// 输入 `ranked` 必须已排序（`probe_all_latency` 的输出）。可达台数为 0 时返回空 Vec
+/// （调用方再回退到全量 `HQ_HOSTS`）。
+fn select_low_latency(
+    ranked: &[Probe],
+    band: Duration,
+    min: usize,
+    max: usize,
+) -> Vec<(String, u16)> {
+    let reachable: Vec<&Probe> = ranked.iter().filter(|p| p.ok).collect();
+    if reachable.is_empty() {
+        return Vec::new();
+    }
+    let fastest = reachable[0].latency;
+    let cutoff = fastest.saturating_add(band);
+    // 带宽内的低延时子集（reachable 已按延迟升序，故为前缀）。
+    let in_band: Vec<&Probe> = reachable
+        .iter()
+        .copied()
+        .filter(|p| p.latency <= cutoff)
+        .collect();
+    let chosen: &[&Probe] = if in_band.len() >= min {
+        // 子集够大：用子集，并 clamp 到 max。
+        let n = in_band.len().min(max);
+        &in_band[..n]
+    } else {
+        // 子集不足下界：用全部可达兜底，clamp 到 max（仍 ≥1）。
+        let n = reachable.len().min(max);
+        &reachable[..n]
+    };
+    chosen.iter().map(|p| (p.host.clone(), p.port)).collect()
 }
 
 impl Default for TdxConnectionManager {
@@ -140,12 +222,14 @@ impl Default for TdxConnectionManager {
 
 impl TdxConnectionManager {
     pub fn new() -> Self {
-        let slots = (0..POOL_SIZE)
+        // 物理上预分配 MAX_POOL 条槽；首次探测后只有前 active_count 条参与 round-robin
+        // （active_count = 低延时台数 clamp[MIN_POOL, MAX_POOL]，spec §5）。
+        let slots = (0..MAX_POOL)
             .map(|i| {
                 Arc::new(Mutex::new(State {
                     client: None,
                     last_call: None,
-                    // 槽 i 默认 pin 到排序后第 i 台 host（首次连接时按 ranked 列表解析）。
+                    // 槽 i 默认 pin 到选中低延时子集第 i 台 host（首次连接时按 active_hosts 解析）。
                     host_idx: i,
                 }))
             })
@@ -153,30 +237,86 @@ impl TdxConnectionManager {
         Self {
             slots: Arc::new(slots),
             next: Arc::new(AtomicUsize::new(0)),
-            ranked_hosts: Arc::new(Mutex::new(None)),
+            pool: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// round-robin 取一条连接槽（携带其下标，用于 pin host）。并发调用各拿不同槽 → 真并行。
+    /// round-robin 取一条 **active** 连接槽（携带其下标，用于 pin host）。
+    ///
+    /// 只在前 `active_count` 条物理槽里轮转（`next % active_count`），其余 `MAX_POOL - active_count`
+    /// 条不参与（对应的低延时台不足时不开连接）。并发调用各拿不同槽 → 真并行。
     fn slot(&self) -> (usize, Arc<Mutex<State>>) {
-        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let active = self.pool().active_count.max(1).min(self.slots.len());
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % active;
         (i, Arc::clone(&self.slots[i]))
     }
 
-    /// 取（必要时探测并缓存）按延迟排序的 host 列表。首次调用会联网 probe `HQ_HOSTS`，
-    /// 之后复用缓存。空列表（极端：全部探测失败 + HQ_HOSTS 为空）兜底回退到全量 `HQ_HOSTS`。
-    fn ranked_hosts(&self) -> Arc<Vec<(String, u16)>> {
-        let mut guard = self.ranked_hosts.lock().expect("ranked_hosts poisoned");
-        if let Some(r) = guard.as_ref() {
-            return Arc::clone(r);
+    /// 有效并发数（active 连接数）。供 service 层把 universe burst / refresh_quote_batch 的
+    /// `buffer_unordered` 并发度接到实际池大小，而非硬编码（spec §5）。
+    /// 首次调用会触发一次性探测。
+    pub fn active_connections(&self) -> usize {
+        self.pool().active_count
+    }
+
+    /// 取（必要时**并行**探测并缓存）动态池：低延时子集 host 列表 + active_count。
+    ///
+    /// 首次调用会联网 probe 全部 `HQ_HOSTS`、选低延时子集（spec §5），之后复用缓存。
+    /// 极端：全部探测失败 → 兜底回退到全量 `HQ_HOSTS`（仍 clamp 到 MAX_POOL）。
+    fn pool(&self) -> Arc<Pool> {
+        let mut guard = self.pool.lock().expect("pool poisoned");
+        if let Some(p) = guard.as_ref() {
+            return Arc::clone(p);
         }
-        let mut ranked = rank_hosts_by_latency();
-        if ranked.is_empty() {
-            ranked = HQ_HOSTS.iter().map(|(_, h, p)| (h.to_string(), *p)).collect();
+        let probes = probe_all_latency();
+        let mut selected = select_low_latency(&probes, LATENCY_BAND, MIN_POOL, MAX_POOL);
+        if selected.is_empty() {
+            // 全部探测失败：兜底用全量 HQ_HOSTS（clamp 到 MAX_POOL），让 connect_slot 自己换台重试。
+            selected = HQ_HOSTS
+                .iter()
+                .take(MAX_POOL)
+                .map(|(_, h, p)| (h.to_string(), *p))
+                .collect();
         }
-        let arc = Arc::new(ranked);
-        *guard = Some(Arc::clone(&arc));
-        arc
+        let active_count = selected.len().max(1);
+        let pool = Arc::new(Pool {
+            active_hosts: Arc::new(selected),
+            active_count,
+        });
+        *guard = Some(Arc::clone(&pool));
+        pool
+    }
+
+    /// 并行探测**全部** `HQ_HOSTS`，返回每台 `HostProbe`（给前端延时 popup）。
+    ///
+    /// Spec: docs/design/quotes-module.md §TDX 连接池与并发。
+    ///
+    /// `inPool` = 该台是否被选进当前 active 池（低延时子集）。会先确保动态池已选定
+    /// （`self.pool()` 首次触发一次性探测、之后复用缓存），再按当前 active 池的 host 集合标记。
+    /// 本方法自身的探测是**实时**的（不读 pool 缓存的延迟），故 popup 的延迟反映当下网络。
+    /// 结果按「成功优先 → 延迟升序」排序（同 `probe_all_latency`）。
+    pub fn probe_all_hosts(&self) -> Vec<HostProbe> {
+        // 当前 active 池的 host 集合（host:port）。确保已探测选定。
+        let pool = self.pool();
+        let in_pool: std::collections::HashSet<(String, u16)> = pool
+            .active_hosts
+            .iter()
+            .map(|(h, p)| (h.clone(), *p))
+            .collect();
+        probe_all_latency()
+            .into_iter()
+            .map(|p| HostProbe {
+                name: p.name.to_string(),
+                latency_ms: if p.ok {
+                    Some(p.latency.as_millis().min(u32::MAX as u128) as u32)
+                } else {
+                    None
+                },
+                ok: p.ok,
+                in_pool: in_pool.contains(&(p.host.clone(), p.port)),
+                host: p.host,
+                port: p.port,
+            })
+            .collect()
     }
 
     /// 拉单只标的实时报价。失败后丢弃连接。
@@ -195,7 +335,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         let result = task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             // 速率：保持最小间隔。
@@ -264,7 +404,7 @@ impl TdxConnectionManager {
                 continue;
             }
             let (_slot_i, inner) = self.slot();
-            let ranked = self.ranked_hosts();
+            let ranked = self.pool().active_hosts.clone();
             let pairs_for_call: Vec<(TdxMarket, String)> = pairs
                 .iter()
                 .map(|(m, c, _, _, _)| (*m, c.clone()))
@@ -351,7 +491,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
@@ -420,7 +560,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         let cat = kline_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -490,7 +630,7 @@ impl TdxConnectionManager {
         let code = ts_code.as_str()[..6].to_string();
         let cat = kline_period_to_tdx(period);
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         task::spawn_blocking(move || {
             const HARD_CAP: u32 = 50_000;
             let mut all: Vec<Bar> = Vec::new();
@@ -577,7 +717,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         let cat = minute_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -628,7 +768,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -680,7 +820,7 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -727,7 +867,7 @@ impl TdxConnectionManager {
         market: TdxMarket,
     ) -> Result<Vec<SecurityListEntry>, TdxManagerError> {
         let (_slot_i, inner) = self.slot();
-        let ranked = self.ranked_hosts();
+        let ranked = self.pool().active_hosts.clone();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -1081,57 +1221,118 @@ mod tests {
         }
     }
 
+    /// 测试辅助：构造 N 台延迟（毫秒）+ ok 的 Probe 列表（已按延迟升序），免联网。
+    fn probes(specs: &[(u64, bool)]) -> Vec<Probe> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(i, (ms, ok))| Probe {
+                name: "t",
+                host: format!("10.0.0.{i}"),
+                port: 7709,
+                latency: Duration::from_millis(*ms),
+                ok: *ok,
+            })
+            .collect()
+    }
+
+    /// 测试辅助：直接把 active_hosts 注入 pool 缓存，免触发网络探测。
+    fn seed_pool(mgr: &TdxConnectionManager, hosts: Vec<(String, u16)>) {
+        let active_count = hosts.len().max(1);
+        let pool = Arc::new(Pool {
+            active_hosts: Arc::new(hosts),
+            active_count,
+        });
+        *mgr.pool.lock().unwrap() = Some(pool);
+    }
+
     #[test]
-    fn new_builds_pool_size_slots() {
+    fn new_builds_max_pool_slots() {
         let mgr = TdxConnectionManager::new();
-        // 构造出 POOL_SIZE 条独立槽，next 计数从 0 起。
-        assert_eq!(mgr.slots.len(), POOL_SIZE);
+        // 物理槽 = MAX_POOL（动态池只激活前 active_count 条）；next 从 0 起。
+        assert_eq!(mgr.slots.len(), MAX_POOL);
         assert_eq!(mgr.next.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn slot_round_robins_through_pool() {
+    fn slot_round_robins_only_through_active_subset() {
+        // active_count = 3（注入 3 台低延时 host）→ slot() 只在 slots[0..3] 轮转。
         let mgr = TdxConnectionManager::new();
-        // 连续取 POOL_SIZE 次应轮转到每一条不同的槽（按 next % POOL_SIZE）。
-        let picked: Vec<(usize, Arc<Mutex<State>>)> = (0..POOL_SIZE).map(|_| mgr.slot()).collect();
-        for i in 0..POOL_SIZE {
-            // 第 i 次取到的槽应是 slots[i]（next 从 0 起，fetch_add 后 %）。
+        seed_pool(
+            &mgr,
+            vec![
+                ("a".into(), 7709),
+                ("b".into(), 7709),
+                ("c".into(), 7709),
+            ],
+        );
+        assert_eq!(mgr.active_connections(), 3);
+        let picked: Vec<(usize, Arc<Mutex<State>>)> = (0..3).map(|_| mgr.slot()).collect();
+        for i in 0..3 {
             assert_eq!(picked[i].0, i, "pick {i} index");
-            assert!(
-                Arc::ptr_eq(&picked[i].1, &mgr.slots[i]),
-                "pick {i} should map to slots[{i}]"
-            );
+            assert!(Arc::ptr_eq(&picked[i].1, &mgr.slots[i]), "pick {i} → slots[{i}]");
         }
-        // 取满一圈后所有槽互不相同。
-        for i in 0..POOL_SIZE {
-            for j in (i + 1)..POOL_SIZE {
-                assert!(!Arc::ptr_eq(&picked[i].1, &picked[j].1), "slots {i} and {j} aliased");
-            }
-        }
-        // 再取一次应回绕到 slots[0]。
+        // 第 4 次回绕到 slots[0]（不会用到 slots[3..MAX_POOL]）。
         let wrapped = mgr.slot();
-        assert_eq!(wrapped.0, 0);
-        assert!(Arc::ptr_eq(&wrapped.1, &mgr.slots[0]), "should wrap to slots[0]");
+        assert_eq!(wrapped.0, 0, "active_count=3 → 第 4 次 wrap 回 0");
+        assert!(Arc::ptr_eq(&wrapped.1, &mgr.slots[0]));
     }
 
     #[test]
-    fn pool_size_is_eight_and_each_slot_pins_distinct_host_idx() {
-        // spec §5：N = 8，8 个槽默认 pin 到排序后前 8 台不同 host（host_idx = slot_idx）。
+    fn select_low_latency_picks_in_band_subset() {
+        // 最快 30ms，band 250ms → cutoff 280ms：选 30/50/200（≤280），排除 400/可达但慢。
+        let ranked = probes(&[(30, true), (50, true), (200, true), (400, true)]);
+        let sel = select_low_latency(&ranked, Duration::from_millis(250), 2, 12);
+        assert_eq!(sel.len(), 3, "带宽内应选 3 台（30/50/200）");
+        assert_eq!(sel[0].0, "10.0.0.0");
+        assert_eq!(sel[2].0, "10.0.0.2");
+    }
+
+    #[test]
+    fn select_low_latency_clamps_to_max() {
+        // 15 台全在带宽内 → clamp 到 max=12（取最快的 12 台）。
+        let specs: Vec<(u64, bool)> = (0..15).map(|i| (10 + i, true)).collect();
+        let ranked = probes(&specs);
+        let sel = select_low_latency(&ranked, Duration::from_millis(250), 2, 12);
+        assert_eq!(sel.len(), 12, "应 clamp 到 max=12");
+    }
+
+    #[test]
+    fn select_low_latency_falls_back_to_all_reachable_when_band_too_narrow() {
+        // 最快 30ms，band 5ms → cutoff 35ms：带宽内只有 1 台 < min=2 →
+        // 兜底用全部可达（4 台，clamp max=12）。
+        let ranked = probes(&[(30, true), (100, true), (300, true), (900, true)]);
+        let sel = select_low_latency(&ranked, Duration::from_millis(5), 2, 12);
+        assert_eq!(sel.len(), 4, "带宽内不足 min → 兜底全部可达");
+    }
+
+    #[test]
+    fn select_low_latency_uses_only_reachable_and_handles_one() {
+        // 仅 1 台可达（其余 ok=false）→ 兜底用那 1 台（< min 也 ≥1）。
+        let ranked = probes(&[(40, true), (50, false), (60, false)]);
+        let sel = select_low_latency(&ranked, Duration::from_millis(250), 2, 12);
+        assert_eq!(sel.len(), 1, "仅 1 台可达 → 用 1 台");
+        assert_eq!(sel[0].0, "10.0.0.0");
+        // 全不可达 → 空（调用方回退全量 HQ_HOSTS）。
+        let none = probes(&[(40, false), (50, false)]);
+        assert!(select_low_latency(&none, Duration::from_millis(250), 2, 12).is_empty());
+    }
+
+    #[test]
+    fn active_count_equals_selected_hosts_len() {
+        // active_count = 选中台数（注入 5 台 → 5）。
         let mgr = TdxConnectionManager::new();
-        assert_eq!(mgr.slots.len(), 8, "POOL_SIZE 应为 8");
-        for (i, slot) in mgr.slots.iter().enumerate() {
-            let g = slot.lock().unwrap();
-            assert_eq!(g.host_idx, i, "槽 {i} 初始应 pin 到 host_idx {i}");
-        }
+        let hosts: Vec<(String, u16)> = (0..5).map(|i| (format!("h{i}"), 7709u16)).collect();
+        seed_pool(&mgr, hosts);
+        assert_eq!(mgr.active_connections(), 5);
     }
 
     #[test]
     fn assign_host_disperses_slots_to_distinct_hosts() {
-        // 8 槽 / 16 台 → 每槽分到不同 host（slot_idx % len，前 8 个互不相同）。
-        let ranked_len = 16;
+        // active_count 个槽 → 每槽分到不同 host（slot_idx % len）。8 槽 / 12 台 → 前 8 个互不相同。
+        let ranked_len = 12;
         let assigned: Vec<usize> = (0..8).map(|i| assign_host(i, ranked_len)).collect();
         assert_eq!(assigned, vec![0, 1, 2, 3, 4, 5, 6, 7]);
-        // 互不相同。
         for i in 0..assigned.len() {
             for j in (i + 1)..assigned.len() {
                 assert_ne!(assigned[i], assigned[j], "槽 {i} 与 {j} 撞 host");

@@ -182,6 +182,22 @@ async refreshQuotes(tsCodes: string[]) : Promise<Result<null, CommandError>> {
 }
 },
 /**
+ * 并行探测全部 TDX 行情站点延时（给前端「延时 popup」）。
+ * 
+ * 返回每台 `{ name, host, port, latencyMs, ok, inPool }`，按「可达 + 延迟」排序；
+ * `inPool` = 该台是否在当前 active 连接池（低延时子集）里。探测阻塞 → spawn_blocking。
+ * 
+ * Spec: docs/design/quotes-module.md §TDX 连接池与并发。
+ */
+async probeTdxHosts() : Promise<Result<HostProbe[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("probe_tdx_hosts") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Frontend log forwarder：前端调 commands.forwardLog(msg) → 后端 tracing
  * → tauri dev stdout，可以从开发者那里直接读 log 文件分析性能问题。
  * 仅供 dev / 调试用，生产 build 可去掉。
@@ -456,6 +472,34 @@ dateCounts?: NewsDateCount[] }
  */
 export type Freshness = { status: FreshnessStatus; capturedAt?: string | null; exchangeTime?: string | null; ageMs?: number | null; source?: string | null; warning?: WarningCode | null }
 export type FreshnessStatus = "fresh" | "stale" | "missing"
+/**
+ * 单台 TDX HQ 站点的探测结果。
+ */
+export type HostProbe = { 
+/**
+ * 站点中文名（来自 `HQ_HOSTS`）。
+ */
+name: string; 
+/**
+ * IP / 域名。
+ */
+host: string; 
+/**
+ * 端口（默认 7709，个别 80）。
+ */
+port: number; 
+/**
+ * connect + handshake 往返延时（毫秒）；连不上 / 握手失败为 `None`。
+ */
+latencyMs: number | null; 
+/**
+ * 是否可达（探测成功）。
+ */
+ok: boolean; 
+/**
+ * 是否被选进当前 active 连接池（低延时子集）。
+ */
+inPool: boolean }
 export type IndicatorBasis = { period: KlinePeriod; adjust: Adjust; fetchedAt: string }
 /**
  * Spec: quotes-module.md §2

@@ -68,6 +68,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::quotes::cmd::extend_chart_history,
         adapters::quotes::cmd::fetch_kline_page,
         adapters::quotes::cmd::refresh_quotes,
+        adapters::quotes::cmd::probe_tdx_hosts,
         adapters::quotes::cmd::forward_log,
         adapters::agent::cmd::agent_list_tools,
         adapters::agent::cmd::agent_channel_presets,

@@ -5,7 +5,7 @@
 
 use crate::adapters::error::CommandError;
 use crate::domain::quotes::{
-    IndustryHeatmap, KlinePeriod, MarketBreadth, MinuteKlinePeriod, RefreshDataScope,
+    HostProbe, IndustryHeatmap, KlinePeriod, MarketBreadth, MinuteKlinePeriod, RefreshDataScope,
 };
 use crate::domain::shared::{ErrorCode, TsCode};
 use crate::pipeline::quotes::service::{
@@ -61,6 +61,29 @@ pub async fn refresh_quotes(
     let svc = service.inner().clone();
     svc.refresh_quotes(codes).await?;
     Ok(())
+}
+
+/// 并行探测全部 TDX 行情站点延时（给前端「延时 popup」）。
+///
+/// 返回每台 `{ name, host, port, latencyMs, ok, inPool }`，按「可达 + 延迟」排序；
+/// `inPool` = 该台是否在当前 active 连接池（低延时子集）里。探测阻塞 → spawn_blocking。
+///
+/// Spec: docs/design/quotes-module.md §TDX 连接池与并发。
+#[tauri::command]
+#[specta::specta]
+pub async fn probe_tdx_hosts(
+    service: State<'_, Arc<QuotesService>>,
+) -> Result<Vec<HostProbe>, CommandError> {
+    let svc = service.inner().clone();
+    let probes = tokio::task::spawn_blocking(move || svc.probe_tdx_hosts())
+        .await
+        .map_err(|e| {
+            CommandError::with_message(
+                ErrorCode::ProviderUnavailable,
+                format!("probe join failed: {e}"),
+            )
+        })?;
+    Ok(probes)
 }
 
 /// 市场宽度（spec §4 `market_breadth`）。

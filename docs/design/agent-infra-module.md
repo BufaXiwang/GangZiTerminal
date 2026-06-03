@@ -235,7 +235,7 @@ type ToolRegistrySnapshot = {
 - Runtime 决定每类 run 的 enabled tools，把对应 `ToolSpec` 注册进本次 loop。
 - `sideEffect = "trading_write"` 的 tool 必须由 Runtime 显式允许，Infra 默认不得注册到非交易 run。
 - 同名 tool 只能注册一次；重复注册必须 fail closed。
-- Tool input 必须按 `inputSchema` 校验；校验失败包装为 `<tool_error>` 回传，不调用 handler。
+- **inputSchema 校验是强制且自动的**：`ToolRegistry` 在注册时就用 `inputSchema` 编译出 JSON Schema 校验器（不依赖调用方手动传校验器），dispatch 前对 input 校验。校验失败：① 包装为 `<tool_error code="invalid_input">` 回传给模型让它自行纠偏（**不调用 handler、不终止 loop**）；② 同时 emit `tool_end{ isError: true }` 事件，让前端能展示「这次工具调用 input 不合 schema」。`inputSchema` 是**强制契约**，不是文档性提示。
 - Tool output 必须转换成可摘要的 `JsonSummary`，供 stream / 审计 / chat 历史复用。
 - Tool 描述和示例应当能被产品负责人手写为 markdown（例如 `skills/<name>/SKILL.md` 或编译期 `include_str!`），不要塞业务逻辑代码到描述里。
 
@@ -338,6 +338,7 @@ type AgentEvent =
 - `text_delta` 只 emit 首个 `<use_tool>` **之前**的 preamble 文本（实时、与原始 LLM 输出顺序一致）；首个 tool 之后的文本按上文「工具调用是本轮文本逻辑终点」规则抑制，不 emit。
 - Tool input / output 在 event 内是摘要；完整 payload 通过 `toolCallId` 查 `agent_tool_calls` + `agent_payloads`。
 - `compacted.tier = "reactive_retry"` 专用于 §4 描述的 context-too-long 触发的压缩。
+- **`usage` 是「每轮增量」语义**：每个 turn 的 provider 响应聚合出一条 `usage`（只含该 turn 的 token），loop **不**再额外 emit「run 累计」那一条。订阅方（前端 / Runtime）按需自行累加；run 总量由 Runtime 在收尾时落到 `AgentRun` 记录。即一次 run 收到 N 个 turn 就有 N 条 `usage`，每条互不重叠。
 - `error.code` 必须取自 `ErrorCode` 封闭集合（shared-types §5）。
 
 ### `ProviderChannel`
@@ -390,14 +391,11 @@ type ProviderChannel = {
 ```ts
 type ContextBundle = {
   runId: string;
-  systemParts: ContextPart[];
-  realtimeParts: ContextPart[];
-  chatParts: ContextPart[];
-  memoryParts: ContextPart[];
+  systemParts: ContextPart[];   // 唯一一条 lane：身份 + 工具清单 + Runtime 注入的 realtime packet / memory
 };
 
 type ContextPart = {
-  kind: "system" | "realtime" | "chat" | "memory" | "tool_result_stub";
+  kind: "system" | "realtime" | "memory" | "tool_result_stub";  // 语义标签；全部承载在 systemParts 内
   content: string | JsonSummary;
   freshness?: Freshness;
   tokenEstimate?: number;
@@ -405,12 +403,14 @@ type ContextPart = {
 };
 ```
 
+> **设计：单 lane（`systemParts`）+ 独立 `messages` 历史**。早期设计曾有 `realtimeParts` / `chatParts` / `memoryParts` 四条 lane，但多轮历史已改由独立的 `AgentMessage[]`（`request.input` + repo 自动续接，见 §4「多轮会话持久化与续接」）承载，`chatParts` 成为僵尸；`realtimeParts` / `memoryParts` 因 provider 只渲染 `systemParts` 而从不进 wire。现统一为：**Runtime 把 realtime packet（每次 run 重建的行情 / 账户快照）和 memory 都作为 `ContextPart` 放进 `systemParts`（用 `kind` 标语义、用 `droppable` 标可清理性）；run 过程中拉的实时数据走 tool（`fetch_quotes` 等）→ 落进 `messages` 的 `<tool_result>` → 由 message-lane 压缩处理**。
+
 规则：
 
-- Runtime 负责提供业务上下文内容；Infra 负责排序、压缩和 provider format 转换。
+- Runtime 负责提供业务上下文内容（放进 `systemParts`）；Infra 负责排序、压缩和 provider format 转换。
 - Infra 把 `SystemPromptBuilder` 编译出的 tool 清单作为 `kind = "system"` 的 ContextPart 自动 prepend 到 `systemParts`，Runtime 不需要手动塞。
-- Infra 不维护聊天历史；Runtime 每次 run 必须把需要续接的 `AgentMessage[]` 转换成 `chatParts` 注入。
-- 当前交易事实必须来自 Runtime 本次提供的 realtime context 或本次 tool 调用。
+- Infra 不维护聊天历史；多轮续接由 Infra 经 `request.input` + `conversationId` + repo 自动完成（§4），Runtime **不**把历史塞进 ContextBundle。
+- 当前交易事实必须来自 Runtime 本次注入的 realtime packet（`systemParts`）或本次 tool 调用。
 - 历史聊天和 summary 只能作为交互上下文，不能替代实时行情 / 账户读取。
 - `droppable = false` 的内容只允许在 hard failure 前保留；如果超限仍无法发送，必须 fail closed（`stop_reason = context_limit`）。
 - Context compaction 只影响本次或后续 provider request 的上下文投影，不修改已经持久化的 `AgentMessage`、`ToolCall`、`DecisionEpisode` 或 evidence snapshot 或 PayloadStore。
@@ -447,7 +447,7 @@ type PayloadStoreEntry = {
 Runtime builds AgentRunRequest
   -> Infra builds canonical chat request
        - SystemPromptBuilder 注入 tool 清单到 systemParts
-       - AgentMessage[] (含 inline <tool_result> XML) 注入 chatParts
+       - AgentMessage[] (含 inline <tool_result> XML) 作为独立 messages 历史（repo 续接）
        - Image dataRef 由 provider adapter 从 PayloadStore 解引用
   -> provider.stream()           // 纯 chat stream，不传 tools
   -> ToolCallParser 增量扫描
@@ -468,6 +468,7 @@ Runtime builds AgentRunRequest
 约束：
 
 - 每次 run 必须有最大 turn 数（默认由 Runtime 注入），防止无限 tool 循环。
+- **可取消**：`run_agent_turn` 接受一个取消信号（`CancellationToken`）。loop 在每个 turn 边界 + provider stream 进行中检查；一旦被取消 → 停止后续 turn、emit `done{ stop_reason: "cancelled" }`（已落库的消息 / ToolCall 不回滚，正在执行的 handler 由其自身幂等保证）。取消由触发入口（Tauri command / scheduler / Runtime）持有 token、经另一条命令触发（见前端架构「取消长任务」）。
 - Tool 有超时（`ToolSpec.timeoutMs`）；超时作为 `<tool_error code="tool_timeout">` 回传给模型，**不**直接终止 loop。
 - 所有 tool 调用都进入统一事件流（`tool_start` / `tool_end`）和 `ToolCall` 审计。
 - Provider 返回 context-too-long 时，按 §4 的 reactive retry 策略：压缩一次 → 重试一次 → 如果仍失败 → `stop_reason = context_limit`，emit `error` event (`code = "provider_context_too_long"`)。
@@ -584,14 +585,16 @@ Infra 默认注册的通用 tool：
 
 ## 4. 上下文管理
 
-上下文由四类内容构成：
+上下文由四类内容构成，按**承载位置**分两处（见 §2 ContextBundle「单 lane」设计）：
 
-| 类型 | 内容 | 生命周期 |
-|---|---|---|
-| Identity / System | Agent 身份、运行纪律、tool 清单（由 SystemPromptBuilder 注入） | 长期，适合 cache |
-| Realtime Packet | trigger、账户、行情、新闻、策略、近期 episode 摘要 | 每次 run 重建 |
-| Chat Context | 用户最近对话、当前问题、历史 tool_result | 只服务交互 |
-| Review / Memory | 用户偏好、复盘建议、策略说明 | 独立存储，按需注入 |
+| 类型 | 内容 | 承载位置 | 生命周期 |
+|---|---|---|---|
+| Identity / System | Agent 身份、运行纪律、tool 清单（由 SystemPromptBuilder 注入） | `ContextBundle.systemParts`（`kind=system`） | 长期，适合 cache |
+| Realtime Packet | trigger、账户、行情、新闻、策略、近期 episode 摘要 | `ContextBundle.systemParts`（`kind=realtime`，`droppable` 由 Runtime 标） | 每次 run 重建 |
+| Chat Context | 用户最近对话、当前问题、历史 tool_result | 独立 `messages: AgentMessage[]`（repo 自动续接） | 只服务交互 |
+| Review / Memory | 用户偏好、复盘建议、策略说明 | `ContextBundle.systemParts`（`kind=memory`） | 独立存储，按需注入 |
+
+> 压缩的两个作用面：① **message-lane**（`messages` vec 里的多轮历史 + `<tool_result>`）—— MicroClear / Summarize / Drop 的主战场，run 过程中拉的实时数据都在这里；② **systemParts** —— realtime packet 是 run-fresh、量小，默认不做 run 内压缩（如需可按 `droppable` 清理）。
 
 规则：
 
@@ -619,8 +622,7 @@ Infra 默认注册的通用 tool：
 
 | Trigger | 条件 | 动作 |
 |---|---|---|
-| time-based micro clear | 距上一条 assistant 消息超过约 60 分钟 | 清理旧易腐 tool 结果（替换为 `<tool_result_stub />`），保留最近若干条 |
-| soft limit | 估算 token 超过 `context_soft_limit_tokens` | 先 MicroClear；仍过大时进入 Summarize / Drop |
+| soft limit | 估算 token 超过 `context_soft_limit_tokens` | 先 MicroClear（清理旧易腐 tool 结果，替换为 `<tool_result_stub />`，保留最近若干条）；仍过大时进入 Summarize / Drop |
 | summarize threshold | MicroClear 后仍超过 `context_summarize_threshold` | 调 compact 模型生成摘要边界 |
 | manual compact | Runtime 请求 compact | 下一轮强制 Summarize |
 | provider rejection | provider 返回 context-too-long | **Reactive retry**：调 `compact_context` 做一次激进压缩 → 重发同一 turn 请求 → 仍失败时 fail closed |
@@ -707,7 +709,9 @@ Infra 默认注册的通用 tool：
 // providers = 有序 provider 列表：providers[0] = primary（对应 request.channel），
 // providers[1..] 对应 request.fallback_channels（顺序一致）。调用方按 [channel]++fallback_channels
 // 构建（生产用 HttpProvider，测试注入 ScriptedProvider）。loop 按 §4 容错策略在其上退避重试 + fallback。
-run_agent_turn(request, registry, context, providers, event_tx, repo) -> RunSummary;
+run_agent_turn(request, registry, context, providers, event_tx, repo, cancel) -> RunSummary;
+// cancel: CancellationToken。被取消 → 停后续 turn + emit done(stop_reason=cancelled)（§3）。
+// 不需要取消的入口传一个未触发的 token 即可。
 estimate_context_tokens(messages, context, channel) -> TokenEstimate;
 compact_context(messages, context, policy, ...) -> Compacted; // 纯计算，作用于会话 messages + ContextBundle
 

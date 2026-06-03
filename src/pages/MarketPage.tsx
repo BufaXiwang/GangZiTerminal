@@ -17,7 +17,7 @@
 // 默认选中 `000001.SH`（上证指数）—— 这只有 K 线数据（K-line warmup 已覆盖核心指数）。
 // 选中非核心标的会显示"暂无 K 线数据"（后续加 on-demand refresh）。
 
-import { Search } from "lucide-react";
+import { Search, Server } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useWatchlistStore } from "../lib/watchlistStore";
@@ -25,6 +25,7 @@ import { InstrumentDetail } from "./market/InstrumentDetail";
 import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
 import { MarketMetricsRow } from "./market/MarketMetricsRow";
 import { RowContextMenu } from "./market/RowContextMenu";
+import { HostLatencyPopup } from "./market/HostLatencyPopup";
 import { CORE_INDEXES } from "../lib/useCoreIndexes";
 import { setSource as setPullSource } from "../lib/quotePull";
 import {
@@ -77,6 +78,7 @@ export default function MarketPage() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selected, setSelected] = useState<TsCode | null>(DEFAULT_SELECTED);
   const [externalItem, setExternalItem] = useState<ListMarketItem | null>(null);
+  const [hostPopupOpen, setHostPopupOpen] = useState(false);
   const starred = useWatchlistStore((s) => s.codes);
   const addWatch = useWatchlistStore((s) => s.add);
   const removeWatch = useWatchlistStore((s) => s.remove);
@@ -302,6 +304,16 @@ export default function MarketPage() {
           selected={selected}
           onSelectIndex={handleSelectIndex}
           statusText={status}
+          statusSlot={
+            <button
+              type="button"
+              className="host-latency-trigger"
+              title="数据源连接延时"
+              onClick={() => setHostPopupOpen(true)}
+            >
+              <Server size={16} />
+            </button>
+          }
         />
         <div className="market-workspace">
           <div className="market-workspace-list">
@@ -376,6 +388,9 @@ export default function MarketPage() {
           </div>
         </div>
       </div>
+      {hostPopupOpen && (
+        <HostLatencyPopup onClose={() => setHostPopupOpen(false)} />
+      )}
       {menuState && (
         <RowContextMenu
           x={menuState.x}

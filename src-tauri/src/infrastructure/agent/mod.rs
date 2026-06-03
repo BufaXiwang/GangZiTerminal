@@ -68,7 +68,9 @@ pub use subagent::{
     subagent_output, ForkHandle, ForkRuntime, ProviderFactory, SubAgentProgress, SubAgentStatus,
     SubAgentTaskRegistry,
 };
-pub use loop_executor::{run_agent_turn, run_agent_turn_forked, LoopError, ProviderStream};
+pub use loop_executor::{
+    run_agent_turn, run_agent_turn_cancellable, run_agent_turn_forked, LoopError, ProviderStream,
+};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};

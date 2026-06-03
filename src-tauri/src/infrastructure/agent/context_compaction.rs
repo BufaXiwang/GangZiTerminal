@@ -10,9 +10,9 @@
 //!   5. HardLimit fail closed
 //!
 //! 本文件提供：
-//! - `micro_clear`：替换易腐 part 为 stub
-//! - `drop_oldest_chat_until`：按 soft limit 丢弃最旧 chat part
-//! - `compact_context(bundle, policy)`：spec §4 描述的纯计算 API（作用于 ContextBundle）
+//! - `micro_clear`：替换易腐 part 为 stub（作用于 systemParts）
+//! - `drop_oldest_droppable_part`：按 soft limit 丢弃最旧 droppable systemPart
+//! - `compact_context(bundle, policy)`：spec §4 描述的纯计算 API（作用于 ContextBundle.systemParts）
 //! - `compact_messages(messages, policy, durable_ids, ...)`：spec §4/§5 — 作用于会话 messages 的纯计算
 //! - `decide_tier`：纯判定函数
 //! - `estimate_context_tokens(messages, context, channel)`：spec §5 描述的纯计算 token 估算
@@ -55,24 +55,18 @@ pub struct MicroClearReport {
 /// `<tool_result name="X" call_id="Y" ref="Z">...</tool_result>` 的 wrapper 做 stub；
 /// 非 wrapper 的 droppable parts 无 attrs 可填，不该走 stub 路径。
 ///
-/// **Realtime lane**（spec §4 line 322）：trigger / 账户 / 行情 / 新闻 / 策略——这些不一定是
-/// tool_result wrapper。处理策略：
-///   - 是 `<tool_result>` wrapper → stub 化（保留 name + call_id + ref）
-///   - 不是 wrapper 但 droppable → 直接移除（drop，不 stub）。realtime lane 是 fresh data，过期就该 drop。
-///   - `droppable = false` 的 part 保留不动（spec §2 line 332 invariant）。
-///
-/// **Chat lane**（spec §4 line 442）：历史 tool_result。只对 wrapper 做 stub，纯用户 / 助理对话留给
-/// Drop / Summarize 处理。
+/// **作用面：`systemParts`**（单 lane 设计，spec §2 ContextBundle）。systemParts 内含身份 / 工具清单
+/// （`kind=system`，`droppable=false`，永不动）+ Runtime 注入的 realtime packet（`kind=realtime`，由
+/// Runtime 标 `droppable`）/ memory。处理策略：
+///   - droppable + `<tool_result>` wrapper → stub 化（保留 name + call_id + ref）
+///   - droppable + 非 wrapper → 直接移除（无 attrs 可填，不能走 stub）。realtime packet 是 fresh data，过期就该 drop。
+///   - `droppable = false` 的 part 保留不动（spec §2 invariant，工具清单 / 身份在此）。
 pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
     let mut report = MicroClearReport {
         stubbed_parts: 0,
         estimated_tokens_saved: 0,
     };
-    // Realtime parts:
-    //   - droppable + tool_result wrapper → stub 化（attrs 完整）
-    //   - droppable + 非 wrapper → 直接移除（无 attrs 可填，不能走 stub）
-    //   - 非 droppable → 保留
-    bundle.realtime_parts.retain_mut(|p| {
+    bundle.system_parts.retain_mut(|p| {
         if !p.droppable || is_stub(p) {
             return true;
         }
@@ -82,22 +76,12 @@ pub fn micro_clear(bundle: &mut ContextBundle) -> MicroClearReport {
             report.stubbed_parts += 1;
             true
         } else {
-            // Non-wrapper realtime part: drop entirely (counted in stubbed_parts as "compacted").
+            // Non-wrapper droppable part (e.g. realtime packet): drop entirely.
             report.estimated_tokens_saved += p.estimated_tokens();
             report.stubbed_parts += 1;
             false
         }
     });
-    // Chat parts: only stub-replace droppable parts whose content is itself a
-    // <tool_result ...> wrapper (historical tool_results migrated into chat history).
-    // Pure user / assistant chat is left untouched — Drop / Summarize handle that lane.
-    for p in bundle.chat_parts.iter_mut() {
-        if p.droppable && !is_stub(p) && content_is_tool_result(&p.content) {
-            report.estimated_tokens_saved += p.estimated_tokens();
-            stub_in_place(p);
-            report.stubbed_parts += 1;
-        }
-    }
     report
 }
 
@@ -212,21 +196,21 @@ fn is_stub(p: &ContextPart) -> bool {
     matches!(p.kind, ContextPartKind::ToolResultStub)
 }
 
-/// Drop 最旧 chat parts，直到落到 soft limit 以下。
+/// Drop 最旧的 droppable systemParts，直到落到 soft limit 以下。
 ///
-/// Spec §4 顺序步骤 3。返回被丢弃的 part 数。
-pub fn drop_oldest_chat_until(
+/// Spec §4 顺序步骤 3。返回被丢弃的 part 数。`droppable=false`（工具清单 / 身份）永不丢。
+pub fn drop_oldest_droppable_part(
     bundle: &mut ContextBundle,
     limits: ContextWindowLimits,
 ) -> u32 {
     let mut dropped = 0u32;
     while bundle.estimated_tokens() > limits.soft_limit_tokens
-        && !bundle.chat_parts.is_empty()
+        && !bundle.system_parts.is_empty()
     {
-        let pos = bundle.chat_parts.iter().position(|p| p.droppable);
+        let pos = bundle.system_parts.iter().position(|p| p.droppable);
         match pos {
             Some(i) => {
-                bundle.chat_parts.remove(i);
+                bundle.system_parts.remove(i);
                 dropped += 1;
             }
             None => break,
@@ -237,12 +221,10 @@ pub fn drop_oldest_chat_until(
 
 /// 决策下一步该走的压缩 tier。
 ///
-/// Spec §4 触发条件表 — 按 token 估算决策；time-based MicroClear 由 caller 提供
-/// since_last_assistant_secs。
+/// Spec §4 触发条件表 — 按 token 估算决策（time-based MicroClear 已从 spec 删除）。
 pub fn decide_tier(
     bundle: &ContextBundle,
     limits: ContextWindowLimits,
-    since_last_assistant_secs: Option<u64>,
 ) -> Option<CompactTier> {
     let est = bundle.estimated_tokens();
     if est > limits.hard_limit_tokens {
@@ -253,11 +235,6 @@ pub fn decide_tier(
     }
     if est > limits.soft_limit_tokens {
         return Some(CompactTier::MicroClear);
-    }
-    if let Some(s) = since_last_assistant_secs {
-        if s > limits.micro_clear_after_secs {
-            return Some(CompactTier::MicroClear);
-        }
     }
     None
 }
@@ -329,17 +306,21 @@ pub fn compact_context(
         CompactPolicy::Summarize | CompactPolicy::Drop => {
             // 在没有 summarize 模型可用前，Summarize / Drop 都走 drop-oldest 占位。
             // loop executor 在真实场景需要时再调外部 compact provider。
-            let n = drop_oldest_chat_until(&mut bundle, limits);
+            let n = drop_oldest_droppable_part(&mut bundle, limits);
             (bundle, n)
         }
         CompactPolicy::ReactiveRetry => {
-            // 更激进：MicroClear + 丢弃整个最老一轮 chat（droppable 的）。
+            // 更激进：MicroClear + 丢弃最老若干 droppable systemParts。
+            // 跳过 stub —— stub 体积已极小且携带 replay ref（name/call_id/ref），不该被二次丢弃。
             let rep = micro_clear(&mut bundle);
-            // 丢弃最老一条 droppable chat（一轮的近似定义）
             let mut extra = 0u32;
             for _ in 0..2 {
-                if let Some(i) = bundle.chat_parts.iter().position(|p| p.droppable) {
-                    bundle.chat_parts.remove(i);
+                if let Some(i) = bundle
+                    .system_parts
+                    .iter()
+                    .position(|p| p.droppable && !is_stub(p))
+                {
+                    bundle.system_parts.remove(i);
                     extra += 1;
                 } else {
                     break;
@@ -455,9 +436,10 @@ pub fn drop_oldest_round_messages(
 mod tests {
     use super::*;
 
-    fn chat(text: &str, droppable: bool) -> ContextPart {
+    /// 测试辅助：构造一个 systemParts 内的 part（kind=Realtime，由 caller 标 droppable）。
+    fn sys(text: &str, droppable: bool) -> ContextPart {
         ContextPart {
-            kind: ContextPartKind::Chat,
+            kind: ContextPartKind::Realtime,
             content: ContextContent::Text(text.into()),
             freshness: None,
             token_estimate: None,
@@ -466,35 +448,29 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_replaces_realtime_tool_result_wrappers_with_stubs() {
-        // Spec §2 line 261: realtime droppable tool_result wrappers → stub with attrs.
+    fn micro_clear_replaces_tool_result_wrappers_with_stubs() {
+        // Spec §2: droppable tool_result wrappers in systemParts → stub with attrs.
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(format!(
+        b.system_parts.push(sys(
+            &format!(
                 r#"<tool_result name="q1" call_id="tc_a" ref="pl_a">{}</tool_result>"#,
                 "q".repeat(400)
-            )),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(format!(
+            ),
+            true,
+        ));
+        b.system_parts.push(sys(
+            &format!(
                 r#"<tool_result name="q2" call_id="tc_b" ref="pl_b">{}</tool_result>"#,
                 "r".repeat(400)
-            )),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
+            ),
+            true,
+        ));
         let before = b.estimated_tokens();
         let rep = micro_clear(&mut b);
         let after = b.estimated_tokens();
         assert_eq!(rep.stubbed_parts, 2);
         assert!(after < before);
-        for p in &b.realtime_parts {
+        for p in &b.system_parts {
             assert!(is_stub(p));
         }
     }
@@ -502,88 +478,79 @@ mod tests {
     #[test]
     fn drop_oldest_keeps_non_droppable() {
         let mut b = ContextBundle::new("r1");
-        b.chat_parts.push(chat(&"a".repeat(1000), false));
-        b.chat_parts.push(chat(&"b".repeat(1000), true));
-        b.chat_parts.push(chat(&"c".repeat(1000), true));
+        b.system_parts.push(sys(&"a".repeat(1000), false));
+        b.system_parts.push(sys(&"b".repeat(1000), true));
+        b.system_parts.push(sys(&"c".repeat(1000), true));
         let limits = ContextWindowLimits {
             soft_limit_tokens: 300,
             summarize_threshold_tokens: 500,
             hard_limit_tokens: 1000,
-            micro_clear_after_secs: 60,
         };
-        let n = drop_oldest_chat_until(&mut b, limits);
+        let n = drop_oldest_droppable_part(&mut b, limits);
         assert_eq!(n, 2);
-        assert_eq!(b.chat_parts.len(), 1);
-        assert!(!b.chat_parts[0].droppable);
+        assert_eq!(b.system_parts.len(), 1);
+        assert!(!b.system_parts[0].droppable);
     }
 
     #[test]
     fn decide_tier_picks_summarize_above_threshold() {
         let mut b = ContextBundle::new("r1");
-        b.chat_parts.push(chat(&"x".repeat(4_000), true)); // ~1000 tokens
+        b.system_parts.push(sys(&"x".repeat(4_000), true)); // ~1000 tokens
         let limits = ContextWindowLimits {
             soft_limit_tokens: 200,
             summarize_threshold_tokens: 500,
             hard_limit_tokens: 5000,
-            micro_clear_after_secs: 60,
         };
-        assert_eq!(decide_tier(&b, limits, None), Some(CompactTier::Summarize));
+        assert_eq!(decide_tier(&b, limits), Some(CompactTier::Summarize));
     }
 
     #[test]
-    fn decide_tier_picks_micro_clear_when_idle() {
-        let b = ContextBundle::new("r1");
-        let limits = ContextWindowLimits::default();
-        assert_eq!(
-            decide_tier(&b, limits, Some(60 * 60 * 2)),
-            Some(CompactTier::MicroClear)
-        );
-        assert_eq!(decide_tier(&b, limits, Some(10)), None);
-    }
-
-    #[test]
-    fn compact_context_reactive_retry_drops_chats_and_stubs_realtime() {
+    fn decide_tier_picks_micro_clear_above_soft_limit() {
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(format!(
+        b.system_parts.push(sys(&"x".repeat(1_200), true)); // ~300 tokens
+        let limits = ContextWindowLimits {
+            soft_limit_tokens: 200,
+            summarize_threshold_tokens: 5000,
+            hard_limit_tokens: 9000,
+        };
+        assert_eq!(decide_tier(&b, limits), Some(CompactTier::MicroClear));
+        // Empty bundle under soft limit → no compaction.
+        assert_eq!(decide_tier(&ContextBundle::new("r2"), limits), None);
+    }
+
+    #[test]
+    fn compact_context_reactive_retry_drops_parts_and_stubs_wrappers() {
+        let mut b = ContextBundle::new("r1");
+        b.system_parts.push(sys(
+            &format!(
                 r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,
                 "q".repeat(400)
-            )),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        b.chat_parts.push(chat(&"a".repeat(1000), true));
-        b.chat_parts.push(chat(&"b".repeat(1000), true));
+            ),
+            true,
+        ));
+        b.system_parts.push(sys(&"a".repeat(1000), true));
+        b.system_parts.push(sys(&"b".repeat(1000), true));
         let (out, n) = compact_context(b, CompactPolicy::ReactiveRetry, ContextWindowLimits::default());
         assert!(n >= 2);
-        // realtime wrapper stubbed (survives as stub)
-        assert_eq!(out.realtime_parts.len(), 1);
-        for p in &out.realtime_parts {
-            assert!(matches!(p.kind, ContextPartKind::ToolResultStub));
-        }
-        // most chat parts removed
-        assert!(out.chat_parts.len() <= 1);
+        // The wrapper survives as a stub; the plain droppable parts are removed.
+        assert!(out
+            .system_parts
+            .iter()
+            .any(|p| matches!(p.kind, ContextPartKind::ToolResultStub)));
+        assert!(out.system_parts.len() <= 1);
     }
 
     #[test]
     fn micro_clear_preserves_name_call_id_ref_in_stub() {
-        // Spec §4 line 511: 易腐 tool 结果替换 stub 时，必须保留 name + call_id + ref。
+        // Spec §4: 易腐 tool 结果替换 stub 时，必须保留 name + call_id + ref。
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(
-                r#"<tool_result name="fetch_quote" call_id="tc_abc" ref="pl_xyz">{"price":"1.0"}</tool_result>"#
-                    .into(),
-            ),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
+        b.system_parts.push(sys(
+            r#"<tool_result name="fetch_quote" call_id="tc_abc" ref="pl_xyz">{"price":"1.0"}</tool_result>"#,
+            true,
+        ));
         let rep = micro_clear(&mut b);
         assert_eq!(rep.stubbed_parts, 1);
-        let rendered = match &b.realtime_parts[0].content {
+        let rendered = match &b.system_parts[0].content {
             ContextContent::Text(s) => s.clone(),
             _ => panic!("expected text"),
         };
@@ -595,74 +562,21 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_stubs_chat_tool_results_but_leaves_plain_chat_alone() {
-        // Spec §4: chat history that contains historical tool_result must be stub-replaced
-        // by MicroClear (preserves replay link); plain user / assistant chat is left untouched.
-        let mut b = ContextBundle::new("r1");
-        b.chat_parts.push(ContextPart {
-            kind: ContextPartKind::Chat,
-            content: ContextContent::Text(
-                r#"<tool_result name="news_search" call_id="tc_news" ref="pl_news">{"items":[]}</tool_result>"#
-                    .into(),
-            ),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        b.chat_parts.push(ContextPart {
-            kind: ContextPartKind::Chat,
-            content: ContextContent::Text("user said something".into()),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        let rep = micro_clear(&mut b);
-        assert_eq!(rep.stubbed_parts, 1);
-        // First chat part stubbed:
-        let head = match &b.chat_parts[0].content {
-            ContextContent::Text(s) => s.clone(),
-            _ => panic!("text"),
-        };
-        assert!(head.starts_with("<tool_result_stub"));
-        assert!(head.contains(r#"name="news_search""#));
-        assert!(head.contains(r#"ref="pl_news""#));
-        // Second chat part left as-is:
-        let tail = match &b.chat_parts[1].content {
-            ContextContent::Text(s) => s.clone(),
-            _ => panic!("text"),
-        };
-        assert_eq!(tail, "user said something");
-        assert!(matches!(b.chat_parts[1].kind, ContextPartKind::Chat));
-    }
-
-    #[test]
-    fn micro_clear_drops_non_tool_result_realtime_parts() {
-        // Spec §2 line 261: stub must have name/call_id/ref attrs — non-wrapper realtime parts
+    fn micro_clear_drops_non_tool_result_droppable_parts() {
+        // Spec §2: stub must have name/call_id/ref attrs — non-wrapper droppable parts
         // have no attrs to fill, so they're dropped entirely instead of stubbed.
-        // (Spec §4 line 322: realtime lane is fresh data; expired non-wrapper data should drop.)
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text("plain realtime data with no tool_result tag".into()),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(
-                r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#
-                    .into(),
-            ),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
+        b.system_parts
+            .push(sys("plain realtime packet with no tool_result tag", true));
+        b.system_parts.push(sys(
+            r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#,
+            true,
+        ));
         let rep = micro_clear(&mut b);
         assert_eq!(rep.stubbed_parts, 2, "both droppable parts compacted (1 dropped + 1 stubbed)");
         // Only the wrapper part survives, as a stub with attrs:
-        assert_eq!(b.realtime_parts.len(), 1);
-        let surviving = &b.realtime_parts[0];
+        assert_eq!(b.system_parts.len(), 1);
+        let surviving = &b.system_parts[0];
         assert!(matches!(surviving.kind, ContextPartKind::ToolResultStub));
         let rendered = match &surviving.content {
             ContextContent::Text(s) => s.clone(),
@@ -676,38 +590,23 @@ mod tests {
     }
 
     #[test]
-    fn micro_clear_keeps_droppable_false_realtime_parts() {
-        // Spec §2 line 332 invariant: parts with droppable = false must never be removed
-        // or mutated by compaction — even by realtime-lane micro_clear.
+    fn micro_clear_keeps_droppable_false_parts() {
+        // Spec §2 invariant: parts with droppable = false must never be removed or mutated
+        // by compaction — this is where the tool list / identity live.
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text("system trigger payload — must survive".into()),
-            freshness: None,
-            token_estimate: None,
-            droppable: false,
-        });
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(
-                r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#
-                    .into(),
-            ),
-            freshness: None,
-            token_estimate: None,
-            droppable: false,
-        });
+        b.system_parts.push(sys("tool list / identity — must survive", false));
+        b.system_parts.push(sys(
+            r#"<tool_result name="quote" call_id="tc_q" ref="pl_q">{"px":"1"}</tool_result>"#,
+            false,
+        ));
         let rep = micro_clear(&mut b);
         assert_eq!(rep.stubbed_parts, 0);
-        assert_eq!(b.realtime_parts.len(), 2);
-        // Both untouched (not stubbed, not dropped):
-        assert!(matches!(b.realtime_parts[0].kind, ContextPartKind::Realtime));
-        assert!(matches!(b.realtime_parts[1].kind, ContextPartKind::Realtime));
-        let head = match &b.realtime_parts[0].content {
+        assert_eq!(b.system_parts.len(), 2);
+        let head = match &b.system_parts[0].content {
             ContextContent::Text(s) => s.clone(),
             _ => panic!("text"),
         };
-        assert_eq!(head, "system trigger payload — must survive");
+        assert_eq!(head, "tool list / identity — must survive");
     }
 
     #[test]
@@ -729,7 +628,7 @@ mod tests {
     fn estimate_context_tokens_returns_over_soft_limit_when_above() {
         use crate::domain::agent::{ProviderChannel, WireFormat};
         let mut b = ContextBundle::new("r1");
-        b.chat_parts.push(chat(&"x".repeat(40_000), true)); // ~10k tokens
+        b.system_parts.push(sys(&"x".repeat(40_000), true)); // ~10k tokens
         let channel = ProviderChannel {
             channel_id: "c".into(),
             provider: "p".into(),
@@ -799,27 +698,24 @@ mod tests {
     }
 
     #[test]
-    fn compact_context_micro_clear_only_stubs_realtime() {
+    fn compact_context_micro_clear_stubs_wrapper_and_drops_plain() {
         let mut b = ContextBundle::new("r1");
-        b.realtime_parts.push(ContextPart {
-            kind: ContextPartKind::Realtime,
-            content: ContextContent::Text(format!(
+        b.system_parts.push(sys(
+            &format!(
                 r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,
                 "q".repeat(400)
-            )),
-            freshness: None,
-            token_estimate: None,
-            droppable: true,
-        });
-        b.chat_parts.push(chat(&"x".repeat(400), true));
+            ),
+            true,
+        ));
+        b.system_parts.push(sys(&"x".repeat(400), true)); // plain droppable → dropped
         let (out, n) = compact_context(b, CompactPolicy::MicroClear, ContextWindowLimits::default());
-        assert_eq!(n, 1);
+        assert_eq!(n, 2);
+        // wrapper survives as stub, plain droppable part dropped.
+        assert_eq!(out.system_parts.len(), 1);
         assert!(matches!(
-            out.realtime_parts[0].kind,
+            out.system_parts[0].kind,
             ContextPartKind::ToolResultStub
         ));
-        // chat untouched
-        assert_eq!(out.chat_parts.len(), 1);
     }
 
     // ---- message-lane compaction ----

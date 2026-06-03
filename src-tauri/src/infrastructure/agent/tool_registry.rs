@@ -115,10 +115,44 @@ where
 
 /// Input 校验闭包；返回 None = 通过，返回 Some(message) = 拒绝。
 ///
-/// Spec §2: tool input 必须按 `inputSchema` 校验。Infra 默认行为是"接受任何 JSON"，
-/// 由调用方通过 `register_tool_with_validator` 注入实际 schema 校验器。
+/// Spec §2: tool input 必须按 `inputSchema` 校验，且**强制自动** —— `register_tool` 注册时即由
+/// `build_schema_validator` 从 `spec.input_schema` 编译出校验器。`register_tool_with_validator` 仍
+/// 保留为「显式 override」入口（测试 / 特殊校验逻辑用）。
 pub type InputValidator =
     Arc<dyn Fn(&JsonSummary) -> Option<String> + Send + Sync + 'static>;
+
+/// 从 `ToolSpec.input_schema` 编译出一个 `InputValidator`（spec §2：inputSchema 强制自动校验）。
+///
+/// - 空 schema（`{}` / 非 object / null）→ 返回 `None`（接受任意 input，无约束）。
+/// - 合法 JSON Schema → 编译成校验器，input 不符时返回首条错误消息。
+/// - schema 本身无法编译（写错了）→ 返回 `None`（不因 spec 笔误阻断注册；仅放弃该 tool 的校验）。
+fn build_schema_validator(schema: &serde_json::Value) -> Option<InputValidator> {
+    let is_empty = schema
+        .as_object()
+        .map(|m| m.is_empty())
+        .unwrap_or(true); // 非 object（null / 标量）也视为无约束
+    if is_empty {
+        return None;
+    }
+    match jsonschema::validator_for(schema) {
+        Ok(compiled) => {
+            let compiled = Arc::new(compiled);
+            Some(Arc::new(move |input: &JsonSummary| -> Option<String> {
+                if compiled.is_valid(input) {
+                    None
+                } else {
+                    let msg = compiled
+                        .iter_errors(input)
+                        .next()
+                        .map(|e| format!("input does not match inputSchema: {e}"))
+                        .unwrap_or_else(|| "input does not match inputSchema".to_string());
+                    Some(msg)
+                }
+            }))
+        }
+        Err(_) => None,
+    }
+}
 
 struct ToolEntry {
     spec: ToolSpec,
@@ -175,12 +209,15 @@ impl ToolRegistry {
     /// 注册 tool。
     ///
     /// Spec §5 Tool Registry API: `register_tool(spec, handler) -> Result<()>`。
+    /// Spec §2: inputSchema 校验**强制且自动** —— 注册时即从 `spec.input_schema` 编译出
+    /// JSON Schema 校验器，dispatch 前自动校验，不依赖调用方手动传校验器。
     pub fn register_tool(
         &self,
         spec: ToolSpec,
         handler: Arc<dyn ToolHandler>,
     ) -> Result<(), RegisterError> {
-        self.register_tool_with_validator(spec, handler, None)
+        let validator = build_schema_validator(&spec.input_schema);
+        self.register_tool_with_validator(spec, handler, validator)
     }
 
     /// 注册 tool 并附带 input schema 校验器。

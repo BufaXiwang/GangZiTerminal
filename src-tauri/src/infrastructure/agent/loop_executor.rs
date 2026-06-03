@@ -38,6 +38,7 @@ use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
 use std::collections::HashSet;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
 
@@ -249,7 +250,35 @@ pub async fn run_agent_turn(
     event_tx: Sender<AgentEvent>,
     repo: Option<AgentMessagesRepo>,
 ) -> Result<RunSummary, LoopError> {
-    run_agent_turn_forked(request, registry, context, providers, event_tx, repo, None).await
+    // 便利入口：不需要取消 → 传一个永不触发的 token（spec §3）。
+    run_agent_turn_forked(
+        request,
+        registry,
+        context,
+        providers,
+        event_tx,
+        repo,
+        None,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// 可取消入口（spec §3）：生产触发入口（Tauri command / scheduler / Runtime）持有 `cancel`，
+/// 经另一条命令触发 `cancel.cancel()` → loop 在 turn 边界检测后停止并 emit `done(stop_reason=cancelled)`。
+pub async fn run_agent_turn_cancellable(
+    request: AgentRunRequest,
+    registry: Arc<ToolRegistry>,
+    context: ContextBundle,
+    providers: Vec<Box<dyn ProviderStream>>,
+    event_tx: Sender<AgentEvent>,
+    repo: Option<AgentMessagesRepo>,
+    cancel: CancellationToken,
+) -> Result<RunSummary, LoopError> {
+    run_agent_turn_forked(
+        request, registry, context, providers, event_tx, repo, None, cancel,
+    )
+    .await
 }
 
 /// `run_agent_turn` 的全量版本：额外带一个每-run 的 `fork_ctx`（`DispatchExt`），在本 run 内每次
@@ -269,6 +298,7 @@ pub async fn run_agent_turn_forked(
     event_tx: Sender<AgentEvent>,
     repo: Option<AgentMessagesRepo>,
     fork_ctx: Option<DispatchExt>,
+    cancel: CancellationToken,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
     let plan = CompactionPlan::derive(request.compaction.as_ref(), &request.channel);
@@ -332,6 +362,11 @@ pub async fn run_agent_turn_forked(
     let mut reactive_retry_used = false;
     let stop_reason: AgentStopReason;
     'outer: loop {
+        // Spec §3: 可取消 —— 在每个 turn 边界检查取消信号，被取消则停后续 turn + emit done(cancelled)。
+        if cancel.is_cancelled() {
+            stop_reason = AgentStopReason::Cancelled;
+            break;
+        }
         if turn >= request.max_turns {
             stop_reason = AgentStopReason::MaxTurns;
             break;
@@ -406,7 +441,30 @@ pub async fn run_agent_turn_forked(
                 turn -= 1;
                 continue 'outer;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Spec §4: 全渠道耗尽 / 致命 provider 错误 → fail closed，但必须发终态事件
+                // （run_start 已发，订阅方否则会看到一个永不终止的 run）。emit error + done，再把
+                // Err 上抛给调用方（保持调用方按 Result 判错的能力）。
+                send_event(
+                    &event_tx,
+                    AgentEvent::Error {
+                        run_id: run_id.clone(),
+                        code: ErrorCode::ProviderUnavailable,
+                        message: e.to_string(),
+                    },
+                )
+                .await?;
+                send_event(
+                    &event_tx,
+                    AgentEvent::Done {
+                        run_id: run_id.clone(),
+                        stop_reason: AgentStopReason::Error,
+                        turns: turn,
+                    },
+                )
+                .await?;
+                return Err(e);
+            }
         };
         usage_input = usage_input.saturating_add(outcome.usage_input);
         usage_output = usage_output.saturating_add(outcome.usage_output);
@@ -567,24 +625,10 @@ pub async fn run_agent_turn_forked(
         // Continue to next turn.
     }
 
-    // usage event semantics.
-    // The provider emits a *per-turn* `AgentEvent::Usage` inside `next_turn` (one per
-    // provider round-trip). Here the loop emits the *cumulative run total* exactly ONCE,
-    // just before `Done`. Same variant, but disambiguated by position: the final Usage
-    // immediately preceding Done is always the run total; any earlier Usage is per-turn.
-    // (We keep the public AgentEvent shape unchanged; consumers that need the run total
-    // can read the last Usage before Done, which also matches RunSummary.)
-    send_event(
-        &event_tx,
-        AgentEvent::Usage {
-            run_id: run_id.clone(),
-            input_tokens: usage_input,
-            output_tokens: usage_output,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-        },
-    )
-    .await?;
+    // usage event semantics (spec §2): `Usage` is **per-turn incremental** — the provider emits
+    // one `AgentEvent::Usage` per `next_turn` (covering only that turn). The loop does NOT emit an
+    // extra cumulative event; subscribers accumulate as needed. The run total still lives in the
+    // returned `RunSummary` (usage_input / usage_output below).
     send_event(
         &event_tx,
         AgentEvent::Done {
@@ -786,8 +830,6 @@ fn plan_limits(plan: &CompactionPlan) -> crate::domain::agent::ContextWindowLimi
         soft_limit_tokens: plan.soft_limit,
         summarize_threshold_tokens: plan.summarize_threshold,
         hard_limit_tokens: plan.hard_limit,
-        micro_clear_after_secs: crate::domain::agent::ContextWindowLimits::default()
-            .micro_clear_after_secs,
     }
 }
 
@@ -1186,6 +1228,43 @@ mod tests {
         }
         assert!(matches!(events.first(), Some(AgentEvent::RunStart { .. })));
         assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+    }
+
+    #[tokio::test]
+    async fn loop_cancelled_before_first_turn_emits_done_cancelled() {
+        // Spec §3: 预先取消的 token → loop 在第一个 turn 边界即停，emit done(stop_reason=cancelled)，
+        // 不调用 provider（turns=0）。
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        let provider = Box::new(ScriptedProvider {
+            // 若被调用会 panic（脚本耗尽）—— 用于证明 provider 未被触达。
+            script: vec![],
+            index: 0,
+        });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let summary = run_agent_turn_cancellable(
+            req(),
+            registry,
+            ContextBundle::new("r1"),
+            vec![provider],
+            tx,
+            None,
+            cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.turns, 0);
+        assert_eq!(summary.stop_reason, AgentStopReason::Cancelled);
+        let mut saw_done_cancelled = false;
+        while let Some(e) = rx.recv().await {
+            if let AgentEvent::Done { stop_reason, .. } = e {
+                if stop_reason == AgentStopReason::Cancelled {
+                    saw_done_cancelled = true;
+                }
+            }
+        }
+        assert!(saw_done_cancelled, "expected Done(stop_reason=cancelled)");
     }
 
     #[tokio::test]
@@ -1827,7 +1906,7 @@ mod tests {
         // Tiny window: soft = 200/2 = 100, summarize = 140, hard = 180.
         request.channel.context_window_tokens = Some(200);
         let mut ctx = ContextBundle::new("r1");
-        ctx.realtime_parts.push(ContextPart {
+        ctx.system_parts.push(ContextPart {
             kind: ContextPartKind::Realtime,
             content: ContextContent::Text(format!(
                 r#"<tool_result name="q" call_id="tc_q" ref="pl_q">{}</tool_result>"#,

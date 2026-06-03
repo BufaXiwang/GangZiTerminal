@@ -4,7 +4,7 @@
 //
 // 卡片：4 个核心指数 + 市场宽度 + 行业热度。
 
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useCoreIndexes, CORE_INDEXES } from "../../lib/useCoreIndexes";
 import { setSource as setPullSource } from "../../lib/quotePull";
 import { useMarketBreadth } from "../../lib/useMarketBreadth";
@@ -19,12 +19,15 @@ interface MarketMetricsRowProps {
   onSelectIndex?: (tsCode: string) => void;
   /** 顶部右上角小字（如 "已更新 19:30:00"） */
   statusText?: string;
+  /** 状态区尾部插槽（如数据源延时诊断按钮） */
+  statusSlot?: ReactNode;
 }
 
 export function MarketMetricsRow({
   selected,
   onSelectIndex,
   statusText,
+  statusSlot,
 }: MarketMetricsRowProps) {
   const indexes = useCoreIndexes();
   const breadth = useMarketBreadth();
@@ -52,6 +55,7 @@ export function MarketMetricsRow({
             {session.label}
           </span>
           {statusText}
+          {statusSlot}
         </div>
       )}
       {CORE_INDEXES.map((info) => {

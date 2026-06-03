@@ -597,6 +597,8 @@ pub async fn run_forked_agent(
         child_tx,
         handle.repo.clone(),
         Some(child_ext),
+        // 子 run 的取消走任务注册表的 AbortHandle（stop_subagent），不经 loop 的 CancellationToken。
+        tokio_util::sync::CancellationToken::new(),
     );
 
     // 并行消费子事件 + 等子 run 完成。
@@ -1769,6 +1771,7 @@ mod tests {
             tx,
             None,
             Some(top_rt.into_ext()),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -1963,6 +1966,7 @@ mod tests {
             tx,
             None,
             Some(top_rt.into_ext()),
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .unwrap();

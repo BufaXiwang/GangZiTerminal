@@ -13,8 +13,9 @@ use super::messages::JsonSummary;
 #[serde(rename_all = "snake_case")]
 pub enum ContextPartKind {
     System,
+    /// Runtime 注入的 realtime packet（行情 / 账户快照），承载在 `systemParts` 内、用 `droppable` 标可清理性。
     Realtime,
-    Chat,
+    /// Runtime 注入的 memory（用户偏好 / 复盘建议），承载在 `systemParts` 内。
     Memory,
     /// Spec §2: 易腐 tool 结果被压缩成 stub 时，content 文本是
     /// `<tool_result_stub name="..." call_id="..." ref="..." />`。
@@ -62,15 +63,15 @@ impl ContextPart {
 
 /// Runtime 提交给 Infra 的上下文包。
 ///
-/// Spec: agent-infra-module.md §2 `ContextBundle`，§4 四类上下文分层
+/// Spec: agent-infra-module.md §2 `ContextBundle`（单 lane 设计）。
+/// 只有 `systemParts` 一条 lane：身份 + 工具清单（Infra 注入）+ Runtime 注入的
+/// realtime packet（`kind=realtime`）/ memory（`kind=memory`）。多轮历史走独立的
+/// `AgentMessage[]`（repo 自动续接），不进 ContextBundle。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextBundle {
     pub run_id: String,
     pub system_parts: Vec<ContextPart>,
-    pub realtime_parts: Vec<ContextPart>,
-    pub chat_parts: Vec<ContextPart>,
-    pub memory_parts: Vec<ContextPart>,
 }
 
 impl ContextBundle {
@@ -78,9 +79,6 @@ impl ContextBundle {
         Self {
             run_id: run_id.into(),
             system_parts: vec![],
-            realtime_parts: vec![],
-            chat_parts: vec![],
-            memory_parts: vec![],
         }
     }
 
@@ -89,9 +87,6 @@ impl ContextBundle {
         let sum = self
             .system_parts
             .iter()
-            .chain(self.realtime_parts.iter())
-            .chain(self.chat_parts.iter())
-            .chain(self.memory_parts.iter())
             .map(ContextPart::estimated_tokens)
             .map(u64::from)
             .sum::<u64>();
@@ -116,8 +111,6 @@ pub struct ContextWindowLimits {
     pub soft_limit_tokens: u32,
     pub summarize_threshold_tokens: u32,
     pub hard_limit_tokens: u32,
-    /// time-based MicroClear 间隔；默认 60 分钟（spec §4 表格）。
-    pub micro_clear_after_secs: u64,
 }
 
 impl Default for ContextWindowLimits {
@@ -127,7 +120,6 @@ impl Default for ContextWindowLimits {
             soft_limit_tokens: 60_000,
             summarize_threshold_tokens: 90_000,
             hard_limit_tokens: 180_000,
-            micro_clear_after_secs: 60 * 60,
         }
     }
 }
@@ -147,12 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn context_bundle_estimates_tokens_across_lanes() {
+    fn context_bundle_estimates_tokens_across_parts() {
         let mut b = ContextBundle::new("r1");
         b.system_parts
             .push(part(ContextPartKind::System, &"a".repeat(40), false));
-        b.chat_parts
-            .push(part(ContextPartKind::Chat, &"b".repeat(80), true));
+        b.system_parts
+            .push(part(ContextPartKind::Realtime, &"b".repeat(80), true));
         // 40 / 4 + 80 / 4 = 10 + 20 = 30
         assert_eq!(b.estimated_tokens(), 30);
     }
