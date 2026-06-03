@@ -26,7 +26,9 @@ use crate::infrastructure::account::repository::{AccountRepository, FreezeEntry,
 use crate::infrastructure::db::AppDb;
 use crate::pipeline::account::fills::{simulate_limit, FillDecision, NotEligibleReason};
 use crate::pipeline::account::quote_gateway::AccountQuoteGateway;
-use crate::pipeline::account::service::{consume_lots_fifo, quote_err_to_warning};
+use crate::pipeline::account::service::{
+    consume_lots_fifo, next_trade_date_after, quote_err_to_warning,
+};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -538,7 +540,9 @@ fn commit_limit_fill(
                 let trade_date = ctx
                     .current_trade_date
                     .unwrap_or(ctx.latest_completed_trade_date);
-                let sellable_from = ctx.next_trade_date.unwrap_or(trade_date);
+                // T+1：与 service.rs 买入路径统一取法；日历缺数据时保守顺延到次一日历日，
+                // 绝不回退当日（否则当日买入 lot 当日可卖，破坏 T+1）。Spec §5。
+                let sellable_from = next_trade_date_after(now);
                 let lot = PositionLot {
                     lot_id: new_id("lot"),
                     position_id: position_id.clone(),
@@ -906,60 +910,67 @@ fn evaluate_protection(
     }
 
     // 2) price-based: stop_loss / take_profit (依赖行情)
+    //
+    // Spec §5 行情边界（account-module.md:~1078）：
+    //   - trigger 是「通知」不是「成交」，因此用**显示语义取数**（stale-tolerant，
+    //     与估值同源 `get_display_snapshot`），而非交易写路径的 fail-closed `get_snapshot`。
+    //   - stale quote 命中价格型保护条件仍**正常生成 trigger**，并在 trigger /
+    //     warnings 中携带 `quote_stale` + freshness。
+    //   - missing quote / 关键价格缺失 → 跳过价格型评估、不生成 trigger，
+    //     本批次 warnings 携带 `quote_missing` / `quote_price_missing`。
     if prot.stop_loss.is_some() || prot.take_profit.is_some() {
-        match deps.gateway.get_snapshot(&pos.ts_code) {
-            Ok(snap) => {
-                let Some(price) = snap.quote.price else {
-                    warnings_out.push(WarningCode::QuotePriceMissing);
-                    return;
-                };
-                let mut warns: Vec<WarningCode> = vec![];
-                let freshness = snap.quote.freshness.clone();
-                if matches!(freshness.status, FreshnessStatus::Stale) {
-                    warns.push(WarningCode::QuoteStale);
-                }
-                if let Some(sl) = prot.stop_loss {
-                    if price.0 <= sl.0 {
-                        create_protection_trigger(
-                            repo,
-                            pos,
-                            prot,
-                            AccountTriggerType::StopLoss,
-                            Some(price),
-                            Some(sl.0.to_string()),
-                            trade_date,
-                            Some(freshness.clone()),
-                            warns.clone(),
-                            now,
-                            triggers_out,
-                            events_out,
-                        );
-                    }
-                }
-                if let Some(tp) = prot.take_profit {
-                    if price.0 >= tp.0 {
-                        create_protection_trigger(
-                            repo,
-                            pos,
-                            prot,
-                            AccountTriggerType::TakeProfit,
-                            Some(price),
-                            Some(tp.0.to_string()),
-                            trade_date,
-                            Some(freshness),
-                            warns,
-                            now,
-                            triggers_out,
-                            events_out,
-                        );
-                    }
-                }
+        let Some(snap) = deps.gateway.get_display_snapshot(&pos.ts_code) else {
+            // 无可展示 quote → 视为 missing：跳过价格型评估、不生成 trigger。
+            if !warnings_out.contains(&WarningCode::QuoteMissing) {
+                warnings_out.push(WarningCode::QuoteMissing);
             }
-            Err(e) => {
-                let w = quote_err_to_warning(e.kind);
-                if !warnings_out.contains(&w) {
-                    warnings_out.push(w);
-                }
+            return;
+        };
+        let Some(price) = snap.quote.price else {
+            if !warnings_out.contains(&WarningCode::QuotePriceMissing) {
+                warnings_out.push(WarningCode::QuotePriceMissing);
+            }
+            return;
+        };
+        let mut warns: Vec<WarningCode> = vec![];
+        let freshness = snap.quote.freshness.clone();
+        if matches!(freshness.status, FreshnessStatus::Stale) {
+            warns.push(WarningCode::QuoteStale);
+        }
+        if let Some(sl) = prot.stop_loss {
+            if price.0 <= sl.0 {
+                create_protection_trigger(
+                    repo,
+                    pos,
+                    prot,
+                    AccountTriggerType::StopLoss,
+                    Some(price),
+                    Some(sl.0.to_string()),
+                    trade_date,
+                    Some(freshness.clone()),
+                    warns.clone(),
+                    now,
+                    triggers_out,
+                    events_out,
+                );
+            }
+        }
+        if let Some(tp) = prot.take_profit {
+            if price.0 >= tp.0 {
+                create_protection_trigger(
+                    repo,
+                    pos,
+                    prot,
+                    AccountTriggerType::TakeProfit,
+                    Some(price),
+                    Some(tp.0.to_string()),
+                    trade_date,
+                    Some(freshness),
+                    warns,
+                    now,
+                    triggers_out,
+                    events_out,
+                );
             }
         }
     }
@@ -1356,10 +1367,94 @@ mod tests {
             .iter()
             .find(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss))
             .expect("stale quote should still produce stop_loss trigger");
+        // Spec §5 line 1079: stale-quote 价格型 trigger 必须携带 quote_stale warning。
         assert!(
             stop.warnings.contains(&WarningCode::QuoteStale),
             "stale-quote trigger must carry quote_stale warning"
         );
+        // Spec §5 line 1079: trigger 必须携带 quoteFreshness（且为 stale）。
+        let fr = stop
+            .quote_freshness
+            .as_ref()
+            .expect("stale-quote trigger must carry quote_freshness");
+        assert!(
+            matches!(fr.status, FreshnessStatus::Stale),
+            "trigger freshness must be Stale, got {:?}",
+            fr.status
+        );
+        // 命中价已带出（90 <= stop_loss 95）。
+        assert!(stop.price.is_some(), "trigger must carry hit price");
+        let _ = deps;
+    }
+
+    // ------------------------------------------------------------------
+    // P0 regression — protection 评估走 **stale-tolerant 显示语义**取数。
+    // 这条测试在「protection 用 fail-closed get_snapshot」的旧实现下会 FAIL：
+    //   faithful mock 的 get_snapshot 对 stale 返回 Err(QuoteStale) → 旧实现落 Err
+    //   分支只 push warning、不生成 trigger → find(StopLoss) panic。
+    // 新实现用 get_display_snapshot（返回 stale 快照）→ 命中仍生成 trigger。
+    // Spec: §5 行情边界（account-module.md:~1078）— trigger 是通知非成交。
+    // ------------------------------------------------------------------
+    #[test]
+    fn protection_uses_display_semantics_so_stale_quote_still_triggers() {
+        let (db, deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_disp");
+        // take_profit 命中：price 90 >= tp 80。
+        let prot = PositionProtection {
+            stop_loss: None,
+            take_profit: Some(Price(Decimal::new(80, 0))),
+            time_stop_at: None,
+            invalidation_signals: vec![],
+            enabled: true,
+            revision: 1,
+            updated_at: Utc::now(),
+        };
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_disp", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        let gw_mock = MockQuoteGateway::new();
+        // 配置「底层 stale 快照」：faithful mock 的 get_snapshot 会对它返回
+        // Err(QuoteStale)（fail-closed，证明旧实现会吞掉 trigger），
+        // 而 get_display_snapshot 返回该 stale 快照。
+        gw_mock.set(
+            &code,
+            Ok(snap_with_price_and_freshness(&code, 90.0, FreshnessStatus::Stale)),
+        );
+        // 自检：mock 的取数语义与生产 facade 一致。
+        assert!(
+            gw_mock.get_snapshot(&code).is_err(),
+            "faithful mock get_snapshot must fail-close on stale"
+        );
+        assert!(
+            gw_mock.get_display_snapshot(&code).is_some(),
+            "display snapshot must tolerate stale"
+        );
+        let deps2 = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw_mock),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps2,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        let tp = r
+            .triggers
+            .iter()
+            .find(|t| matches!(t.trigger_type, AccountTriggerType::TakeProfit))
+            .expect("stale quote (display semantics) must still produce take_profit trigger");
+        assert!(tp.warnings.contains(&WarningCode::QuoteStale));
+        assert!(matches!(
+            tp.quote_freshness.as_ref().map(|f| f.status),
+            Some(FreshnessStatus::Stale)
+        ));
         let _ = deps;
     }
 
@@ -1420,5 +1515,313 @@ mod tests {
             r1.triggers[0].order_id, r2.triggers[0].order_id,
             "resume must process a different order"
         );
+    }
+
+    // ==================================================================
+    // P1-b — commit_limit_fill hermetic 覆盖
+    // Spec §5 订单成交模拟 + §2 持仓批次模型 / 冻结规则。
+    // ==================================================================
+
+    /// 固定的盘中交易时刻（周一 10:30 Shanghai），让 simulate_limit 撮合，
+    /// 避免依赖墙钟时间（盘外 → is_trading_time=false → pending）。
+    fn trading_now() -> OccurredAt {
+        use chrono::TimeZone;
+        chrono_tz::Asia::Shanghai
+            .with_ymd_and_hms(2026, 6, 1, 10, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn pending_limit_order(
+        id: &str,
+        code: &TsCode,
+        side: OrderSide,
+        limit_price: f64,
+        qty: i64,
+        position_id: Option<&str>,
+        now: OccurredAt,
+    ) -> crate::domain::account::types::Order {
+        crate::domain::account::types::Order {
+            order_id: id.into(),
+            ts_code: code.clone(),
+            side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Price(Decimal::from_str_exact(&limit_price.to_string()).unwrap())),
+            quantity: Shares(qty),
+            filled_quantity: Shares(0),
+            status: OrderStatus::Pending,
+            intent: crate::domain::account::types::OrderIntent::DirectOrder,
+            position_id: position_id.map(|s| s.to_string()),
+            reason: Some("limit test".into()),
+            actor: TradingActor::Agent,
+            created_at: now - chrono::Duration::seconds(30),
+            updated_at: now - chrono::Duration::seconds(30),
+            expires_at: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 全成交买单 → position_opened + order_filled trigger + 现金扣减 + frozen 释放 + T+1 lot。
+    // ------------------------------------------------------------------
+    #[test]
+    fn limit_buy_full_fill_opens_position_releases_freeze_and_emits_filled_trigger() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let now = trading_now();
+        let order = pending_limit_order("ord_buy", &code, OrderSide::Buy, 100.0, 100, None, now);
+        // 冻结现金（limit 100 × 100 股 + 估算费用），模拟下单时已冻结的金额。
+        repo.tx(|tx| {
+            AccountRepository::upsert_order(tx, &order)?;
+            AccountRepository::upsert_freeze(
+                tx,
+                &FreezeEntry {
+                    order_id: "ord_buy".into(),
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    frozen_cash: Money(Decimal::from(10_050)),
+                    frozen_shares: Shares(0),
+                    frozen_lots: vec![],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // fresh quote：卖一 99 <= limit 100 → 可成交。
+        let gw = MockQuoteGateway::new();
+        gw.set(&code, Ok(snap_with_price_and_freshness(&code, 99.0, FreshnessStatus::Fresh)));
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size: 10,
+            cursor: None,
+        });
+        // order_filled trigger（终态）。
+        let trig = r
+            .triggers
+            .iter()
+            .find(|t| matches!(t.trigger_type, AccountTriggerType::OrderFilled))
+            .expect("full fill must emit order_filled trigger");
+        assert_eq!(trig.order_id.as_deref(), Some("ord_buy"));
+        // 订单终态 = Filled。
+        let o = repo.get_order("ord_buy").unwrap().unwrap();
+        assert_eq!(o.status, OrderStatus::Filled);
+        assert_eq!(o.filled_quantity.0, 100);
+        // 仓位开出 100 股。
+        let pos = repo.find_open_position_by_ts_code(&code).unwrap().unwrap();
+        assert_eq!(pos.quantity.0, 100);
+        // frozen 全释放（全成交 → delete_freeze）。
+        assert!(repo.get_freeze("ord_buy").unwrap().is_none(), "full fill must release freeze");
+        // 事件链含 order_filled + position_opened。
+        let events = repo.list_events(50, 0).unwrap();
+        let types: Vec<_> = events.iter().map(|e| e.event_type).collect();
+        assert!(types.contains(&AccountEventType::OrderFilled), "must emit order_filled");
+        assert!(types.contains(&AccountEventType::PositionOpened), "must emit position_opened");
+        assert!(types.contains(&AccountEventType::CashReleased), "excess freeze must be released");
+        // T+1：买入 lot sellable_from 严格晚于成交日（next_trade_date_after，绝不当日）。
+        let lots = repo.list_lots_by_position(&pos.position_id).unwrap();
+        assert_eq!(lots.len(), 1);
+        let buy_date = next_trade_date_after(now);
+        assert_eq!(lots[0].sellable_from.format(), buy_date.format());
+        assert!(
+            lots[0].sellable_from.as_naive() > resolve_market_time(now)
+                .current_trade_date
+                .unwrap()
+                .as_naive(),
+            "T+1: lot must not be sellable on the buy date"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 全成交卖单 → position_closed + realized PnL + 冻结 lot 释放 + order_filled trigger。
+    // ------------------------------------------------------------------
+    #[test]
+    fn limit_sell_full_fill_closes_position_and_releases_frozen_lots() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let now = trading_now();
+        // seed 开仓 100 股 @ avg_cost 90，已可卖 lot（sellable_from 在过去）。
+        let mut pos = make_position(&code, "pos_sell");
+        pos.quantity = Shares(100);
+        pos.sellable_quantity = Shares(100);
+        pos.avg_cost = Price(Decimal::from(90));
+        let order = pending_limit_order(
+            "ord_sell",
+            &code,
+            OrderSide::Sell,
+            100.0,
+            100,
+            Some("pos_sell"),
+            now,
+        );
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            let lot = crate::domain::account::types::PositionLot {
+                lot_id: "lot_s".into(),
+                position_id: "pos_sell".into(),
+                ts_code: code.clone(),
+                source_fill_id: "seed_fill".into(),
+                trade_date: crate::domain::shared::TradeDate::parse("20200101").unwrap(),
+                quantity: Shares(100),
+                remaining_quantity: Shares(100),
+                frozen_quantity: Shares(100),
+                sellable_from: crate::domain::shared::TradeDate::parse("20200101").unwrap(),
+                created_at: now - chrono::Duration::days(30),
+            };
+            AccountRepository::insert_lot(tx, &lot)?;
+            AccountRepository::upsert_order(tx, &order)?;
+            AccountRepository::upsert_freeze(
+                tx,
+                &FreezeEntry {
+                    order_id: "ord_sell".into(),
+                    ts_code: code.clone(),
+                    side: OrderSide::Sell,
+                    frozen_cash: Money(Decimal::ZERO),
+                    frozen_shares: Shares(100),
+                    frozen_lots: vec![FrozenLot { lot_id: "lot_s".into(), quantity: 100 }],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // fresh quote：买一 100 >= limit 100 → 可成交。
+        let gw = MockQuoteGateway::new();
+        gw.set(&code, Ok(snap_with_price_and_freshness(&code, 100.0, FreshnessStatus::Fresh)));
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size: 10,
+            cursor: None,
+        });
+        // order_filled trigger。
+        assert!(
+            r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::OrderFilled)),
+            "sell full fill must emit order_filled trigger"
+        );
+        // 订单 Filled。
+        assert_eq!(repo.get_order("ord_sell").unwrap().unwrap().status, OrderStatus::Filled);
+        // 仓位平掉（卖出 100 = 全部持仓 → closed）。
+        let pos_after = repo.get_position("pos_sell").unwrap().unwrap();
+        assert_eq!(pos_after.status, PositionStatus::Closed);
+        assert_eq!(pos_after.quantity.0, 0);
+        // realized PnL = (100 - 90) × 100 - 卖出费用 → > 0。
+        assert!(pos_after.realized_pnl.0 > Decimal::ZERO, "sell above cost must realize positive PnL");
+        // 卖出冻结释放（全成交 → delete_freeze）。
+        assert!(repo.get_freeze("ord_sell").unwrap().is_none(), "full sell fill must release frozen lots");
+        let events = repo.list_events(50, 0).unwrap();
+        let types: Vec<_> = events.iter().map(|e| e.event_type).collect();
+        assert!(types.contains(&AccountEventType::OrderFilled));
+        assert!(types.contains(&AccountEventType::PositionClosed), "must emit position_closed");
+    }
+
+    // ------------------------------------------------------------------
+    // 部分成交中间态 → partially_filled（无 trigger），再次 evaluate 盘口足量 → filled。
+    // Spec §5：部分成交不创建 AccountTrigger；全成交才发 order_filled trigger。
+    // ------------------------------------------------------------------
+    #[test]
+    fn limit_buy_partial_then_full_fill_transitions_to_filled() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let now = trading_now();
+        // 想买 200 股 @ limit 100。
+        let order = pending_limit_order("ord_pf", &code, OrderSide::Buy, 100.0, 200, None, now);
+        repo.tx(|tx| {
+            AccountRepository::upsert_order(tx, &order)?;
+            AccountRepository::upsert_freeze(
+                tx,
+                &FreezeEntry {
+                    order_id: "ord_pf".into(),
+                    ts_code: code.clone(),
+                    side: OrderSide::Buy,
+                    frozen_cash: Money(Decimal::from(20_100)),
+                    frozen_shares: Shares(0),
+                    frozen_lots: vec![],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // 第一次：卖一仅 80 股可成交（< 200）→ 部分成交。
+        let gw = MockQuoteGateway::new();
+        gw.set(&code, Ok(snap_with_depth(&code, 99.0, 80, FreshnessStatus::Fresh)));
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r1 = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size: 10,
+            cursor: None,
+        });
+        // 部分成交不发 trigger。
+        assert!(
+            !r1.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::OrderFilled)),
+            "partial fill must NOT emit order_filled trigger"
+        );
+        let o1 = repo.get_order("ord_pf").unwrap().unwrap();
+        assert_eq!(o1.status, OrderStatus::PartiallyFilled);
+        assert_eq!(o1.filled_quantity.0, 80);
+        // 部分成交仍释放/收缩冻结，剩余冻结仍在。
+        assert!(repo.get_freeze("ord_pf").unwrap().is_some(), "remaining freeze persists after partial");
+
+        // 第二次：盘口足量（卖一 120 >= 剩余 120）→ 全成交。
+        let gw2 = MockQuoteGateway::new();
+        gw2.set(&code, Ok(snap_with_depth(&code, 99.0, 200, FreshnessStatus::Fresh)));
+        let deps2 = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw2),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r2 = evaluate_account_triggers(EvalInput {
+            deps: &deps2,
+            now,
+            batch_size: 10,
+            cursor: None,
+        });
+        assert!(
+            r2.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::OrderFilled)),
+            "second eval reaching full fill must emit order_filled trigger"
+        );
+        let o2 = repo.get_order("ord_pf").unwrap().unwrap();
+        assert_eq!(o2.status, OrderStatus::Filled);
+        assert_eq!(o2.filled_quantity.0, 200);
+        assert!(repo.get_freeze("ord_pf").unwrap().is_none(), "full fill releases freeze");
+        let pos = repo.find_open_position_by_ts_code(&code).unwrap().unwrap();
+        assert_eq!(pos.quantity.0, 200, "position scaled to full 200 after both fills");
+    }
+
+    /// 带可控 ask 量的 fresh 快照（用于部分成交场景）。
+    fn snap_with_depth(
+        code: &TsCode,
+        price: f64,
+        ask_volume: i64,
+        freshness: FreshnessStatus,
+    ) -> crate::domain::quotes::MarketQuoteSnapshot {
+        let mut snap = snap_with_price_and_freshness(code, price, freshness);
+        // ask[0] 量 = 可成交上限。
+        snap.quote.ask[0].volume = Some(crate::domain::shared::Volume(ask_volume));
+        snap.quote.bid[0].volume = Some(crate::domain::shared::Volume(ask_volume));
+        snap
     }
 }

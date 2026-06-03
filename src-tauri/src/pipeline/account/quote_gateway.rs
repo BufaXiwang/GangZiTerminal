@@ -82,9 +82,22 @@ impl MockQuoteGateway {
 
 #[cfg(test)]
 impl AccountQuoteGateway for MockQuoteGateway {
+    /// Faithful 生产语义（fail-closed）：与 `QuotesFacadeGateway` / facade 一致——
+    /// stale 快照 **返回 `Err(QuoteStale)`**（交易写路径不得用 stale 成交）。
+    ///
+    /// 测试仍用 `.set(code, Ok(snap))` 配置「底层 snapshot」，stale/fresh 由 snapshot
+    /// 自身的 `freshness` 决定，mock 据此派生 Err/Ok，避免测试预设「反的」语义。
+    /// Spec: facade.rs `get_quote_snapshot`（stale → Err）；account-module.md §4 line 459。
     fn get_snapshot(&self, ts_code: &TsCode) -> Result<MarketQuoteSnapshot, QuoteFacadeError> {
+        use crate::domain::shared::FreshnessStatus;
         match self.responses.lock().unwrap().get(ts_code.as_str()) {
-            Some(Ok(snap)) => Ok(snap.clone()),
+            Some(Ok(snap)) => match snap.quote.freshness.status {
+                FreshnessStatus::Stale => Err(QuoteFacadeError::new(QuoteFacadeErrorKind::QuoteStale)),
+                FreshnessStatus::Missing => {
+                    Err(QuoteFacadeError::new(QuoteFacadeErrorKind::QuoteMissing))
+                }
+                FreshnessStatus::Fresh => Ok(snap.clone()),
+            },
             Some(Err(kind)) => Err(QuoteFacadeError::new(*kind)),
             None => Err(QuoteFacadeError::new(QuoteFacadeErrorKind::QuoteMissing)),
         }
@@ -95,8 +108,12 @@ impl AccountQuoteGateway for MockQuoteGateway {
     ) -> Vec<Result<MarketQuoteSnapshot, QuoteFacadeError>> {
         ts_codes.iter().map(|c| self.get_snapshot(c)).collect()
     }
+    /// Stale-tolerant 展示语义（与 facade `get_quote_for_display` 一致）：
+    /// 返回底层 snapshot（fresh 或 stale）作为可展示 quote；无配置 / Err 配置 → None。
     fn get_display_snapshot(&self, ts_code: &TsCode) -> Option<MarketQuoteSnapshot> {
-        // mock：复用 get_snapshot 的 Ok 分支作为可展示 quote。
-        self.get_snapshot(ts_code).ok()
+        match self.responses.lock().unwrap().get(ts_code.as_str()) {
+            Some(Ok(snap)) => Some(snap.clone()),
+            _ => None,
+        }
     }
 }

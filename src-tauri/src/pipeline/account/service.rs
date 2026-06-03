@@ -2983,10 +2983,16 @@ fn trade_date_for(now: OccurredAt) -> crate::domain::shared::TradeDate {
         .unwrap_or(ctx.latest_completed_trade_date)
 }
 
-fn next_trade_date_after(now: OccurredAt) -> crate::domain::shared::TradeDate {
+/// Spec §5 / 验收：当日买入 lot 的 `sellableQuantity` 为 0，次一交易日才可卖（T+1）。
+///
+/// 日历缺数据（`next_trade_date = None`）时**保守顺延**到「次一日历日」，
+/// 绝不回退当日——否则会让当日买入 lot 当日可卖，破坏 T+1。
+/// service / eval 两条买入路径必须统一调用此函数。
+pub(crate) fn next_trade_date_after(now: OccurredAt) -> crate::domain::shared::TradeDate {
     let ctx = resolve_market_time(now);
     ctx.next_trade_date.unwrap_or_else(|| {
-        // Fallback: tomorrow as best-effort
+        // Fallback: tomorrow (calendar day) as conservative best-effort —
+        // 保证不早于次日，从而 T+1 不被破坏。
         let d = now.with_timezone(&Shanghai).date_naive();
         crate::domain::shared::TradeDate::from_naive(d.succ_opt().unwrap_or(d))
     })
@@ -3574,7 +3580,7 @@ mod tests {
     fn watchlist_degrades_gracefully_when_quote_unavailable() {
         let (db, svc, gw) = setup_account(1_000_000);
         let code = seed_inst(&db, "600519.SH");
-        // mock display 路径 = get_snapshot().ok()；设成 Err → None。
+        // mock display 路径：Err 配置 → get_display_snapshot 返回 None。
         gw.set(&code, Err(QuoteFacadeErrorKind::QuoteMissing));
         let add = svc.update_watchlist(
             UpdateWatchlistRequest {
