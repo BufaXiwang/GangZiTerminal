@@ -152,11 +152,13 @@ impl NewsService {
 
         // 查询路径（spec §4：query / sources / 时间范围按 AND 组合）
         let repo = self.repo();
+        let order = req.order.unwrap_or_default();
         let result = match repo.list_news_items(
             req.sources.as_deref(),
             req.published_from.as_ref(),
             req.published_to.as_ref(),
             req.query.as_deref(),
+            order,
             limit,
             offset,
         ) {

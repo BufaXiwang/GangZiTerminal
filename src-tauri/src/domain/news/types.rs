@@ -65,6 +65,18 @@ pub struct ProviderNewsItem {
 // §4 对外接口 — fetch_news
 // ============================================================================
 
+/// 排序方向。默认语义 `Desc`（最新在前）。`Asc` 专供前端「往上滑加载更新」的
+/// keyset 游标（升序取紧邻最新一条之上的一页，前端 reverse 后 prepend）。
+///
+/// Spec: news-module.md §4 fetch_news（`order` 语义 + 双向 keyset 读取）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NewsOrder {
+    #[default]
+    Desc,
+    Asc,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Type, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchNewsRequest {
@@ -82,6 +94,9 @@ pub struct FetchNewsRequest {
     pub limit: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
+    /// 排序方向，默认 `desc`。详见 [`NewsOrder`] 与 spec §4 双向 keyset 读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<NewsOrder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]

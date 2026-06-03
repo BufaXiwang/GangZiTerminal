@@ -10,7 +10,7 @@
 //! - 不做 provider 调用，不做 normalize；只接受 domain 类型 / canonical URL
 
 use crate::domain::news::source::NewsSource;
-use crate::domain::news::types::{ArticleContent, NewsItem};
+use crate::domain::news::types::{ArticleContent, NewsItem, NewsOrder};
 use crate::domain::shared::{ErrorCode, OccurredAt, WarningCode};
 use crate::infrastructure::db::AppDb;
 use chrono::{DateTime, Utc};
@@ -160,11 +160,21 @@ impl<'a> NewsRepository<'a> {
         published_from: Option<&DateTime<Utc>>,
         published_to: Option<&DateTime<Utc>>,
         query: Option<&str>,
+        order: NewsOrder,
         limit: u32,
         offset: u32,
     ) -> rusqlite::Result<ListResult> {
         self.db.with(|conn| {
-            list_news_items_impl(conn, sources, published_from, published_to, query, limit, offset)
+            list_news_items_impl(
+                conn,
+                sources,
+                published_from,
+                published_to,
+                query,
+                order,
+                limit,
+                offset,
+            )
         })
     }
 
@@ -647,12 +657,14 @@ fn count_news_by_date_impl(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_news_items_impl(
     conn: &Connection,
     sources: Option<&[String]>,
     published_from: Option<&DateTime<Utc>>,
     published_to: Option<&DateTime<Utc>>,
     query: Option<&str>,
+    order: NewsOrder,
     limit: u32,
     offset: u32,
 ) -> rusqlite::Result<ListResult> {
@@ -664,11 +676,24 @@ fn list_news_items_impl(
             total: 0,
         });
     };
-    let order_sql = if filter.has_query {
-        "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string()
-    } else {
-        "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
-            .to_string()
+    // Spec: news-module.md §4 `order` 语义。
+    // - Desc（默认）：有 query 走 FTS relevance（rank）+ `published_at desc, created_at desc, id asc`
+    //   tiebreak；无 query 走 `COALESCE(published_at,created_at) desc, created_at desc, id asc`。
+    // - Asc：整体时间升序 `COALESCE(published_at,created_at) asc, created_at asc, id asc`。
+    //   **有 query 时 asc 也走时间升序为主序（不走 rank）**——keyset 翻页需要时间单调。
+    let order_sql = match order {
+        NewsOrder::Desc => {
+            if filter.has_query {
+                "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string()
+            } else {
+                "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
+                    .to_string()
+            }
+        }
+        NewsOrder::Asc => {
+            "ORDER BY COALESCE(ni.published_at, ni.created_at) ASC, ni.created_at ASC, ni.id ASC"
+                .to_string()
+        }
     };
     let binds = filter.binds;
 
@@ -908,7 +933,7 @@ mod tests {
         repo.upsert_news_item(&b).unwrap();
 
         let r = repo
-            .list_news_items(None, None, None, Some("gangzi"), 50, 0)
+            .list_news_items(None, None, None, Some("gangzi"), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].id, "id-a");
@@ -927,9 +952,9 @@ mod tests {
 
         // delete_news_item 同步清 FTS：搜索不再命中已删条目。
         repo.delete_news_item("id-a").unwrap();
-        let r = repo.list_news_items(None, None, None, Some("alpha"), 50, 0).unwrap();
+        let r = repo.list_news_items(None, None, None, Some("alpha"), NewsOrder::Desc, 50, 0).unwrap();
         assert_eq!(r.items.len(), 0, "deleted item must not be searchable");
-        let r2 = repo.list_news_items(None, None, None, Some("beta"), 50, 0).unwrap();
+        let r2 = repo.list_news_items(None, None, None, Some("beta"), NewsOrder::Desc, 50, 0).unwrap();
         assert_eq!(r2.items.len(), 1);
 
         // 制造幽灵：绕过 delete_news_item 直接删 news_items 行，留下孤儿 FTS 行。
@@ -971,12 +996,12 @@ mod tests {
         repo.upsert_news_item(&a).unwrap();
         // 全大写 + 单引号 quote 应能命中（normalize 折叠为 lowercase）
         let r = repo
-            .list_news_items(None, None, None, Some("GANGZI"), 50, 0)
+            .list_news_items(None, None, None, Some("GANGZI"), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r.items.len(), 1, "uppercase GANGZI should match lowercase title");
         // 混合大小写
         let r2 = repo
-            .list_news_items(None, None, None, Some("Quant"), 50, 0)
+            .list_news_items(None, None, None, Some("Quant"), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r2.items.len(), 1, "mixed-case Quant should match lowercase title");
     }
@@ -1011,14 +1036,14 @@ mod tests {
             "abc NOT widgets",
         ] {
             let r = repo
-                .list_news_items(None, None, None, Some(q), 50, 0)
+                .list_news_items(None, None, None, Some(q), NewsOrder::Desc, 50, 0)
                 .expect(&format!("query `{}` must not raise SQL error", q));
             // 仅断言不报错；命中结果集对每个 q 不同
             let _ = r;
         }
         // 显式断言：normalize 之后只剩 `abc widgets` 的 query 必须命中
         let r = repo
-            .list_news_items(None, None, None, Some("\"abc widgets\""), 50, 0)
+            .list_news_items(None, None, None, Some("\"abc widgets\""), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r.items.len(), 1, "stripped quotes still match by AND");
     }
@@ -1033,7 +1058,7 @@ mod tests {
         repo.upsert_news_item(&a).unwrap();
         // 仅特殊字符 normalize 为空字符串 → 等价于无 query，应返回所有
         let r = repo
-            .list_news_items(None, None, None, Some(" + - * "), 50, 0)
+            .list_news_items(None, None, None, Some(" + - * "), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r.items.len(), 1);
     }
@@ -1119,6 +1144,7 @@ mod tests {
                 Some(&from),
                 Some(&to),
                 Some("match"),
+                NewsOrder::Desc,
                 50,
                 0,
             )
@@ -1171,7 +1197,7 @@ mod tests {
             _ => panic!("expected Updated"),
         }
         let r = repo
-            .list_news_items(None, None, None, Some("widgets"), 50, 0)
+            .list_news_items(None, None, None, Some("widgets"), NewsOrder::Desc, 50, 0)
             .unwrap();
         assert_eq!(r.items.len(), 1);
     }

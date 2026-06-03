@@ -224,6 +224,10 @@ type FetchNewsRequest = {
   includeArticle?: boolean;
   limit?: number;
   offset?: number;
+  // 排序方向，默认 "desc"（最新在前）。"asc"（最早在前）专供前端「往上滑加载更新」
+  // 的 keyset 游标：以 publishedFrom = 当前最新一条时间 + order:"asc" + limit 取紧邻其上的
+  // 一页（升序），前端 reverse 后 prepend。详见下方「双向 keyset 读取」。
+  order?: "desc" | "asc";
 };
 
 type FetchNewsResponse = {
@@ -272,7 +276,13 @@ type FetchNewsResponse = {
 - `query`、`sources`、时间范围同时出现时按 AND 组合。
 - `publishedFrom` / `publishedTo` 是闭区间；`publishedAt` 缺失的新闻不命中发布时间范围过滤。
 - 有 `query` 时默认按 FTS relevance 排序，并以 `publishedAt desc, createdAt desc, id asc` 作为稳定 tie-breaker；无 `query` 时按 `publishedAt desc, createdAt desc, id asc` 排序。`publishedAt` 缺失时用 `createdAt` 参与第一排序位。
+- `order` 默认 `"desc"`（同上）；`order:"asc"` 时整体排序反向为 `publishedAt asc, createdAt asc, id asc`（`publishedAt` 缺失用 `createdAt`）。`order` 只影响排序方向，不改变 filter 语义；有 `query` 时 `asc` 仍以发布时间升序为主序（不走 relevance，因为 keyset 翻页需要时间单调）。
 - `limit` 默认 50，最大 200；`offset` 默认 0；`hasMore` 必须基于同一查询条件计算。
+- **双向 keyset 读取（资讯页时间线窗口流，落实「长期回看用时间窗口分批」§接口边界）**：前端把列表视为全局倒序时间线的一段连续窗口，用游标按需向两端扩展，**任何跳转/滑动都只取一页**，绝不一次拉取两个时间点之间的全部条目。
+  - **锚定到某天**：`publishedTo = 该北京日 23:59:59.999`、`order:"desc"`、`limit` → 该日最新一页打头（不设 `publishedFrom`，否则下界会挡住继续向更早翻）。
+  - **向更早（下滑）**：`publishedTo = 当前窗口最老一条的 publishedAt`、`order:"desc"`、`limit` → 紧邻其下一页。
+  - **向更新（上滑）**：`publishedFrom = 当前窗口最新一条的 publishedAt`、`order:"asc"`、`limit` → 紧邻其上一页（升序），前端 reverse 后 prepend。
+  - 两端各自的 `hasMore` 由各自方向的查询是否满页判定。游标用 `publishedAt`（闭区间），同一时刻多条用 `id` 去重避免边界重复/漏读。
 - `includeArticle = true` 时不触发远端抽取；缺正文、正文失败缓存或 `ArticleContent.content` 为空时，不返回 `article` 字段，并必须返回 `article_missing` warning。
 - `articleExcerpt` 是面向 Agent / 列表摘要的短正文摘录；当本地存在 `ArticleContent.content` 时必须由 News query facade 生成并返回，默认取清洗后正文前 500 个字符（清洗后空白已折叠为单空格，不保留段落分隔）。`includeArticle = false` 时也可以返回已有 `articleExcerpt`，但不得触发远端抽取。
 - News 不生成行业标签、相关标的或影响判断；`query` 只是资讯文本搜索条件。

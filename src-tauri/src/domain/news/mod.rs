@@ -19,7 +19,7 @@ pub use events::{NewsFailure, NewsRefreshStage, NewsRefreshWarning, NewsRefreshe
 pub use ids::{compute_stable_id, IdInput};
 pub use source::{NewsSource, NewsSourceLastError, NewsSourceRef};
 pub use types::{
-    ArticleContent, ArticleSnippet, FetchNewsItem, FetchNewsRequest, FetchNewsResponse,
+    ArticleContent, ArticleSnippet, FetchNewsItem, FetchNewsRequest, FetchNewsResponse, NewsOrder,
     ListNewsSourcesResponse, NewsDateCount, NewsItem, NewsItemFreshness, ProviderNewsItem,
     WarmArticlesRequest, WarmArticlesResponse, WarmArticlesResult,
 };

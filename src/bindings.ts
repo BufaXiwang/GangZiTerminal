@@ -422,7 +422,11 @@ export type FetchLimits = { kline?: number | null; minuteKline?: number | null; 
 export type FetchNewsError = { field?: string | null; code: ErrorCode; message?: string | null }
 export type FetchNewsItem = { id: string; source: string; title: string; summary?: string | null; url?: string | null; publishedAt?: string | null; articleExcerpt?: string | null; article?: ArticleSnippet | null; freshness?: NewsItemFreshness | null; warnings?: WarningCode[]; errors?: ErrorCode[] }
 export type FetchNewsPage = { limit: number; offset: number; hasMore: boolean }
-export type FetchNewsRequest = { query?: string | null; sources?: string[] | null; publishedFrom?: string | null; publishedTo?: string | null; includeArticle?: boolean | null; limit?: number | null; offset?: number | null }
+export type FetchNewsRequest = { query?: string | null; sources?: string[] | null; publishedFrom?: string | null; publishedTo?: string | null; includeArticle?: boolean | null; limit?: number | null; offset?: number | null; 
+/**
+ * 排序方向，默认 `desc`。详见 [`NewsOrder`] 与 spec §4 双向 keyset 读取。
+ */
+order?: NewsOrder | null }
 export type FetchNewsResponse = { items: FetchNewsItem[]; errors: FetchNewsError[]; page: FetchNewsPage; 
 /**
  * 按北京日期(YYYY-MM-DD)的每日真实总条数（同 filter，不受分页限制）。
@@ -564,6 +568,13 @@ export type NewsDateCount = { date: string; count: number }
  */
 export type NewsFailure = { provider: string; source?: string | null; code: ErrorCode; message?: string | null; details?: JsonValue | null; stage?: NewsRefreshStage | null; retryable?: boolean | null; occurredAt: string }
 export type NewsItemFreshness = { ageMs?: number | null; articleFetchedAt?: string | null }
+/**
+ * 排序方向。默认语义 `Desc`（最新在前）。`Asc` 专供前端「往上滑加载更新」的
+ * keyset 游标（升序取紧邻最新一条之上的一页，前端 reverse 后 prepend）。
+ * 
+ * Spec: news-module.md §4 fetch_news（`order` 语义 + 双向 keyset 读取）。
+ */
+export type NewsOrder = "desc" | "asc"
 /**
  * Refresh stage（spec §4 / §5）。
  */

@@ -1,18 +1,23 @@
 // NewsPage — 资讯页主结构。
 //
-// Spec: docs/design/frontend-design.md §4 资讯页 + docs/design/news-module.md §4 §5
+// Spec: docs/design/frontend-design.md §4 资讯页（日期导航 = 双向窗口流）
+//       docs/design/news-module.md §4 fetch_news（order 语义 + 双向 keyset 读取）
 //
 // 结构：
 //   PageShell
 //     control strip：source 多选 chip + FTS 搜索 + 刷新
 //   ─ 顶部 横向 日期 nav（最近 14 天）
-//   ─ workspace：纵向时间线（按日分组，倒序，滚动加载更多）；正文行内展示、>3 行可展开
+//   ─ workspace：纵向时间线（按日分组，倒序，双向窗口流）；正文行内展示、>3 行可展开
 //
-// 数据流：
-//   - mount: listNewsSources() + fetchNews({ limit, offset: 0 })
-//   - query / sources / refresh 变化 → 清空 items + 重拉
-//   - 滚动到底 → fetchNews({ offset: prev + limit }) 拼接
-//   - 正文在刷新时按 source 策略同步抓取（无侧边 drawer）；行内点击展开/收起
+// 数据流（双向 keyset 窗口流，spec §4）：
+//   - 列表是「全局倒序时间线」的一段连续窗口；游标取窗口首/尾的 publishedAt。
+//   - mount / filter 变化：fetchNews({ order:"desc", limit }) → 最新一页（最新端）。
+//   - 向更早（下滑底部 sentinel）：publishedTo = oldest.publishedAt, order:"desc"。
+//   - 向更新（上滑顶部 sentinel）：publishedFrom = newest.publishedAt, order:"asc"
+//     → reverse → prepend，并做滚动锚定补偿避免视口跳动。
+//   - 点日期锚定：publishedTo = 该北京日 23:59:59.999, order:"desc" → 替换窗口。
+//   - 任何跳转/滑动都只取一页，绝不全量拉取中间天。
+//   - 去重一律按 id Set（闭区间游标会带回边界条）。
 
 import { Search, X } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -27,11 +32,12 @@ import { PageShell } from "../components/PageShell";
 import {
   commands,
   type FetchNewsItem,
-  type FetchNewsPage,
+  type FetchNewsRequest,
   type NewsSource,
 } from "../bindings";
 import { NewsDateNav, formatDateKey } from "./news/NewsDateNav";
 import { NewsTimeline } from "./news/NewsTimeline";
+import { beijingDayEndIso } from "../lib/beijingTime";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -49,21 +55,30 @@ export default function NewsPage() {
   const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set());
   const [refreshTick, setRefreshTick] = useState(0);
 
-  // === list state ===
+  // === 双向窗口 state ===
+  // items 是全局倒序时间线的一段连续窗口（按 publishedAt desc）。
   const [items, setItems] = useState<FetchNewsItem[]>([]);
-  const [page, setPage] = useState<FetchNewsPage | null>(null);
-  // 跳日期时在 async 循环里读最新 page / items，避免闭包拿到旧值。
-  const pageRef = useRef<FetchNewsPage | null>(null);
-  pageRef.current = page;
+  // 两端是否还能继续扩展（各自方向是否满页判定）。
+  const [hasMoreOlder, setHasMoreOlder] = useState(false);
+  const [hasMoreNewer, setHasMoreNewer] = useState(false);
+  // 跳日期 / sentinel 回调里读最新窗口，避免闭包拿旧值。
   const itemsRef = useRef<FetchNewsItem[]>([]);
   itemsRef.current = items;
+  const hasMoreNewerRef = useRef(false);
+  hasMoreNewerRef.current = hasMoreNewer;
+
   // 每日真实总数（后端 GROUP BY，不受分页限制）—— 给日期导航显示真实条数。
   const [dateCounts, setDateCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadingNewer, setLoadingNewer] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+
+  // prepend 滚动锚定：记下 prepend 前的 scrollHeight，DOM 更新后在 layout effect 里补偿。
+  const timelineElRef = useRef<HTMLElement | null>(null);
+  const pendingScrollAnchor = useRef<number | null>(null);
 
   // === date nav 当前激活日期（由 timeline 上报当前 viewport 顶部那一天） ===
   const [activeDate, setActiveDate] = useState<string | null>(null);
@@ -89,9 +104,9 @@ export default function NewsPage() {
     });
   }, []);
 
-  // === reset list when filters / refresh change, then fetch first page ===
-  const fetchPage = useCallback(
-    async (offset: number) => {
+  // === 统一 fetch 入口：注入当前 filter（query / sources），调用方补 order / 游标。 ===
+  const fetchWindow = useCallback(
+    async (extra: Omit<FetchNewsRequest, "query" | "sources" | "includeArticle" | "limit">) => {
       const sourceArr = selectedSources.size > 0 ? Array.from(selectedSources) : undefined;
       return commands.fetchNews({
         query: query.length > 0 ? query : undefined,
@@ -99,40 +114,45 @@ export default function NewsPage() {
         // 带全文：行内展开要显示完整正文，不能只给 500 字的 articleExcerpt。
         includeArticle: true,
         limit: PAGE_SIZE,
-        offset,
+        ...extra,
       });
     },
     [query, selectedSources],
   );
 
+  const applyDateCounts = useCallback((dc?: { date: string; count: number }[] | null) => {
+    const m: Record<string, number> = {};
+    for (const d of dc ?? []) m[d.date] = d.count;
+    setDateCounts(m);
+  }, []);
+
+  // === 默认初始加载（mount / filter 变化）：最新一页 ===
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     setWarnings([]);
-    void fetchPage(0).then((res) => {
+    void fetchWindow({ order: "desc" }).then((res) => {
       if (cancelled) return;
       if (res.status === "error") {
-        setError(
-          `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-        );
+        setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
         setItems([]);
-        setPage(null);
+        setHasMoreOlder(false);
+        setHasMoreNewer(false);
         setLoading(false);
         return;
       }
-      setItems(res.data.items);
-      setPage(res.data.page);
-      // 日期导航用后端按日聚合的真实总数（不随分页累积）。
-      {
-        const m: Record<string, number> = {};
-        for (const dc of res.data.dateCounts ?? []) m[dc.date] = dc.count;
-        setDateCounts(m);
-      }
+      const batch = res.data.items;
+      setItems(batch);
+      // 处于最新端：上方没有更新的。下方是否还有取决于本批是否满页。
+      setHasMoreNewer(false);
+      setHasMoreOlder(batch.length >= PAGE_SIZE);
+      applyDateCounts(res.data.dateCounts);
       if (res.data.errors && res.data.errors.length > 0) {
         setWarnings(
-          res.data.errors.map((e) =>
-            `${e.code}${e.field ? ` (${e.field})` : ""}${e.message ? `: ${e.message}` : ""}`,
+          res.data.errors.map(
+            (e) =>
+              `${e.code}${e.field ? ` (${e.field})` : ""}${e.message ? `: ${e.message}` : ""}`,
           ),
         );
       }
@@ -142,28 +162,28 @@ export default function NewsPage() {
     return () => {
       cancelled = true;
     };
-  }, [fetchPage, refreshTick]);
+  }, [fetchWindow, applyDateCounts, refreshTick]);
 
-  // === 后端 scheduler 刷新出新资讯时同步前端 ===
-  // 后端每 ~60s run_refresh，若 savedCount>0 / articleUpdated>0 会 emit `news-refreshed`
-  // (lib.rs → app.emit)。这里监听并**静默**拉第一页，把新条目并入列表顶部——
-  // 不清空、不闪 loading、不动用户滚动位置（区别于手动刷新的整页重置）。
+  // === 后端 scheduler 刷新出新资讯时同步前端（仅最新端） ===
+  // 后端每 ~60s run_refresh，savedCount>0 / articleUpdated>0 时 emit `news-refreshed`。
+  // 只在「处于最新端」（hasMoreNewer===false，即没在看历史）时 merge-prepend 新条；
+  // anchored 看历史时忽略，避免历史视图被今天的新闻插入跳动（spec：live gating）。
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
     void listen("news-refreshed", () => {
-      void fetchPage(0).then((res) => {
+      if (hasMoreNewerRef.current) return; // 在看历史，忽略
+      void fetchWindow({ order: "desc" }).then((res) => {
         if (cancelled || res.status !== "ok") return;
+        if (hasMoreNewerRef.current) return; // 二次确认（async 间隙可能已跳历史）
         setItems((prev) => {
           const seen = new Set(prev.map((x) => x.id));
           const fresh = res.data.items.filter((x) => !seen.has(x.id));
           if (fresh.length === 0) return prev;
-          // 新条目时间最新 → 放在倒序时间线最前；已存在的保持原序与滚动锚点。
+          // 新条目时间最新 → 放在倒序时间线最前。
           return [...fresh, ...prev];
         });
-        const m: Record<string, number> = {};
-        for (const dc of res.data.dateCounts ?? []) m[dc.date] = dc.count;
-        setDateCounts(m);
+        applyDateCounts(res.data.dateCounts);
         setLastUpdated(new Date());
       });
     }).then((un) => {
@@ -174,28 +194,67 @@ export default function NewsPage() {
       cancelled = true;
       unlisten?.();
     };
-  }, [fetchPage]);
+  }, [fetchWindow, applyDateCounts]);
 
-  // === load more (append) ===
-  const handleLoadMore = useCallback(async () => {
-    if (!page || !page.hasMore || loadingMore || loading) return;
+  // === 向更早（下滑底部 sentinel）：publishedTo = oldest.publishedAt, order:"desc" ===
+  const handleLoadOlder = useCallback(async () => {
+    if (!hasMoreOlder || loadingMore || loading) return;
+    const window = itemsRef.current;
+    const oldest = window[window.length - 1];
+    if (!oldest?.publishedAt) {
+      // 末尾条无 publishedAt（落到"未知日期"组）无法做游标，停止下扩。
+      setHasMoreOlder(false);
+      return;
+    }
     setLoadingMore(true);
-    const nextOffset = page.offset + page.limit;
-    const res = await fetchPage(nextOffset);
+    const res = await fetchWindow({ publishedTo: oldest.publishedAt, order: "desc" });
     if (res.status === "ok") {
+      const batch = res.data.items;
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
-        const newOnes = res.data.items.filter((x) => !seen.has(x.id));
-        return [...prev, ...newOnes];
+        return [...prev, ...batch.filter((x) => !seen.has(x.id))];
       });
-      setPage(res.data.page);
+      setHasMoreOlder(batch.length >= PAGE_SIZE);
+      applyDateCounts(res.data.dateCounts);
     } else {
-      setError(
-        `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
-      );
+      setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
     }
     setLoadingMore(false);
-  }, [fetchPage, loading, loadingMore, page]);
+  }, [fetchWindow, applyDateCounts, hasMoreOlder, loading, loadingMore]);
+
+  // === 向更新（上滑顶部 sentinel）：publishedFrom = newest.publishedAt, order:"asc" ===
+  // reverse 后 prepend，并在 layout effect 里做滚动锚定补偿。
+  const handleLoadNewer = useCallback(async () => {
+    if (!hasMoreNewer || loadingNewer || loading) return;
+    const window = itemsRef.current;
+    const newest = window[0];
+    if (!newest?.publishedAt) {
+      setHasMoreNewer(false);
+      return;
+    }
+    setLoadingNewer(true);
+    const res = await fetchWindow({ publishedFrom: newest.publishedAt, order: "asc" });
+    if (res.status === "ok") {
+      const batch = res.data.items; // 升序
+      const rawLen = batch.length;
+      const ascDedupReversed = [...batch].reverse(); // → desc，准备 prepend
+      setItems((prev) => {
+        const seen = new Set(prev.map((x) => x.id));
+        const fresh = ascDedupReversed.filter((x) => !seen.has(x.id));
+        if (fresh.length === 0) return prev;
+        // prepend 前记录 scrollHeight，layout effect 里补偿（避免视口跳动）。
+        const el = timelineElRef.current;
+        if (el) pendingScrollAnchor.current = el.scrollHeight;
+        return [...fresh, ...prev];
+      });
+      // 原始批满页 → 上方可能还有更新的；空/不满 → 已到最新端。
+      setHasMoreNewer(rawLen >= PAGE_SIZE);
+      applyDateCounts(res.data.dateCounts);
+    } else {
+      setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
+    }
+    setLoadingNewer(false);
+  }, [fetchWindow, applyDateCounts, hasMoreNewer, loading, loadingNewer]);
 
   const handleRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
@@ -230,43 +289,29 @@ export default function NewsPage() {
     return true;
   }, []);
 
-  // 点日期导航跳转：把目标日「最新一条」顶到列表顶部。
-  // 关键：必须一直加载到**比目标日更早**的日期，目标日下方才有内容垫着，
-  // 否则目标日成了列表末尾，scrollIntoView 无法把它顶到顶部（只能停在底部，
-  // 看起来"只滚到当日最早一条"）。
-  const localDateKey = (it: FetchNewsItem): string | null =>
-    it.publishedAt ? formatDateKey(new Date(it.publishedAt)) : null;
-
+  // === 点日期锚定（spec §4 锚定到某天）===
+  // publishedTo = 该北京日 23:59:59.999, order:"desc" → 该日最新一页打头，替换窗口。
+  // hasMoreOlder = 批==50；hasMoreNewer = true（除非空批，首次上滑自然置 false）。
   const handleSelectDate = useCallback(
     async (dateKey: string) => {
-      // 已经加载到比目标日更早的内容？没有就继续 load more。
-      const hasLoadedPast = () =>
-        itemsRef.current.some((it) => {
-          const k = localDateKey(it);
-          return k !== null && k < dateKey;
-        });
-      if (!hasLoadedPast()) {
-        setLoadingMore(true);
-        let cur = pageRef.current;
-        let guard = 0;
-        while (cur?.hasMore && guard < 60) {
-          guard++;
-          const res = await fetchPage(cur.offset + cur.limit);
-          if (res.status !== "ok") break;
-          const batch = res.data.items;
-          setItems((prev) => {
-            const seen = new Set(prev.map((x) => x.id));
-            return [...prev, ...batch.filter((x) => !seen.has(x.id))];
-          });
-          cur = res.data.page;
-          setPage(cur);
-          pageRef.current = cur;
-          const oldest = batch[batch.length - 1];
-          const oldestKey = oldest ? localDateKey(oldest) : null;
-          if (oldestKey !== null && oldestKey < dateKey) break; // 已越过目标日
-        }
-        setLoadingMore(false);
+      setLoadingMore(true);
+      setError(null);
+      const res = await fetchWindow({
+        publishedTo: beijingDayEndIso(dateKey),
+        order: "desc",
+      });
+      if (res.status === "ok") {
+        const batch = res.data.items;
+        setItems(batch); // 替换窗口
+        setHasMoreOlder(batch.length >= PAGE_SIZE);
+        // anchored 看历史：上方可能有更新的，置 true；空批时首次上滑会把它置 false。
+        setHasMoreNewer(batch.length > 0);
+        applyDateCounts(res.data.dateCounts);
+        setLastUpdated(new Date());
+      } else {
+        setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
       }
+      setLoadingMore(false);
       // 等新 section 渲染 + ref 注册后再滚动；跨帧重试直到命中。
       let tries = 30;
       const tick = () => {
@@ -275,7 +320,7 @@ export default function NewsPage() {
       };
       requestAnimationFrame(tick);
     },
-    [fetchPage, scrollToDate],
+    [fetchWindow, applyDateCounts, scrollToDate],
   );
 
   const handleRegisterSectionRef = useCallback(
@@ -285,6 +330,10 @@ export default function NewsPage() {
     },
     [],
   );
+
+  const handleRegisterTimelineRef = useCallback((el: HTMLElement | null) => {
+    timelineElRef.current = el;
+  }, []);
 
   // === sourceId → displayName map，timeline row 友好显示来源名 ===
   const sourceNames = useMemo(() => {
@@ -325,7 +374,7 @@ export default function NewsPage() {
       {query.length > 0 && (
         <span className="muted">
           · 匹配 {items.length} 条
-          {page?.hasMore ? "+" : ""} (query: "{query}")
+          {hasMoreOlder ? "+" : ""} (query: "{query}")
         </span>
       )}
       {selectedSources.size > 0 && (
@@ -437,9 +486,14 @@ export default function NewsPage() {
               items={items}
               loading={loading}
               loadingMore={loadingMore}
-              hasMore={page?.hasMore ?? false}
-              onLoadMore={handleLoadMore}
+              loadingNewer={loadingNewer}
+              hasMore={hasMoreOlder}
+              hasMoreNewer={hasMoreNewer}
+              onLoadMore={handleLoadOlder}
+              onLoadNewer={handleLoadNewer}
               registerSectionRef={handleRegisterSectionRef}
+              registerTimelineRef={handleRegisterTimelineRef}
+              scrollAnchorRef={pendingScrollAnchor}
               onActiveDateChange={setActiveDate}
               query={query}
               sourceNames={sourceNames}

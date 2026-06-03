@@ -44,6 +44,16 @@ export function shiftDateKey(key: string, delta: number): string {
   return `${yy}-${mm}-${dd}`;
 }
 
+/**
+ * "YYYY-MM-DD"（北京日历日）→ 该日 23:59:59.999（北京时, +08:00）的 UTC ISO。
+ *
+ * 资讯页双向 keyset 锚定到某天用：`publishedTo = beijingDayEndIso(key)` + order:"desc"
+ * 取该日最新一页打头。北京无夏令时，恒 +08:00。
+ */
+export function beijingDayEndIso(key: string): string {
+  return new Date(`${key}T23:59:59.999+08:00`).toISOString();
+}
+
 /** "YYYY-MM-DD" 的星期几 index（0=周日），UTC 锚定，与日历日一致。 */
 export function dateKeyWeekday(key: string): number {
   const [y, m, d] = key.split("-").map((s) => Number.parseInt(s, 10));

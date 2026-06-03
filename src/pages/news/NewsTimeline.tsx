@@ -14,7 +14,14 @@
 // 红涨绿跌不适用资讯；只有 has-article 用绿色调，warning 用 state-warn 暖色。
 
 import { AlertTriangle, BookOpen } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type MutableRefObject,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
 import { NewsRowMenu } from "./NewsRowMenu";
@@ -25,10 +32,23 @@ const WEEKDAY_LABEL = ["周日", "周一", "周二", "周三", "周四", "周五
 export interface NewsTimelineProps {
   items: FetchNewsItem[];
   loading: boolean;
+  /** 向更早（下滑）加载中。 */
   loadingMore: boolean;
+  /** 向更新（上滑）加载中。 */
+  loadingNewer: boolean;
+  /** 下方（更早）是否还能扩展。 */
   hasMore: boolean;
+  /** 上方（更新）是否还能扩展。 */
+  hasMoreNewer: boolean;
+  /** 向更早加载（底部 sentinel）。 */
   onLoadMore: () => void;
+  /** 向更新加载（顶部 sentinel）。 */
+  onLoadNewer: () => void;
   registerSectionRef: (dateKey: string, el: HTMLElement | null) => void;
+  /** 把滚动容器（.news-timeline）回传给父组件，用于 prepend 滚动锚定。 */
+  registerTimelineRef: (el: HTMLElement | null) => void;
+  /** prepend 前父组件写入 scrollHeight，DOM 更新后这里补偿 scrollTop。 */
+  scrollAnchorRef: MutableRefObject<number | null>;
   onActiveDateChange: (dateKey: string) => void;
   query: string;
   /** sourceId → 友好展示名，row 上的 source chip 用；缺失时回落到 ID。 */
@@ -179,9 +199,14 @@ export function NewsTimeline({
   items,
   loading,
   loadingMore,
+  loadingNewer,
   hasMore,
+  hasMoreNewer,
   onLoadMore,
+  onLoadNewer,
   registerSectionRef,
+  registerTimelineRef,
+  scrollAnchorRef,
   onActiveDateChange,
   query,
   sourceNames = {},
@@ -217,7 +242,27 @@ export function NewsTimeline({
     }));
   }, [items]);
 
-  // === auto-load on sentinel visible ===
+  // === 滚动容器 ref（既给 active-date 计算，也给父组件做 prepend 锚定） ===
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  const setTimelineRef = (el: HTMLDivElement | null) => {
+    timelineRef.current = el;
+    registerTimelineRef(el);
+  };
+
+  // === prepend 滚动锚定补偿 ===
+  // 父组件向更新方向 prepend 前写入旧 scrollHeight；items 变更触发 DOM 更新后，
+  // 在 layout effect（paint 前）按 scrollHeight 增量补偿 scrollTop，避免视口跳动。
+  useLayoutEffect(() => {
+    const prev = scrollAnchorRef.current;
+    if (prev === null) return;
+    scrollAnchorRef.current = null;
+    const el = timelineRef.current;
+    if (!el) return;
+    const delta = el.scrollHeight - prev;
+    if (delta !== 0) el.scrollTop += delta;
+  }, [items, scrollAnchorRef]);
+
+  // === auto-load on sentinel visible（向更早，底部） ===
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const onLoadMoreRef = useRef(onLoadMore);
   onLoadMoreRef.current = onLoadMore;
@@ -238,6 +283,28 @@ export function NewsTimeline({
     obs.observe(node);
     return () => obs.disconnect();
   }, [hasMore, groups.length]);
+
+  // === auto-load on top sentinel visible（向更新，顶部，与底部对称） ===
+  const topSentinelRef = useRef<HTMLDivElement | null>(null);
+  const onLoadNewerRef = useRef(onLoadNewer);
+  onLoadNewerRef.current = onLoadNewer;
+
+  useEffect(() => {
+    const node = topSentinelRef.current;
+    if (!node || !hasMoreNewer) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            onLoadNewerRef.current();
+          }
+        }
+      },
+      { rootMargin: "200px" },
+    );
+    obs.observe(node);
+    return () => obs.disconnect();
+  }, [hasMoreNewer, groups.length]);
 
   // === active date tracking via header intersect ===
   const headerRefs = useRef<Map<string, HTMLElement>>(new Map());
@@ -292,7 +359,22 @@ export function NewsTimeline({
   }
 
   return (
-    <div className="news-timeline">
+    <div className="news-timeline" ref={setTimelineRef}>
+      {/* top sentinel for auto-load newer（与底部对称） */}
+      {hasMoreNewer && <div ref={topSentinelRef} style={{ height: 1 }} />}
+      {hasMoreNewer && (
+        <div className="news-load-more">
+          <button
+            className="btn"
+            type="button"
+            disabled={loadingNewer}
+            onClick={onLoadNewer}
+          >
+            {loadingNewer ? "加载中…" : "加载更新"}
+          </button>
+        </div>
+      )}
+
       {groups.map((g) => (
         <section
           key={g.dateKey}
