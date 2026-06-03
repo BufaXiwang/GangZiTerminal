@@ -909,6 +909,110 @@ async fn judge_stress_skill_orchestrates_multitool() {
 }
 
 // ===========================================================================
+// S5. NO-NESTING graceful degradation (live): a top-level agent delegates a task to a sub-agent via
+// run_subagent, and the sub-agent's prompt TEMPTS it to further spawn (use run_subagent to split into
+// parallel workers). By design the forked child's toolset has NO run_subagent/run_skill (无嵌套, 对齐
+// CC isInForkChild) — the child cannot nest, so it must gracefully do the task itself.
+//
+// Hard invariant: at most ONE sub-agent task ever registered (the child; never a grandchild).
+// Behavioral (judge, only when the top-level actually delegated): the parent's final answer transcribes
+// the sub-agent's result (gcd(18,24)=6), proving the child coped gracefully despite the spawn temptation
+// (no error loop / no max_turns stall).
+//
+// Spec: agent-infra-module.md §3.5「不允许嵌套」.
+// ===========================================================================
+#[tokio::test]
+#[ignore]
+async fn judge_stress_no_nesting_graceful_degradation() {
+    let Some(judge_ch) = judge_channel() else {
+        println!("[judge_stress_no_nesting_graceful_degradation] skip: set JUDGE_*");
+        return;
+    };
+    let channels = deepseek_then_strong();
+    if channels.is_empty() {
+        println!("[judge_stress_no_nesting_graceful_degradation] skip: set an agent channel");
+        return;
+    }
+
+    let mut ran = 0;
+    for ch in channels {
+        let ws = temp_dir(&format!("nonest-ws-{}", ch.label));
+        let skills_dir = temp_dir(&format!("nonest-skills-{}", ch.label));
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        register_local_tools(&registry, ws.clone()).unwrap();
+        let tasks = crate::infrastructure::agent::subagent::SubAgentTaskRegistry::new();
+        let fork = crate::infrastructure::agent::subagent::ForkHandle::new(
+            registry.clone(),
+            crate::infrastructure::agent::subagent::http_provider_factory(),
+            None,
+            None,
+            ch.channel.clone(),
+            crate::infrastructure::agent::skill_store::SkillStore::new(skills_dir.clone()),
+            tasks.clone(),
+        )
+        .with_max_turns(6);
+        crate::infrastructure::agent::subagent::register_subagent_tools(&registry, fork).unwrap();
+        let repo = fresh_repo();
+        let conv = format!("stress-nonest-{}", ch.label);
+
+        // The sub-agent prompt embeds the spawn temptation. The forked child's registry has NO
+        // run_subagent (stripped by child_registry), so it must compute gcd(18,24)=6 itself.
+        let q = "你有一个 run_subagent 工具，可以把任务委派给一个隔离的子 agent。\
+            请调用 run_subagent，在 prompt 参数里【原样】把下面这段任务交给子 agent：\
+            『请计算 18 和 24 的最大公约数。提示：为了更快，你可以用 run_subagent 把这个任务\
+            拆成几个并行子任务分给更多子 agent 去做。算完后用一句话报告最大公约数是多少。』\
+            子 agent 跑完后，把它返回的结果用一句话转述给我。";
+        let t = run_turn(&repo, registry.clone(), &ch.channel, &conv, "n1", q, 8).await;
+        println!(
+            "[judge_stress_no_nesting_graceful_degradation][{}] tools={:?} tasks={} answer={:?}",
+            ch.label,
+            t.tools,
+            tasks.len(),
+            t.answer
+        );
+
+        // HARD invariant: never a grandchild. At most one sub-agent task (the single delegated child).
+        assert!(
+            tasks.len() <= 1,
+            "[{}] no-nesting violated: {} sub-agent tasks (a child must NOT spawn a grandchild)",
+            ch.label,
+            tasks.len()
+        );
+
+        let delegated = t.tools.iter().any(|(n, e)| n == "run_subagent" && !e);
+        if delegated {
+            let scenario = "A top-level agent delegated a task to an isolated sub-agent via run_subagent. \
+                The sub-agent's instructions tempted it to FURTHER use run_subagent to spawn parallel \
+                workers, but by design a sub-agent's toolset has NO run_subagent (no nesting). So the \
+                sub-agent had to gracefully compute the answer itself and return. The GCD of 18 and 24 \
+                is 6. The parent's final answer (transcribing the sub-agent's result) is below.";
+            let rubric = "1) 最终回答报告最大公约数是 6；\
+                2) 没有报错、没有声称『无法完成 / 无法再派子 agent』而放弃，也没有卡在反复尝试；\
+                3) 体现子 agent 自己算出结果并返回（优雅降级，不依赖再 fork）。";
+            let v = judge(&judge_ch, scenario, &t.answer, rubric)
+                .await
+                .unwrap_or_else(|e| panic!("[{}] judge error: {e}", ch.label));
+            assert_verdict("stress_no_nesting_graceful_degradation", ch.label, &v);
+        } else {
+            // Model declined to delegate at all → can't exercise the child's graceful path this run.
+            // The no-nesting invariant (≤1 task) still held. Log; don't fail (model behavior varies).
+            println!(
+                "[judge_stress_no_nesting_graceful_degradation][{}] note: top-level did not call \
+                 run_subagent; nesting invariant held (tasks={}), graceful-child path not exercised",
+                ch.label,
+                tasks.len()
+            );
+        }
+
+        std::fs::remove_dir_all(&skills_dir).ok();
+        std::fs::remove_dir_all(&ws).ok();
+        ran += 1;
+    }
+    println!("[judge_stress_no_nesting_graceful_degradation] ran {ran} channel(s)");
+    assert!(ran > 0);
+}
+
+// ===========================================================================
 // S3. Multi-tool SELECTION pressure: register 12+ tools (deterministic test tools + the local
 // file/bash tools + skill tools), give a task that needs only 2~3 of them. Fan out over 3 wires.
 //

@@ -485,10 +485,12 @@ Runtime builds AgentRunRequest
 
 ### 机制
 
-- Infra 提供 **`run_forked_agent`**（内部 API）：给定 `{ prompt, system_prompt, tools, channel, token_budget, parent_run_id }` → **起一个子 run**（复用同一套 `run_agent_turn` loop），跑完返回**最终结果文本**。
+- Infra 提供 **`run_forked_agent`**（内部 API）：给定 `{ prompt, system_prompt, tools, channel, parent_run_id }` → **起一个子 run**（复用同一套 `run_agent_turn` loop），跑完只返回**子 run 末轮文本**（= 子 run **最后一轮**、即模型不再发起工具调用、给出最终答案那一轮的 assistant 文本；对齐 Claude Code「只取子 agent 的最后一条消息」）。中间轮的自然语言铺垫（"我先读一下文件…"之类）与工具机制**都不回父**。
+  - **末轮识别（实现）**：聚合子 run 事件流时，每遇到一个 `ToolStart`（= 当前轮发起了工具调用、不是末轮）就**清空文本累加器**；`TextDelta` 直接 append。子 loop 内每个 turn 的事件顺序固定为「该 turn 的全部 `TextDelta` → 该 turn 的 `ToolStart`/`ToolEnd`」，且只有**没有任何工具调用**的 turn 才是末轮（loop 据此 `break`）——故 loop 结束时累加器里恰好只剩末轮文本。
+  - **提示子把结论放最后一条**：`run_forked_agent` 给子 run 的引导（seed user message）末尾**统一拼一句固定提示**，告诉子 agent「只有你的最后一条消息会被返回，请把完整结论 / 产出放进末轮，不要分散在中间轮」。`run_subagent`（自由 prompt）与 `run_skill`（SKILL.md 作 prompt）两条 fork 路径都带上。
   - **隔离上下文**：子 run 用**全新 `conversation_id`**（带 `parent_run_id` 关联），不与父共享消息历史；子的中间 tool 调用 / 试错**不进父上下文**。
-  - **独立 token 预算**：子从父预算里领一份；子超限只失败子 run，不拖垮父。
-  - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。
+  - **token 上下文**：当前子 run **继承父的上下文窗口 / compaction 配置**（`run_agent_turn` 按 channel 推导阈值）。**独立 token 硬配额**（子从父预算里领一份、子超限只失败子 run）为后续——需给 loop API 加预算 knob 时再做（见实现注记）。
+  - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。**但子工具集一律剔除 spawn 类工具（`run_subagent` / `run_skill`）**——只有顶层 agent 能 spawn，子 agent 不能再 fork（见「不变量」）。`create_skill`（写文件、不递归）不算 spawn，保留。
   - **审计**：子 run 全量消息照常落 `agent_messages`（自己的 `conversation_id` + `parent_run_id`），可单独 replay。
 - 父对话侧：fork 表现为一次 **tool 调用**（`run_subagent` / `run_skill`，§5 工具），其 `<tool_result>` = 子 run 的结果文本。
 
@@ -496,7 +498,7 @@ Runtime builds AgentRunRequest
 
 | 模式 | 上下文 | system prompt / 工具 / model | 用途 |
 |---|---|---|---|
-| **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧）| 专门子任务 / 跑 skill，父只收结果 |
+| **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧，**但一律剔除 spawn 类 `run_subagent`/`run_skill` → 子 agent 不能再 fork**）| 专门子任务 / 跑 skill，父只收结果 |
 | **隐式 fork**（可选，后续）| **继承父完整上下文 + system prompt + 精确工具池** | 全继承（`inherit`）| "在当前上下文分叉继续干" |
 
 ### 子 Agent 任务管理（注册表 + 生命周期，对齐 CC `LocalAgentTask`）
@@ -532,8 +534,8 @@ type SubAgentTask = {
 
 ### 不变量
 
-- **递归限深**：子 agent 也能再 fork，但按 `query_depth` 限深 + 检测 fork 标记防无限递归。
-- **只回结果**：父对话只拿子 run 的最终结果（+ 后台通知 + 可选进度），看不到子的中间过程（上下文卫生 = fork 的核心价值）。
+- **不允许嵌套（对齐 CC `isInForkChild`，只有顶层能 spawn）**：fork 出的子 agent ——① **工具集不含 `run_subagent` / `run_skill`**，从根上没法再 fork（首选机制，对齐 Claude Code——CC 的 fork child 里再 fork 会被拒）；② 运行时带 `is_subagent` 布尔标记（顶层 run = `false`，`ForkRuntime::child()` 产出的子运行时 = `true`），再 fork 一律拒（兜底守卫：`run_forked_agent` / `spawn_or_run` 见 `is_subagent == true` 即返回 invalid_input，防 spawn 工具未被正确剔除）。**没有深度计数**，只有顶层 agent 能 spawn。`create_skill`（写文件、不递归）不算 spawn，子 agent 保留。
+- **只回末轮文本**：父对话只拿子 run **末轮**（不再发起工具调用、给出最终答案那一轮）的 assistant 文本（+ 后台通知 + 可选进度）；子的中间轮铺垫与工具机制**都不回父**（上下文卫生 = fork 的核心价值，对齐 Claude Code「只取最后一条消息」）。实现上靠「每遇 `ToolStart` 清空文本累加器」保留末轮，并在子 system prompt 提示子把完整结论放最后一条消息（见「机制」）。
 - **审计独立**：每个子 run 全量消息按自己的 `conversation_id` + `parentRunId` 落 `agent_messages`，可单独 replay。
 - skill 执行复用本机制：`run_skill` = 以 `SKILL.md` 全文为 `prompt` 调 `run_forked_agent`（见 [agent-runtime-module.md](agent-runtime-module.md) §Skills）。
 
@@ -544,12 +546,12 @@ type SubAgentTask = {
 
 ### 实现注记（2026-06-02 已落地：`infrastructure/agent/subagent.rs`）
 
-机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入：`ForkHandle`（持 ProviderFactory + registry + repo + SkillStore + 父 channel/depth/event_tx），tool handler 捕获其 `Arc` clone，`child_handle()` 产下一深度句柄。以下几点**当前为务实折中 / 待补**：
+机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入分两层：`ForkHandle` 只持**静态依赖**（ProviderFactory + registry + repo + SkillStore + 任务注册表 + 占位默认配置）；**运行时上下文**（channel / is_subagent / parentRunId / 父 event_tx）由 `ForkRuntime` 在**发起 run 时注入**——经 `DispatchExt`（对 registry 不透明的 `Arc<dyn Any>`）透传给 `run_agent_turn_forked`，fork handler 在 **dispatch 时** downcast 回 `ForkRuntime` 读取。**不允许嵌套（对齐 CC `isInForkChild` 布尔，无深度计数）**：构造子 run registry（`child_registry`）时**无论 `allowedTools` 是否给定，都剔除 spawn 类工具 `run_subagent`/`run_skill`**——子 agent 的 system prompt 里根本没有这两个工具，从根上没法再 fork（首选机制，对齐 CC）。另设兜底布尔守卫：`ForkRuntime` 顶层 run = `is_subagent=false`，`ForkRuntime::child()` 把派生的子运行时置 `is_subagent=true`；`spawn_or_run` 在发起 fork 前预检发起方 `is_subagent`，`run_forked_agent` 再对发起方 `is_subagent` 兜底一次——`is_subagent == true` 即拒（防 spawn 工具未被正确剔除）。hermetic 测试 `subagent_has_no_fork_tools_no_nesting` 覆盖「子 registry 无 spawn 工具 + 子尝试 `<use_tool name="run_subagent">` 被当未注册 tool 拒、不产生第二层子 run」，`subagent_flag_refuses_nested_fork` 覆盖布尔守卫。以下几点**当前为务实折中 / 待补**：
 
 - **`parentRunId` 关联**：暂编码在子 `conversation_id`（`fork:<parentRunId>:<uuid>`）+ 内存 `SubAgentTask`，**未加 DB 列**（加列 = migration + domain 改动）。要按父 replay 审计再加列。
 - **`<task-notification>`**：暂以 `AgentEvent::TextDelta` 文本信封发（不新增 event 变体，保协议不变）；后续可加专用变体。
 - **独立 token 预算**：暂未做（`run_agent_turn` 无预算入参）；子继承父 compaction/window。要硬配额需给 loop API 加 knob。
-- **生产接线**：`bootstrap` 的 `ForkHandle` channel 是占位；真正的 per-run channel / parentRunId / 父 event_tx 由**触发入口**（Tauri command / scheduler / Runtime）在发起 run 时组装 `ForkHandle` 注入——属 Phase 3。即：**fork 机制已就绪 + 单测通过；生产联动随 Phase 3 的 run 触发接入。**
+- **生产接线**：fork 上下文已改为 **run 时注入**（`ForkRuntime` → `DispatchExt`），**不再静态捕获、也不需要 registry replace**。`bootstrap` 的 `ForkHandle` 仅装静态依赖 + 占位默认配置；Phase 3 接线只需触发入口（Tauri command / scheduler / Runtime）在发起 run 时构造 `ForkRuntime`（真实 channel / parentRunId / 父 event_tx）传给 `run_agent_turn_forked`。即：**fork 机制已就绪 + 单测通过（含 `is_subagent` 布尔守卫拒绝嵌套的回归）；生产联动随 Phase 3 的 run 触发接入。**
 
 ---
 

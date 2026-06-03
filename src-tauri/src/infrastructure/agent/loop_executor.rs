@@ -33,7 +33,7 @@ use crate::infrastructure::agent::context_compaction::{
 use crate::infrastructure::agent::http_provider::HttpProvider;
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
 use crate::infrastructure::agent::tool_parser::ParserEvent;
-use crate::infrastructure::agent::tool_registry::{DispatchError, ToolRegistry};
+use crate::infrastructure::agent::tool_registry::{DispatchError, DispatchExt, ToolRegistry};
 use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
 use std::collections::HashSet;
@@ -242,12 +242,33 @@ async fn resilient_next_turn(
 ///
 /// Spec §3 Agent Loop，§4 上下文管理（主动压缩 + Summarize + 多轮持久化），§5 Infra Loop API。
 pub async fn run_agent_turn(
+    request: AgentRunRequest,
+    registry: Arc<ToolRegistry>,
+    context: ContextBundle,
+    providers: Vec<Box<dyn ProviderStream>>,
+    event_tx: Sender<AgentEvent>,
+    repo: Option<AgentMessagesRepo>,
+) -> Result<RunSummary, LoopError> {
+    run_agent_turn_forked(request, registry, context, providers, event_tx, repo, None).await
+}
+
+/// `run_agent_turn` 的全量版本：额外带一个每-run 的 `fork_ctx`（`DispatchExt`），在本 run 内每次
+/// `dispatch_tool_call` 时原样透传给 handler。fork 子 agent tool（`run_subagent` / `run_skill`）据此在
+/// **dispatch 时**读到当前 run 的真实 channel / is_subagent / parent_run_id / event_tx —— 子 run 跑
+/// `run_agent_turn_forked` 时透传的 fork_ctx 已被 `ForkRuntime::child()` 置 `is_subagent=true`，于是子 run
+/// 内部再触发 fork 会被布尔守卫拒绝（无深度计数，对齐 CC `isInForkChild`）。
+/// `fork_ctx=None` 时行为与 `run_agent_turn` 完全一致。
+///
+/// Spec §3 Agent Loop + §3.5（fork 上下文 run 时注入，不嵌套经 `is_subagent` 布尔守卫生效）。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_turn_forked(
     mut request: AgentRunRequest,
     registry: Arc<ToolRegistry>,
     mut context: ContextBundle,
     mut providers: Vec<Box<dyn ProviderStream>>,
     event_tx: Sender<AgentEvent>,
     repo: Option<AgentMessagesRepo>,
+    fork_ctx: Option<DispatchExt>,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
     let plan = CompactionPlan::derive(request.compaction.as_ref(), &request.channel);
@@ -423,7 +444,13 @@ pub async fn run_agent_turn(
                     .await?;
 
                     let dispatch_res = registry
-                        .dispatch_tool_call(&run_id, call_id.clone(), &name, input.clone())
+                        .dispatch_tool_call_with_ext(
+                            &run_id,
+                            call_id.clone(),
+                            &name,
+                            input.clone(),
+                            fork_ctx.clone(),
+                        )
                         .await;
 
                     let (out_summary, is_error, duration_ms, used_call_id, err_code) =

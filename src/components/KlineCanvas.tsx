@@ -73,6 +73,24 @@ function isMinutePeriod(p: ChartPeriod): p is MinuteKlinePeriod {
   return (MINUTE_PERIODS as readonly string[]).includes(p);
 }
 
+// 启动后台预热：App 启动后静默对默认标的跑一次 ensureChartData，把结果写进
+// ensuredKeys 缓存。首次切到市场页时 KlineCanvas 命中缓存 → 跳过最重的
+// ensureChartData(后端拉数) 一步，直接读 DB 渲染，消掉首切延迟。
+// fire-and-forget：失败静默，真正进入市场页会再 ensure 一次。
+export async function prewarmChartData(
+  tsCode: string,
+  period: ChartPeriod,
+): Promise<void> {
+  const cacheKey = `${tsCode}|${period}`;
+  if (ensuredKeys.has(cacheKey)) return;
+  try {
+    const res = await commands.ensureChartData(tsCode, period);
+    if (res.status !== "error") ensuredKeys.add(cacheKey);
+  } catch {
+    // 预热失败静默忽略
+  }
+}
+
 function readCssVar(name: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   const v = getComputedStyle(document.documentElement)
@@ -331,7 +349,14 @@ export function KlineCanvas({
 
     // 容器尺寸变化时让图表重算布局（窗口 / 面板 resize；以及万一在 0 尺寸下 init 后获得尺寸）。
     // 注：页面懒挂载（App.tsx）已保证图表首次在可见状态下 init，这里是兜底 + 处理后续 resize。
-    const resizeObserver = new ResizeObserver(() => {
+    //
+    // ⚠️ 必须跳过 0 尺寸：keep-alive 用 display:none 隐藏非激活 tab，此时容器 contentRect 变 0×0，
+    // 若对 klinecharts resize(0) 会把 barSpace/缩放钳坏（visible bar 数塌缩、barSpace 顶到最大），
+    // 切回来尺寸恢复但被污染的超宽 barSpace 不会自动重置 → 蜡烛被拉成稀疏宽柱。display:none 下
+    // canvas 内容本就保留，跳过 0 尺寸即可：切回来尺寸没变就原样显示，真变了(窗口 resize)才重绘。
+    const resizeObserver = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (!rect || rect.width === 0 || rect.height === 0) return;
       chartRef.current?.resize();
     });
     resizeObserver.observe(container);

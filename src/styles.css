@@ -1689,6 +1689,11 @@ body {
   padding: 9px 16px 9px 12px;
   cursor: pointer;
   transition: background 80ms ease;
+  /* 原生窗口化：屏外行跳过布局/绘制，长列表滚动 + 切 tab 重绘大幅减负。
+     contain-intrinsic-size 给屏外行一个占位高度（auto = 记住上次真实高度，回落 72px），
+     保持滚动条尺寸稳定。DOM 仍在，sticky 头 / IntersectionObserver / 跳转 anchor 照常。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
 }
 
 /* 时间轨道竖线：贯穿最左侧 dot 中心（dot 在 time 列最左、padding 内）。 */

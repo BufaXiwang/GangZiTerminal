@@ -13,7 +13,7 @@
 //
 // 不发请求，纯展示组件。
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   beijingDateKey,
   beijingTodayKey,
@@ -48,8 +48,19 @@ export function NewsDateNav({
   activeDate,
   onSelect,
 }: NewsDateNavProps) {
+  // 跨午夜自动滚动「今天」：beijingTodayKey() 只在依赖变化时重算，若 app 跨天开着不刷新，
+  // 顶部「今天」会卡在昨天。用一个每分钟检查的 tick，日历日真变了才 setState 触发重算。
+  const [todayKey, setTodayKey] = useState(() => beijingTodayKey());
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const k = beijingTodayKey();
+      setTodayKey((prev) => (prev === k ? prev : k));
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
   const days = useMemo(() => {
-    const today = beijingTodayKey();
+    const today = todayKey;
     const out: { key: string; label: string; weekday: string; isToday: boolean }[] = [];
     for (let i = 0; i < daysBack; i++) {
       const key = shiftDateKey(today, -i);
@@ -61,7 +72,7 @@ export function NewsDateNav({
       });
     }
     return out;
-  }, [daysBack]);
+  }, [daysBack, todayKey]);
 
   const activeStopRef = useRef<HTMLButtonElement | null>(null);
 

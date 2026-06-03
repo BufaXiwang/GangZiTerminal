@@ -179,12 +179,12 @@ Agent 具备 Claude Code / Codex 量级的本地能力，但按**约定级沙箱
 
 ### 子 Agent（fork）—— 机制在 Infra，Runtime 只用
 
-> ⚠️ **fork 子 agent 的执行机制属 Agent Infra 层**（隔离上下文 + 独立预算 + 继承/收紧 + 只回结果 + 限深），定义见 [agent-infra-module.md](agent-infra-module.md) §3.5「子 Agent / Fork」。本节只说 Runtime 怎么**用**它。
+> ⚠️ **fork 子 agent 的执行机制属 Agent Infra 层**（隔离上下文 + 继承父上下文窗口 + 继承/收紧 + 只回结果 + 无嵌套），定义见 [agent-infra-module.md](agent-infra-module.md) §3.5「子 Agent / Fork」。本节只说 Runtime 怎么**用**它。
 
 - **`run_subagent` tool**（Infra 默认提供）：父 agent 调它 → Infra `run_forked_agent` 起隔离子 run，跑完只把结果回灌。Runtime 侧关心的是：哪些 profile 允许它（`allowedTools`）、是否传工具子集收紧。
 - **`run_skill` tool**：调某 skill = 以其 `SKILL.md` 为 prompt 调同一 fork 机制（见下 §Skills）。
 - model / effort / 渠道：子 agent **一律继承父**（本项目不做 per-子覆盖）；工具集默认继承、可用 `allowedTools` 收紧。
-- 嵌套按 `query_depth` 限深（Infra 保证）。
+- **无嵌套**：fork 出的子 agent 工具集不含 `run_subagent` / `run_skill`，只有顶层 agent 能 spawn（Infra 保证，对齐 CC `isInForkChild`；无深度计数）。
 
 ### Skills（playbook，CC 式 fork 执行，初始为空）
 

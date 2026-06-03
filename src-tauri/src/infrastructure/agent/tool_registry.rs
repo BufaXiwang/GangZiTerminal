@@ -21,12 +21,24 @@ use crate::infrastructure::agent::payload_store::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use specta::Type;
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
+
+/// 每-run 的「dispatch 运行时扩展」——一个对 registry **不透明**的上下文，由 caller 在发起 run 时
+/// 注入、dispatch 时原样传给 handler，handler 自行 downcast 读取（fork 子 agent 用它拿当前 run 的真实
+/// channel / depth / parent_run_id / event_tx，避免在注册时被静态捕获）。
+///
+/// 设计要点（保持分层）：`ToolRegistry` 只负责把它从 `dispatch_tool_call_with_ext` 透传到
+/// `ToolHandler::invoke_with_ext`，**完全不理解**它的内容。fork 语义全在 `subagent.rs` 里通过
+/// downcast 到 `ForkRuntime` 实现。registry 因此对「fork」零知识。
+///
+/// Spec: agent-infra-module.md §3.5（fork 上下文 run 时注入，而非注册时静态捕获）。
+pub type DispatchExt = Arc<dyn Any + Send + Sync>;
 
 /// Tool handler 的输入。
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -76,6 +88,17 @@ pub type ToolHandlerFuture =
 /// 必须 `Send + Sync + 'static`，以便 `Arc<ToolRegistry>` 跨任务共享。
 pub trait ToolHandler: Send + Sync + 'static {
     fn invoke(&self, inv: ToolInvocation) -> ToolHandlerFuture;
+
+    /// dispatch 时带「运行时扩展」(`DispatchExt`) 的入口。绝大多数 handler 不关心 ext，
+    /// 默认实现直接忽略并转调 `invoke`。需要 run 时上下文的 handler（如 fork 的
+    /// `run_subagent` / `run_skill`）**覆盖**本方法、downcast `ext` 读取当前 run 的 fork 上下文。
+    fn invoke_with_ext(
+        &self,
+        inv: ToolInvocation,
+        _ext: Option<DispatchExt>,
+    ) -> ToolHandlerFuture {
+        self.invoke(inv)
+    }
 }
 
 /// 函数 closure -> ToolHandler adapter。
@@ -262,6 +285,24 @@ impl ToolRegistry {
         tool_name: &str,
         input: JsonSummary,
     ) -> Result<ToolCallResult, DispatchError> {
+        self.dispatch_tool_call_with_ext(run_id, tool_call_id, tool_name, input, None)
+            .await
+    }
+
+    /// `dispatch_tool_call` 的全量版本：额外带一个对 registry 不透明的 `DispatchExt`（每-run 注入），
+    /// 透传给 `ToolHandler::invoke_with_ext`。fork 子 agent tool 用它在**调用时**读到当前 run 的真实
+    /// channel / depth / parent_run_id / event_tx（而非注册时静态捕获）。`ext=None` 时行为与
+    /// `dispatch_tool_call` 完全一致。
+    ///
+    /// Spec §5 `dispatch_tool_call` + §3.5（fork 上下文 run 时注入）。
+    pub async fn dispatch_tool_call_with_ext(
+        &self,
+        run_id: &str,
+        tool_call_id: ToolCallId,
+        tool_name: &str,
+        input: JsonSummary,
+        ext: Option<DispatchExt>,
+    ) -> Result<ToolCallResult, DispatchError> {
         let (handler, spec, validator) = {
             let g = self.tools.read().expect("RwLock poisoned");
             let entry = g
@@ -314,7 +355,8 @@ impl ToolRegistry {
 
         let timeout = Duration::from_millis(spec.timeout_ms);
         let started_instant = std::time::Instant::now();
-        let result = tokio::time::timeout(timeout, handler.invoke(invocation)).await;
+        let result =
+            tokio::time::timeout(timeout, handler.invoke_with_ext(invocation, ext)).await;
         let duration_ms = started_instant.elapsed().as_millis() as u64;
 
         let output: ToolHandlerOutput = match result {

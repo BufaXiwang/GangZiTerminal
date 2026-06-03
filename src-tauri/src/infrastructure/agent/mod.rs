@@ -65,16 +65,16 @@ pub use skill_store::{parse_frontmatter, render_skill_md, SkillIndexEntry, Skill
 pub use skill_tools::register_skill_tools;
 pub use subagent::{
     http_provider_factory, register_subagent_tools, run_forked_agent, stop_subagent,
-    subagent_output, ForkHandle, ProviderFactory, SubAgentProgress, SubAgentStatus,
-    SubAgentTaskRegistry, MAX_FORK_DEPTH,
+    subagent_output, ForkHandle, ForkRuntime, ProviderFactory, SubAgentProgress, SubAgentStatus,
+    SubAgentTaskRegistry,
 };
-pub use loop_executor::{run_agent_turn, LoopError, ProviderStream};
+pub use loop_executor::{run_agent_turn, run_agent_turn_forked, LoopError, ProviderStream};
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};
 pub use tool_parser::{ParserEvent, ToolCallParser};
 pub use tool_registry::{
-    DispatchError, FnToolHandler, InputValidator, ToolHandler, ToolHandlerFuture,
+    DispatchError, DispatchExt, FnToolHandler, InputValidator, ToolHandler, ToolHandlerFuture,
     ToolHandlerOutput, ToolInvocation, ToolRegistry,
 };
 pub use system_prompt::{build_system_prompt, build_system_prompt_with_skills, PROTOCOL_PREAMBLE};
@@ -114,12 +114,14 @@ pub fn bootstrap(
     let skill_store = SkillStore::new(skills_dir);
     // 默认注册 fork 子 agent tool（run_subagent / run_skill）（spec §3.5 / §3.6）。
     //
-    // ForkHandle 的 channel 是占位默认——run_forked_agent 在真正起子 run 时，**应**由触发入口
-    // （Tauri command / scheduler / Runtime）按当前 run 的实际 channel + parent_run_id 重新装配
-    // ForkHandle（见 `ForkHandle::for_parent_run` / `with_max_turns` 等 builder）。bootstrap 这里
-    // 只先把 tool 名注册进 registry（system prompt 需要它们出现在 tool 清单里），子 run 的 provider
-    // 工厂用 http_provider_factory（生产）。channel 缺省取 channels_repo 暂不在此读，交由 adapter 接线时
-    // 用真 channel 重注册 / 覆盖 ForkHandle。
+    // ForkHandle 只持有**静态依赖**（registry / provider 工厂 / repo / 任务注册表 / SkillStore）+ 一组
+    // 占位默认运行时配置。真实的运行时上下文（channel / is_subagent / parent_run_id / event_tx）由发起 run 的
+    // 入口（Tauri command / scheduler / Runtime）构造 `ForkRuntime` 在跑 run 时注入：调用
+    // `run_agent_turn_forked(..., Some(ForkRuntime::new(channel, run_id).into_ext()))`。fork handler 在
+    // dispatch 时把它 downcast 回来，于是子 run 用的是**当前 run 的真实 channel / is_subagent**——无需 registry
+    // replace、也不会再有「占位 channel 被真用 / 子 agent 的 is_subagent 标记丢失」的 P0 漏洞。bootstrap 这里只把
+    // tool 名注册进 registry（system prompt 需要它们出现在 tool 清单里），provider 工厂用
+    // http_provider_factory（生产）；fork_channel 仅作无注入时的退路占位。
     let tasks = SubAgentTaskRegistry::new();
     let fork_channel = crate::domain::agent::ProviderChannel {
         channel_id: String::new(),

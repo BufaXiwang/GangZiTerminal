@@ -322,18 +322,11 @@ export default function NewsPage() {
           {enabledCount}/{totalCount} 来源启用
         </span>
       )}
-      {query.length > 0 ? (
+      {query.length > 0 && (
         <span className="muted">
           · 匹配 {items.length} 条
           {page?.hasMore ? "+" : ""} (query: "{query}")
         </span>
-      ) : (
-        items.length > 0 && (
-          <span className="muted">
-            · 当前 {items.length} 条
-            {page?.hasMore ? "+（可加载更多）" : ""}
-          </span>
-        )
       )}
       {selectedSources.size > 0 && (
         <span className="muted">· {selectedSources.size} 来源过滤中</span>

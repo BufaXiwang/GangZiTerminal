@@ -10,6 +10,7 @@ import { useEffect, useRef } from "react";
 import { useLocation } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { ROUTES } from "./lib/router";
+import { prewarmChartData } from "./components/KlineCanvas";
 import { useWatchlistStore } from "./lib/watchlistStore";
 import MarketPage from "./pages/MarketPage";
 import NewsPage from "./pages/NewsPage";
@@ -27,6 +28,9 @@ export default function App() {
   const loadWatchlist = useWatchlistStore((s) => s.load);
   useEffect(() => {
     void loadWatchlist();
+    // 后台预热市场页首屏图表数据（默认 000001.SH 日K，与 MarketPage DEFAULT_SELECTED /
+    // InstrumentDetail 默认周期一致）。fire-and-forget，消掉首次切到市场页的延迟。
+    void prewarmChartData("000001.SH", "day");
   }, [loadWatchlist]);
 
   const { pathname } = useLocation();

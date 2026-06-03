@@ -14,7 +14,7 @@
 // 红涨绿跌不适用资讯；只有 has-article 用绿色调，warning 用 state-warn 暖色。
 
 import { AlertTriangle, BookOpen } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
 import { NewsRowMenu } from "./NewsRowMenu";
@@ -99,18 +99,40 @@ function NewsRow({
   const hasWarn = warnings.length > 0;
   // 优先全文（展开要看完整正文）；无全文回落 excerpt / summary。
   const body = it.article?.content ?? it.articleExcerpt ?? it.summary ?? "";
+  const rowRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [overflow, setOverflow] = useState(false);
-  // 只在折叠态测量真实溢出（open 时 clamp 解除会让 scrollHeight==clientHeight）。
-  useLayoutEffect(() => {
+  // 只在折叠态、且本行真正进入视口时才测溢出（open 时 clamp 解除会让 scrollHeight==clientHeight）。
+  // 用 IntersectionObserver 懒测 + 测完即断开：避免 ~2000 行挂载时同步读 scrollHeight 的强制
+  // reflow 雪崩，也避免对 content-visibility:auto 跳过的屏外行强制布局。
+  useEffect(() => {
     if (open) return;
-    const el = bodyRef.current;
-    if (el) setOverflow(el.scrollHeight > el.clientHeight + 1);
+    const rowEl = rowRef.current;
+    const bodyEl = bodyRef.current;
+    if (!rowEl || !bodyEl) return;
+    let done = false;
+    const measure = () => {
+      if (done) return;
+      done = true;
+      setOverflow(bodyEl.scrollHeight > bodyEl.clientHeight + 1);
+    };
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          measure();
+          io.disconnect();
+        }
+      },
+      { rootMargin: "100px" },
+    );
+    io.observe(rowEl);
+    return () => io.disconnect();
   }, [body, open]);
 
   return (
     <div
+      ref={rowRef}
       className={`news-row acc-${acc}${open ? " expanded" : ""}${overflow ? " clickable" : ""}`}
       onClick={() => overflow && setOpen((v) => !v)}
       onContextMenu={(e) => {
