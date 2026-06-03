@@ -276,6 +276,20 @@ pub fn run() {
                         tracing::warn!(target: "quotes.startup", error = ?e, "core quote refresh failed");
                     }
 
+                    // 3b) 冷启动 universe intraday 首刷（spec §5）：刷新窗内立即跑一次全市场盘中刷新，
+                    //     不等 scheduler 首个 +60s tick——否则冷启动后全市场盘中价最长等近 1min 才首刷。
+                    //     复用渐进批量（stock→index→fund + 200/批 progress），前端增量填充。
+                    if svc.market_time_now().is_in_quote_refresh_window {
+                        let req = crate::pipeline::quotes::service::RefreshMarketQuotesRequest {
+                            scope: crate::domain::quotes::RefreshMarketQuotesScope::Universe,
+                            purpose: crate::domain::quotes::RefreshPurpose::Intraday,
+                            trade_date: None,
+                        };
+                        if let Err(e) = svc.refresh_market_quotes(req).await {
+                            tracing::warn!(target: "quotes.startup", error = ?e, "universe intraday first-refresh failed");
+                        }
+                    }
+
                     // 4) K 线日线预热（核心指数）— 小而快（~4 codes），先跑，UI 切到指数 K 线立即可见。
                     //    Universe 级 K 线刷新交给 scheduler 16:00 / 下次启动后台。
                     let core = svc.core_indexes();

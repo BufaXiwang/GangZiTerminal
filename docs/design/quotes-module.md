@@ -1035,6 +1035,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 
 - **`is_trading_time`**：是否处于**可交易报价时段**（连续竞价 09:30–11:30 + 13:00–15:00）。用于 §2 quote 有效性（盘中 1h 硬过期 / 非盘中读最新已完成交易日）与 Account 成交时段判断。**不是** scheduler 刷新节奏的判据。
 - **`is_in_quote_refresh_window`**：scheduler 实时行情三档（热点 / 核心 / universe）的刷新节奏判据 = **连续竞价 + 每个 session 收盘后 30min 尾窗**，即交易日的 **09:30–12:00 ∪ 13:00–15:30**（北京时）。尾窗内继续按各档节奏刷新并写 in-memory snapshot（读路径照常服务最新 in-memory snapshot），以捕获收盘后稍晚落定的最终价、并让行情不在 11:30 / 15:00 整点冻结。尾窗与 `is_trading_time`（可交易性）解耦——尾窗内**不**可交易、Account 仍 fail closed。15:30 收盘快照 / 16:00 K 线预热不变。
+
+- **冷启动 universe intraday 首刷**：启动 catch-up 在 `is_in_quote_refresh_window` 为真时**立即跑一次 universe intraday 刷新**（复用渐进批量 stock→index→fund + 200/批 `market-quotes-refresh-progress`），**不等 scheduler 的首个 +60s tick**——否则全市场盘中实时价冷启动后最长要等近 1 分钟才首刷。之后 60s universe tick 负责持续刷新。与 close-snapshot catch-up（仅非刷新窗 / 快照不全时补最新已完成交易日收盘）互补、不重复。
 - **`is_in_trading_session`**：是否处于**分时 / 分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_intraday` / `refresh_minute_klines` 的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
 
 规则：
