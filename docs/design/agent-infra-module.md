@@ -845,7 +845,9 @@ discover_models(wire_format: WireFormat, base_url: &str, api_key: &str)
 
 ### 前端命令（设置页）
 
-设置页通过 specta 强类型 command 操作（不裸调 invoke、apiKey 只提交不回读）：`agent_list_channels`（屏蔽 apiKey）/ `agent_add_channel` / `agent_remove_channel` / `agent_set_active_channel` / `agent_discover_models` / `agent_channel_presets`（返回内置快速预设）。
+设置页通过 specta 强类型 command 操作（不裸调 invoke、apiKey 只提交不回读）：`agent_list_channels`（屏蔽 apiKey）/ `agent_add_channel` / `agent_update_channel` / `agent_remove_channel` / `agent_set_active_channel` / `agent_discover_models` / `agent_channel_presets`（返回内置快速预设）。
+
+- `agent_update_channel`：按 `channel_id` 更新已有渠道（渠道名 / 消息格式 / Host / model / enabled，可选 apiKey）。**apiKey 语义**：input 的 apiKey 为空 / 省略 = **保留原有 key 不变**（与"只提交不回读"一致——前端不持有明文，编辑时不预填、留空即不改）；非空才覆盖。不修改 `is_active`（当前模型由 `agent_set_active_channel` 单独管）；未在 input 暴露的能力字段（如 thinking budget）保留原值。`channel_id` 不存在 → `not_found`。
 
 ### 前端消息入口
 

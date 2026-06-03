@@ -74,6 +74,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::agent::cmd::agent_channel_presets,
         adapters::agent::cmd::agent_discover_models,
         adapters::agent::cmd::agent_add_channel,
+        adapters::agent::cmd::agent_update_channel,
         adapters::agent::cmd::agent_list_channels,
         adapters::agent::cmd::agent_remove_channel,
         adapters::agent::cmd::agent_set_active_channel,

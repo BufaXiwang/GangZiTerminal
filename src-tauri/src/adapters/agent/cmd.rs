@@ -83,6 +83,34 @@ pub struct AddChannelInput {
     pub context_window_tokens: Option<u32>,
 }
 
+/// 编辑已有渠道的请求 —— 按 channelId 更新可编辑字段。
+///
+/// Spec §5 前端命令：`agent_update_channel`。apiKey 为空/省略 = 保留原 key 不变；
+/// 不修改 is_active；未暴露的能力字段（thinking budget 等）保留原值。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateChannelInput {
+    pub channel_id: String,
+    pub provider: String,
+    pub wire_format: WireFormat,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub model: String,
+    /// 空/省略 = 保留原 key；非空才覆盖。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
+    #[serde(default)]
+    pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub context_window_tokens: Option<u32>,
+}
+
 fn map_repo_err(e: impl std::fmt::Display) -> CommandError {
     CommandError::with_message(ErrorCode::DbError, e.to_string())
 }
@@ -156,6 +184,57 @@ pub fn agent_add_channel(
             .map_err(map_repo_err)?;
     }
     Ok(())
+}
+
+/// 编辑已有渠道（按 channelId）。apiKey 为空/省略保留原 key；不改 is_active；
+/// 未暴露字段保留原值。channelId 不存在 → not_found。
+///
+/// Spec §5 前端命令：`agent_update_channel`
+#[tauri::command]
+#[specta::specta]
+pub fn agent_update_channel(
+    infra: State<'_, AgentInfra>,
+    input: UpdateChannelInput,
+) -> Result<(), CommandError> {
+    let existing = infra
+        .channels_repo
+        .get(&input.channel_id)
+        .map_err(map_repo_err)?
+        .ok_or_else(|| {
+            CommandError::with_message(
+                ErrorCode::NotFound,
+                format!("channel not found: {}", input.channel_id),
+            )
+        })?;
+
+    // apiKey 语义：空/省略 = 保留原 key；非空才覆盖。
+    let api_key = match input.api_key {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => existing.api_key,
+    };
+
+    let channel = ProviderChannel {
+        channel_id: existing.channel_id,
+        provider: input.provider,
+        wire_format: input.wire_format,
+        base_url: input.base_url,
+        api_key,
+        model: input.model,
+        stream: true,
+        enabled: input.enabled.unwrap_or(existing.enabled),
+        supports_vision: input.supports_vision.unwrap_or(existing.supports_vision),
+        supports_thinking: input
+            .supports_thinking
+            .unwrap_or(existing.supports_thinking),
+        max_output_tokens: input.max_output_tokens.or(existing.max_output_tokens),
+        context_window_tokens: input
+            .context_window_tokens
+            .or(existing.context_window_tokens),
+        // 未在 input 暴露：保留原值。
+        thinking_budget_tokens: existing.thinking_budget_tokens,
+    };
+
+    infra.channels_repo.update(&channel).map_err(map_repo_err)
 }
 
 /// 列出所有渠道（**屏蔽 apiKey 明文**）。

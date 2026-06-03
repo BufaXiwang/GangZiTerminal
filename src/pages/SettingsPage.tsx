@@ -149,6 +149,7 @@ export default function SettingsPage() {
             <ChannelList
               channels={channels}
               onRemove={handleRemove}
+              onSaved={handleSaved}
               busy={mutating}
             />
           </section>

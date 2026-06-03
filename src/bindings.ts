@@ -247,6 +247,20 @@ async agentAddChannel(input: AddChannelInput) : Promise<Result<null, CommandErro
 }
 },
 /**
+ * 编辑已有渠道（按 channelId）。apiKey 为空/省略保留原 key；不改 is_active；
+ * 未暴露字段保留原值。channelId 不存在 → not_found。
+ * 
+ * Spec §5 前端命令：`agent_update_channel`
+ */
+async agentUpdateChannel(input: UpdateChannelInput) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_update_channel", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 列出所有渠道（**屏蔽 apiKey 明文**）。
  * 
  * Spec §5 前端命令：`agent_list_channels`（屏蔽 apiKey）
@@ -702,6 +716,17 @@ export type TriggerHandledFilter = boolean | TriggerHandledAll
  * - 非 `TsCode` 标识不能作为跨模块持久化主键。
  */
 export type TsCode = string
+/**
+ * 编辑已有渠道的请求 —— 按 channelId 更新可编辑字段。
+ * 
+ * Spec §5 前端命令：`agent_update_channel`。apiKey 为空/省略 = 保留原 key 不变；
+ * 不修改 is_active；未暴露的能力字段（thinking budget 等）保留原值。
+ */
+export type UpdateChannelInput = { channelId: string; provider: string; wireFormat: WireFormat; baseUrl?: string | null; model: string; 
+/**
+ * 空/省略 = 保留原 key；非空才覆盖。
+ */
+apiKey?: string | null; enabled?: boolean | null; supportsVision?: boolean | null; supportsThinking?: boolean | null; maxOutputTokens?: number | null; contextWindowTokens?: number | null }
 export type UpdateWatchlistRequest = ({ action: "add"; ts_code: TsCode; note?: string | null; reason?: string | null } | { action: "remove"; ts_code: TsCode; reason?: string | null } | { action: "update_note"; ts_code: TsCode; note?: string | null; reason?: string | null })
 export type UpdateWatchlistResponse = { accepted: boolean; reason?: ErrorCode | null; message?: string | null; item?: WatchlistItem | null; accountEventIds: string[]; warnings?: WarningCode[] }
 /**
