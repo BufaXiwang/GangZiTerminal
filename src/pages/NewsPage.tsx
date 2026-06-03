@@ -42,11 +42,11 @@ import { captureTopAnchor, type TopAnchor } from "../lib/scrollAnchor";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
-// 滑动窗口 DOM 上限：保留的 items 封顶（约 8 页）。向一端扩展超限即裁掉远端，
+// 滑动窗口 DOM 上限：保留的 items 封顶（4 页）。向一端扩展超限即裁掉远端，
 // 被裁端 hasMore 置回 true 可用 keyset 游标回滚重拉。根治长滚动后数千常驻节点
 // 导致的切 tab / 滚动布局重算卡顿（content-visibility 只省绘制不省布局）。
-// Spec: news-module.md §fetch_news 双向 keyset「窗口有界（如 ~400）」；frontend-design.md §4。
-const MAX_WINDOW = 400;
+// Spec: news-module.md §fetch_news 双向 keyset「窗口有界（~200）」；frontend-design.md §4。
+const MAX_WINDOW = 200;
 
 function formatTime(date: Date): string {
   return date.toLocaleTimeString("zh-CN", { hour12: false });

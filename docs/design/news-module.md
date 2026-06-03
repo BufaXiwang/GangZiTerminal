@@ -284,7 +284,7 @@ type FetchNewsResponse = {
   - **向更新（上滑）**：`publishedFrom = 当前窗口最新一条的 publishedAt`、`order:"asc"`、`limit` → 紧邻其上一页（升序），前端 reverse 后 prepend。
   - 两端各自的 `hasMore` 由各自方向的查询是否满页判定。游标用 `publishedAt`（闭区间），同一时刻多条用 `id` 去重避免边界重复/漏读。
   - **`dateCounts` 是全量计数，不受翻页游标影响**：`dateCounts` 随请求的 filter 计算（含 `publishedFrom/To`），所以**带游标的窗口请求返回的 `dateCounts` 是被截断的**（只含游标一侧的天），**不可**用它刷新日期导航。日期导航的全量每日真实总数**只由无游标请求**（初始加载 / `query`·`sources` 筛选变化 / 刷新）维护；窗口翻页/锚定请求忽略其返回的 `dateCounts`。
-  - **窗口有界（滑动窗口）**：前端保留的 items 数有上限（实现取常量，如 ~400）。向一端扩展导致超限时，**裁掉远离当前视口的另一端**，并把被裁端的 `hasMore` 置回 `true`（回滚时用 keyset 游标重新拉，一页一页补）。裁剪/prepend 都必须做**滚动锚定**（按当前视口顶部的真实行补偿 `scrollTop`），视口不跳。这样 DOM 行数恒定有界——长时间滚动后切 tab / 继续滚都不卡（`content-visibility` 只省绘制，省不掉数千常驻节点的布局重算）。
+  - **窗口有界（滑动窗口）**：前端保留的 items 数有上限（实现取常量，如 ~200）。向一端扩展导致超限时，**裁掉远离当前视口的另一端**，并把被裁端的 `hasMore` 置回 `true`（回滚时用 keyset 游标重新拉，一页一页补）。裁剪/prepend 都必须做**滚动锚定**（按当前视口顶部的真实行补偿 `scrollTop`），视口不跳。这样 DOM 行数恒定有界——长时间滚动后切 tab / 继续滚都不卡（`content-visibility` 只省绘制，省不掉数千常驻节点的布局重算）。
 - `includeArticle = true` 时不触发远端抽取；缺正文、正文失败缓存或 `ArticleContent.content` 为空时，不返回 `article` 字段，并必须返回 `article_missing` warning。
 - `articleExcerpt` 是面向 Agent / 列表摘要的短正文摘录；当本地存在 `ArticleContent.content` 时必须由 News query facade 生成并返回，默认取清洗后正文前 500 个字符（清洗后空白已折叠为单空格，不保留段落分隔）。`includeArticle = false` 时也可以返回已有 `articleExcerpt`，但不得触发远端抽取。
 - News 不生成行业标签、相关标的或影响判断；`query` 只是资讯文本搜索条件。
