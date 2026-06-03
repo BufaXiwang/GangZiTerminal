@@ -1536,7 +1536,7 @@ impl QuotesService {
     /// (scope=subscribed) 让前端各视图刷新。盘外直接返回。
     pub async fn refresh_hot_quotes(&self) {
         let ctx = self.market_time_now();
-        if !ctx.is_trading_time {
+        if !ctx.is_in_quote_refresh_window {
             return;
         }
         let now = ctx.now;

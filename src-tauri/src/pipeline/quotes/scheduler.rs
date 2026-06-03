@@ -94,7 +94,7 @@ pub fn spawn_full_scheduler(
                         // 当前未持有 Account 关注列表（spec §5 — 调用方传入合并集）；
                         // scheduler 内部至少用核心指数 + 任意 cache 中已有的 ts_code 作 subscribed scope。
                         let ctx = svc.market_time_now();
-                        if !ctx.is_trading_time {
+                        if !ctx.is_in_quote_refresh_window {
                             continue;
                         }
                         // Spec §2 line 992：关注标的 + 核心指数 15s，全市场 universe 60s。
@@ -133,7 +133,7 @@ pub fn spawn_full_scheduler(
                 tokio::select! {
                     _ = stop_rx.recv() => break,
                     _ = ticker.tick() => {
-                        // 内部已 gate is_trading_time + 走 TDX batch（≤120），盘外直接返回。
+                        // 内部已 gate is_in_quote_refresh_window + 走 TDX batch（≤120），刷新窗外直接返回。
                         svc.refresh_hot_quotes().await;
                     }
                 }
@@ -156,7 +156,7 @@ pub fn spawn_full_scheduler(
                     _ = stop_rx.recv() => break,
                     _ = ticker.tick() => {
                         let ctx = svc.market_time_now();
-                        if !ctx.is_trading_time {
+                        if !ctx.is_in_quote_refresh_window {
                             continue;
                         }
                         let req = RefreshMarketQuotesRequest {

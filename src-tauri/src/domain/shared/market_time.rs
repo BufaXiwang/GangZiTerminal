@@ -29,6 +29,11 @@ pub struct MarketTimeContext {
     pub latest_completed_trade_date: TradeDate,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_trade_date: Option<TradeDate>,
+    /// 后台行情刷新窗：连续竞价 + 每个 session 收盘后 30min 尾窗，
+    /// 即交易日的 09:30–12:00 ∪ 13:00–15:30（北京时）。与 `is_trading_time` 解耦。
+    ///
+    /// Spec: quotes-module.md §5 `is_in_quote_refresh_window`
+    pub is_in_quote_refresh_window: bool,
 }
 
 /// Spec: shared-types.md §3
@@ -47,6 +52,13 @@ pub fn resolve_market_time(now: OccurredAt) -> MarketTimeContext {
     let is_trading_time = today_is_trade
         && ((t >= session_morning_open && t < session_morning_close)
             || (t >= session_afternoon_open && t < session_afternoon_close));
+
+    // 刷新窗：连续竞价 + 收盘后 30min 尾窗 → 09:30–12:00 ∪ 13:00–15:30。
+    let refresh_morning_close = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+    let refresh_afternoon_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+    let is_in_quote_refresh_window = today_is_trade
+        && ((t >= session_morning_open && t < refresh_morning_close)
+            || (t >= session_afternoon_open && t < refresh_afternoon_close));
 
     let current_trade_date = if today_is_trade {
         Some(TradeDate::from_naive(today_naive))
@@ -86,6 +98,7 @@ pub fn resolve_market_time(now: OccurredAt) -> MarketTimeContext {
         current_trade_date,
         latest_completed_trade_date,
         next_trade_date,
+        is_in_quote_refresh_window,
     }
 }
 

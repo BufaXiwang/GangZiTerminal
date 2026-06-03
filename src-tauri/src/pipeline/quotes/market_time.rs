@@ -39,6 +39,14 @@ pub fn resolve_market_time_with_calendar(
         && ((t >= morning_open && t < morning_close)
             || (t >= afternoon_open && t < afternoon_close));
 
+    // 刷新窗：连续竞价 + 收盘后 30min 尾窗 → 09:30–12:00 ∪ 13:00–15:30。
+    // 与 is_trading_time 解耦（后者保持 11:30/15:00 边界）。Spec: quotes-module.md §5。
+    let refresh_morning_close = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+    let refresh_afternoon_close = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+    let is_in_quote_refresh_window = today_is_trade
+        && ((t >= morning_open && t < refresh_morning_close)
+            || (t >= afternoon_open && t < refresh_afternoon_close));
+
     let current_trade_date = if today_is_trade {
         Some(TradeDate::from_naive(today_naive))
     } else {
@@ -85,6 +93,7 @@ pub fn resolve_market_time_with_calendar(
         current_trade_date,
         latest_completed_trade_date,
         next_trade_date,
+        is_in_quote_refresh_window,
     }
 }
 
@@ -239,6 +248,48 @@ mod tests {
         // 全非交易日历：latest_completed 365 次向前找不到 → 回退到初始猜测（今日）。
         // next_trade_date 30 次向后找不到 → None。
         assert!(ctx.next_trade_date.is_none(), "全节假日历 next_trade_date 应为 None");
+    }
+
+    // ====================================================================== 刷新窗
+    // is_in_quote_refresh_window = 09:30–12:00 ∪ 13:00–15:30，与 is_trading_time 解耦。
+    // Spec: quotes-module.md §5 `is_in_quote_refresh_window`。
+
+    #[test]
+    fn refresh_window_morning_tail_1145_open_but_not_trading() {
+        // 11:45 在午休尾窗内（< 12:00）→ refresh_window=true、is_trading_time=false。
+        let ctx = resolve_market_time_with_calendar(sh(2026, 5, 26, 11, 45), &WeekdayCalendar);
+        assert!(ctx.is_in_quote_refresh_window, "11:45 应在刷新窗内");
+        assert!(!ctx.is_trading_time, "11:45 不可交易");
+    }
+
+    #[test]
+    fn refresh_window_morning_tail_closes_at_1205() {
+        // 12:05 越过 12:00 尾窗 → refresh_window=false。
+        let ctx = resolve_market_time_with_calendar(sh(2026, 5, 26, 12, 5), &WeekdayCalendar);
+        assert!(!ctx.is_in_quote_refresh_window, "12:05 应在刷新窗外");
+    }
+
+    #[test]
+    fn refresh_window_afternoon_tail_1515_open_but_not_trading() {
+        // 15:15 在收盘尾窗内（< 15:30）→ refresh_window=true、is_trading_time=false。
+        let ctx = resolve_market_time_with_calendar(sh(2026, 5, 26, 15, 15), &WeekdayCalendar);
+        assert!(ctx.is_in_quote_refresh_window, "15:15 应在刷新窗内");
+        assert!(!ctx.is_trading_time, "15:15 不可交易");
+    }
+
+    #[test]
+    fn refresh_window_afternoon_tail_closes_at_1535() {
+        // 15:35 越过 15:30 尾窗 → refresh_window=false。
+        let ctx = resolve_market_time_with_calendar(sh(2026, 5, 26, 15, 35), &WeekdayCalendar);
+        assert!(!ctx.is_in_quote_refresh_window, "15:35 应在刷新窗外");
+    }
+
+    #[test]
+    fn refresh_window_during_continuous_auction_both_true() {
+        // 10:00 连续竞价内 → 两者都 true。
+        let ctx = resolve_market_time_with_calendar(sh(2026, 5, 26, 10, 0), &WeekdayCalendar);
+        assert!(ctx.is_in_quote_refresh_window, "10:00 应在刷新窗内");
+        assert!(ctx.is_trading_time, "10:00 应可交易");
     }
 
     #[test]

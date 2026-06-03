@@ -111,6 +111,7 @@ export function InstrumentDetail({ item }: InstrumentDetailProps) {
           tsCode={item.tsCode}
           period={period}
           pricePrecision={pricePrecision}
+          liveQuote={q ?? null}
         />
       </div>
 

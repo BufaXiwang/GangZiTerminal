@@ -28,6 +28,7 @@ import {
   type FetchInclude,
   type KlinePeriod,
   type MinuteKlinePeriod,
+  type ListMarketQuoteSummary,
 } from "../bindings";
 import { perf } from "../lib/perfLog";
 import { isContinuousAuction } from "../lib/tradingSession";
@@ -47,6 +48,8 @@ interface KlineCanvasProps {
   tsCode: string;
   period: ChartPeriod;
   pricePrecision?: number;
+  /** 实时报价；日 K 用它合成 / 更新「今日 forming bar」。Spec: frontend-design.md §5 */
+  liveQuote?: ListMarketQuoteSummary | null;
 }
 
 // 渐进式加载：先用 INITIAL_LIMIT 喂首屏（覆盖后端 ensure_chart_data 拉的首 800 根），
@@ -255,6 +258,7 @@ export function KlineCanvas({
   tsCode,
   period,
   pricePrecision = 2,
+  liveQuote = null,
 }: KlineCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<Chart | null>(null);
@@ -510,6 +514,34 @@ export function KlineCanvas({
       window.clearInterval(timer);
     };
   }, [tsCode, period, pricePrecision]);
+
+  // 日 K「今日 forming bar」由实时 quote 驱动（Spec: frontend-design.md §5）。
+  // 仅 day 周期：用详情已有实时 quote 合成今日 bar 并 updateData（命中末根则更新、否则
+  // append），使图表最后一根与 header 实时价始终一致，不依赖盘中轮询时机 / 午休。
+  // tradeDateToMillis 与 normalizeDayKline 同口径，保证 ts 命中已有日 bar。
+  useEffect(() => {
+    if (period !== "day") return;
+    if (status !== "ok") return;
+    const chart = chartRef.current;
+    if (!chart) return;
+    const price = toNumber(liveQuote?.price);
+    if (price == null) return;
+    const timestamp = tradeDateToMillis(liveQuote?.tradeDate);
+    if (timestamp == null) return;
+    const bar: KLineData = {
+      timestamp,
+      open: toNumber(liveQuote?.open) ?? price,
+      high: toNumber(liveQuote?.high) ?? price,
+      low: toNumber(liveQuote?.low) ?? price,
+      close: price,
+      volume: toNumber(liveQuote?.volume) ?? undefined,
+    };
+    chart.updateData(bar);
+    // 同步末根最大时间戳，避免与盘中轮询的尾部 merge 打架。
+    if (timestamp > lastTsRef.current) {
+      lastTsRef.current = timestamp;
+    }
+  }, [liveQuote, period, status]);
 
   return (
     <div

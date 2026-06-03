@@ -1022,7 +1022,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | Cold-start seed | 进程启动时把 `BUILTIN_INSTRUMENTS` upsert 入 `quote_instruments`，保证 UI 第一帧非空 |
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；`TushareHealthState.isAvailable = true` 时 enrich |
 | TuShare 健康探针 | 进程启动时首次 ping；`isAvailable = false` 时每 1 小时重试 |
-| 实时行情 | 连续竞价时段三档：**热点档 ~3s**（核心指数 ∪ 前端热点集 = 自选 + 可见列表 top-N，TDX batch，总量 ≤ ~120）；核心指数兜底 15s；**全市场 universe 60s**（TDX batch）。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
+| 实时行情 | **刷新窗内**三档：**热点档 ~3s**（核心指数 ∪ 前端热点集 = 自选 + 可见列表 top-N，TDX batch，总量 ≤ ~120）；核心指数兜底 15s；**全市场 universe 60s**（TDX batch）。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale。**刷新窗 = 连续竞价 + 每个 session 收盘后 30min 尾窗**（见下「时段判定」`is_in_quote_refresh_window`）——捕获收盘集合竞价(14:57–15:00)/午盘收盘后稍晚才落定的最终价，避免行情在 11:30 / 15:00 整点戛然冻结 |
 | 热点集（hot set） | 前端通过 `set_quote_hotset(tsCodes)` 声明高频刷新标的（自选 + 可见列表 top-N + 关注）；**全覆盖语义**（每次替换，单一推送方发完整集，自动淘汰）；服务端去重 + cap 120；热点档 tick 刷 `core_indexes ∪ hot_set`，走 TDX batch；emit `market-quotes-refresh-progress`(scope=subscribed) 驱动前端各视图刷新 |
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
@@ -1033,7 +1033,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 
 时段判定：
 
-- **`is_trading_time`**：是否处于**报价时段**（连续竞价 09:30–11:30 + 13:00–15:00），仅用于实时 quote refresh 节奏判断。
+- **`is_trading_time`**：是否处于**可交易报价时段**（连续竞价 09:30–11:30 + 13:00–15:00）。用于 §2 quote 有效性（盘中 1h 硬过期 / 非盘中读最新已完成交易日）与 Account 成交时段判断。**不是** scheduler 刷新节奏的判据。
+- **`is_in_quote_refresh_window`**：scheduler 实时行情三档（热点 / 核心 / universe）的刷新节奏判据 = **连续竞价 + 每个 session 收盘后 30min 尾窗**，即交易日的 **09:30–12:00 ∪ 13:00–15:30**（北京时）。尾窗内继续按各档节奏刷新并写 in-memory snapshot（读路径照常服务最新 in-memory snapshot），以捕获收盘后稍晚落定的最终价、并让行情不在 11:30 / 15:00 整点冻结。尾窗与 `is_trading_time`（可交易性）解耦——尾窗内**不**可交易、Account 仍 fail closed。15:30 收盘快照 / 16:00 K 线预热不变。
 - **`is_in_trading_session`**：是否处于**分时 / 分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_intraday` / `refresh_minute_klines` 的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
 
 规则：

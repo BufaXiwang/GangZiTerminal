@@ -301,6 +301,7 @@ K 线图统一使用 **lightweight-charts** 库（TradingView 出品，已锁定
 - 周期切换器（分时 / 1m / 5m / 15m / 30m / 60m / 日 / 周 / 月，默认日 K）作为页面 control strip 的一部分，切换时调对应后端 command 重拉数据并 `setData()`。
 - 页面层负责为图表提供稳定容器尺寸（一般 fixed height，例如 480 / 600px），不能让图表因列表切换或按钮 hover 发生高度跳动。
 - 涨跌颜色按 CSS variables `--chart-up` / `--chart-down` 配置（A 股语义红涨绿跌）。
+- **日 K「今日 forming bar」由实时 quote 驱动**：后端日 K 只维护到已完成交易日（盘后 16:00 预热），不维护今日盘中这根。前端在 `period = day` 时用详情已有的实时 `quote`（开 / 高 / 低 / 现价 / 量）**合成或更新日 K 的最后一根「今日 bar」**（timestamp = 今日北京日历日），使图表最后一根与详情 header 的实时价**始终一致**，不依赖盘中轮询时机 / 午休。quote 刷新 → 今日 bar 随之 `updateData`；收盘后该日由后端转为已完成 bar、与之吻合。
 - 不同页面需要 K 线时各自调 lightweight-charts；如果出现明显重复逻辑（例如周期切换 + 数据拉取 + 错误态），允许在 `src/lib/` 抽 hook（如 `useKlineData`），但不抽完整 UI 组件 wrapper。
 
 ---
