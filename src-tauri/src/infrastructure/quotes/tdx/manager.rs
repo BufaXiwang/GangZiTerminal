@@ -258,6 +258,23 @@ impl TdxConnectionManager {
         self.pool().active_count
     }
 
+    /// 启动预热：触发一次性 host 探测（动态池选定，~3s 并行）+ 预建立所有 active 连接，
+    /// 让**首笔用户请求免去 ~3s 冷探测 + 建连延迟**（spec §连接池「启动时探测」）。
+    /// best-effort：连接失败静默（connect_slot 内部已换台重试），下次正常路径再连。
+    /// **阻塞**（probe + connect 走同步 TCP）——调用方须放 `spawn_blocking` / 独立线程，勿在 async 上下文直接调。
+    pub fn warm(&self) {
+        let pool = self.pool(); // 触发探测 + 缓存（~3s 一次性，Mutex 守护只算一次）
+        let ranked = pool.active_hosts.clone();
+        let active = pool.active_count.min(self.slots.len());
+        for i in 0..active {
+            if let Ok(mut guard) = self.slots[i].lock() {
+                if guard.client.is_none() {
+                    let _ = connect_slot(&mut guard, ranked.as_slice(), CONNECT_TIMEOUT);
+                }
+            }
+        }
+    }
+
     /// 取（必要时**并行**探测并缓存）动态池：低延时子集 host 列表 + active_count。
     ///
     /// 首次调用会联网 probe 全部 `HQ_HOSTS`、选低延时子集（spec §5），之后复用缓存。

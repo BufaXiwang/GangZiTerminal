@@ -242,6 +242,15 @@ pub fn run() {
                 );
             }
 
+            // -- 启动预热 TDX 连接池（spec §连接池「启动时探测」）：后台 probe + 预建 active 连接，
+            // 让首笔用户请求（含盘后/休市冷开）免去 ~3s 冷探测 + 建连延迟。不阻塞 setup、不依赖交易时段。
+            {
+                let svc = Arc::clone(&quotes_service);
+                tauri::async_runtime::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || svc.tdx.warm()).await;
+                });
+            }
+
             // -- Quotes startup catch-up（spec §5）：异步后台 task；不阻塞 setup。
             // 用 tauri::async_runtime::spawn 而非 tokio::spawn — setup 闭包没有
             // current tokio runtime context；tauri::async_runtime 提供同等接口。
