@@ -36,11 +36,17 @@ import {
   type NewsSource,
 } from "../bindings";
 import { NewsDateNav, formatDateKey } from "./news/NewsDateNav";
-import { NewsTimeline } from "./news/NewsTimeline";
+import { NewsTimeline, NEWS_ROW_SELECTOR } from "./news/NewsTimeline";
 import { beijingDayEndIso } from "../lib/beijingTime";
+import { captureTopAnchor, type TopAnchor } from "../lib/scrollAnchor";
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
+// 滑动窗口 DOM 上限：保留的 items 封顶（约 8 页）。向一端扩展超限即裁掉远端，
+// 被裁端 hasMore 置回 true 可用 keyset 游标回滚重拉。根治长滚动后数千常驻节点
+// 导致的切 tab / 滚动布局重算卡顿（content-visibility 只省绘制不省布局）。
+// Spec: news-module.md §fetch_news 双向 keyset「窗口有界（如 ~400）」；frontend-design.md §4。
+const MAX_WINDOW = 400;
 
 function formatTime(date: Date): string {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
@@ -76,9 +82,10 @@ export default function NewsPage() {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  // prepend 滚动锚定：记下 prepend 前的 scrollHeight，DOM 更新后在 layout effect 里补偿。
+  // 滚动锚定（元素锚定）：头部内容增减（prepend 向更新 / 裁头部）前记下视口顶部第一条
+  // 可见行的 TopAnchor，DOM 更新后在 NewsTimeline 的 layout effect 里按同一行真实位移补偿。
   const timelineElRef = useRef<HTMLElement | null>(null);
-  const pendingScrollAnchor = useRef<number | null>(null);
+  const pendingScrollAnchor = useRef<TopAnchor | null>(null);
 
   // === date nav 当前激活日期（由 timeline 上报当前 viewport 顶部那一天） ===
   const [activeDate, setActiveDate] = useState<string | null>(null);
@@ -176,13 +183,23 @@ export default function NewsPage() {
       void fetchWindow({ order: "desc" }).then((res) => {
         if (cancelled || res.status !== "ok") return;
         if (hasMoreNewerRef.current) return; // 二次确认（async 间隙可能已跳历史）
+        let trimmedTail = false;
         setItems((prev) => {
           const seen = new Set(prev.map((x) => x.id));
           const fresh = res.data.items.filter((x) => !seen.has(x.id));
           if (fresh.length === 0) return prev;
           // 新条目时间最新 → 放在倒序时间线最前。
-          return [...fresh, ...prev];
+          const merged = [...fresh, ...prev];
+          // 窗口有界：live prepend 也封顶，从尾部（最早端）裁掉多出的条。
+          // 用户在最新端（hasMoreNewer===false），裁尾在视口下方、不需要锚定补偿。
+          if (merged.length > MAX_WINDOW) {
+            trimmedTail = true;
+            return merged.slice(0, MAX_WINDOW);
+          }
+          return merged;
         });
+        // 被裁的最早端可回滚：底部 sentinel 会用 keyset 游标向更早重拉。
+        if (trimmedTail) setHasMoreOlder(true);
         applyDateCounts(res.data.dateCounts);
         setLastUpdated(new Date());
       });
@@ -210,11 +227,26 @@ export default function NewsPage() {
     const res = await fetchWindow({ publishedTo: oldest.publishedAt, order: "desc" });
     if (res.status === "ok") {
       const batch = res.data.items;
+      // 滑动窗口：append 到尾部（视口下方，不影响视口）；若超限从头部（最新端）裁掉多出的条。
+      // 裁头部 = 视口上方内容减少 → 必须做元素锚定补偿（否则视口往上跳）。
+      let trimmedHead = false;
+      // 裁头部前记录锚（视口顶部第一条可见行）；裁完在 layout effect 补偿。
+      pendingScrollAnchor.current = captureTopAnchor(timelineElRef.current, NEWS_ROW_SELECTOR);
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
-        return [...prev, ...batch.filter((x) => !seen.has(x.id))];
+        const merged = [...prev, ...batch.filter((x) => !seen.has(x.id))];
+        if (merged.length > MAX_WINDOW) {
+          trimmedHead = true;
+          // 从头部（最新端）裁掉多出的条，保持连续倒序窗口。游标随尾部 publishedAt 自然延续。
+          return merged.slice(merged.length - MAX_WINDOW);
+        }
+        // 没裁头部就不需要锚定补偿（append 在视口下方）。
+        pendingScrollAnchor.current = null;
+        return merged;
       });
       setHasMoreOlder(batch.length >= PAGE_SIZE);
+      // 被裁掉的新端可回滚：顶部 sentinel 会用 keyset 游标向更新重拉一页一页补回。
+      if (trimmedHead) setHasMoreNewer(true);
       // 不更新 dateCounts：本请求带 publishedTo 游标，返回的 dateCounts 被截断（只含 ≤游标 的天）。
       // dateCounts 是「全量每日真实总数」，只由无游标请求（初始/筛选/刷新）维护。
     } else {
@@ -239,17 +271,28 @@ export default function NewsPage() {
       const batch = res.data.items; // 升序
       const rawLen = batch.length;
       const ascDedupReversed = [...batch].reverse(); // → desc，准备 prepend
+      let trimmedTail = false;
+      // prepend 头部 = 视口上方内容增加 → 元素锚定：记下视口顶部第一条可见行，layout effect 补偿。
+      pendingScrollAnchor.current = captureTopAnchor(timelineElRef.current, NEWS_ROW_SELECTOR);
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
         const fresh = ascDedupReversed.filter((x) => !seen.has(x.id));
-        if (fresh.length === 0) return prev;
-        // prepend 前记录 scrollHeight，layout effect 里补偿（避免视口跳动）。
-        const el = timelineElRef.current;
-        if (el) pendingScrollAnchor.current = el.scrollHeight;
-        return [...fresh, ...prev];
+        if (fresh.length === 0) {
+          pendingScrollAnchor.current = null;
+          return prev;
+        }
+        const merged = [...fresh, ...prev];
+        if (merged.length > MAX_WINDOW) {
+          trimmedTail = true;
+          // 从尾部（最早端）裁掉多出的条。裁尾在视口下方，不影响视口（无需补偿，锚仍只管 prepend）。
+          return merged.slice(0, MAX_WINDOW);
+        }
+        return merged;
       });
       // 原始批满页 → 上方可能还有更新的；空/不满 → 已到最新端。
       setHasMoreNewer(rawLen >= PAGE_SIZE);
+      // 被裁掉的最早端可回滚：底部 sentinel 会用 keyset 游标向更早重拉一页一页补回。
+      if (trimmedTail) setHasMoreOlder(true);
       // 不更新 dateCounts（同上：本请求带 publishedFrom 游标，返回值被截断）。
     } else {
       setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);

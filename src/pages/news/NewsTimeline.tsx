@@ -26,6 +26,10 @@ import type { FetchNewsItem } from "../../bindings";
 import { formatDateKey } from "./NewsDateNav";
 import { NewsRowMenu } from "./NewsRowMenu";
 import { beijingHHmm, beijingTodayKey, dateKeyWeekday } from "../../lib/beijingTime";
+import { restoreTopAnchor, type TopAnchor } from "../../lib/scrollAnchor";
+
+/** row selector for 元素锚定（captureTopAnchor / restoreTopAnchor 共用）。 */
+export const NEWS_ROW_SELECTOR = ".news-row[data-news-id]";
 
 const WEEKDAY_LABEL = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -45,10 +49,13 @@ export interface NewsTimelineProps {
   /** 向更新加载（顶部 sentinel）。 */
   onLoadNewer: () => void;
   registerSectionRef: (dateKey: string, el: HTMLElement | null) => void;
-  /** 把滚动容器（.news-timeline）回传给父组件，用于 prepend 滚动锚定。 */
+  /** 把滚动容器（.news-timeline）回传给父组件，用于 prepend / 裁剪滚动锚定。 */
   registerTimelineRef: (el: HTMLElement | null) => void;
-  /** prepend 前父组件写入 scrollHeight，DOM 更新后这里补偿 scrollTop。 */
-  scrollAnchorRef: MutableRefObject<number | null>;
+  /**
+   * 元素锚定：父组件在 items 变更（prepend 头部 / 裁头部）前写入 TopAnchor，
+   * DOM 更新后这里在 layout effect 按同一行真实位移补偿 scrollTop，视口不跳。
+   */
+  scrollAnchorRef: MutableRefObject<TopAnchor | null>;
   onActiveDateChange: (dateKey: string) => void;
   query: string;
   /** sourceId → 友好展示名，row 上的 source chip 用；缺失时回落到 ID。 */
@@ -153,6 +160,7 @@ function NewsRow({
   return (
     <div
       ref={rowRef}
+      data-news-id={it.id}
       className={`news-row acc-${acc}${open ? " expanded" : ""}${overflow ? " clickable" : ""}`}
       onClick={() => overflow && setOpen((v) => !v)}
       onContextMenu={(e) => {
@@ -249,17 +257,16 @@ export function NewsTimeline({
     registerTimelineRef(el);
   };
 
-  // === prepend 滚动锚定补偿 ===
-  // 父组件向更新方向 prepend 前写入旧 scrollHeight；items 变更触发 DOM 更新后，
-  // 在 layout effect（paint 前）按 scrollHeight 增量补偿 scrollTop，避免视口跳动。
+  // === 滚动锚定补偿（元素锚定）===
+  // 父组件在「头部内容增减」（向更新 prepend / 向更早裁头部）前写入 TopAnchor（视口顶部
+  // 第一条可见行的 id + rect.top）；items 变更触发 DOM 更新后，在 layout effect（paint 前）
+  // 按同一行的真实位移补偿 scrollTop，视口纹丝不动。
+  // 用元素锚定而非 scrollHeight 差值：content-visibility:auto 下屏外行高是估计值，差值会带误差。
   useLayoutEffect(() => {
-    const prev = scrollAnchorRef.current;
-    if (prev === null) return;
+    const anchor = scrollAnchorRef.current;
+    if (anchor === null) return;
     scrollAnchorRef.current = null;
-    const el = timelineRef.current;
-    if (!el) return;
-    const delta = el.scrollHeight - prev;
-    if (delta !== 0) el.scrollTop += delta;
+    restoreTopAnchor(timelineRef.current, anchor, NEWS_ROW_SELECTOR);
   }, [items, scrollAnchorRef]);
 
   // === auto-load on sentinel visible（向更早，底部） ===
