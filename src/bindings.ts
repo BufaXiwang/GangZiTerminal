@@ -181,6 +181,19 @@ async setQuoteHotset(tsCodes: string[]) : Promise<Result<null, CommandError>> {
 }
 },
 /**
+ * 聚焦按需刷新一批 quotes（spec §5「实时行情（聚焦按需）」）：前端把当前关注的标的
+ * （自选 / 可见列表 / 详情）传入，后端按新鲜度跳过 + 80/批并发跑连接池刷 `MARKET_SNAPSHOT`，
+ * 通过 `market-quotes-refresh-progress`(scope=subscribed) 增量推回前端。非法 ts_code 跳过。
+ */
+async refreshQuotes(tsCodes: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("refresh_quotes", { tsCodes }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Frontend log forwarder：前端调 commands.forwardLog(msg) → 后端 tracing
  * → tauri dev stdout，可以从开发者那里直接读 log 文件分析性能问题。
  * 仅供 dev / 调试用，生产 build 可去掉。

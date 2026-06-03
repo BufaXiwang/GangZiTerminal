@@ -35,6 +35,10 @@ use std::sync::Arc;
 /// adapters 仍可能引用本符号；现作为 shared::ResponseError 的别名。
 pub type PipelineResponseError = ResponseError;
 
+/// `refresh_quotes` 的新鲜度跳过阈值（spec §5「实时行情（聚焦按需）」+ 新鲜度跳过）：
+/// cache 内 capturedAt 距今 < 该时长的 code 视为足够新，本次不再 fetch。
+const QUOTE_FRESH_SKIP: std::time::Duration = std::time::Duration::from_millis(1500);
+
 #[derive(Debug, Clone)]
 pub struct QuotesServiceConfig {
     pub config: QuotesConfig,
@@ -1356,6 +1360,181 @@ impl QuotesService {
             total,
             success,
             failed_batches,
+            captured_at: now,
+        };
+        self.emit_refreshed(payload.clone());
+        Ok(payload)
+    }
+
+    /// 聚焦按需刷新一批 quotes 到 `MARKET_SNAPSHOT`（spec §5「实时行情（聚焦按需）」）。
+    ///
+    /// 与 universe 全量刷新的区别：传入的是前端当前关注的小集合（自选 / 可见列表 / 详情），
+    /// 用同一套「80/批 + buffer_unordered 并发跑连接池」的 TDX 路径拉取，但先按新鲜度跳过
+    /// cache 内 < `QUOTE_FRESH_SKIP`（~1.5s）的 code（spec §5 新鲜度跳过 + §连接池 line 947）。
+    ///
+    /// emit `market-quotes-refresh-progress`(scope=subscribed) 驱动前端增量更新；
+    /// TDX 失败 / BJ 的少量走腾讯 HTTP fallback（复用 `fallback_http_quote`）。
+    ///
+    /// 注意：本方法与 `refresh_hot_quotes` / scheduler 并存（spec §5 热点档保留）。
+    pub async fn refresh_quotes(
+        self: &Arc<Self>,
+        ts_codes: Vec<TsCode>,
+    ) -> Result<MarketQuotesRefreshedPayload, ResponseError> {
+        use futures_util::StreamExt;
+        const TDX_CHUNK: usize = 80;
+        const FETCH_CONCURRENCY: usize = 8; // = TDX 连接池 POOL_SIZE
+
+        let ctx = self.market_time_now();
+        let now = ctx.now;
+        let trade_date = eligible_trade_date(&ctx).trade_date;
+
+        // 去重，保留输入顺序。
+        let mut seen: HashSet<TsCode> = HashSet::with_capacity(ts_codes.len());
+        let mut requested: Vec<TsCode> = Vec::with_capacity(ts_codes.len());
+        for c in ts_codes {
+            if seen.insert(c.clone()) {
+                requested.push(c);
+            }
+        }
+        let requested_total = requested.len() as u32;
+
+        // 1. 新鲜度跳过：cache 内 capturedAt 距今 < QUOTE_FRESH_SKIP 的 code 不再 fetch。
+        let mut targets: Vec<TsCode> = Vec::with_capacity(requested.len());
+        for ts in requested {
+            let fresh = self
+                .cache
+                .get(&ts)
+                .map(|s| {
+                    now.signed_duration_since(s.captured_at)
+                        .to_std()
+                        .map(|age| age < QUOTE_FRESH_SKIP)
+                        .unwrap_or(false) // 负 age（capturedAt 在未来）当作不新鲜
+                })
+                .unwrap_or(false);
+            if !fresh {
+                targets.push(ts);
+            }
+        }
+
+        // 全被跳过 → 直接返回（不 emit）。
+        if targets.is_empty() {
+            let payload = MarketQuotesRefreshedPayload {
+                scope: RefreshScopeKind::Subscribed,
+                purpose: RefreshPurpose::Intraday,
+                trade_date: Some(trade_date),
+                affected_ts_codes: Some(Vec::new()),
+                total: requested_total,
+                success: 0,
+                failed_batches: 0,
+                captured_at: now,
+            };
+            return Ok(payload);
+        }
+
+        let (targets, cats) = self.resolve_categories(targets);
+        let total = targets.len() as u32;
+
+        // 2. TDX vs BJ 分流（与 universe / hot 路径一致）。
+        let mut tdx_input: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+        let mut fallback_queue: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
+        for ts in &targets {
+            let (cat, name) = cats.get(ts).cloned().unwrap_or((InstrumentCategory::Stock, None));
+            if matches!(ts.market(), crate::domain::shared::Market::BJ) {
+                fallback_queue.push((ts.clone(), cat, name));
+            } else {
+                tdx_input.push((ts.clone(), cat, name));
+            }
+        }
+
+        let mut success: u32 = 0;
+        let mut completed: u32 = 0;
+        let mut affected: Vec<TsCode> = Vec::new();
+
+        // 3. 80/批 + 并发 buffer_unordered 跑连接池（同 universe 路径）。
+        let chunks: Vec<Vec<(TsCode, InstrumentCategory, Option<String>)>> =
+            tdx_input.chunks(TDX_CHUNK).map(|c| c.to_vec()).collect();
+        let mut fetch_stream = futures_util::stream::iter(chunks)
+            .map(|chunk| {
+                let tdx = &self.tdx;
+                async move {
+                    let results = tdx.fetch_quotes(chunk.clone(), trade_date, now).await;
+                    (chunk, results)
+                }
+            })
+            .buffer_unordered(FETCH_CONCURRENCY);
+
+        let mut affected_in_batch: Vec<TsCode> = Vec::new();
+        while let Some((chunk, results)) = fetch_stream.next().await {
+            for ((ts, cat, name), res) in chunk.into_iter().zip(results.into_iter()) {
+                completed += 1;
+                match res {
+                    // is_display_complete：指数 / 基金 TDX 不返五档，list 视图只需 price。
+                    Ok(q) if q.is_display_complete() => {
+                        let captured_at = q.captured_at;
+                        let source = q.source.as_str().to_string();
+                        self.cache.put(CachedSnapshot {
+                            quote: q,
+                            captured_at,
+                            trade_date,
+                            source,
+                        });
+                        success += 1;
+                        affected.push(ts.clone());
+                        affected_in_batch.push(ts);
+                    }
+                    _ => fallback_queue.push((ts, cat, name)),
+                }
+            }
+            if !affected_in_batch.is_empty() {
+                self.emit_progress(MarketQuotesRefreshProgressPayload {
+                    scope: RefreshScopeKind::Subscribed,
+                    purpose: RefreshPurpose::Intraday,
+                    trade_date: Some(trade_date),
+                    completed,
+                    success,
+                    total,
+                    affected_ts_codes: std::mem::take(&mut affected_in_batch),
+                    captured_at: now,
+                });
+            }
+        }
+        drop(fetch_stream);
+
+        // 4. TDX 失败 + BJ → 腾讯 HTTP fallback（小集合，同步等即可）。
+        for (ts, cat, _name) in fallback_queue {
+            completed += 1;
+            if let Some(q) = self.fallback_http_quote(&ts, cat, trade_date, now).await {
+                let captured_at = q.captured_at;
+                let source = q.source.as_str().to_string();
+                self.cache.put(CachedSnapshot {
+                    quote: q,
+                    captured_at,
+                    trade_date,
+                    source,
+                });
+                success += 1;
+                affected.push(ts.clone());
+                self.emit_progress(MarketQuotesRefreshProgressPayload {
+                    scope: RefreshScopeKind::Subscribed,
+                    purpose: RefreshPurpose::Intraday,
+                    trade_date: Some(trade_date),
+                    completed,
+                    success,
+                    total,
+                    affected_ts_codes: vec![ts],
+                    captured_at: now,
+                });
+            }
+        }
+
+        let payload = MarketQuotesRefreshedPayload {
+            scope: RefreshScopeKind::Subscribed,
+            purpose: RefreshPurpose::Intraday,
+            trade_date: Some(trade_date),
+            affected_ts_codes: Some(affected),
+            total,
+            success,
+            failed_batches: total.saturating_sub(success),
             captured_at: now,
         };
         self.emit_refreshed(payload.clone());

@@ -10,6 +10,7 @@
 //! - 最大重试次数：1 次 reconnect + 1 次 retry，避免线程卡死。
 //! - per-connection 速率限制：同一连接调用间最小间隔 `MIN_CALL_INTERVAL`。
 
+use super::hosts::HQ_HOSTS;
 use super::{
     Bar, BarCategory, MinuteTimePoint, SecurityListEntry, SecurityQuote, TdxHqClient, TdxMarket,
     XdxrRecord,
@@ -30,8 +31,10 @@ const MIN_CALL_INTERVAL: Duration = Duration::from_millis(80);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const QUOTE_BATCH_MAX: usize = 80;
 const BARS_MAX: u16 = 800;
-/// TDX 连接池大小（spec §5）。3-5 保守值，避免单 IP 并发过高触发服务端限频。
-const POOL_SIZE: usize = 4;
+/// TDX 连接池大小（spec §5「TDX 连接池与并发」：默认 N = 8，分散到 16 台 host → 每台 ≤1 连接）。
+const POOL_SIZE: usize = 8;
+/// 探测单台 host 延迟用的超时（短于建连超时——只为排序，连不上的排到队尾）。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
 pub enum TdxManagerError {
@@ -46,6 +49,8 @@ pub enum TdxManagerError {
 struct State {
     client: Option<TdxHqClient>,
     last_call: Option<Instant>,
+    /// 该槽当前 pin 到的 host 在排序列表里的下标。连接失败时 +1（wrap）换台。
+    host_idx: usize,
 }
 
 #[derive(Clone)]
@@ -53,6 +58,78 @@ pub struct TdxConnectionManager {
     /// N 条独立连接槽；round-robin 取用，最多 N 个调用并发。
     slots: Arc<Vec<Arc<Mutex<State>>>>,
     next: Arc<AtomicUsize>,
+    /// 按延迟排序的 host 列表（`(host, port)`），首次需要连接时探测一次并缓存。
+    /// 槽 i 默认 pin 到 `ranked[i % len]`（spec §5：N 个槽分散到延迟最低的 N 台不同 host）。
+    ranked_hosts: Arc<Mutex<Option<Arc<Vec<(String, u16)>>>>>,
+}
+
+/// 为某个槽（依据其 `State.host_idx`）连一台 host。失败则前进到排序列表下一台（wrap）重试，
+/// 最多遍历整张 ranked 列表一圈。成功后把连接装入 `state.client` 并返回 `Ok(())`。
+///
+/// 与旧 `connect_bestip` 的差异：每个槽**只连自己 pin 的那台 host**（不再全池 race 同一台最快的），
+/// 单台慢 / 挂只影响该槽（自动换台），不拖垮整池。spec §5「分散到多台 host」。
+fn connect_slot(
+    state: &mut State,
+    ranked: &[(String, u16)],
+    timeout: Duration,
+) -> Result<(), TdxManagerError> {
+    if ranked.is_empty() {
+        return Err(TdxManagerError::Reconnect("no hosts available".into()));
+    }
+    let n = ranked.len();
+    let mut last_err: Option<String> = None;
+    for _ in 0..n {
+        let idx = assign_host(state.host_idx, n);
+        let (host, port) = &ranked[idx];
+        match TdxHqClient::connect((host.as_str(), *port), timeout) {
+            Ok(c) => {
+                state.client = Some(c);
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = Some(e.to_string());
+                // 该槽换下一台 host（wrap），下次调用也从新台起。
+                state.host_idx = (state.host_idx + 1) % n;
+            }
+        }
+    }
+    Err(TdxManagerError::Reconnect(
+        last_err.unwrap_or_else(|| "all hosts unreachable".into()),
+    ))
+}
+
+/// 把槽下标映射到排序后 host 列表的初始下标：`slot_idx % ranked.len()`。
+///
+/// N = 8 / 16 台 → 8 个槽分别 pin 到延迟最低的前 8 台不同 host，每台 ≤1 连接。
+/// 纯函数，无 I/O，便于单测。`ranked_len` 为 0 时返回 0（调用方需另行保证非空）。
+fn assign_host(slot_idx: usize, ranked_len: usize) -> usize {
+    if ranked_len == 0 {
+        0
+    } else {
+        slot_idx % ranked_len
+    }
+}
+
+/// 对 `HQ_HOSTS` 全部探测一遍连接延迟，返回按延迟升序排序的 `(host, port)` 列表。
+///
+/// 复用 [`TdxHqClient::connect`] 的「connect + handshake」语义做一次性 probe：每台单独计时，
+/// 连不上 / 握手失败的排到队尾（用 `Err` 标记）。**会联网**——只在首次需要建连时调用一次。
+fn rank_hosts_by_latency() -> Vec<(String, u16)> {
+    let mut timed: Vec<(Duration, bool, String, u16)> = Vec::with_capacity(HQ_HOSTS.len());
+    for (_name, host, port) in HQ_HOSTS {
+        let t0 = Instant::now();
+        let ok = TdxHqClient::connect((*host, *port), PROBE_TIMEOUT).is_ok();
+        let dt = t0.elapsed();
+        // 失败的标 ok=false，排序时排到所有成功之后（仍保留为候选，供 wrap 换台兜底）。
+        timed.push((dt, ok, host.to_string(), *port));
+    }
+    // 成功优先，其次按延迟升序。
+    timed.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.cmp(&b.0),
+    });
+    timed.into_iter().map(|(_, _, h, p)| (h, p)).collect()
 }
 
 impl Default for TdxConnectionManager {
@@ -64,23 +141,42 @@ impl Default for TdxConnectionManager {
 impl TdxConnectionManager {
     pub fn new() -> Self {
         let slots = (0..POOL_SIZE)
-            .map(|_| {
+            .map(|i| {
                 Arc::new(Mutex::new(State {
                     client: None,
                     last_call: None,
+                    // 槽 i 默认 pin 到排序后第 i 台 host（首次连接时按 ranked 列表解析）。
+                    host_idx: i,
                 }))
             })
             .collect();
         Self {
             slots: Arc::new(slots),
             next: Arc::new(AtomicUsize::new(0)),
+            ranked_hosts: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// round-robin 取一条连接槽。并发调用各拿不同槽 → 真并行。
-    fn slot(&self) -> Arc<Mutex<State>> {
+    /// round-robin 取一条连接槽（携带其下标，用于 pin host）。并发调用各拿不同槽 → 真并行。
+    fn slot(&self) -> (usize, Arc<Mutex<State>>) {
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
-        Arc::clone(&self.slots[i])
+        (i, Arc::clone(&self.slots[i]))
+    }
+
+    /// 取（必要时探测并缓存）按延迟排序的 host 列表。首次调用会联网 probe `HQ_HOSTS`，
+    /// 之后复用缓存。空列表（极端：全部探测失败 + HQ_HOSTS 为空）兜底回退到全量 `HQ_HOSTS`。
+    fn ranked_hosts(&self) -> Arc<Vec<(String, u16)>> {
+        let mut guard = self.ranked_hosts.lock().expect("ranked_hosts poisoned");
+        if let Some(r) = guard.as_ref() {
+            return Arc::clone(r);
+        }
+        let mut ranked = rank_hosts_by_latency();
+        if ranked.is_empty() {
+            ranked = HQ_HOSTS.iter().map(|(_, h, p)| (h.to_string(), *p)).collect();
+        }
+        let arc = Arc::new(ranked);
+        *guard = Some(Arc::clone(&arc));
+        arc
     }
 
     /// 拉单只标的实时报价。失败后丢弃连接。
@@ -98,7 +194,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         let result = task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             // 速率：保持最小间隔。
@@ -110,14 +207,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client present");
@@ -169,7 +263,8 @@ impl TdxConnectionManager {
             if pairs.is_empty() {
                 continue;
             }
-            let inner = self.slot();
+            let (_slot_i, inner) = self.slot();
+            let ranked = self.ranked_hosts();
             let pairs_for_call: Vec<(TdxMarket, String)> = pairs
                 .iter()
                 .map(|(m, c, _, _, _)| (*m, c.clone()))
@@ -184,14 +279,11 @@ impl TdxConnectionManager {
                 }
                 for attempt in 0..2 {
                     if guard.client.is_none() {
-                        match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                            Ok((c, _)) => guard.client = Some(c),
-                            Err(e) => {
-                                if attempt == 1 {
-                                    return Err(TdxManagerError::Reconnect(e.to_string()));
-                                }
-                                continue;
+                        if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                            if attempt == 1 {
+                                return Err(e);
                             }
+                            continue;
                         }
                     }
                     let cli = guard.client.as_mut().expect("client");
@@ -258,7 +350,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
@@ -270,14 +363,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
@@ -329,7 +419,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         let cat = kline_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -342,14 +433,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
@@ -401,7 +489,8 @@ impl TdxConnectionManager {
         };
         let code = ts_code.as_str()[..6].to_string();
         let cat = kline_period_to_tdx(period);
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         task::spawn_blocking(move || {
             const HARD_CAP: u32 = 50_000;
             let mut all: Vec<Bar> = Vec::new();
@@ -424,16 +513,12 @@ impl TdxConnectionManager {
                     Err(TdxManagerError::Reconnect("retries exhausted".into()));
                 for attempt in 0..2 {
                     if guard.client.is_none() {
-                        match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                            Ok((c, _)) => guard.client = Some(c),
-                            Err(e) => {
-                                if attempt == 1 {
-                                    batch_res =
-                                        Err(TdxManagerError::Reconnect(e.to_string()));
-                                    break;
-                                }
-                                continue;
+                        if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                            if attempt == 1 {
+                                batch_res = Err(e);
+                                break;
                             }
+                            continue;
                         }
                     }
                     let cli = guard.client.as_mut().expect("client");
@@ -491,7 +576,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         let cat = minute_period_to_tdx(period);
         let count = count.min(BARS_MAX);
         task::spawn_blocking(move || {
@@ -504,14 +590,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
@@ -544,7 +627,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -555,14 +639,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
@@ -598,7 +679,8 @@ impl TdxConnectionManager {
             crate::domain::shared::Market::BJ => return Err(TdxManagerError::UnsupportedMarket),
         };
         let code = ts_code.as_str()[..6].to_string();
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -609,14 +691,11 @@ impl TdxConnectionManager {
             }
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 let cli = guard.client.as_mut().expect("client");
@@ -647,7 +726,8 @@ impl TdxConnectionManager {
         &self,
         market: TdxMarket,
     ) -> Result<Vec<SecurityListEntry>, TdxManagerError> {
-        let inner = self.slot();
+        let (_slot_i, inner) = self.slot();
+        let ranked = self.ranked_hosts();
         task::spawn_blocking(move || {
             let mut guard = inner.lock().expect("tdx state poisoned");
             if let Some(last) = guard.last_call {
@@ -659,14 +739,11 @@ impl TdxConnectionManager {
             // 确保连接
             for attempt in 0..2 {
                 if guard.client.is_none() {
-                    match TdxHqClient::connect_bestip(CONNECT_TIMEOUT) {
-                        Ok((c, _)) => guard.client = Some(c),
-                        Err(e) => {
-                            if attempt == 1 {
-                                return Err(TdxManagerError::Reconnect(e.to_string()));
-                            }
-                            continue;
+                    if let Err(e) = connect_slot(&mut guard, &ranked, CONNECT_TIMEOUT) {
+                        if attempt == 1 {
+                            return Err(e);
                         }
+                        continue;
                     }
                 }
                 break;
@@ -1016,23 +1093,93 @@ mod tests {
     fn slot_round_robins_through_pool() {
         let mgr = TdxConnectionManager::new();
         // 连续取 POOL_SIZE 次应轮转到每一条不同的槽（按 next % POOL_SIZE）。
-        let picked: Vec<Arc<Mutex<State>>> = (0..POOL_SIZE).map(|_| mgr.slot()).collect();
+        let picked: Vec<(usize, Arc<Mutex<State>>)> = (0..POOL_SIZE).map(|_| mgr.slot()).collect();
         for i in 0..POOL_SIZE {
             // 第 i 次取到的槽应是 slots[i]（next 从 0 起，fetch_add 后 %）。
+            assert_eq!(picked[i].0, i, "pick {i} index");
             assert!(
-                Arc::ptr_eq(&picked[i], &mgr.slots[i]),
+                Arc::ptr_eq(&picked[i].1, &mgr.slots[i]),
                 "pick {i} should map to slots[{i}]"
             );
         }
         // 取满一圈后所有槽互不相同。
         for i in 0..POOL_SIZE {
             for j in (i + 1)..POOL_SIZE {
-                assert!(!Arc::ptr_eq(&picked[i], &picked[j]), "slots {i} and {j} aliased");
+                assert!(!Arc::ptr_eq(&picked[i].1, &picked[j].1), "slots {i} and {j} aliased");
             }
         }
         // 再取一次应回绕到 slots[0]。
         let wrapped = mgr.slot();
-        assert!(Arc::ptr_eq(&wrapped, &mgr.slots[0]), "should wrap to slots[0]");
+        assert_eq!(wrapped.0, 0);
+        assert!(Arc::ptr_eq(&wrapped.1, &mgr.slots[0]), "should wrap to slots[0]");
+    }
+
+    #[test]
+    fn pool_size_is_eight_and_each_slot_pins_distinct_host_idx() {
+        // spec §5：N = 8，8 个槽默认 pin 到排序后前 8 台不同 host（host_idx = slot_idx）。
+        let mgr = TdxConnectionManager::new();
+        assert_eq!(mgr.slots.len(), 8, "POOL_SIZE 应为 8");
+        for (i, slot) in mgr.slots.iter().enumerate() {
+            let g = slot.lock().unwrap();
+            assert_eq!(g.host_idx, i, "槽 {i} 初始应 pin 到 host_idx {i}");
+        }
+    }
+
+    #[test]
+    fn assign_host_disperses_slots_to_distinct_hosts() {
+        // 8 槽 / 16 台 → 每槽分到不同 host（slot_idx % len，前 8 个互不相同）。
+        let ranked_len = 16;
+        let assigned: Vec<usize> = (0..8).map(|i| assign_host(i, ranked_len)).collect();
+        assert_eq!(assigned, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // 互不相同。
+        for i in 0..assigned.len() {
+            for j in (i + 1)..assigned.len() {
+                assert_ne!(assigned[i], assigned[j], "槽 {i} 与 {j} 撞 host");
+            }
+        }
+    }
+
+    #[test]
+    fn assign_host_wraps_when_fewer_hosts_than_slots() {
+        // 极端：仅 3 台可用、8 槽 → wrap 复用，但仍均匀分散（0,1,2,0,1,2,0,1）。
+        let assigned: Vec<usize> = (0..8).map(|i| assign_host(i, 3)).collect();
+        assert_eq!(assigned, vec![0, 1, 2, 0, 1, 2, 0, 1]);
+        // 空列表兜底 → 0，不 panic。
+        assert_eq!(assign_host(5, 0), 0);
+    }
+
+    #[test]
+    fn connect_slot_advances_host_on_failure_then_succeeds() {
+        // 不联网验证「失败换台」语义：ranked 列表里前两台必然连不上（保留地址 + 关闭端口），
+        // connect_slot 会逐台前进。这里用 connect 必然失败的地址断言 host_idx 推进 + wrap。
+        // 注：connect_slot 真连，会对每台尝试 TCP——用 TEST-NET（RFC 5737）+ 1 端口确保快速 refused/timeout。
+        let ranked = vec![
+            ("192.0.2.1".to_string(), 1u16), // TEST-NET-1，不可路由
+            ("192.0.2.2".to_string(), 1u16),
+            ("192.0.2.3".to_string(), 1u16),
+        ];
+        let mut state = State {
+            client: None,
+            last_call: None,
+            host_idx: 0,
+        };
+        // 全部连不上 → Err；遍历一圈后 host_idx 回到起点（wrap n 次 → 0）。
+        let r = connect_slot(&mut state, &ranked, Duration::from_millis(150));
+        assert!(r.is_err(), "全部不可达应返回 Err");
+        assert!(state.client.is_none());
+        // 遍历 n=3 台各 +1 → host_idx = (0+3) % 3 = 0。
+        assert_eq!(state.host_idx, 0, "遍历一圈后 host_idx wrap 回 0");
+    }
+
+    #[test]
+    fn connect_slot_empty_hosts_errors() {
+        let mut state = State {
+            client: None,
+            last_call: None,
+            host_idx: 0,
+        };
+        let r = connect_slot(&mut state, &[], Duration::from_millis(50));
+        assert!(r.is_err());
     }
 
     #[test]

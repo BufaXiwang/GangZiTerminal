@@ -940,9 +940,11 @@ TDX > 腾讯
 
 为压榨 TDX 吞吐并解耦"后台批量刷新"与"前台交互请求"（K 线 / 详情），TDX 连接层用**连接池**而非单连接：
 
-- **连接池**：维护 N 条独立 TDX 连接（默认 **N = 4**），各自持有 socket + 独立的 per-call 节流（`MIN_CALL_INTERVAL` 80ms 是 per-connection，不是全局）。每次调用取一条空闲连接执行；失败丢弃该连接、下次该槽自动重连。N 取 3-5 保守值，避免单 IP 并发过高触发服务端限频；可连不同 HQ host 分摊。
-- **交互解耦**：前台请求（`ensure_chart_data` / `fetch_data` / K 线分页）和后台批量（universe 60s / 热点档 3s）共享连接池。即使后台批量占用若干连接，前台请求也能拿到空闲连接立即执行，不再排在整轮 universe 刷新（~15-20s）之后。
-- **并发批次**：universe 全市场刷新和热点档刷新必须把 80-batch **并发**发起（并发度 ≤ 池大小 N），而非逐批 `await` 串行。universe ~94 批并发跑在 N 条连接上，目标完成时间从单连接 ~15-20s 压到 **~3-5s**。每批完成即写 cache（盘中只写 in-memory cache，线程安全；`purpose=close` 的 EOD 才写 `quote_close_snapshot`，DB 写经单连接串行化）+ emit progress。
+- **连接池**：维护 N 条独立 TDX 连接（默认 **N = 8**），各自持有 socket + 独立 per-call 节流（`MIN_CALL_INTERVAL` 80ms 是 per-connection，不是全局）。每次调用取一条空闲连接执行；失败丢弃该连接、该槽换一台 host 重连。
+- **分散到多台 host**（重要）：`HQ_HOSTS` 有 16 台。启动时对各 host 测延迟，**N 个槽 pin 到延迟最低的 N 台不同服务器**（每台仅 1 条连接），而非全部 race 到同一台最快的。这样：① 每台只 1 连接 → 绕开单台限频、负载分摊；② 单台慢 / 挂只影响该槽（换台），不拖垮整池。N = 8 / 16 台 → 每台 1 连接，cold burst 期每台 ~5 req/s 数秒、稳态趋近 0，极安全。
+- **交互解耦**：前台请求（`ensure_chart_data` / `fetch_data` / K 线分页 / `refresh_quotes`）和后台 universe 滚动共享连接池。universe 滚动只占 ~1 连接、负载平滑 → 其余 ~7 条随时给前台/agent，**不再有 universe 全量扫描那几秒把前台饿死**的问题。
+- **并发批次**：cold-start burst（一次性全量）把 80-batch **并发**发起（并发度 ≤ N），~94 批跑在 8 连接上、完成时间 ~2.5s。稳态 universe 滚动则按节奏逐批推（~1 连接）。每批完成即写 cache（盘中只写 in-memory cache，线程安全；`purpose=close` 的 EOD 才写 `quote_close_snapshot`）+ emit progress。
+- **`refresh_quotes` 内部**：传入 tsCodes 同样按 80/批切、并发跑在池上；先按新鲜度跳过 cache 内 < ~1.5s 的 code。
 - **顺序无关**：并发后批次完成顺序不保证，但 progress 是中间态、前端读 cache/DB 重排，故 Stock→Index→Fund 仅影响入队顺序、不要求完成顺序。
 
 日 / 周 / 月 K：
@@ -1022,8 +1024,8 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | Cold-start seed | 进程启动时把 `BUILTIN_INSTRUMENTS` upsert 入 `quote_instruments`，保证 UI 第一帧非空 |
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；`TushareHealthState.isAvailable = true` 时 enrich |
 | TuShare 健康探针 | 进程启动时首次 ping；`isAvailable = false` 时每 1 小时重试 |
-| 实时行情 | **刷新窗内**三档：**热点档 ~3s**（核心指数 ∪ 前端热点集 = 自选 + 可见列表 top-N，TDX batch，总量 ≤ ~120）；核心指数兜底 15s；**全市场 universe 60s**（TDX batch）。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale。**刷新窗 = 连续竞价 + 每个 session 收盘后 30min 尾窗**（见下「时段判定」`is_in_quote_refresh_window`）——捕获收盘集合竞价(14:57–15:00)/午盘收盘后稍晚才落定的最终价，避免行情在 11:30 / 15:00 整点戛然冻结 |
-| 热点集（hot set） | 前端通过 `set_quote_hotset(tsCodes)` 声明高频刷新标的（自选 + 可见列表 top-N + 关注）；**全覆盖语义**（每次替换，单一推送方发完整集，自动淘汰）；服务端去重 + cap 120；热点档 tick 刷 `core_indexes ∪ hot_set`，走 TDX batch；emit `market-quotes-refresh-progress`(scope=subscribed) 驱动前端各视图刷新 |
+| 实时行情（背景基线） | **唯一后台报价任务 = universe 滚动刷新**：把全市场切 80 只/批，**按固定周期（默认 30s，可配 10–60s）滚动轮刷**——每 ~`cycle/批数` 推一批、每只每 `cycle` 轮到一次（不再"每 60s 一次性全量扫"的锯齿）。只在 `is_in_quote_refresh_window` 内跑、占 ~1 连接、负载平滑。职责：屏外行 / 全列表排序基线 / **headless（agent 无前端）兜底**。每批 emit `market-quotes-refresh-progress` 驱动前端增量更新。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
+| 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §前端命令）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
 | xdxr 事件 | 启动后预热关注标的；盘后随 K 线刷新一同补拉，按 `tsCode` 幂等 |
@@ -1034,9 +1036,9 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 时段判定：
 
 - **`is_trading_time`**：是否处于**可交易报价时段**（连续竞价 09:30–11:30 + 13:00–15:00）。用于 §2 quote 有效性（盘中 1h 硬过期 / 非盘中读最新已完成交易日）与 Account 成交时段判断。**不是** scheduler 刷新节奏的判据。
-- **`is_in_quote_refresh_window`**：scheduler 实时行情三档（热点 / 核心 / universe）的刷新节奏判据 = **连续竞价 + 每个 session 收盘后 30min 尾窗**，即交易日的 **09:30–12:00 ∪ 13:00–15:30**（北京时）。尾窗内继续按各档节奏刷新并写 in-memory snapshot（读路径照常服务最新 in-memory snapshot），以捕获收盘后稍晚落定的最终价、并让行情不在 11:30 / 15:00 整点冻结。尾窗与 `is_trading_time`（可交易性）解耦——尾窗内**不**可交易、Account 仍 fail closed。15:30 收盘快照 / 16:00 K 线预热不变。
+- **`is_in_quote_refresh_window`**：universe 滚动刷新的节奏判据 = **连续竞价 + 每个 session 收盘后 30min 尾窗**，即交易日的 **09:30–12:00 ∪ 13:00–15:30**（北京时）。窗内才滚动刷新并写 in-memory snapshot（读路径照常服务最新 snapshot），以捕获收盘后稍晚落定的最终价、并让行情不在 11:30 / 15:00 整点冻结。与 `is_trading_time`（可交易性）解耦——尾窗内**不**可交易、Account 仍 fail closed。15:30 收盘快照 / 16:00 K 线预热不变。前端 `refresh_quotes` pull **不受**此窗限制（用户任何时候打开都该拉到最新可得快照；非交易时段拉到的即当日/最近已完成交易日事实）。
 
-- **冷启动 universe intraday 首刷**：启动 catch-up 在 `is_in_quote_refresh_window` 为真时**立即跑一次 universe intraday 刷新**（复用渐进批量 stock→index→fund + 200/批 `market-quotes-refresh-progress`），**不等 scheduler 的首个 +60s tick**——否则全市场盘中实时价冷启动后最长要等近 1 分钟才首刷。之后 60s universe tick 负责持续刷新。与 close-snapshot catch-up（仅非刷新窗 / 快照不全时补最新已完成交易日收盘）互补、不重复。
+- **冷启动 universe burst 首刷**：启动 catch-up 在刷新窗内**先跑一次性全量 universe burst**（用满连接池 ~2.5s 填满全市场），**之后转入 30s 滚动稳态**。burst 解决"冷启动全列表填充快"，滚动解决"稳态平滑、不占满连接"。与 close-snapshot catch-up（仅非刷新窗 / 快照不全时补最新已完成交易日收盘）互补、不重复。
 - **`is_in_trading_session`**：是否处于**分时 / 分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_intraday` / `refresh_minute_klines` 的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
 
 规则：

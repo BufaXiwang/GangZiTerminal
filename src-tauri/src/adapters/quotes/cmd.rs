@@ -58,6 +58,27 @@ pub fn set_quote_hotset(
     Ok(())
 }
 
+/// 聚焦按需刷新一批 quotes（spec §5「实时行情（聚焦按需）」）：前端把当前关注的标的
+/// （自选 / 可见列表 / 详情）传入，后端按新鲜度跳过 + 80/批并发跑连接池刷 `MARKET_SNAPSHOT`，
+/// 通过 `market-quotes-refresh-progress`(scope=subscribed) 增量推回前端。非法 ts_code 跳过。
+#[tauri::command]
+#[specta::specta]
+pub async fn refresh_quotes(
+    ts_codes: Vec<String>,
+    service: State<'_, Arc<QuotesService>>,
+) -> Result<(), CommandError> {
+    let codes: Vec<TsCode> = ts_codes
+        .iter()
+        .filter_map(|s| TsCode::parse(s).ok())
+        .collect();
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let svc = service.inner().clone();
+    svc.refresh_quotes(codes).await?;
+    Ok(())
+}
+
 /// 市场宽度（spec §4 `market_breadth`）。
 ///
 /// 纯只读聚合，不触发 provider；只统计 `category == stock`。
