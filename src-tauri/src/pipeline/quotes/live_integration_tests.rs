@@ -1846,3 +1846,310 @@ async fn quotes_acc_daily_basic_self_consistent() {
         assert!(pe > 0.0 && pe < 1000.0, "[ACC-5] pe_ttm={pe} 不在合理正区间");
     }
 }
+
+// ============================================================================= 准确性补齐 (ACC-6..8)
+//
+// Spec: docs/design/quotes-module.md §2（StockQuote change% / 盘口 bid≤ask / freshness）+
+//       §5（今日 bar 由报价驱动 vs 历史日 K 量纲一致）。
+// 这些为「数据准确性」judge 输出结构化数值 + numeric 断言。
+
+/// ACC-6 · 实时报价 change% 数学一致：change == price - prevClose；
+/// change% == (price - prevClose) / prevClose × 100。两源（TDX / 腾讯）各验。
+/// 结构化输出供 judge 判「公式一致」。Provider: TDX + 腾讯。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_change_percent_math() {
+    let mgr = TdxConnectionManager::new();
+    let tx = TencentProvider::new().expect("build tencent");
+    let c = ts(OLD_STOCK_SH);
+    let mut judged = 0usize;
+    // (源名, quote)
+    let tdx = mgr.fetch_quote(&c, InstrumentCategory::Stock, recent_trade_date(), Utc::now(), None).await.ok();
+    let txq = tx.fetch_quote(&c, InstrumentCategory::Stock, recent_trade_date(), Utc::now()).await.ok();
+    for (src, q) in [("tdx", tdx), ("tencent", txq)] {
+        let Some(q) = q else {
+            eprintln!("[ACC-6/{src}] SKIP — provider 不可达");
+            continue;
+        };
+        let (Some(price), Some(prev)) = (q.price, q.previous_close) else {
+            eprintln!("[ACC-6/{src}] INFO — price/prevClose 缺（非交易时段?），跳过");
+            continue;
+        };
+        let price = dec_f64(price.0);
+        let prev = dec_f64(prev.0);
+        let change = q.change.map(|d| dec_f64(d.0));
+        let pct = q.change_percent;
+        let expected_change = price - prev;
+        let expected_pct = if prev != 0.0 { (price - prev) / prev * 100.0 } else { f64::NAN };
+        // JUDGE 结构化输出。
+        eprintln!(
+            "[ACC-6/{src}] JUDGE code={} price={price:.4} prevClose={prev:.4} change={change:?} expectedChange={expected_change:.4} changePct={pct:?} expectedPct={expected_pct:.4}",
+            c.as_str()
+        );
+        if let Some(ch) = change {
+            assert!((ch - expected_change).abs() < 0.02, "[ACC-6/{src}] change 数学不一致 got={ch} expected={expected_change}");
+        }
+        if let Some(p) = pct {
+            assert!((p - expected_pct).abs() < 0.05, "[ACC-6/{src}] change% 数学不一致 got={p} expected={expected_pct}");
+        }
+        judged += 1;
+    }
+    if judged == 0 {
+        eprintln!("[ACC-6] SKIP — 无任一源拿到 price+prevClose");
+    }
+}
+
+/// ACC-7 · 今日 bar（实时报价驱动）vs 历史日 K（security_bars）量纲一致：
+/// 报价的 price/open/high/low 应与最近一根历史日 K 的价格量级一致（同标的、相邻交易日，
+/// 不应突刺 ~10× / ~100×）。报价 volume（股）也应与历史日 K volume（股）同数量级。
+/// 这验证「今日 bar 由报价驱动」拼接进 K 线时不会因单位错位出现突刺。
+/// Provider: TDX（报价 + 历史日 K 同源，排除跨源口径差异）。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_today_bar_vs_history_kline_scale() {
+    let mgr = TdxConnectionManager::new();
+    let c = ts(OLD_STOCK_SH);
+    let q = match mgr.fetch_quote(&c, InstrumentCategory::Stock, recent_trade_date(), Utc::now(), None).await {
+        Ok(q) => q,
+        Err(e) => { eprintln!("[ACC-7] SKIP — TDX quote 不可达: {e}"); return; }
+    };
+    let bars = match mgr.fetch_kline_at(&c, KlinePeriod::Day, 0, 20).await {
+        Ok(b) if !b.is_empty() => b,
+        _ => { eprintln!("[ACC-7] SKIP — TDX 日 K 空 / 不可达"); return; }
+    };
+    let Some(price) = q.price.map(|p| dec_f64(p.0)) else {
+        eprintln!("[ACC-7] INFO — 报价无现价（非交易时段），用 prevClose 比");
+        let Some(prev) = q.previous_close.map(|p| dec_f64(p.0)) else {
+            eprintln!("[ACC-7] SKIP — 报价 price/prevClose 都空"); return;
+        };
+        let last = bars.last().unwrap();
+        let ratio = prev / last.close.max(1e-9);
+        eprintln!("[ACC-7] JUDGE prevClose={prev:.4} lastBarClose={:.4} ratio={ratio:.4}", last.close);
+        assert!(ratio > 0.5 && ratio < 2.0, "[ACC-7] prevClose vs 最近日 K close 比 {ratio} 偏离 1（疑似单位突刺）");
+        return;
+    };
+    let last = bars.last().unwrap();
+    let price_ratio = price / last.close.max(1e-9);
+    eprintln!(
+        "[ACC-7] JUDGE code={} quotePrice={price:.4} lastBarDate={} lastBarClose={:.4} priceRatio={price_ratio:.4}",
+        c.as_str(), bar_date_key(last), last.close
+    );
+    // 现价与最近收盘价比应在 [0.5, 2.0]（单日涨跌幅 ≤ ±100% 远超 A 股 ±10%，足够宽松抓 10×/100× bug）。
+    assert!(price_ratio > 0.5 && price_ratio < 2.0, "[ACC-7] 现价 vs 最近日 K close 比 {price_ratio} 偏离 1（疑似今日 bar 单位突刺）");
+    // volume 量纲：报价 volume（股）应与历史日 K volume（股）同数量级。
+    if let Some(qv) = q.volume {
+        let qv = qv.0 as f64;
+        let bv = last.volume;
+        if qv > 0.0 && bv > 0.0 {
+            let vratio = qv / bv;
+            eprintln!("[ACC-7] JUDGE quoteVol={qv:.0} lastBarVol={bv:.0} volRatio={vratio:.4}");
+            // 当日累计成交量 vs 上一交易日成交量：同数量级（放宽 [0.05, 20] 抓 100× 单位 bug）。
+            assert!(vratio > 0.05 && vratio < 20.0, "[ACC-7] 报价 volume vs 历史日 K volume 比 {vratio} 差 ~100×（疑似 手/股 bug）");
+        }
+    }
+}
+
+/// ACC-8 · 实时报价五档盘口买卖价合理（bid[0] ≤ ask[0]）+ 各档单调（买价递减、卖价递增）+ 无负价/NaN。
+/// 仅交易时段五档齐全；非交易时段盘口可能为空 → 优雅 skip。Provider: TDX（五档主路径）+ 腾讯。
+#[tokio::test]
+#[ignore]
+async fn quotes_acc_depth_bid_le_ask() {
+    let mgr = TdxConnectionManager::new();
+    let tx = TencentProvider::new().expect("build tencent");
+    let c = ts(OLD_STOCK_SH);
+    let tdx = mgr.fetch_quote(&c, InstrumentCategory::Stock, recent_trade_date(), Utc::now(), None).await.ok();
+    let txq = tx.fetch_quote(&c, InstrumentCategory::Stock, recent_trade_date(), Utc::now()).await.ok();
+    let mut checked = 0usize;
+    for (src, q) in [("tdx", tdx), ("tencent", txq)] {
+        let Some(q) = q else { eprintln!("[ACC-8/{src}] SKIP — 不可达"); continue; };
+        let bid0 = q.bid.first().and_then(|l| l.price).map(|p| dec_f64(p.0));
+        let ask0 = q.ask.first().and_then(|l| l.price).map(|p| dec_f64(p.0));
+        eprintln!("[ACC-8/{src}] JUDGE code={} bid0={bid0:?} ask0={ask0:?} bidLevels={} askLevels={}", c.as_str(), q.bid.len(), q.ask.len());
+        if let (Some(b), Some(a)) = (bid0, ask0) {
+            assert!(b.is_finite() && a.is_finite() && b > 0.0 && a > 0.0, "[ACC-8/{src}] 盘口价应正且有限");
+            assert!(b <= a, "[ACC-8/{src}] 买一 {b} 应 ≤ 卖一 {a}");
+            checked += 1;
+        } else {
+            eprintln!("[ACC-8/{src}] INFO — 买一/卖一缺（非交易时段?），跳过该源");
+        }
+        // 各档单调：买价递减、卖价递增。
+        let bids: Vec<f64> = q.bid.iter().filter_map(|l| l.price).map(|p| dec_f64(p.0)).collect();
+        for w in bids.windows(2) { assert!(w[0] >= w[1], "[ACC-8/{src}] 买档价应递减 {:?}", w); }
+        let asks: Vec<f64> = q.ask.iter().filter_map(|l| l.price).map(|p| dec_f64(p.0)).collect();
+        for w in asks.windows(2) { assert!(w[0] <= w[1], "[ACC-8/{src}] 卖档价应递增 {:?}", w); }
+    }
+    if checked == 0 { eprintln!("[ACC-8] INFO — 无源有完整买一/卖一（可能非交易时段）"); }
+}
+
+// ============================================================================= 速度 (SPD-1..5)
+//
+// Spec: docs/design/quotes-module.md §5（冷启动 universe burst ~2.5s / refresh_quotes < ~500ms /
+//       universe 滚动一轮 ≤ 30s / 连接池 8 并发 / ensure_chart_data 首屏延迟）+
+//       §「TDX 连接池与并发」。
+// 这些 println 结构化 `SPD/JUDGE` 行 + 目标阈值，供 speed judge 对照判 pass / slow。
+// 断言用宽松上限（避免环境抖动 flaky），精确判定交给 judge rubric 对照目标值。
+
+/// SPD-1 · 冷启动 universe burst 填充耗时（目标 ~2.5–5s，全市场 ~7500）。
+/// seed 真实全市场 universe（refresh_market_instruments 拉 TDX）后，计时一次性 universe
+/// quote refresh 的「主体完成」耗时。Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_spd_cold_start_universe_burst() {
+    use std::time::Instant;
+    let svc = make_service();
+    // 真实拉 universe（若 TDX 不可达则 seed 小批兜底，仍能测 burst 路径但不代表全市场）。
+    if let Err(e) = svc.refresh_market_instruments().await {
+        eprintln!("[SPD-1] INFO — refresh_market_instruments 失败({e:?})，seed 小批兜底");
+        for i in 0..200u32 { seed_instrument(&svc, &format!("60{:04}.SH", i), "x", InstrumentCategory::Stock); }
+    }
+    let targets = svc.universe_quote_targets();
+    eprintln!("[SPD-1] universe size = {}", targets.len());
+    if targets.is_empty() { eprintln!("[SPD-1] SKIP — universe 空"); return; }
+    let t0 = Instant::now();
+    let req = RefreshMarketQuotesRequest {
+        scope: RefreshMarketQuotesScope::Universe,
+        purpose: RefreshPurpose::Intraday,
+        trade_date: None,
+    };
+    let r = svc.refresh_market_quotes(req).await;
+    let dt = t0.elapsed();
+    match r {
+        Ok(p) => {
+            eprintln!(
+                "[SPD-1] SPD/JUDGE metric=cold_start_universe_burst universeSize={} elapsedMs={} success={} total={} targetMs=2500-5000",
+                targets.len(), dt.as_millis(), p.success, p.total
+            );
+            // 宽松上限：全市场 ≤ 30s 视为未异常（精确 ~2.5s 判定交 judge）。
+            assert!(dt < std::time::Duration::from_secs(30), "[SPD-1] burst 主体完成应 < 30s（目标 ~2.5s）");
+        }
+        Err(e) => eprintln!("[SPD-1] SKIP — universe refresh 失败: {e:?}"),
+    }
+}
+
+/// SPD-2 · refresh_quotes(~50 codes) 往返延迟（目标 < ~500ms）。
+/// 模拟前端聚焦 pull：50 只标的一次 refresh_quotes。Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_spd_refresh_quotes_roundtrip() {
+    use std::time::Instant;
+    let svc = make_service();
+    // 50 只主板股票（连续代码，多数有效）。
+    let mut codes = Vec::new();
+    for i in 0..50u32 {
+        let s = format!("6000{:02}.SH", i);
+        seed_instrument(&svc, &s, "x", InstrumentCategory::Stock);
+        codes.push(ts(&s));
+    }
+    let t0 = Instant::now();
+    let r = svc.refresh_quotes(codes.clone()).await;
+    let dt = t0.elapsed();
+    match r {
+        Ok(p) => {
+            eprintln!(
+                "[SPD-2] SPD/JUDGE metric=refresh_quotes_roundtrip codeCount={} elapsedMs={} success={} total={} targetMs=500",
+                codes.len(), dt.as_millis(), p.success, p.total
+            );
+            assert!(dt < std::time::Duration::from_secs(5), "[SPD-2] 50 只往返应 < 5s（目标 <500ms）");
+        }
+        Err(e) => eprintln!("[SPD-2] SKIP — refresh_quotes 失败: {e:?}"),
+    }
+}
+
+/// SPD-3 · universe 滚动跑完一轮覆盖时间（目标 ~30s）。
+/// 用 batches_per_tick + 真实 refresh_quote_batch 串起一轮（cursor 从 0 wrap 回 0），计时。
+/// 不直接跑 scheduler（避免 30s 真实等待）——按 batches_per_tick 的节奏一次性把全部 batch 跑完，
+/// 测「跑完全 universe 一轮」的纯执行耗时（≈ scheduler 一轮覆盖的工作量，排除 tick sleep）。
+/// Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_spd_universe_rolling_one_cycle() {
+    use std::time::Instant;
+    use crate::pipeline::quotes::scheduler::QUOTES_ROLL_BATCH;
+    let svc = make_service();
+    if let Err(e) = svc.refresh_market_instruments().await {
+        eprintln!("[SPD-3] INFO — universe 拉取失败({e:?})，seed 小批兜底");
+        for i in 0..300u32 { seed_instrument(&svc, &format!("60{:04}.SH", i), "x", InstrumentCategory::Stock); }
+    }
+    let targets = svc.universe_quote_targets();
+    if targets.is_empty() { eprintln!("[SPD-3] SKIP — universe 空"); return; }
+    let num_batches = targets.len().div_ceil(QUOTES_ROLL_BATCH);
+    let t0 = Instant::now();
+    for b in 0..num_batches {
+        let start = b * QUOTES_ROLL_BATCH;
+        let end = (start + QUOTES_ROLL_BATCH).min(targets.len());
+        let slice: Vec<TsCode> = targets[start..end].iter().map(|(c, _, _)| c.clone()).collect();
+        let _ = svc.refresh_quote_batch(slice).await;
+    }
+    let dt = t0.elapsed();
+    eprintln!(
+        "[SPD-3] SPD/JUDGE metric=universe_rolling_one_cycle universeSize={} batches={} elapsedMs={} targetMs=30000",
+        targets.len(), num_batches, dt.as_millis()
+    );
+    // 一轮纯执行耗时应 ≤ 60s（目标 ~30s；scheduler 实际把它摊到 30s 周期内）。
+    assert!(dt < std::time::Duration::from_secs(60), "[SPD-3] 一轮覆盖应 < 60s（目标 ~30s）");
+}
+
+/// SPD-4 · 连接池 8 并发批 vs 串行吞吐对比。
+/// 复用 manager perf_pool_speedup 的思路，在 pipeline 层用多只 refresh_quote_batch 验加速比。
+/// Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_spd_pool_concurrency_speedup() {
+    use std::time::Instant;
+    let mgr = TdxConnectionManager::new();
+    // 8 批，每批 80 只主板股票。
+    let make_batch = |base: u32| -> Vec<(TsCode, InstrumentCategory, Option<String>)> {
+        (0..80u32).map(|i| {
+            let code = format!("60{:04}.SH", base * 80 + i);
+            (ts(&code), InstrumentCategory::Stock, None)
+        }).collect()
+    };
+    let batches: Vec<_> = (0..8u32).map(make_batch).collect();
+    // 串行。
+    let t0 = Instant::now();
+    for b in &batches {
+        let _ = mgr.fetch_quotes(b.clone(), recent_trade_date(), Utc::now()).await;
+    }
+    let seq = t0.elapsed();
+    // 并发（连接池 8 槽并行）。
+    use futures_util::stream::{self, StreamExt};
+    let t1 = Instant::now();
+    let _r: Vec<_> = stream::iter(batches.clone())
+        .map(|b| { let mgr = &mgr; async move { mgr.fetch_quotes(b, recent_trade_date(), Utc::now()).await } })
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    let conc = t1.elapsed();
+    let speedup = seq.as_secs_f64() / conc.as_secs_f64().max(1e-9);
+    eprintln!(
+        "[SPD-4] SPD/JUDGE metric=pool_concurrency_speedup batches=8 seqMs={} concMs={} speedup={:.2} targetSpeedup>=2.0",
+        seq.as_millis(), conc.as_millis(), speedup
+    );
+    // 并发不应慢于串行（连接池有效）；理想 ~接近 8×，宽松断言 ≤ 串行。
+    assert!(conc <= seq + std::time::Duration::from_millis(500), "[SPD-4] 8 并发应 ≤ 串行（连接池）");
+}
+
+/// SPD-5 · 单标的 ensure_chart_data 首屏延迟（fetch_kline_page start=0 落 DB）。
+/// 这是 ensure_chart_data(day) 的默认路径（首屏单页）。目标：首屏出图 < ~1s。Provider: TDX。
+#[tokio::test]
+#[ignore]
+async fn quotes_spd_ensure_chart_data_first_screen() {
+    use std::time::Instant;
+    let svc = make_service();
+    seed_instrument(&svc, OLD_STOCK_SH, "贵州茅台", InstrumentCategory::Stock);
+    let c = ts(OLD_STOCK_SH);
+    let t0 = Instant::now();
+    let r = svc.fetch_kline_page(&c, KlinePeriod::Day, 0).await;
+    let dt = t0.elapsed();
+    match r {
+        Ok((added, has_more)) => {
+            eprintln!(
+                "[SPD-5] SPD/JUDGE metric=ensure_chart_data_first_screen code={} addedBars={} hasMore={} elapsedMs={} targetMs=1000",
+                c.as_str(), added, has_more, dt.as_millis()
+            );
+            assert!(added > 0, "[SPD-5] 首屏应落入 K 线");
+            assert!(dt < std::time::Duration::from_secs(5), "[SPD-5] 首屏页应 < 5s（目标 <1s）");
+        }
+        Err(e) => eprintln!("[SPD-5] SKIP — fetch_kline_page 失败: {e:?}"),
+    }
+}

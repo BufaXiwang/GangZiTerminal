@@ -1203,6 +1203,53 @@ mod tests {
         assert!(q.freshness.warning.is_none());
     }
 
+    // change% 数学一致性：change_percent == (price - prevClose) / prevClose × 100。
+    // sample_raw: price=1500, last_close=1480 → change=20, change%=20/1480×100≈1.3514%。
+    // Spec §2 StockQuote：changePercent 用百分点；不能用 prevClose 伪造现价。
+    #[test]
+    fn map_security_quote_change_percent_matches_price_over_prev_close() {
+        let raw = sample_raw();
+        let code = TsCode::parse("600519.SH").unwrap();
+        let td = TradeDate::parse("20260526").unwrap();
+        let q = map_security_quote(&raw, code, InstrumentCategory::Stock, None, td, Utc::now());
+        let price = q.price.unwrap().0;
+        let prev = q.previous_close.unwrap().0;
+        let change = q.change.unwrap().0;
+        // change == price - prevClose（Decimal 精确）。
+        assert_eq!(change, price - prev, "change 应等于 price - prevClose");
+        // change% == (price - prevClose) / prevClose × 100（容差到小数点后 4 位）。
+        use rust_decimal::prelude::ToPrimitive;
+        let expected_pct =
+            ((price - prev) / prev * rust_decimal::Decimal::from(100)).to_f64().unwrap();
+        let got_pct = q.change_percent.unwrap();
+        assert!(
+            (got_pct - expected_pct).abs() < 1e-4,
+            "change% 数学不一致 got={got_pct} expected={expected_pct}"
+        );
+    }
+
+    // 五档盘口买卖价合理性：bid[0] ≤ ask[0]（买一价 ≤ 卖一价），且各档非负。
+    // sample_raw: bid0=1499 ask0=1501 → 合理。Spec §2 盘口：bid/ask 按离成交价排序。
+    #[test]
+    fn map_security_quote_bid_le_ask_and_non_negative() {
+        let raw = sample_raw();
+        let code = TsCode::parse("600519.SH").unwrap();
+        let td = TradeDate::parse("20260526").unwrap();
+        let q = map_security_quote(&raw, code, InstrumentCategory::Stock, None, td, Utc::now());
+        let bid0 = q.bid[0].price.unwrap().0;
+        let ask0 = q.ask[0].price.unwrap().0;
+        assert!(bid0 <= ask0, "买一价 {bid0} 应 ≤ 卖一价 {ask0}");
+        // 有价的档位价格 / 量都应非负。
+        for lvl in q.bid.iter().chain(q.ask.iter()) {
+            if let Some(p) = lvl.price {
+                assert!(p.0 >= rust_decimal::Decimal::ZERO, "盘口价应非负");
+            }
+            if let Some(v) = lvl.volume {
+                assert!(v.0 >= 0, "盘口量应非负");
+            }
+        }
+    }
+
     /// 回归：security_quotes 的成交量 / 盘口量是「手」，必须 ×100 转「股」
     /// （shared-types §Volume / quotes-module §盘口）。曾漏转，导致 account 成交模拟
     /// 把 2 手当 2 股、现实只成交极少量 + UI 量 100× 偏低。

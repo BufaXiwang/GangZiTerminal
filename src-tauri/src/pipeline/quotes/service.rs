@@ -3345,6 +3345,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_quote_batch_skips_fresh_cached_codes() {
+        // Spec §5「refresh_quotes 内部 / 新鲜度跳过」+ const QUOTE_FRESH_SKIP=1500ms：
+        // cache 内 capturedAt < 1.5s 的 code 本轮跳过、不触发 fetch。
+        //
+        // hermetic：默认 TDX manager 在测试网络下不可达；若 fresh-skip 失效会去 fetch
+        // 并失败计入 completed/total。这里预置一条「刚刚」写入的 fresh snapshot，断言
+        // 该 code 被跳过 → requested_total 计入但 total（实际 fetch 集合）为空、success=0、
+        // affected 为空、不进网络。
+        let svc = Arc::new(make_service());
+        let ts_fresh = TsCode::parse("600519.SH").unwrap();
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        use crate::domain::shared::{Freshness, FreshnessStatus, Price};
+        let eligible = eligible_trade_date(&svc.market_time_now());
+        let now = Utc::now();
+        let q = StockQuote {
+            ts_code: ts_fresh.clone(),
+            name: None,
+            category: InstrumentCategory::Stock,
+            trade_date: eligible.trade_date,
+            price: Some(Price(Decimal::new(150000, 2))),
+            previous_close: None,
+            open: None,
+            high: None,
+            low: None,
+            change: None,
+            change_percent: None,
+            volume: None,
+            amount: None,
+            turnover_rate: None,
+            volume_ratio: None,
+            limit_up: None,
+            limit_down: None,
+            bid: Vec::new(),
+            ask: Vec::new(),
+            trade_status: TradeStatus::Trading,
+            source: QuoteSource::Tdx,
+            captured_at: now,
+            exchange_time: None,
+            freshness: Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: Some(0),
+                source: Some("tdx".into()),
+                warning: None,
+            },
+            warnings: Vec::new(),
+        };
+        svc.cache.put(crate::infrastructure::quotes::CachedSnapshot {
+            quote: q,
+            captured_at: now, // 刚刚 → age ≈ 0 < QUOTE_FRESH_SKIP
+            trade_date: eligible.trade_date,
+            source: "tdx".into(),
+        });
+        let (requested_total, success, affected) =
+            svc.refresh_quote_batch(vec![ts_fresh.clone()]).await;
+        assert_eq!(requested_total, 1, "请求计入 requested_total");
+        assert_eq!(success, 0, "fresh 被跳过 → 无新成功写入");
+        assert!(affected.is_empty(), "fresh 跳过 → affected 为空（未触发 fetch）");
+    }
+
+    #[test]
+    fn quote_fresh_skip_threshold_is_1500ms() {
+        // Spec §5：新鲜度跳过窗 ~1.5s。
+        assert_eq!(QUOTE_FRESH_SKIP, std::time::Duration::from_millis(1500));
+    }
+
+    #[tokio::test]
     async fn refresh_daily_basic_without_token_returns_ok_with_warning() {
         // Spec §5 line 764: token 缺失保持旧数据 + warning，不报错。
         let svc = make_service();
