@@ -2099,9 +2099,9 @@ impl AccountService {
             );
         }
         // Spec §2 line 352-353: 多头仓位 stop_loss < currentPrice, take_profit > currentPrice。
-        // 初始保护条件使用 fresh quote 当前价 / 成交价做校验。market 路径 fill price = ask[0]，
-        // 用 fresh quote 当前价做预校验是合理近似；stale quote 校验时允许写入但携带 warning。
-        let mut pre_warnings: Vec<WarningCode> = vec![];
+        // 初始保护条件用 fresh quote 当前价做校验（market 路径 fill price = ask[0]，fresh 当前价是合理近似）。
+        // 注：交易级 get_snapshot 对 stale/missing 直接返回 Err（§6 market quote stale 必须拒单），
+        // 故下面 Ok 分支拿到的必为 fresh，无需额外 stale warning；stale 落 Err 分支拒单。
         if matches!(ot, OrderType::Market)
             && (stop_loss.is_some() || take_profit.is_some())
         {
@@ -2129,9 +2129,6 @@ impl AccountService {
                             );
                         }
                     }
-                    if matches!(snap.quote.freshness.status, FreshnessStatus::Stale) {
-                        pre_warnings.push(WarningCode::QuoteStale);
-                    }
                 }
                 Err(e) => {
                     let code = quote_err_to_error_code(e.kind);
@@ -2156,11 +2153,6 @@ impl AccountService {
             if stop_loss.is_some() || take_profit.is_some() || time_stop_at.is_some() {
                 if let Some(pid) = response.position_id.clone() {
                     let _ = self.apply_initial_protection(&pid, stop_loss, take_profit, time_stop_at);
-                }
-            }
-            for w in pre_warnings {
-                if !response.warnings.contains(&w) {
-                    response.warnings.push(w);
                 }
             }
         }
