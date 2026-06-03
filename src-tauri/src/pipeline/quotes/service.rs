@@ -1076,7 +1076,7 @@ impl QuotesService {
                     .unwrap_or_default();
                 // **Resume-from-missing** (purpose=Close 时)：跳过已经有今日 close_snapshot
                 // 的标的，只刷新缺数据的。这样 cargo rebuild 打断后下次重启不会从头再来。
-                // 其他 purpose（Intraday / Wakeup）保持全量刷新（实时性需要）。
+                // 其他 purpose（Intraday）保持全量刷新（实时性需要）。
                 let skip_existing = matches!(req.purpose, RefreshPurpose::Close);
                 let existing: std::collections::HashSet<TsCode> = if skip_existing {
                     self.repo()

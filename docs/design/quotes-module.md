@@ -1028,7 +1028,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；`TushareHealthState.isAvailable = true` 时 enrich |
 | TuShare 健康探针 | 进程启动时首次 ping；`isAvailable = false` 时每 1 小时重试 |
 | 实时行情（背景基线） | **唯一后台报价任务 = universe 滚动刷新**：把全市场切 80 只/批，**按固定周期（默认 30s，可配 10–60s）滚动轮刷**——每 ~`cycle/批数` 推一批、每只每 `cycle` 轮到一次（不再"每 60s 一次性全量扫"的锯齿）。只在 `is_in_quote_refresh_window` 内跑、占 ~1 连接、负载平滑。职责：屏外行 / 全列表排序基线 / **headless（agent 无前端）兜底**。每批 emit `market-quotes-refresh-progress` 驱动前端增量更新。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
-| 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §前端命令）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
+| 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §前端命令）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。前端取并集后 **cap ~120**（超出按 `account（自选+持仓） > selected（选中） > indices（核心指数） > market（可见列表）` 优先级截断，保证最关心的不被列表头挤掉；实现锚 `src/lib/quotePull.ts`）。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
 | xdxr 事件 | 启动后预热关注标的；盘后随 K 线刷新一同补拉，按 `tsCode` 幂等 |
