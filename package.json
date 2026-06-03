@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "test": "vitest run",
     "build": "tsc && vite build",
     "tauri": "tauri",
     "tmux:start": "bash scripts/tmux-dev.sh start",
@@ -31,6 +32,8 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3"
+    "@types/react-dom": "^19.2.3",
+    "jsdom": "^29.1.1",
+    "vitest": "^4.1.8"
   }
 }
