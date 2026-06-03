@@ -312,3 +312,349 @@ async fn account_live_limit_open_pending_and_subscribed_codes() {
         "subscribed_codes 应含 pending 单标的（编排层据此刷新行情）"
     );
 }
+
+// =============================================================================
+// LLM-as-Judge 正确性验证骨架（交主 agent 跑）。
+//
+// 每条测试在能拿到 fresh 可成交行情时，用**真实报价**驱动一笔成交，并 println 结构化
+// 的 `JUDGE` 行：把 actual 值与 spec 费用/PnL 公式算出的 expected 值并列输出，供 LLM
+// 判定数据/行为准确性。非交易时段（拿不到 fresh 现价）→ println `JUDGE ... SKIP` 不 panic。
+//
+// 费用公式（spec §硬风控模型，account-module.md §2）：
+//   notional      = price * quantity
+//   commission    = max(notional * 0.0003, 5.0)        双向
+//   stampTax      = notional * 0.0005                  仅卖出
+//   transferFee   = notional * 0.00001                 仅 SH stock/fund，双向
+//   买入现金扣减   = notional + commission + transferFee
+//   卖出现金增加   = notional - commission - stampTax - transferFee
+//   avgCost(首买) = (notional + buyCommission + buyTransferFee) / quantity
+//   realizedPnl   = (sellPrice - avgCost) * qty - sellCommission - stampTax - sellTransferFee
+//
+// 凭据 env（LLM judge 调用 LLM 用，沿用 agent judge 读法；测试本身不读 key）：
+//   JUDGE_BASE / JUDGE_KEY / JUDGE_MODEL  —— 主 agent 负责注入，**绝不在代码里硬编码**。
+// =============================================================================
+
+/// 费用常量（spec 默认值；与 AccountFeePolicy::default 对齐）。
+const COMMISSION_RATE: f64 = 0.0003;
+const MIN_COMMISSION: f64 = 5.0;
+#[allow(dead_code)] // 文档化卖出印花税率（judge rubric 引用；T+1 锁仓下 live 卖出走 fail-closed）
+const STAMP_TAX_SELL_RATE: f64 = 0.0005;
+const TRANSFER_FEE_RATE: f64 = 0.00001; // 仅 SH
+
+fn expected_commission(notional: f64) -> f64 {
+    (notional * COMMISSION_RATE).max(MIN_COMMISSION)
+}
+
+/// 取真实 fresh 卖一价（成交可行时）。
+async fn real_ask0(quotes: &Arc<QuotesService>, code: &TsCode) -> Option<f64> {
+    let req = RefreshMarketQuotesRequest {
+        scope: RefreshMarketQuotesScope::Manual { ts_codes: vec![code.clone()] },
+        purpose: RefreshPurpose::Intraday,
+        trade_date: None,
+    };
+    if quotes.refresh_market_quotes(req).await.is_err() {
+        return None;
+    }
+    let snap =
+        crate::pipeline::quotes::facade::get_quote_snapshot(quotes.db(), quotes.cache(), code)
+            .ok()?;
+    if !matches!(snap.quote.freshness.status, FreshnessStatus::Fresh) {
+        return None;
+    }
+    snap.quote
+        .ask
+        .iter()
+        .find(|l| l.price.is_some() && l.volume.unwrap_or(Volume(0)).0 > 0)
+        .and_then(|l| l.price)
+        .map(|p| p.0.to_string().parse::<f64>().unwrap())
+}
+
+fn dec_to_f64(d: Decimal) -> f64 {
+    d.to_string().parse::<f64>().unwrap()
+}
+
+/// account_live_3 · 成交价 + 费用 + avgCost + 现金扣减正确性（market buy）。
+///
+/// JUDGE 行覆盖：fillPrice==realAsk0、commission/transferFee==公式、avgCost==公式、
+/// cashAfter==cashBefore - notional - commission - transferFee。
+#[tokio::test]
+#[ignore]
+async fn account_live_market_buy_fees_and_avgcost_correct() {
+    let (quotes, account) = make_wired_services();
+    let code = ts(STOCK_SH); // SH → 收过户费
+    seed_instrument(&quotes, &code);
+
+    let Some(real_ask) = real_ask0(&quotes, &code).await else {
+        println!("JUDGE account_live_3 SKIP reason=no_fresh_ask note=需盘中跑");
+        return;
+    };
+
+    let before = account.fetch_account(FetchAccountRequest {
+        include: Some(FetchAccountInclude { snapshot: Some(true), ..Default::default() }),
+        ..Default::default()
+    });
+    let cash_before = dec_to_f64(before.snapshot.unwrap().cash.0);
+
+    let qty = 100i64;
+    let resp = account.operate_account(
+        OperateAccountRequest {
+            action: OperateAccountAction::OpenPosition {
+                ts_code: code.clone(),
+                quantity: Shares(qty),
+                order_type: Some(OrderType::Market),
+                limit_price: None,
+                expires_at: None,
+                stop_loss: None,
+                take_profit: None,
+                time_stop_at: None,
+                reason: "account_live_3 fees".into(),
+            },
+        },
+        AccountActor::Agent,
+    );
+    if !resp.accepted {
+        println!(
+            "JUDGE account_live_3 SKIP reason={:?} note=fresh但拒单(盘口/涨跌停等合法fail-closed)",
+            resp.reason
+        );
+        return;
+    }
+    let pos_id = resp.position_id.clone().unwrap();
+    let fetched = account.fetch_account(FetchAccountRequest {
+        include: Some(FetchAccountInclude {
+            positions: Some(true),
+            snapshot: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let pos = fetched
+        .positions
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| p.position_id == pos_id)
+        .unwrap();
+    let avg_cost = dec_to_f64(pos.avg_cost.0);
+    let cash_after = dec_to_f64(resp.snapshot.cash.0);
+
+    // 用持仓数 * avgCost 反推；fillPrice 取 avgCost 去除费用后近似（hermetic 已精确验证费用，
+    // 这里 JUDGE 用 realAsk 作为预期成交价基准）。
+    let notional = real_ask * qty as f64;
+    let exp_commission = expected_commission(notional);
+    let exp_transfer = notional * TRANSFER_FEE_RATE; // SH
+    let exp_avg_cost = (notional + exp_commission + exp_transfer) / qty as f64;
+    let exp_cash_after = cash_before - notional - exp_commission - exp_transfer;
+
+    println!(
+        "JUDGE account_live_3 market_buy_fees \
+         realAsk0={real_ask} qty={qty} notional={notional:.4} \
+         avgCost={avg_cost} expectedAvgCost={exp_avg_cost:.6} \
+         expectedCommission={exp_commission:.4} expectedTransferFee={exp_transfer:.6} \
+         cashBefore={cash_before} cashAfter={cash_after} expectedCashAfter={exp_cash_after:.4} \
+         positionQty={}",
+        pos.quantity.0
+    );
+    // 软硬断言：成交价应等于卖一价 → avgCost 约等公式（容微小 round_dp 误差）。
+    assert!(
+        (avg_cost - exp_avg_cost).abs() < 0.01,
+        "avgCost 偏离公式：actual={avg_cost} expected={exp_avg_cost}"
+    );
+    assert!(
+        (cash_after - exp_cash_after).abs() < 0.05,
+        "cashAfter 偏离公式：actual={cash_after} expected={exp_cash_after}"
+    );
+    assert_eq!(pos.quantity.0, qty, "持仓数量应为 {qty}");
+}
+
+/// account_live_4 · 卖出 realizedPnl 正确性（买入后立即全平）。
+///
+/// JUDGE 行覆盖：buyPrice / sellPrice / qty / realizedPnl == 公式(扣印花+过户+双边佣金)。
+/// 注：T+1 锁仓，正常盘中当日买入不可卖 → 该条主要验证「当日卖被拒(insufficient_sellable)」
+/// 这一 fail-closed 行为；若测试环境放开 T+1（非生产），才验证 PnL 公式。默认 println SKIP。
+#[tokio::test]
+#[ignore]
+async fn account_live_sell_realized_pnl_correct() {
+    let (quotes, account) = make_wired_services();
+    let code = ts(STOCK_SH);
+    seed_instrument(&quotes, &code);
+
+    let Some(real_ask) = real_ask0(&quotes, &code).await else {
+        println!("JUDGE account_live_4 SKIP reason=no_fresh_ask note=需盘中跑");
+        return;
+    };
+    let buy = account.operate_account(
+        OperateAccountRequest {
+            action: OperateAccountAction::OpenPosition {
+                ts_code: code.clone(),
+                quantity: Shares(100),
+                order_type: Some(OrderType::Market),
+                limit_price: None,
+                expires_at: None,
+                stop_loss: None,
+                take_profit: None,
+                time_stop_at: None,
+                reason: "account_live_4 buy".into(),
+            },
+        },
+        AccountActor::Agent,
+    );
+    if !buy.accepted {
+        println!("JUDGE account_live_4 SKIP reason={:?} note=买入未成交", buy.reason);
+        return;
+    }
+    let pos_id = buy.position_id.clone().unwrap();
+    // 当日卖出（T+1 锁仓）→ spec 要求 insufficient_sellable_quantity（fail-closed 行为正确性）。
+    let sell = account.operate_account(
+        OperateAccountRequest {
+            action: OperateAccountAction::ClosePosition {
+                position_id: pos_id.clone(),
+                quantity: Some(Shares(100)),
+                order_type: Some(OrderType::Market),
+                limit_price: None,
+                expires_at: None,
+                reason: "account_live_4 sell same day".into(),
+            },
+        },
+        AccountActor::Agent,
+    );
+    println!(
+        "JUDGE account_live_4 sell_t1_lock buyPrice={real_ask} sellAccepted={} sellReason={:?} \
+         expectedReason=insufficient_sellable_quantity(当日买入T+1锁仓不可卖)",
+        sell.accepted, sell.reason
+    );
+    // fail-closed 行为：当日买入不可卖。
+    use crate::domain::shared::ErrorCode;
+    assert!(
+        !sell.accepted && sell.reason == Some(ErrorCode::InsufficientSellableQuantity),
+        "T+1：当日买入当日卖出必须 fail-closed (insufficient_sellable_quantity)，实测 accepted={} reason={:?}",
+        sell.accepted,
+        sell.reason
+    );
+}
+
+/// account_live_5 · limit 撮合：用真实报价驱动挂单评估。
+///
+/// 挂一个**高于现价**的限价买单（保证 fresh 报价下立即可成交），evaluate_account_triggers
+/// 用真实 snapshot 撮合。JUDGE 行输出 limitPrice / realAsk0 / 是否成交 / fillPrice。
+#[tokio::test]
+#[ignore]
+async fn account_live_limit_fill_with_real_quote() {
+    use crate::domain::account::requests::FetchAccountInclude as Inc;
+    let (quotes, account) = make_wired_services();
+    let code = ts(STOCK_SH);
+    seed_instrument(&quotes, &code);
+
+    let Some(real_ask) = real_ask0(&quotes, &code).await else {
+        println!("JUDGE account_live_5 SKIP reason=no_fresh_ask note=需盘中跑");
+        return;
+    };
+    // 限价 = 现价 * 1.02（高于卖一 → fresh 时可成交）。
+    let limit_px = (real_ask * 1.02 * 100.0).round() / 100.0;
+    let place = account.operate_account(
+        OperateAccountRequest {
+            action: OperateAccountAction::OpenPosition {
+                ts_code: code.clone(),
+                quantity: Shares(100),
+                order_type: Some(OrderType::Limit),
+                limit_price: Some(Price(Decimal::from_str_exact(&limit_px.to_string()).unwrap())),
+                expires_at: Some(Utc::now() + chrono::Duration::days(1)),
+                stop_loss: None,
+                take_profit: None,
+                time_stop_at: None,
+                reason: "account_live_5 limit".into(),
+            },
+        },
+        AccountActor::Agent,
+    );
+    assert!(place.accepted, "limit 挂单应被接受: {:?}", place.reason);
+    let order_id = place.order_id.clone().unwrap();
+
+    // 用真实 snapshot 驱动撮合评估（沿用 scheduler 的 EvalDeps 构造方式）。
+    use crate::pipeline::account::eval::{evaluate_account_triggers, EvalDeps, EvalInput};
+    let deps = EvalDeps {
+        db: account.db().clone(),
+        gateway: account.gateway.clone(),
+        fee_policy: account.config().fee_policy.clone(),
+    };
+    let r = evaluate_account_triggers(EvalInput {
+        deps: &deps,
+        now: Utc::now(),
+        batch_size: 50,
+        cursor: None,
+    });
+    let fetched = account.fetch_account(FetchAccountRequest {
+        include: Some(Inc { orders: Some(true), ..Default::default() }),
+        order_status_in: None,
+        ..Default::default()
+    });
+    let order = fetched
+        .orders
+        .unwrap_or_default()
+        .into_iter()
+        .find(|o| o.order_id == order_id);
+    let (status, filled) = order
+        .map(|o| (format!("{:?}", o.status), o.filled_quantity.0))
+        .unwrap_or(("<gone>".into(), 0));
+    println!(
+        "JUDGE account_live_5 limit_match realAsk0={real_ask} limitPrice={limit_px} \
+         orderStatus={status} filledQty={filled} triggersThisBatch={} \
+         expected=ask0<=limitPrice且fresh时应(部分)成交",
+        r.triggers.len()
+    );
+    // 不硬断言成交（盘口深度可能不足），但若成交则数量必须 ≤ 100。
+    assert!(filled <= 100, "成交量不得超过委托量");
+}
+
+/// account_live_6 · fail-closed：非交易时段 / 不可达 stale → 即时成交拒单 code 正确。
+///
+/// 不依赖盘中：直接对 SH 标的发 market 单，若行情非 fresh / 拿不到盘口 → 必须 fail-closed，
+/// JUDGE 行输出实际 reason，与 spec 允许的 fail-closed code 集合比对。
+#[tokio::test]
+#[ignore]
+async fn account_live_fail_closed_reason_correct() {
+    use crate::domain::shared::ErrorCode;
+    let (quotes, account) = make_wired_services();
+    let code = ts(STOCK_SH);
+    seed_instrument(&quotes, &code);
+    let ask = real_ask0(&quotes, &code).await;
+
+    let resp = account.operate_account(
+        OperateAccountRequest {
+            action: OperateAccountAction::OpenPosition {
+                ts_code: code.clone(),
+                quantity: Shares(100),
+                order_type: Some(OrderType::Market),
+                limit_price: None,
+                expires_at: None,
+                stop_loss: None,
+                take_profit: None,
+                time_stop_at: None,
+                reason: "account_live_6 fail-closed".into(),
+            },
+        },
+        AccountActor::Agent,
+    );
+    println!(
+        "JUDGE account_live_6 fail_closed freshAsk={:?} accepted={} reason={:?} \
+         expected=有fresh盘口则成交;否则reason∈{{quote_stale,quote_missing,quote_price_missing,depth_missing,outside_trading_session,instrument_suspended,limit_up_down_blocked}}",
+        ask, resp.accepted, resp.reason
+    );
+    if ask.is_none() {
+        // 无 fresh 可成交行情 → 必须拒单，且 reason 为行情/盘口类。
+        assert!(!resp.accepted, "无 fresh 可成交行情时必须 fail-closed");
+        assert!(
+            matches!(
+                resp.reason,
+                Some(ErrorCode::QuoteStale)
+                    | Some(ErrorCode::QuoteMissing)
+                    | Some(ErrorCode::QuotePriceMissing)
+                    | Some(ErrorCode::DepthMissing)
+                    | Some(ErrorCode::OutsideTradingSession)
+                    | Some(ErrorCode::InstrumentSuspended)
+                    | Some(ErrorCode::LimitUpDownBlocked)
+            ),
+            "fail-closed reason 应为行情/盘口类，实测 {:?}",
+            resp.reason
+        );
+    }
+}

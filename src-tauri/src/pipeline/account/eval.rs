@@ -1824,4 +1824,252 @@ mod tests {
         snap.quote.bid[0].volume = Some(crate::domain::shared::Volume(ask_volume));
         snap
     }
+
+    // ------------------------------------------------------------------
+    // 保护条件触发：take_profit。
+    // Spec: §5 保护条件触发 — 多头 `price >= takeProfit` → take_profit trigger。
+    // ------------------------------------------------------------------
+    #[test]
+    fn protection_take_profit_triggers_when_price_ge_threshold() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_tp");
+        let prot = PositionProtection {
+            stop_loss: None,
+            take_profit: Some(Price(Decimal::new(110, 0))),
+            time_stop_at: None,
+            invalidation_signals: vec![],
+            enabled: true,
+            revision: 1,
+            updated_at: Utc::now(),
+        };
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_tp", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        // 现价 115 >= take_profit 110 → 命中。
+        let gw = MockQuoteGateway::new();
+        gw.set(&code, Ok(snap_with_price_and_freshness(&code, 115.0, FreshnessStatus::Fresh)));
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        let tp = r
+            .triggers
+            .iter()
+            .find(|t| matches!(t.trigger_type, AccountTriggerType::TakeProfit))
+            .expect("price >= takeProfit must emit take_profit trigger");
+        assert_eq!(tp.threshold.as_deref(), Some("110"), "trigger threshold = takeProfit");
+        assert!(tp.price.is_some(), "price-type trigger must carry hit price");
+        assert!(tp.quote_freshness.is_some(), "price-type trigger must carry freshness");
+    }
+
+    // ------------------------------------------------------------------
+    // 保护条件触发：take_profit 不命中（price < takeProfit）→ 无 trigger。
+    // ------------------------------------------------------------------
+    #[test]
+    fn protection_take_profit_no_trigger_when_price_below_threshold() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_tp2");
+        let prot = PositionProtection {
+            stop_loss: None,
+            take_profit: Some(Price(Decimal::new(110, 0))),
+            time_stop_at: None,
+            invalidation_signals: vec![],
+            enabled: true,
+            revision: 1,
+            updated_at: Utc::now(),
+        };
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_tp2", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        let gw = MockQuoteGateway::new();
+        gw.set(&code, Ok(snap_with_price_and_freshness(&code, 105.0, FreshnessStatus::Fresh)));
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: Arc::new(gw),
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        assert!(
+            !r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::TakeProfit)),
+            "price below takeProfit must NOT trigger"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 保护条件触发：time_stop。
+    // Spec: §5 — `now >= timeStopAt` → time_stop trigger（不依赖行情 freshness）。
+    // ------------------------------------------------------------------
+    #[test]
+    fn protection_time_stop_triggers_when_now_ge_threshold_independent_of_quote() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_ts");
+        let time_stop = Utc::now() - chrono::Duration::hours(1); // 已过期
+        let prot = PositionProtection {
+            stop_loss: None,
+            take_profit: None,
+            time_stop_at: Some(time_stop),
+            invalidation_signals: vec![],
+            enabled: true,
+            revision: 1,
+            updated_at: Utc::now(),
+        };
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_ts", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        // 不配置任何行情 → time_stop 仍应触发（§5 line 1081：time_stop 不依赖 freshness）。
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &_deps,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        assert!(
+            r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::TimeStop)),
+            "now >= timeStopAt must emit time_stop trigger even without quote"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 保护条件触发：missing quote → 跳过价格型评估，不生成 trigger，本批 warning 含 quote_missing。
+    // Spec: §5 行情边界（line 1080）。
+    // ------------------------------------------------------------------
+    #[test]
+    fn protection_price_eval_skipped_on_missing_quote_with_warning() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let pos = make_position(&code, "pos_miss");
+        let prot = make_protection(Some(95.0), 1);
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            AccountRepository::upsert_protection(tx, "pos_miss", &prot)?;
+            Ok(())
+        })
+        .unwrap();
+        // gateway 未配置该 code → get_display_snapshot None（missing）。
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &_deps,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        assert!(
+            !r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss)),
+            "missing quote must NOT generate price-type trigger"
+        );
+        assert!(
+            r.warnings.contains(&WarningCode::QuoteMissing)
+                || r.warnings.contains(&WarningCode::QuotePriceMissing),
+            "missing-quote price eval must surface quote_missing/quote_price_missing warning, got {:?}",
+            r.warnings
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 限价卖单到期 → expired + 释放冻结 lot（§5 line 1060）。
+    // ------------------------------------------------------------------
+    #[test]
+    fn limit_sell_expiry_releases_frozen_lots() {
+        let (db, _deps) = setup();
+        let code = seed_inst_for_eval(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        let now = trading_now();
+        // 先建一个仓位 + 可卖 lot。
+        let pos = make_position(&code, "pos_sx");
+        repo.tx(|tx| {
+            AccountRepository::upsert_position(tx, &pos)?;
+            let lot = crate::domain::account::types::PositionLot {
+                lot_id: "lot_sx".into(),
+                position_id: "pos_sx".into(),
+                ts_code: code.clone(),
+                source_fill_id: "f_sx".into(),
+                trade_date: crate::domain::shared::TradeDate::parse("20200101").unwrap(),
+                quantity: Shares(1000),
+                remaining_quantity: Shares(1000),
+                frozen_quantity: Shares(100),
+                sellable_from: crate::domain::shared::TradeDate::parse("20200102").unwrap(),
+                created_at: now,
+            };
+            AccountRepository::insert_lot(tx, &lot)?;
+            // 已过期的限价卖单 + 对应冻结 lot。
+            let mut order =
+                pending_limit_order("ord_sx", &code, OrderSide::Sell, 999.0, 100, Some("pos_sx"), now);
+            order.expires_at = Some(now - chrono::Duration::hours(1));
+            AccountRepository::upsert_order(tx, &order)?;
+            AccountRepository::upsert_freeze(
+                tx,
+                &FreezeEntry {
+                    order_id: "ord_sx".into(),
+                    ts_code: code.clone(),
+                    side: OrderSide::Sell,
+                    frozen_cash: Money(Decimal::ZERO),
+                    frozen_shares: Shares(100),
+                    frozen_lots: vec![crate::infrastructure::account::repository::FrozenLot {
+                        lot_id: "lot_sx".into(),
+                        quantity: 100,
+                    }],
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &_deps,
+            now,
+            batch_size: 10,
+            cursor: None,
+        });
+        let order = repo.get_order("ord_sx").unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::Expired, "expired sell order");
+        assert!(
+            repo.get_freeze("ord_sx").unwrap().is_none(),
+            "expiry must release sell-side freeze"
+        );
+        let lot = repo
+            .list_lots_by_position("pos_sx")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(lot.frozen_quantity.0, 0, "expiry releases frozen_quantity on lot");
+        assert!(
+            r.triggers
+                .iter()
+                .any(|t| matches!(t.trigger_type, AccountTriggerType::OrderExpired)),
+            "expired order must emit order_expired trigger"
+        );
+    }
 }

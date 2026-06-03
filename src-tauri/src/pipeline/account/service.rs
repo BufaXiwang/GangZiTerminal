@@ -5667,4 +5667,590 @@ mod tests {
             "Position.reasoning must carry the opening reason for audit"
         );
     }
+
+    // ====================================================================
+    // 本轮新增 — 全功能覆盖补齐
+    // ====================================================================
+
+    fn seed_index(db: &AppDb, ts: &str) -> TsCode {
+        let code = TsCode::parse(ts).unwrap();
+        QuotesRepository::new(db)
+            .upsert_instruments(&[Q_MarketInstrument {
+                ts_code: code.clone(),
+                name: "Index".into(),
+                category: InstrumentCategory::Index,
+                market: Market::SH,
+                board: None,
+                sector: None,
+                status: Some(InstrumentStatus::Listed),
+                is_st: Some(false),
+                publisher: None,
+                index_category: None,
+                fund_type: None,
+                management: None,
+                list_date: None,
+                source: Q_InstrumentSource::Tushare,
+                updated_at: Utc::now(),
+            }])
+            .unwrap();
+        code
+    }
+
+    // --- 可交易性：index 不可下单（instrument_not_tradable） ---
+    #[test]
+    fn trade_index_rejected_instrument_not_tradable() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_index(&db, "000001.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InstrumentNotTradable));
+        assert!(resp.account_event_ids.is_empty(), "预校验拒绝不写事件");
+    }
+
+    // --- 可交易性：未知标的（not_found） ---
+    #[test]
+    fn trade_unknown_instrument_rejected_not_found() {
+        let (_db, svc, _gw) = setup_account(10_000_000);
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: TsCode::parse("999999.SH").unwrap(),
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::NotFound));
+        assert!(resp.account_event_ids.is_empty());
+    }
+
+    // --- market 订单携带 limit_price → invalid_input，不创建订单 ---
+    #[test]
+    fn market_order_with_limit_price_rejected_invalid_input_no_event() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::PlaceOrder {
+                    ts_code: code,
+                    side: OrderSide::Buy,
+                    order_type: OrderType::Market,
+                    limit_price: Some(Price(Decimal::from(100))),
+                    quantity: Shares(100),
+                    expires_at: None,
+                    reason: "x".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, Some(ErrorCode::InvalidInput));
+        assert!(
+            resp.account_event_ids.is_empty(),
+            "market+limit_price 预校验拒绝必须不创建订单事实"
+        );
+    }
+
+    // --- close_position 缺省 + sellable 部分可卖 → data_partial（不报错，卖能卖的） ---
+    #[test]
+    fn close_position_default_partial_sellable_warns_data_partial() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        // 把 lot 设为「部分可卖」：sellable_from 过去，但只 500 可卖（手工拆一半冻结），
+        // 这里用更简单方式：直接放开 sellable_from 全量可卖，再造一个当日不可卖 lot。
+        let repo = AccountRepository::new(&db);
+        // 现有 lot 设为可卖。
+        for l in repo.list_lots_by_position(&pos_id).unwrap() {
+            repo.tx(|tx| {
+                tx.execute(
+                    "UPDATE account_lots SET sellable_from = '20200101' WHERE lot_id = ?",
+                    [&l.lot_id],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+        }
+        // 再加一笔当日买入（T+1 锁仓，不可卖）→ position.quantity 2000，sellable 1000。
+        let now = Utc::now();
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: now,
+        };
+        svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution { price: Price(Decimal::new(100, 0)), quantity: Shares(1000) },
+            "scale".into(),
+            OrderIntent::DirectOrder,
+            Some(pos_id.clone()),
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        // close 缺省（用 limit 避开交易时段门禁）→ 只下 sellable(1000)，剩余 1000 保留，warn data_partial。
+        let resp = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::ClosePosition {
+                    position_id: pos_id.clone(),
+                    quantity: None,
+                    order_type: Some(OrderType::Limit),
+                    limit_price: Some(Price(Decimal::new(99, 0))),
+                    expires_at: None,
+                    reason: "close partial".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(resp.accepted, "缺省 close 部分可卖应被接受（卖能卖的），got {:?}", resp);
+        assert!(
+            resp.warnings.contains(&WarningCode::DataPartial),
+            "sellable < quantity 时缺省 close 必须 warn data_partial，got {:?}",
+            resp.warnings
+        );
+        let order = AccountRepository::new(&db)
+            .get_order(resp.order_id.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(order.quantity.0, 1000, "缺省 close 只下 sellable(1000)");
+    }
+
+    // --- adjust_protection upsert 成功（首次创建 enabled 推断）+ no-op 拒绝 ---
+    #[test]
+    fn adjust_protection_upsert_success_then_noop_rejected() {
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        // adjust_protection 价格型保护需要参考价（spec §2 line 353）→ 提供 fresh quote。
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        // 首次创建：只给 stop_loss（低于成本价 100）→ enabled 推断为 true。
+        let r1 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: Some(Some(Price(Decimal::new(90, 0)))),
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: None,
+                    enabled: None,
+                    reason: "set sl".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(r1.accepted, "首次创建保护应成功: {:?}", r1);
+        let repo = AccountRepository::new(&db);
+        let p1 = repo.get_protection(&pos_id).unwrap().unwrap();
+        assert_eq!(p1.stop_loss, Some(Price(Decimal::new(90, 0))));
+        assert!(p1.enabled, "首次创建至少一个条件时 enabled 推断为 true");
+        let rev1 = p1.revision;
+        // no-op：再次提交同样的 stop_loss，无字段变化 → invalid_input，不写空事件。
+        let r2 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: Some(Some(Price(Decimal::new(90, 0)))),
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: None,
+                    enabled: None,
+                    reason: "noop".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(!r2.accepted, "无变化的 adjust_protection 必须拒绝");
+        assert_eq!(r2.reason, Some(ErrorCode::InvalidInput));
+        let p2 = repo.get_protection(&pos_id).unwrap().unwrap();
+        assert_eq!(p2.revision, rev1, "no-op 不得递增 revision");
+        // 实际变更（改 stop_loss）→ revision 递增。
+        let r3 = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: Some(Some(Price(Decimal::new(85, 0)))),
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: None,
+                    enabled: None,
+                    reason: "tighten".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(r3.accepted);
+        let p3 = repo.get_protection(&pos_id).unwrap().unwrap();
+        assert!(p3.revision > rev1, "实际变更必须递增 revision");
+    }
+
+    // --- record_invalidation_signal 成功：精确命中 → 生成 invalidated trigger ---
+    #[test]
+    fn record_invalidation_signal_success_generates_invalidated_trigger() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code, 1000);
+        // 设置失效信号 + enabled。
+        let set = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: None,
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: Some(vec!["earnings_recovery_failed".into()]),
+                    enabled: Some(true),
+                    reason: "set signal".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(set.accepted, "设置失效信号应成功: {:?}", set);
+        // 精确命中 signal → invalidated trigger。
+        let hit = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id.clone(),
+                    signal: "earnings_recovery_failed".into(),
+                    evidence_ref: Some("news#123".into()),
+                    reason: "thesis broke".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(hit.accepted, "命中失效信号应成功: {:?}", hit);
+        assert!(hit.trigger_id.is_some(), "精确命中必须返回 invalidated triggerId");
+        let trig_id = hit.trigger_id.clone().unwrap();
+        let repo = AccountRepository::new(&db);
+        let trig = repo.get_trigger(&trig_id).unwrap().unwrap();
+        assert!(matches!(trig.trigger_type, AccountTriggerType::Invalidated));
+        assert_eq!(trig.position_id.as_deref(), Some(pos_id.as_str()));
+
+        // 同 revision + 同 signal 再次记录 → 不重复生成 trigger（去重）。
+        let again = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id.clone(),
+                    signal: "earnings_recovery_failed".into(),
+                    evidence_ref: None,
+                    reason: "repeat".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(again.accepted, "重复记录仍写 invalidation_signal_recorded 事件");
+        assert!(
+            again.trigger_id.is_none(),
+            "同 revision+signal 不得重复生成 invalidated trigger"
+        );
+
+        // 未命中的 signal → 仅记录事件，无 trigger。
+        let miss = svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::RecordInvalidationSignal {
+                    position_id: pos_id.clone(),
+                    signal: "some_other_signal".into(),
+                    evidence_ref: None,
+                    reason: "no match".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        assert!(miss.accepted);
+        assert!(miss.trigger_id.is_none(), "未命中 signal 不生成 trigger");
+    }
+
+    // --- mark_trigger_handled 成功 + 幂等再标记 ---
+    #[test]
+    fn mark_trigger_handled_success_and_idempotent() {
+        use crate::pipeline::account::eval::{evaluate_account_triggers, EvalDeps, EvalInput};
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        // adjust_protection 需要参考价（fresh quote），成本价 100 → stop_loss 95 合法。
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        // 设置止损 + enabled。
+        svc.operate_account(
+            OperateAccountRequest {
+                action: OperateAccountAction::AdjustProtection {
+                    position_id: pos_id.clone(),
+                    stop_loss: Some(Some(Price(Decimal::new(95, 0)))),
+                    take_profit: None,
+                    time_stop_at: None,
+                    invalidation_signals: None,
+                    enabled: Some(true),
+                    reason: "sl".into(),
+                },
+            },
+            AccountActor::Agent,
+        );
+        // 用 eval 生成 stop_loss trigger（现价 90 <= 95）。
+        let gw2 = Arc::new(MockQuoteGateway::new());
+        gw2.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(90.0, 10_000)],
+                vec![(90.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let deps = EvalDeps {
+            db: db.clone(),
+            gateway: gw2,
+            fee_policy: AccountFeePolicy::default(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now: Utc::now(),
+            batch_size: 10,
+            cursor: None,
+        });
+        let trig = r
+            .triggers
+            .iter()
+            .find(|t| matches!(t.trigger_type, AccountTriggerType::StopLoss))
+            .expect("eval should produce stop_loss trigger");
+        let trig_id = trig.trigger_id.clone();
+        // mark handled — 首次成功，写 trigger_handled 事件。
+        let m1 = svc.mark_trigger_handled(MarkTriggerHandledRequest {
+            trigger_id: trig_id.clone(),
+            reason: "consumed".into(),
+        });
+        assert!(m1.accepted);
+        assert!(!m1.account_event_ids.is_empty(), "首次标记必须写 trigger_handled 事件");
+        assert!(m1.trigger.as_ref().unwrap().handled, "trigger.handled 必须为 true");
+        // 再次标记 — 幂等：accepted=true，不重写事件。
+        let m2 = svc.mark_trigger_handled(MarkTriggerHandledRequest {
+            trigger_id: trig_id.clone(),
+            reason: "again".into(),
+        });
+        assert!(m2.accepted);
+        assert!(m2.account_event_ids.is_empty(), "幂等再标记不得重写事件");
+        assert!(m2.trigger.as_ref().unwrap().handled);
+    }
+
+    // --- 市价同步成交路径创建 order_filled trigger（operate_account 内即时成交） ---
+    #[test]
+    fn market_sync_fill_creates_order_filled_trigger() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        // 市价全量成交（commit_market_fill 绕过交易时段门禁，验证终态 trigger 写入）。
+        let resp = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Buy,
+            Shares(100),
+            FillExecution { price: Price(Decimal::new(100, 0)), quantity: Shares(100) },
+            "buy".into(),
+            OrderIntent::OpenPosition,
+            None,
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(resp.accepted);
+        assert!(
+            resp.trigger_id.is_some(),
+            "市价全量成交（终态 order_filled）必须创建 order_filled trigger 并返回 triggerId"
+        );
+        let repo = AccountRepository::new(&db);
+        let trig = repo.get_trigger(resp.trigger_id.as_ref().unwrap()).unwrap().unwrap();
+        assert!(matches!(trig.trigger_type, AccountTriggerType::OrderFilled));
+        assert_eq!(trig.order_id, resp.order_id);
+    }
+
+    // --- direct_order 仓位派生：买入开仓 → 再买加仓 → 卖出平仓 ---
+    #[test]
+    fn direct_order_derives_position_opened_scaled_closed() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: Utc::now(),
+        };
+        let now = Utc::now();
+        let fresh = Freshness {
+            status: FreshnessStatus::Fresh,
+            captured_at: Some(now),
+            exchange_time: None,
+            age_ms: None,
+            source: None,
+            warning: None,
+        };
+        // 1) direct_order 买入，无 open position → position_opened。
+        let b1 = svc.commit_market_fill(
+            code.clone(),
+            instrument.clone(),
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution { price: Price(Decimal::new(100, 0)), quantity: Shares(1000) },
+            "open".into(),
+            OrderIntent::DirectOrder,
+            None,
+            now,
+            fresh.clone(),
+        );
+        assert!(b1.accepted);
+        let pos_id = b1.position_id.clone().unwrap();
+        let repo = AccountRepository::new(&db);
+        let evs1 = repo.list_events(200, 0).unwrap();
+        assert!(
+            evs1.iter().any(|e| matches!(e.event_type, AccountEventType::PositionOpened)),
+            "首笔 direct_order 买入应派生 position_opened"
+        );
+        // 2) direct_order 再买入，已有 open position → position_scaled。
+        let b2 = svc.commit_market_fill(
+            code.clone(),
+            instrument.clone(),
+            OrderSide::Buy,
+            Shares(1000),
+            FillExecution { price: Price(Decimal::new(110, 0)), quantity: Shares(1000) },
+            "add".into(),
+            OrderIntent::DirectOrder,
+            Some(pos_id.clone()),
+            now,
+            fresh.clone(),
+        );
+        assert!(b2.accepted);
+        let evs2 = repo.list_events(200, 0).unwrap();
+        assert!(
+            evs2.iter().any(|e| matches!(e.event_type, AccountEventType::PositionScaled)),
+            "已有 open position 时 direct_order 买入应派生 position_scaled"
+        );
+        // avg_cost 加权：(1000*100 + buyfee1 + 1000*110 + buyfee2) / 2000，约 105+。
+        let pos = repo.get_position(&pos_id).unwrap().unwrap();
+        assert_eq!(pos.quantity.0, 2000);
+        assert!(
+            pos.avg_cost.0 > Decimal::new(105, 0) && pos.avg_cost.0 < Decimal::new(106, 0),
+            "加仓后 avg_cost 应在 105~106（含双笔买入佣金/过户费），实测 {}",
+            pos.avg_cost.0
+        );
+        // 放开 T+1，全卖 → position_closed。
+        for l in repo.list_lots_by_position(&pos_id).unwrap() {
+            repo.tx(|tx| {
+                tx.execute(
+                    "UPDATE account_lots SET sellable_from = '20200101' WHERE lot_id = ?",
+                    [&l.lot_id],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .unwrap();
+        }
+        let s = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Sell,
+            Shares(2000),
+            FillExecution { price: Price(Decimal::new(120, 0)), quantity: Shares(2000) },
+            "close".into(),
+            OrderIntent::DirectOrder,
+            Some(pos_id.clone()),
+            now,
+            fresh,
+        );
+        assert!(s.accepted, "全卖应成功: {:?}", s);
+        let evs3 = repo.list_events(300, 0).unwrap();
+        assert!(
+            evs3.iter().any(|e| matches!(e.event_type, AccountEventType::PositionClosed)),
+            "卖出后剩余为 0 应派生 position_closed"
+        );
+        let closed = repo.get_position(&pos_id).unwrap().unwrap();
+        assert!(matches!(closed.status, PositionStatus::Closed), "仓位应 closed");
+    }
 }
