@@ -4,7 +4,9 @@
 //
 // 卡片：4 个核心指数 + 市场宽度 + 行业热度。
 
+import { useEffect } from "react";
 import { useCoreIndexes, CORE_INDEXES } from "../../lib/useCoreIndexes";
+import { setSource as setPullSource } from "../../lib/quotePull";
 import { useMarketBreadth } from "../../lib/useMarketBreadth";
 import { useIndustryHeatmap } from "../../lib/useIndustryHeatmap";
 import { useMarketSession } from "../../lib/tradingSession";
@@ -28,6 +30,15 @@ export function MarketMetricsRow({
   const breadth = useMarketBreadth();
   const heatmap = useIndustryHeatmap({ topN: 5 });
   const session = useMarketSession();
+
+  // 聚焦 pull：把核心指数声明为 indices 来源，交给 quotePull 协调器统一刷新。
+  useEffect(() => {
+    setPullSource(
+      "indices",
+      CORE_INDEXES.map((c) => c.tsCode),
+    );
+    return () => setPullSource("indices", []);
+  }, []);
 
   return (
     <div className="market-metrics-row">

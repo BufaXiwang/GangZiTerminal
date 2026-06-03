@@ -29,6 +29,7 @@ import {
   type WatchlistItemView,
 } from "../bindings";
 import { useWatchlistStore } from "../lib/watchlistStore";
+import { setSource as setPullSource } from "../lib/quotePull";
 import { AccountSummary } from "./account/AccountSummary";
 import { AddWatchlistModal } from "./account/AddWatchlistModal";
 import { PositionsPanel } from "./account/PositionsPanel";
@@ -129,6 +130,17 @@ export default function AccountPage() {
       unlisten?.();
     };
   }, [refresh]);
+
+  // 聚焦 pull：把自选 + 持仓声明为 account 来源，交给 quotePull 协调器统一刷新
+  //（account 优先级最高，cap 截断时不会被列表头挤掉）。卸载时清空贡献。
+  useEffect(() => {
+    const codes = [
+      ...watchlistItems.map((it) => it.tsCode),
+      ...positions.map((p) => p.tsCode),
+    ];
+    setPullSource("account", codes);
+  }, [watchlistItems, positions]);
+  useEffect(() => () => setPullSource("account", []), []);
 
   const status = error
     ? `加载失败：${error}`

@@ -26,6 +26,7 @@ import { MarketList, type SortDir, type SortKey } from "./market/MarketList";
 import { MarketMetricsRow } from "./market/MarketMetricsRow";
 import { RowContextMenu } from "./market/RowContextMenu";
 import { CORE_INDEXES } from "../lib/useCoreIndexes";
+import { setSource as setPullSource } from "../lib/quotePull";
 import {
   getCachedList,
   setCachedList,
@@ -198,10 +199,11 @@ export default function MarketPage() {
     };
   }, [category, query, refreshTick]);
 
-  // 声明热点集（spec §5 热点档）：核心指数 + 自选 + 成交额 top-80（可见列表头）。
-  // 后端 3s tick 高频刷这批（≤120）。debounce 800ms；items 每次 progress 重拉会变，
-  // 故约每 2.5s 推一次（命令很轻，只覆盖一个 Vec）。MarketPage keep-alive 常驻，
-  // 切到别的 tab 也持续维护热点集，自选/指数始终高频。
+  // 聚焦 pull（重构 Step B）：把"可见列表头 + 当前选中"声明为 market 来源，
+  // 交给 quotePull 协调器统一并集去重 + 节流刷新（取代旧的后端热点集 setQuoteHotset）。
+  // items 每次 progress 重拉会变，协调器内部按并集去重 + debounce 合并抖动，不会叠刷。
+  // 可见列表头取成交额 top-80；选中标的（含核心指数详情头）一并纳入。
+  // 自选 / 持仓由 AccountPage 经 account 来源贡献，核心指数由 MarketMetricsRow 贡献。
   useEffect(() => {
     const top = [...items]
       .filter((it) => it.quote?.amount != null)
@@ -210,18 +212,9 @@ export default function MarketPage() {
       )
       .slice(0, 80)
       .map((it) => it.tsCode);
-    const codes = Array.from(
-      new Set([
-        ...CORE_INDEXES.map((c) => c.tsCode),
-        ...Array.from(starred),
-        ...top,
-      ]),
-    ).slice(0, 120);
-    const t = window.setTimeout(() => {
-      void commands.setQuoteHotset(codes);
-    }, 800);
-    return () => window.clearTimeout(t);
-  }, [items, starred]);
+    const codes = [...top, ...(selected ? [selected] : [])];
+    setPullSource("market", codes);
+  }, [items, selected]);
 
   // 选中核心指数时加载并**持续刷新**其 quote（externalItem 形式）。
   // 依赖 [selected, refreshTick]：refreshTick 在 universe progress 事件时 +1
