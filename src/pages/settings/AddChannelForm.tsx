@@ -8,7 +8,7 @@
 //
 // API Key 写入即提交，永不回显（type="password"，不预填）。
 
-import { AlertCircle, Loader2, Plus } from "lucide-react";
+import { AlertCircle, Check, Loader2, Plus } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 import {
   commands,
@@ -17,7 +17,12 @@ import {
   type DiscoveredModel,
   type WireFormat,
 } from "../../bindings";
-import { WIRE_FORMAT_LABEL, WIRE_FORMAT_OPTIONS, formatError } from "./types";
+import {
+  WIRE_FORMAT_LABEL,
+  WIRE_FORMAT_OPTIONS,
+  formatError,
+  providerInitial,
+} from "./types";
 
 type Tab = "preset" | "custom";
 
@@ -265,10 +270,25 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
                     onClick={() => setPresetKey(p.key)}
                     aria-pressed={active}
                   >
-                    <span className="settings-preset-name">{p.provider}</span>
-                    <span className="settings-preset-sub muted">
-                      {WIRE_FORMAT_LABEL[p.wireFormat]}
+                    <span className="settings-avatar" aria-hidden>
+                      {providerInitial(p.provider)}
                     </span>
+                    <span className="settings-preset-text">
+                      <span className="settings-preset-name">
+                        {p.provider}
+                      </span>
+                      <span className="settings-preset-sub muted">
+                        {WIRE_FORMAT_LABEL[p.wireFormat]}
+                      </span>
+                    </span>
+                    {active && (
+                      <Check
+                        size={14}
+                        strokeWidth={2.5}
+                        className="settings-preset-check"
+                        aria-hidden
+                      />
+                    )}
                   </button>
                 );
               })

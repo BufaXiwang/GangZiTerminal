@@ -2871,21 +2871,30 @@ body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 24px;
-  max-width: 920px;
+  gap: 20px;
+  max-width: 900px;
   padding-bottom: 24px;
 }
+
+/* -------- section 卡片化 -------- */
 
 .settings-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
 }
 
 .settings-section-head {
   display: flex;
   align-items: baseline;
+  justify-content: space-between;
   gap: 10px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .settings-section-title {
@@ -2900,14 +2909,45 @@ body {
   font-size: 12px;
 }
 
+.settings-section-body {
+  padding: 18px 20px;
+}
+
+/* -------- provider 头像（渠道行 + 预设卡片共用） -------- */
+
+.settings-avatar {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-md);
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1;
+  user-select: none;
+}
+
+/* -------- empty 占位 -------- */
+
 .settings-current-empty,
 .settings-empty {
   font-size: 13px;
-  padding: 12px 14px;
+  padding: 14px 16px;
   border: 1px dashed var(--border-default);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: var(--bg-soft);
 }
+
+.settings-empty {
+  margin: 18px 20px;
+}
+
+/* -------- 当前模型选择器 -------- */
 
 .settings-current-select {
   height: 32px;
@@ -2921,7 +2961,63 @@ body {
   font-size: 13px;
 }
 
-/* -------- 渠道列表 -------- */
+.settings-current-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.settings-current-pill {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 140px;
+  padding: 10px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.settings-current-pill:hover:not(:disabled):not(.active) {
+  background: var(--bg-soft);
+}
+
+.settings-current-pill.active {
+  border: 1.5px solid var(--brand);
+  background: var(--brand-soft);
+  cursor: default;
+  padding: 9.5px 13.5px;
+}
+
+.settings-current-pill-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  color: var(--brand);
+}
+
+.settings-current-pill-model {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg-strong);
+  padding-right: 16px;
+}
+
+.settings-current-pill.active .settings-current-pill-model {
+  font-weight: 600;
+}
+
+.settings-current-pill-provider {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+/* -------- 渠道列表（行 full-bleed） -------- */
 
 .settings-channel-list {
   list-style: none;
@@ -2929,86 +3025,131 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  background: var(--bg-card);
 }
 
 .settings-channel-row {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 10px 14px;
+  gap: 14px;
+  padding: 12px 20px;
   border-bottom: 1px solid var(--border-soft);
+  transition: background 120ms ease;
 }
 
 .settings-channel-row:last-child {
   border-bottom: none;
 }
 
+.settings-channel-row:hover {
+  background: var(--bg-soft);
+}
+
 .settings-channel-row.active {
-  background: var(--brand-soft);
+  background: var(--bg-soft);
+  box-shadow: inset 3px 0 0 var(--brand);
 }
 
 .settings-channel-main {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 2px;
   flex: 1 1 auto;
   min-width: 0;
 }
 
 .settings-channel-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 13px;
-  color: var(--fg-default);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .settings-channel-model {
   font-weight: 600;
   color: var(--fg-strong);
   font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.settings-active-chip {
+.settings-channel-provider {
+  font-size: 11px;
+}
+
+.settings-active-pill {
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .settings-channel-meta {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 14px;
   flex: 0 0 auto;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .settings-wire-badge {
   background: var(--bg-soft);
   color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  padding: 2px 8px;
 }
 
 .settings-channel-host {
-  color: var(--fg-muted);
-  font-size: 12px;
-  max-width: 200px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--fg-faint);
+  font-size: 11px;
+  max-width: 180px;
+}
+
+.settings-channel-host-icon {
+  flex: 0 0 auto;
+  color: var(--fg-faint);
+}
+
+.settings-channel-host-text {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .settings-key-status {
-  color: var(--fg-faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--fg-muted);
+  font-size: 11px;
 }
 
-.settings-key-status.set {
-  color: var(--chart-down);
+.settings-key-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+}
+
+.settings-key-status.set .settings-key-dot {
+  background: var(--chart-down);
 }
 
 .settings-disabled-tag {
   color: var(--state-warn);
+  font-size: 11px;
 }
 
 .settings-remove-btn {
@@ -3016,10 +3157,18 @@ body {
   width: 32px;
   padding: 0;
   justify-content: center;
+  color: var(--fg-faint);
+  opacity: 0.5;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.settings-channel-row:hover .settings-remove-btn {
+  opacity: 1;
   color: var(--fg-muted);
 }
 
 .settings-remove-btn:hover:not(:disabled) {
+  opacity: 1;
   color: var(--chart-up);
 }
 
@@ -3029,10 +3178,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  padding: 16px;
 }
 
 .settings-add-tabs {
@@ -3046,39 +3191,61 @@ body {
 }
 
 .settings-preset-cards {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 10px;
-  flex-wrap: wrap;
 }
 
 .settings-preset-card {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 120px;
-  padding: 10px 14px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
   border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: var(--bg-card);
   cursor: pointer;
   text-align: left;
-  transition: border-color 120ms ease, background 120ms ease;
+  transition: border-color 120ms ease, background 120ms ease,
+    transform 120ms ease, box-shadow 120ms ease;
 }
 
 .settings-preset-card:hover {
   border-color: var(--border-strong);
   background: var(--bg-soft);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
 }
 
 .settings-preset-card.active {
-  border-color: var(--brand);
+  border: 1.5px solid var(--brand);
   background: var(--brand-soft);
+  transform: none;
+  box-shadow: none;
+}
+
+.settings-preset-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-preset-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  color: var(--brand);
 }
 
 .settings-preset-name {
   font-size: 13px;
   font-weight: 600;
   color: var(--fg-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .settings-preset-sub {

@@ -5,9 +5,9 @@
 // 每行：`{model} ({provider})` + wireFormat badge + host + 已配置 key 状态 +
 //        enabled / active 标记 + 删除。apiKey 永不展示明文（只显示 apiKeySet）。
 
-import { Check, Trash2 } from "lucide-react";
+import { Check, Globe, Trash2 } from "lucide-react";
 import type { ProviderChannelView } from "../../bindings";
-import { WIRE_FORMAT_LABEL, hostOf } from "./types";
+import { WIRE_FORMAT_LABEL, hostOf, providerInitial } from "./types";
 
 interface ChannelListProps {
   channels: ProviderChannelView[];
@@ -31,32 +31,50 @@ export function ChannelList({ channels, onRemove, busy }: ChannelListProps) {
           key={ch.channelId}
           className={`settings-channel-row${ch.isActive ? " active" : ""}`}
         >
+          <span className="settings-avatar" aria-hidden>
+            {providerInitial(ch.provider)}
+          </span>
+
           <div className="settings-channel-main">
             <span className="settings-channel-name">
               <span className="settings-channel-model">{ch.model}</span>
-              <span className="muted"> ({ch.provider})</span>
+              {ch.isActive && (
+                <span
+                  className="settings-active-pill"
+                  title="当前模型"
+                >
+                  <Check size={11} strokeWidth={2.5} /> 当前
+                </span>
+              )}
             </span>
-            {ch.isActive && (
-              <span className="chip active settings-active-chip" title="当前模型">
-                <Check size={12} strokeWidth={2} /> 当前
-              </span>
-            )}
+            <span className="settings-channel-provider muted">
+              {ch.provider}
+            </span>
           </div>
 
           <div className="settings-channel-meta">
-            <span className="chip settings-wire-badge" title="消息格式">
+            <span className="settings-wire-badge" title="消息格式">
               {WIRE_FORMAT_LABEL[ch.wireFormat]}
             </span>
-            <span className="settings-channel-host tabular" title={ch.baseUrl ?? ""}>
-              {hostOf(ch.baseUrl)}
+            <span
+              className="settings-channel-host tabular"
+              title={ch.baseUrl ?? ""}
+            >
+              <Globe size={11} className="settings-channel-host-icon" aria-hidden />
+              <span className="settings-channel-host-text">
+                {hostOf(ch.baseUrl)}
+              </span>
             </span>
             <span
               className={`settings-key-status${ch.apiKeySet ? " set" : ""}`}
               title={ch.apiKeySet ? "已配置 API Key" : "未配置 API Key"}
             >
-              {ch.apiKeySet ? "已配置 key" : "无 key"}
+              <span className="settings-key-dot" aria-hidden />
+              {ch.apiKeySet ? "已配置" : "无 key"}
             </span>
-            {!ch.enabled && <span className="settings-disabled-tag">已禁用</span>}
+            {!ch.enabled && (
+              <span className="settings-disabled-tag">已禁用</span>
+            )}
           </div>
 
           <button

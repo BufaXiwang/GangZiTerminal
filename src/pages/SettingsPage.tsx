@@ -125,17 +125,24 @@ export default function SettingsPage() {
               Agent run 走选中渠道
             </span>
           </header>
-          <CurrentModelSelector
-            channels={channels}
-            onSelect={handleSetActive}
-            busy={mutating}
-          />
+          <div className="settings-section-body">
+            <CurrentModelSelector
+              channels={channels}
+              onSelect={handleSetActive}
+              busy={mutating}
+            />
+          </div>
         </section>
 
-        {/* 渠道列表 */}
+        {/* 渠道列表 — 行 full-bleed，不包 body */}
         <section className="settings-section">
           <header className="settings-section-head">
             <h2 className="settings-section-title">模型渠道</h2>
+            {channels.length > 0 && (
+              <span className="muted settings-section-hint">
+                {channels.length} 个
+              </span>
+            )}
           </header>
           <ChannelList
             channels={channels}
@@ -149,7 +156,9 @@ export default function SettingsPage() {
           <header className="settings-section-head">
             <h2 className="settings-section-title">添加渠道</h2>
           </header>
-          <AddChannelForm presets={presets} onSaved={handleSaved} />
+          <div className="settings-section-body">
+            <AddChannelForm presets={presets} onSaved={handleSaved} />
+          </div>
         </section>
       </div>
     </PageShell>

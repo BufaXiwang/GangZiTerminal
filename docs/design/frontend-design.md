@@ -83,6 +83,7 @@ Agent 为什么这样判断 / 操作？
 - 密集列表和工具栏优先用 6-8px gap。
 - 新增卡片默认使用 `--radius-sm`；只有沿用现有容器或 modal 时使用更大圆角。
 - 不新增卡片套卡片；重复项可以是 card，页面 section 不做漂浮卡片。
+- **例外——配置/设置类页面**（如设置页）：内容是分组的配置项而非数据工作面，**允许**把页面 section 做成 `radius-lg` + 轻 `shadow-sm` 的卡片来分组（见 §4 设置页 视觉结构）。数据工作面（市场 / 资讯 / 模拟账户）仍保持扁平、不漂浮。
 
 ### 图标
 
@@ -243,6 +244,13 @@ Agent tabbar
 - API Key **只提交不回显**：保存后列表只显示"已配置"状态，不回传明文（走 specta 强类型 command，不裸调 invoke，不在前端持有 token）。
 - 模型发现失败时降级为手动输入模型名（允许多个），不阻塞配置。
 - 新建渠道默认 enabled；首次配置完成后自动设为当前模型（若此前没有当前模型）。
+
+视觉结构（沿用暖纸面设计系统，不引入新色）：
+
+- 三个区块各为一张卡片（`bg-card` + `border-soft` + `radius-lg` + `shadow-sm`）：header 条（serif 标题 + 右侧 muted hint/计数）+ body。模型渠道的行 full-bleed（无内边距留白，行间 `border-soft` 分隔）。
+- provider 头像：取渠道名首字母的方形 `brand-soft` 徽标，用在渠道行最左与预设卡片左侧，给来源一个视觉锚点。
+- 当前模型选择器用一排 channel pill 卡片（model mono + provider muted）；选中态为 `brand` 边框 + `brand-soft` 底 + 右上角 brand Check，明显区别于未选中。
+- 渠道行 key 状态用状态点 + 文字：已配置 = `chart-down` 绿点，未配置 = `fg-faint` 点；当前渠道左侧 3px `brand` 竖条 + 极淡底色。
 
 ---
 

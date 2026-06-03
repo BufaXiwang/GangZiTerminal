@@ -4,6 +4,7 @@
 //
 // 渠道少时用 segmented，多时退化为原生 select，避免横向溢出。
 
+import { Check } from "lucide-react";
 import type { ProviderChannelView } from "../../bindings";
 
 interface CurrentModelSelectorProps {
@@ -53,7 +54,11 @@ export function CurrentModelSelector({
   }
 
   return (
-    <div className="segmented" role="radiogroup" aria-label="当前模型">
+    <div
+      className="settings-current-pills"
+      role="radiogroup"
+      aria-label="当前模型"
+    >
       {channels.map((ch) => {
         const active = ch.channelId === activeId;
         return (
@@ -62,12 +67,23 @@ export function CurrentModelSelector({
             type="button"
             role="radio"
             aria-checked={active}
-            className={`segmented-item${active ? " active" : ""}`}
+            className={`settings-current-pill${active ? " active" : ""}`}
             disabled={busy || active}
             onClick={() => onSelect(ch.channelId)}
             title={label(ch)}
           >
-            {label(ch)}
+            {active && (
+              <Check
+                size={14}
+                strokeWidth={2.5}
+                className="settings-current-pill-check"
+                aria-hidden
+              />
+            )}
+            <span className="settings-current-pill-model">{ch.model}</span>
+            <span className="settings-current-pill-provider">
+              {ch.provider}
+            </span>
           </button>
         );
       })}

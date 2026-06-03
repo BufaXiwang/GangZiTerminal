@@ -31,6 +31,11 @@ export function hostOf(baseUrl: string | null | undefined): string {
   }
 }
 
+/** 渠道/预设头像首字母：取 provider 名首字符大写，给来源一个视觉锚点。 */
+export function providerInitial(p: string): string {
+  return (p.trim()[0] ?? "?").toUpperCase();
+}
+
 /** Result error → 展示文案（code: message）。 */
 export function formatError(error: {
   code: string;
