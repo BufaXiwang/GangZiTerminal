@@ -215,12 +215,13 @@ export default function NewsPage() {
         return [...prev, ...batch.filter((x) => !seen.has(x.id))];
       });
       setHasMoreOlder(batch.length >= PAGE_SIZE);
-      applyDateCounts(res.data.dateCounts);
+      // 不更新 dateCounts：本请求带 publishedTo 游标，返回的 dateCounts 被截断（只含 ≤游标 的天）。
+      // dateCounts 是「全量每日真实总数」，只由无游标请求（初始/筛选/刷新）维护。
     } else {
       setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
     }
     setLoadingMore(false);
-  }, [fetchWindow, applyDateCounts, hasMoreOlder, loading, loadingMore]);
+  }, [fetchWindow, hasMoreOlder, loading, loadingMore]);
 
   // === 向更新（上滑顶部 sentinel）：publishedFrom = newest.publishedAt, order:"asc" ===
   // reverse 后 prepend，并在 layout effect 里做滚动锚定补偿。
@@ -249,12 +250,12 @@ export default function NewsPage() {
       });
       // 原始批满页 → 上方可能还有更新的；空/不满 → 已到最新端。
       setHasMoreNewer(rawLen >= PAGE_SIZE);
-      applyDateCounts(res.data.dateCounts);
+      // 不更新 dateCounts（同上：本请求带 publishedFrom 游标，返回值被截断）。
     } else {
       setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
     }
     setLoadingNewer(false);
-  }, [fetchWindow, applyDateCounts, hasMoreNewer, loading, loadingNewer]);
+  }, [fetchWindow, hasMoreNewer, loading, loadingNewer]);
 
   const handleRefresh = useCallback(() => {
     setRefreshTick((t) => t + 1);
@@ -306,7 +307,7 @@ export default function NewsPage() {
         setHasMoreOlder(batch.length >= PAGE_SIZE);
         // anchored 看历史：上方可能有更新的，置 true；空批时首次上滑会把它置 false。
         setHasMoreNewer(batch.length > 0);
-        applyDateCounts(res.data.dateCounts);
+        // 不更新 dateCounts（本请求带 publishedTo 锚定游标，返回值被截断；保留全量计数）。
         setLastUpdated(new Date());
       } else {
         setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
@@ -320,7 +321,7 @@ export default function NewsPage() {
       };
       requestAnimationFrame(tick);
     },
-    [fetchWindow, applyDateCounts, scrollToDate],
+    [fetchWindow, scrollToDate],
   );
 
   const handleRegisterSectionRef = useCallback(
