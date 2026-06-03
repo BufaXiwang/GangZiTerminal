@@ -42,22 +42,6 @@ pub fn scan_market(
     Ok(service.scan_market(request))
 }
 
-/// 声明热点集（spec §5 热点档）：前端把自选 + 可见列表 top-N + 关注标的传入，
-/// scheduler 的 3s tick 会高频刷这批（≤120）。非法 ts_code 跳过。
-#[tauri::command]
-#[specta::specta]
-pub fn set_quote_hotset(
-    ts_codes: Vec<String>,
-    service: State<'_, Arc<QuotesService>>,
-) -> Result<(), CommandError> {
-    let codes: Vec<TsCode> = ts_codes
-        .iter()
-        .filter_map(|s| TsCode::parse(s).ok())
-        .collect();
-    service.set_quote_hotset(codes);
-    Ok(())
-}
-
 /// 聚焦按需刷新一批 quotes（spec §5「实时行情（聚焦按需）」）：前端把当前关注的标的
 /// （自选 / 可见列表 / 详情）传入，后端按新鲜度跳过 + 80/批并发跑连接池刷 `MARKET_SNAPSHOT`，
 /// 通过 `market-quotes-refresh-progress`(scope=subscribed) 增量推回前端。非法 ts_code 跳过。

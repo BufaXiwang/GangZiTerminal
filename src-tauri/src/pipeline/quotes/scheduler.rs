@@ -3,17 +3,16 @@
 //! Spec: docs/design/quotes-module.md §5 后台刷新。
 //!
 //! 调度档：
-//! - 关注 quote 15s（subscribed_intraday）
-//! - universe quote 60s（universe_intraday）
+//! - universe 滚动刷新：唯一后台报价任务。把全市场切 80 只/批，按固定 cycle
+//!   （默认 30s）滚动轮刷——每 roll tick（1s）推 `ceil(批数 / cycle_secs)` 个
+//!   80-批，cursor 前进、到末尾 wrap，只在 `is_in_quote_refresh_window` 内跑。
 //! - 收盘快照 15:30 触发（close_snapshot）
 //!   + 5min 重试，最多 6 次，直到当日完整完成。
 //! - 16:00 K 线预热（universe daily K + qfq/hfq）
 //! - 每日 09:00 daily_basic（上一交易日）
 //! - 每日 09:15 公司事件（dividends + suspensions T-3..T+30）
 
-use crate::domain::quotes::{
-    core_indexes, RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose,
-};
+use crate::domain::quotes::{RefreshDataScope, RefreshMarketQuotesScope, RefreshPurpose};
 use crate::infrastructure::quotes::TradeCalendar;
 use crate::pipeline::quotes::service::{QuotesService, RefreshMarketQuotesRequest};
 use chrono::Timelike;
@@ -24,17 +23,19 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-pub const QUOTES_REFRESH_INTERVAL_SECS: u64 = 60;
-pub const QUOTES_SUBSCRIBED_INTERVAL_SECS: u64 = 15;
-/// 热点档刷新间隔（spec §5 热点档）：核心指数 ∪ 前端热点集（自选/可见列表），3s。
-pub const QUOTES_HOT_INTERVAL_SECS: u64 = 3;
+/// universe 滚动 batch 大小（spec §5 / §连接池：80 只/批）。
+pub const QUOTES_ROLL_BATCH: usize = 80;
+/// universe 滚动周期（spec §5：默认 30s，全市场每 ~30s 滚一轮，可配 10–60s）。
+pub const QUOTES_UNIVERSE_ROLLING_CYCLE_SECS: u64 = 30;
+/// 滚动 tick 间隔（固定小间隔 1s；每 tick 推 ceil(批数 / cycle_secs) 个 batch）。
+pub const QUOTES_ROLL_TICK_SECS: u64 = 1;
 
 pub struct QuotesSchedulerHandle {
     _joins: Vec<JoinHandle<()>>,
     _stops: Vec<mpsc::Sender<()>>,
 }
 
-/// 单 tick scheduler — 兼容旧 API，等价于 universe 60s tick。
+/// 单 tick scheduler — 兼容旧 API，等价于 universe 滚动（roll tick = 传入 interval）。
 pub fn spawn_quotes_scheduler(
     service: Arc<QuotesService>,
     interval: Duration,
@@ -42,31 +43,70 @@ pub fn spawn_quotes_scheduler(
     spawn_full_scheduler(
         service,
         QuotesSchedulerIntervals {
-            universe_interval: interval,
-            subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
+            roll_tick_interval: interval,
+            universe_rolling_cycle: Duration::from_secs(QUOTES_UNIVERSE_ROLLING_CYCLE_SECS),
             daily_tick_interval: Duration::from_secs(60),
-            hot_interval: Duration::from_secs(QUOTES_HOT_INTERVAL_SECS),
         },
     )
 }
 
 #[derive(Debug, Clone)]
 pub struct QuotesSchedulerIntervals {
-    pub universe_interval: Duration,
-    pub subscribed_interval: Duration,
+    /// 滚动 tick 固定小间隔（默认 1s）。
+    pub roll_tick_interval: Duration,
+    /// universe 全量滚一轮的目标周期（默认 30s，可配 10–60s）。
+    pub universe_rolling_cycle: Duration,
+    /// 日常时间窗口 tick 间隔（默认 60s：检查 15:30/16:00/08:30/09:00/09:15）。
     pub daily_tick_interval: Duration,
-    pub hot_interval: Duration,
 }
 
 impl Default for QuotesSchedulerIntervals {
     fn default() -> Self {
         Self {
-            universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
-            subscribed_interval: Duration::from_secs(QUOTES_SUBSCRIBED_INTERVAL_SECS),
+            roll_tick_interval: Duration::from_secs(QUOTES_ROLL_TICK_SECS),
+            universe_rolling_cycle: Duration::from_secs(QUOTES_UNIVERSE_ROLLING_CYCLE_SECS),
             daily_tick_interval: Duration::from_secs(60),
-            hot_interval: Duration::from_secs(QUOTES_HOT_INTERVAL_SECS),
         }
     }
+}
+
+/// 一次滚动 tick 推多少个 80-batch（纯函数，便于单测）。
+///
+/// 让全市场 `num_batches` 个 batch 在 `cycle_secs` 秒内（每 `tick_secs` 一 tick）滚完一轮：
+/// `batches_per_tick = ceil(num_batches / (cycle_secs / tick_secs))`，至少 1（universe 非空时）。
+///
+/// Spec: docs/design/quotes-module.md §5「每 ~cycle/批数 推一批」。
+pub fn batches_per_tick(num_batches: usize, cycle_secs: u64, tick_secs: u64) -> usize {
+    if num_batches == 0 {
+        return 0;
+    }
+    let tick_secs = tick_secs.max(1);
+    let ticks_per_cycle = (cycle_secs / tick_secs).max(1);
+    // ceil(num_batches / ticks_per_cycle)
+    let n = (num_batches as u64).div_ceil(ticks_per_cycle);
+    (n as usize).max(1)
+}
+
+/// 计算从 `num_batches` 中、从 `cursor` 起取 `count` 个 batch 的 ts_code 切片（含 wrap）。
+/// 返回 (各 batch 的 (start, end) 半开区间, 推进后的 cursor)。纯函数，便于单测 cursor 推进。
+fn next_batch_ranges(
+    universe_len: usize,
+    cursor: usize,
+    count: usize,
+) -> (Vec<(usize, usize)>, usize) {
+    if universe_len == 0 || count == 0 {
+        return (Vec::new(), cursor);
+    }
+    let num_batches = universe_len.div_ceil(QUOTES_ROLL_BATCH);
+    let mut cur = cursor % num_batches;
+    let mut ranges = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = cur * QUOTES_ROLL_BATCH;
+        let end = (start + QUOTES_ROLL_BATCH).min(universe_len);
+        ranges.push((start, end));
+        cur = (cur + 1) % num_batches;
+    }
+    (ranges, cur)
 }
 
 /// 启动 Quotes 完整 multi-tick scheduler。
@@ -79,93 +119,47 @@ pub fn spawn_full_scheduler(
     let mut joins = Vec::new();
     let mut stops = Vec::new();
 
-    // ----- subscribed 15s tick（关注 + 核心指数 quote refresh）
+    // ----- universe 滚动刷新 tick（spec §5：唯一后台报价任务）
+    //
+    // 维护 cursor over `universe_quote_targets()`（Stock→Index→Fund 有序）。每 roll tick
+    // 在 `is_in_quote_refresh_window` 内推 `batches_per_tick` 个 80-批，cursor 前进、wrap。
+    // 每批走 `refresh_quote_batch`（新鲜度跳过 + 80批并发 + per-batch emit progress），
+    // 不每批 emit 完整 refreshed。universe 大小变化时按当前列表长度重算批数。
     {
         let svc = Arc::clone(&service);
         let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let interval = intervals.subscribed_interval;
+        let tick_interval = intervals.roll_tick_interval;
+        let cycle_secs = intervals.universe_rolling_cycle.as_secs().max(1);
+        let tick_secs = tick_interval.as_secs().max(1);
         let h = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
+            let mut ticker = tokio::time::interval(tick_interval);
             ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = stop_rx.recv() => break,
-                    _ = ticker.tick() => {
-                        // 当前未持有 Account 关注列表（spec §5 — 调用方传入合并集）；
-                        // scheduler 内部至少用核心指数 + 任意 cache 中已有的 ts_code 作 subscribed scope。
-                        let ctx = svc.market_time_now();
-                        if !ctx.is_in_quote_refresh_window {
-                            continue;
-                        }
-                        // Spec §2 line 992：关注标的 + 核心指数 15s，全市场 universe 60s。
-                        // 这里只刷**核心指数**（4 个，subscribed 走逐只 fallback 路径但 N 小很快）。
-                        // 不再合并 cache.snapshot_all() —— 那会在首轮 universe 后变成 7497 只串行
-                        // 刷新（~18min/轮），和 universe 60s batch 抢 TDX 单连接、纯浪费。全市场由
-                        // universe tick 负责。关注标的（watchlist/positions）需调用方传入，scheduler
-                        // 暂不持有，故此处只保证核心指数 15s 新鲜。
-                        let req = RefreshMarketQuotesRequest {
-                            scope: RefreshMarketQuotesScope::Subscribed {
-                                ts_codes: core_indexes(),
-                            },
-                            purpose: RefreshPurpose::Intraday,
-                            trade_date: None,
-                        };
-                        if let Err(e) = svc.refresh_market_quotes(req).await {
-                            warn!(target: "quotes.scheduler.subscribed", error = ?e, "subscribed quote tick failed");
-                        }
-                    }
-                }
-            }
-        });
-        joins.push(h);
-        stops.push(stop_tx);
-    }
-
-    // ----- 热点档 3s tick（spec §5 热点档）：核心指数 ∪ 前端热点集（自选/可见列表）
-    {
-        let svc = Arc::clone(&service);
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let interval = intervals.hot_interval;
-        let h = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = stop_rx.recv() => break,
-                    _ = ticker.tick() => {
-                        // 内部已 gate is_in_quote_refresh_window + 走 TDX batch（≤120），刷新窗外直接返回。
-                        svc.refresh_hot_quotes().await;
-                    }
-                }
-            }
-        });
-        joins.push(h);
-        stops.push(stop_tx);
-    }
-
-    // ----- universe 60s tick
-    {
-        let svc = Arc::clone(&service);
-        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
-        let interval = intervals.universe_interval;
-        let h = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.tick().await;
+            let mut cursor: usize = 0;
             loop {
                 tokio::select! {
                     _ = stop_rx.recv() => break,
                     _ = ticker.tick() => {
                         let ctx = svc.market_time_now();
                         if !ctx.is_in_quote_refresh_window {
+                            // 非刷新窗：cursor 不动、不刷。
                             continue;
                         }
-                        let req = RefreshMarketQuotesRequest {
-                            scope: RefreshMarketQuotesScope::Universe,
-                            purpose: RefreshPurpose::Intraday,
-                            trade_date: None,
-                        };
-                        if let Err(e) = svc.refresh_market_quotes(req).await {
-                            warn!(target: "quotes.scheduler.universe", error = ?e, "universe tick failed");
+                        let targets = svc.universe_quote_targets();
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let num_batches = targets.len().div_ceil(QUOTES_ROLL_BATCH);
+                        let count = batches_per_tick(num_batches, cycle_secs, tick_secs);
+                        let (ranges, next_cursor) =
+                            next_batch_ranges(targets.len(), cursor, count);
+                        cursor = next_cursor;
+                        for (start, end) in ranges {
+                            let slice: Vec<_> = targets[start..end]
+                                .iter()
+                                .map(|(ts, _, _)| ts.clone())
+                                .collect();
+                            // refresh_quote_batch：progress-only（不 emit 完整 refreshed）。
+                            let _ = svc.refresh_quote_batch(slice).await;
                         }
                     }
                 }
@@ -318,59 +312,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intervals_default_has_subscribed_15s_and_universe_60s() {
+    async fn intervals_default_is_rolling_1s_tick_30s_cycle() {
+        // Spec §5：滚动 tick 1s、universe cycle 30s、daily tick 60s。
         let i = QuotesSchedulerIntervals::default();
-        assert_eq!(i.subscribed_interval.as_secs(), 15);
-        assert_eq!(i.universe_interval.as_secs(), 60);
-    }
-
-    #[tokio::test]
-    async fn hot_interval_default_is_3s() {
-        // Spec §5 热点档：核心指数 ∪ 前端热点集，3s。
-        let i = QuotesSchedulerIntervals::default();
-        assert_eq!(i.hot_interval.as_secs(), 3);
+        assert_eq!(i.roll_tick_interval.as_secs(), 1);
+        assert_eq!(i.universe_rolling_cycle.as_secs(), 30);
         assert_eq!(i.daily_tick_interval.as_secs(), 60);
-        assert_eq!(QUOTES_HOT_INTERVAL_SECS, 3);
-        assert_eq!(QUOTES_REFRESH_INTERVAL_SECS, 60);
-        assert_eq!(QUOTES_SUBSCRIBED_INTERVAL_SECS, 15);
+        assert_eq!(QUOTES_UNIVERSE_ROLLING_CYCLE_SECS, 30);
+        assert_eq!(QUOTES_ROLL_BATCH, 80);
+        assert_eq!(QUOTES_ROLL_TICK_SECS, 1);
     }
 
-    #[tokio::test]
-    async fn refresh_hot_quotes_never_panics_on_empty_universe() {
-        // 盲区②：热点档单步刷新（scheduler 3s tick body）必须能裸调不 panic，
-        // 无论当前是否交易时段。in-memory 空 DB + 无网络：
-        //   - 盘外 → is_trading_time gate 提前 return；
-        //   - 盘中 → core_indexes 走 TDX/HTTP fallback（不可达即静默失败），
-        //     不写任何 cache、不 panic。
-        // 注：gate 依赖 wall-clock，无法在不注入时钟的前提下断言确切分支，
-        // 但「单步可调用且不 panic」是 scheduler tick body 的核心契约。
-        let svc = make_service();
-        svc.refresh_hot_quotes().await; // 不应 panic
+    #[test]
+    fn batches_per_tick_spreads_full_universe_over_cycle() {
+        // 全市场 ~7500 只 → ~94 个 80-批；30s cycle / 1s tick = 30 ticks/cycle。
+        // 每 tick ceil(94/30) = 4 个 batch → 一轮 ~24s ≤ 30s。
+        assert_eq!(batches_per_tick(94, 30, 1), 4);
+        // 小 universe：批数 < ticks_per_cycle → 每 tick 至少推 1 个。
+        assert_eq!(batches_per_tick(10, 30, 1), 1);
+        // 空 universe → 0。
+        assert_eq!(batches_per_tick(0, 30, 1), 0);
+        // 整除场景：60 批 / 30 ticks = 每 tick 2。
+        assert_eq!(batches_per_tick(60, 30, 1), 2);
+        // tick_secs 防 0（max(1)）。
+        assert_eq!(batches_per_tick(30, 30, 0), 1);
     }
 
-    #[tokio::test]
-    async fn set_quote_hotset_then_refresh_hot_quotes_no_panic() {
-        // set_quote_hotset 设置后，热点路径选取 core_indexes ∪ hot_set 仍不 panic。
-        // （选取后的 dedup 逻辑本身在 service::set_quote_hotset 测试里已硬断言。）
-        let svc = make_service();
-        svc.set_quote_hotset(vec![
-            crate::domain::shared::TsCode::parse("600519.SH").unwrap(),
-            crate::domain::shared::TsCode::parse("000001.SZ").unwrap(),
-        ]);
-        svc.refresh_hot_quotes().await;
+    #[test]
+    fn next_batch_ranges_advances_and_wraps() {
+        // universe = 200 只 → 3 个 80-批（[0,80),[80,160),[160,200)）。
+        let (r0, c0) = next_batch_ranges(200, 0, 2);
+        assert_eq!(r0, vec![(0, 80), (80, 160)]);
+        assert_eq!(c0, 2);
+        // 从 cursor=2 取 2 个：批 2（[160,200)）→ wrap 回批 0（[0,80)）。
+        let (r1, c1) = next_batch_ranges(200, c0, 2);
+        assert_eq!(r1, vec![(160, 200), (0, 80)]);
+        assert_eq!(c1, 1);
+        // 空 universe / count=0 → 空、cursor 不动。
+        assert_eq!(next_batch_ranges(0, 5, 3), (Vec::new(), 5));
+        assert_eq!(next_batch_ranges(200, 1, 0), (Vec::new(), 1));
     }
 
     #[tokio::test]
     async fn scheduler_handles_drop_without_panic() {
         let svc = make_service();
-        // 1s tick to short-circuit
+        // 大 interval to short-circuit ticks before drop。
         let handle = spawn_full_scheduler(
             svc,
             QuotesSchedulerIntervals {
-                universe_interval: Duration::from_secs(3600),
-                subscribed_interval: Duration::from_secs(3600),
+                roll_tick_interval: Duration::from_secs(3600),
+                universe_rolling_cycle: Duration::from_secs(30),
                 daily_tick_interval: Duration::from_secs(3600),
-                hot_interval: Duration::from_secs(3600),
             },
         );
         drop(handle);

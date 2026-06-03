@@ -62,9 +62,6 @@ pub struct QuotesService {
     pub(crate) config: QuotesConfig,
     pub(crate) event_sink: std::sync::RwLock<Option<RefreshEventSink>>,
     pub(crate) progress_sink: std::sync::RwLock<Option<RefreshProgressSink>>,
-    /// 热点集（spec §5 热点档）：前端声明的高频刷新标的（自选 + 可见列表 top-N 等）。
-    /// scheduler 的 3s tick 刷 core_indexes ∪ hot_set。cap 见 set_quote_hotset。
-    pub(crate) hot_set: std::sync::RwLock<Vec<TsCode>>,
 }
 
 pub type RefreshEventSink = Arc<dyn Fn(MarketQuotesRefreshedPayload) + Send + Sync + 'static>;
@@ -98,25 +95,7 @@ impl QuotesService {
             config,
             event_sink: std::sync::RwLock::new(None),
             progress_sink: std::sync::RwLock::new(None),
-            hot_set: std::sync::RwLock::new(Vec::new()),
         })
-    }
-
-    /// 前端声明热点集（spec §5 热点档）：自选 + 可见列表 top-N 等。去重、cap 120。
-    pub fn set_quote_hotset(&self, codes: Vec<TsCode>) {
-        let mut seen = HashSet::new();
-        let mut out = Vec::with_capacity(codes.len().min(120));
-        for c in codes {
-            if out.len() >= 120 {
-                break;
-            }
-            if seen.insert(c.clone()) {
-                out.push(c);
-            }
-        }
-        if let Ok(mut g) = self.hot_set.write() {
-            *g = out;
-        }
     }
 
     /// 暴露 health check 给 lib / scheduler 调用。
@@ -1375,11 +1354,39 @@ impl QuotesService {
     /// emit `market-quotes-refresh-progress`(scope=subscribed) 驱动前端增量更新；
     /// TDX 失败 / BJ 的少量走腾讯 HTTP fallback（复用 `fallback_http_quote`）。
     ///
-    /// 注意：本方法与 `refresh_hot_quotes` / scheduler 并存（spec §5 热点档保留）。
+    /// 注意：本方法与 universe 滚动刷新（scheduler）共享连接池并存（spec §5）。
     pub async fn refresh_quotes(
         self: &Arc<Self>,
         ts_codes: Vec<TsCode>,
     ) -> Result<MarketQuotesRefreshedPayload, ResponseError> {
+        let (total, success, affected) = self.refresh_quote_batch(ts_codes).await;
+        let trade_date = eligible_trade_date(&self.market_time_now()).trade_date;
+        let payload = MarketQuotesRefreshedPayload {
+            scope: RefreshScopeKind::Subscribed,
+            purpose: RefreshPurpose::Intraday,
+            trade_date: Some(trade_date),
+            affected_ts_codes: Some(affected),
+            total,
+            success,
+            failed_batches: total.saturating_sub(success),
+            captured_at: Utc::now(),
+        };
+        self.emit_refreshed(payload.clone());
+        Ok(payload)
+    }
+
+    /// 刷新一批 quotes 到 `MARKET_SNAPSHOT`（progress-only，不 emit 完整 refreshed）。
+    ///
+    /// 这是「聚焦按需 pull」（`refresh_quotes`）与「universe 滚动刷新」（scheduler 每批）
+    /// 的共享内核（spec §5）：新鲜度跳过 + 80/批并发跑连接池 + 每批 emit
+    /// `market-quotes-refresh-progress`，TDX 失败 / BJ 走腾讯 HTTP fallback。
+    /// 返回 `(total, success, affected)`，由调用方决定是否 emit 完整 refreshed。
+    ///
+    /// Spec: docs/design/quotes-module.md §5 实时行情（背景基线 + 聚焦按需）。
+    pub async fn refresh_quote_batch(
+        self: &Arc<Self>,
+        ts_codes: Vec<TsCode>,
+    ) -> (u32, u32, Vec<TsCode>) {
         use futures_util::StreamExt;
         const TDX_CHUNK: usize = 80;
         const FETCH_CONCURRENCY: usize = 8; // = TDX 连接池 POOL_SIZE
@@ -1418,17 +1425,7 @@ impl QuotesService {
 
         // 全被跳过 → 直接返回（不 emit）。
         if targets.is_empty() {
-            let payload = MarketQuotesRefreshedPayload {
-                scope: RefreshScopeKind::Subscribed,
-                purpose: RefreshPurpose::Intraday,
-                trade_date: Some(trade_date),
-                affected_ts_codes: Some(Vec::new()),
-                total: requested_total,
-                success: 0,
-                failed_batches: 0,
-                captured_at: now,
-            };
-            return Ok(payload);
+            return (requested_total, 0, Vec::new());
         }
 
         let (targets, cats) = self.resolve_categories(targets);
@@ -1527,18 +1524,7 @@ impl QuotesService {
             }
         }
 
-        let payload = MarketQuotesRefreshedPayload {
-            scope: RefreshScopeKind::Subscribed,
-            purpose: RefreshPurpose::Intraday,
-            trade_date: Some(trade_date),
-            affected_ts_codes: Some(affected),
-            total,
-            success,
-            failed_batches: total.saturating_sub(success),
-            captured_at: now,
-        };
-        self.emit_refreshed(payload.clone());
-        Ok(payload)
+        (total, success, affected)
     }
 
     /// 后台异步处理 universe 的 fallback 队列（TDX 失败 / BJ 标的）。
@@ -1709,94 +1695,26 @@ impl QuotesService {
         display_fallback
     }
 
-    /// 热点档高频刷新（spec §5 热点档 ~3s）：刷 `core_indexes ∪ hot_set`。
-    /// 走 TDX **batch**（fetch_quotes，N≤~120 = 2 批，~数百 ms），失败的小集合
-    /// 逐只 HTTP fallback；写 cache（intraday，不写 close_snapshot），emit progress
-    /// (scope=subscribed) 让前端各视图刷新。盘外直接返回。
-    pub async fn refresh_hot_quotes(&self) {
-        let ctx = self.market_time_now();
-        if !ctx.is_in_quote_refresh_window {
-            return;
-        }
-        let now = ctx.now;
-        let trade_date = eligible_trade_date(&ctx).trade_date;
-
-        // core_indexes ∪ hot_set
-        let mut codes: Vec<TsCode> = core_indexes();
-        let mut seen: HashSet<TsCode> = codes.iter().cloned().collect();
-        if let Ok(hs) = self.hot_set.read() {
-            for c in hs.iter() {
-                if seen.insert(c.clone()) {
-                    codes.push(c.clone());
-                }
-            }
-        }
-        let (codes, cats) = self.resolve_categories(codes);
-        if codes.is_empty() {
-            return;
-        }
-
-        let mut tdx_input: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
-        let mut bj: Vec<(TsCode, InstrumentCategory, Option<String>)> = Vec::new();
-        for ts in &codes {
-            let (cat, name) = cats.get(ts).cloned().unwrap_or((InstrumentCategory::Stock, None));
-            if matches!(ts.market(), crate::domain::shared::Market::BJ) {
-                bj.push((ts.clone(), cat, name));
-            } else {
-                tdx_input.push((ts.clone(), cat, name));
-            }
-        }
-
-        let mut affected: Vec<TsCode> = Vec::new();
-        let put = |this: &Self, q: StockQuote| {
-            let captured_at = q.captured_at;
-            let source = q.source.as_str().to_string();
-            this.cache.put(CachedSnapshot {
-                quote: q,
-                captured_at,
-                trade_date,
-                source,
-            });
-        };
-
-        // TDX batch（display_complete 即采纳）；失败 → HTTP fallback。
-        let results = self.tdx.fetch_quotes(tdx_input.clone(), trade_date, now).await;
-        for ((ts, cat, name), res) in tdx_input.into_iter().zip(results.into_iter()) {
-            match res {
-                Ok(q) if q.is_display_complete() => {
-                    put(self, q);
-                    affected.push(ts);
-                }
-                _ => {
-                    let _ = name;
-                    if let Some(q) = self.fallback_http_quote(&ts, cat, trade_date, now).await {
-                        put(self, q);
-                        affected.push(ts);
-                    }
-                }
-            }
-        }
-        // BJ 不支持 TDX batch → 直接 HTTP fallback。
-        for (ts, cat, _name) in bj {
-            if let Some(q) = self.fallback_http_quote(&ts, cat, trade_date, now).await {
-                put(self, q);
-                affected.push(ts);
-            }
-        }
-
-        if !affected.is_empty() {
-            let n = affected.len() as u32;
-            self.emit_progress(MarketQuotesRefreshProgressPayload {
-                scope: RefreshScopeKind::Subscribed,
-                purpose: RefreshPurpose::Intraday,
-                trade_date: Some(trade_date),
-                completed: n,
-                success: n,
-                total: n,
-                affected_ts_codes: affected,
-                captured_at: now,
-            });
-        }
+    /// universe 滚动刷新的有序目标列表（spec §5 实时行情背景基线）。
+    ///
+    /// 与 universe 一次性刷新（`refresh_market_quotes(Universe)`）内部同序：
+    /// 按 `category` Stock → Index → Fund 排序，让"看得见的部分"（股票）先轮到。
+    /// scheduler 维护 cursor over 该列表、按固定 cycle 滚动推批。
+    pub fn universe_quote_targets(&self) -> Vec<(TsCode, InstrumentCategory, Option<String>)> {
+        let (instruments, _total) = self
+            .repo()
+            .list_instruments(None, None, 100_000, 0)
+            .unwrap_or_default();
+        let mut targets: Vec<(TsCode, InstrumentCategory, Option<String>)> = instruments
+            .into_iter()
+            .map(|i| (i.ts_code, i.category, Some(i.name)))
+            .collect();
+        targets.sort_by_key(|(_, cat, _)| match cat {
+            InstrumentCategory::Stock => 0,
+            InstrumentCategory::Index => 1,
+            InstrumentCategory::Fund => 2,
+        });
+        targets
     }
 
     /// Refresh 单只标的：尝试 TDX → 腾讯；按 spec §5 line 742 选取。
@@ -3300,44 +3218,20 @@ mod tests {
     }
 
     #[test]
-    fn set_quote_hotset_dedups_and_caps_at_120() {
+    fn universe_quote_targets_sorted_stock_index_fund() {
+        // Spec §5：universe 滚动目标按 category Stock → Index → Fund 排序。
         let svc = make_service();
-        // 构造 130 个唯一 code，并在末尾追加若干重复，验证去重 + cap 120 + 首次顺序保留。
-        let mut raw: Vec<TsCode> = (0..130)
-            .map(|i| TsCode::parse(&format!("{:06}.SZ", i)).unwrap())
-            .collect();
-        // 重复前 5 个（这些重复落在 cap 之前，应被去重忽略，不占额外 slot）。
-        for i in 0..5 {
-            raw.push(TsCode::parse(&format!("{:06}.SZ", i)).unwrap());
-        }
-        svc.set_quote_hotset(raw);
-
-        let hot = svc.hot_set.read().unwrap();
-        // cap 120：130 唯一 + 5 重复 → 最多 120。
-        assert_eq!(hot.len(), 120);
-        // 去重：无重复元素。
-        let unique: HashSet<&TsCode> = hot.iter().collect();
-        assert_eq!(unique.len(), hot.len());
-        // 首次出现顺序保留：前 120 个唯一 code（000000..000119）按序。
-        for (i, c) in hot.iter().enumerate() {
-            assert_eq!(c.as_str(), format!("{:06}.SZ", i));
-        }
-    }
-
-    #[test]
-    fn set_quote_hotset_early_dup_does_not_evict_later_unique() {
-        let svc = make_service();
-        // 前置重复应被去重折叠，使后面的唯一 code 仍能在 cap 内入选。
-        // 输入：A, A, B, C —— 去重后 [A, B, C]，全部 ≤ 120。
-        let a = TsCode::parse("600000.SH").unwrap();
-        let b = TsCode::parse("600001.SH").unwrap();
-        let c = TsCode::parse("600002.SH").unwrap();
-        svc.set_quote_hotset(vec![a.clone(), a.clone(), b.clone(), c.clone()]);
-        let hot = svc.hot_set.read().unwrap();
-        assert_eq!(hot.len(), 3);
-        assert_eq!(hot[0].as_str(), "600000.SH");
-        assert_eq!(hot[1].as_str(), "600001.SH");
-        assert_eq!(hot[2].as_str(), "600002.SH");
+        seed_instrument(&svc, "510300.SH", "沪深300ETF", InstrumentCategory::Fund);
+        seed_instrument(&svc, "000001.SH", "上证指数", InstrumentCategory::Index);
+        seed_instrument(&svc, "600519.SH", "贵州茅台", InstrumentCategory::Stock);
+        let targets = svc.universe_quote_targets();
+        let cats: Vec<InstrumentCategory> = targets.iter().map(|(_, c, _)| *c).collect();
+        // Stock 在前、Fund 在后；中间 Index。
+        let stock_pos = cats.iter().position(|c| *c == InstrumentCategory::Stock).unwrap();
+        let index_pos = cats.iter().position(|c| *c == InstrumentCategory::Index).unwrap();
+        let fund_pos = cats.iter().position(|c| *c == InstrumentCategory::Fund).unwrap();
+        assert!(stock_pos < index_pos);
+        assert!(index_pos < fund_pos);
     }
 
     #[test]

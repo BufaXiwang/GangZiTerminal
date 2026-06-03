@@ -45,7 +45,6 @@ use crate::pipeline::news::scheduler::{
 use crate::pipeline::news::NewsService;
 use crate::pipeline::quotes::scheduler::{
     spawn_full_scheduler, QuotesSchedulerHandle, QuotesSchedulerIntervals,
-    QUOTES_REFRESH_INTERVAL_SECS, QUOTES_SUBSCRIBED_INTERVAL_SECS,
 };
 use crate::pipeline::quotes::service::QuotesService;
 use rust_decimal::Decimal;
@@ -68,7 +67,6 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::quotes::cmd::ensure_chart_data,
         adapters::quotes::cmd::extend_chart_history,
         adapters::quotes::cmd::fetch_kline_page,
-        adapters::quotes::cmd::set_quote_hotset,
         adapters::quotes::cmd::refresh_quotes,
         adapters::quotes::cmd::forward_log,
         adapters::agent::cmd::agent_list_tools,
@@ -429,16 +427,7 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     spawn_full_scheduler(
                         Arc::clone(&quotes_service),
-                        QuotesSchedulerIntervals {
-                            universe_interval: Duration::from_secs(QUOTES_REFRESH_INTERVAL_SECS),
-                            subscribed_interval: Duration::from_secs(
-                                QUOTES_SUBSCRIBED_INTERVAL_SECS,
-                            ),
-                            daily_tick_interval: Duration::from_secs(60),
-                            hot_interval: Duration::from_secs(
-                                crate::pipeline::quotes::scheduler::QUOTES_HOT_INTERVAL_SECS,
-                            ),
-                        },
+                        QuotesSchedulerIntervals::default(),
                     )
                 });
             app.manage(quotes_handle);
