@@ -266,9 +266,27 @@ export function KlineCanvas({
   );
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // 容器是否真正可见。keep-alive 用 display:none 隐藏非激活 tab —— klinecharts 在隐藏后再显示
+  // 内部 barSpace/缩放/canvas 状态会坏（单靠 resize 救不回，蜡烛被拉宽）。所以：可见才 init、
+  // 隐藏即 dispose、下次可见 fresh 重建。等价于"切回市场页、图表容器可见后才懒加载 K 线"，
+  // tab 切换本身瞬时（不卡），图表随后在正确尺寸下初始化。
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const io = new IntersectionObserver(
+      (entries) => setVisible(entries.some((e) => e.isIntersecting)),
+      { threshold: 0 },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, []);
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
+    // 隐藏态不 init（且上一份可见态 effect 的 cleanup 已 dispose 掉旧图表）。
+    if (!visible) return;
     const mountedAt = performance.now();
     perf(`KlineCanvas mount tsCode=${tsCode} period=${period}`);
 
@@ -453,7 +471,7 @@ export function KlineCanvas({
       );
       chartRef.current = null;
     };
-  }, [tsCode, period, pricePrecision]);
+  }, [tsCode, period, pricePrecision, visible]);
 
   // 盘中近实时轮询：每 15s 触发后端重拉最新 bar（minute → refresh_minute_klines
   // 增量；day → fetch_kline_page(0) 拉今日），再读尾部用 updateData merge
