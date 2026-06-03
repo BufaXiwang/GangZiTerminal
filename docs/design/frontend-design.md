@@ -226,31 +226,33 @@ Agent tabbar
 
 目标：管理 Agent 模型渠道（服务商连接 + 模型）。契约见 [agent-infra-module.md §2](agent-infra-module.md) `ProviderChannel`。
 
-推荐结构：
+推荐结构（两栏吃满宽，桌面端一屏不滚）：
 
 ```text
-模型渠道
-  -> 添加渠道：[快速预设 | 自定义] 两种
+当前模型（顶部全宽）：channel 选择器，单选，run 走选中渠道 —— 唯一的「设为当前」入口
+两栏：
+  左 模型渠道（只读管理）：每个保留模型一行（avatar + {model} / {渠道名} + 消息格式 + host + key 状态 + 删除）
+  右 添加渠道：[快速预设 | 自定义]
        快速预设：选 DeepSeek/OpenAI/Anthropic 官方 → 只填 API Key
        自定义：渠道名 + 消息格式(Messages/Chat Completions/Responses) + Host + API Key
-  -> 保存后自动发现模型 → 勾选确认保留（发现失败则手动输入一个/多个模型名确认）
-  -> 渠道/模型列表（每个保留模型一行，`{model} ({渠道名})`）
-  -> 当前模型选择器（单选，run 走选中渠道）
+       → 保存后自动发现模型 → 勾选确认保留（发现失败则手动输入一个/多个模型名确认）
 ```
 
 规则：
 
 - 渠道按**消息格式**抽象，不按厂商写死；「渠道名」即展示用 provider name，列表与当前模型选择器都用 `{model} ({渠道名})` 文案。
+- **职责分离，避免重复**：「当前模型」是**唯一**的 active 切换入口（选哪个渠道跑 run）；「模型渠道」是**只读管理**视图（看配置 / 删除），**不再标「当前」徽章、不做 active 行高亮**——active 状态只在「当前模型」里表达，两块各司其职不重复标记。
 - API Key **只提交不回显**：保存后列表只显示"已配置"状态，不回传明文（走 specta 强类型 command，不裸调 invoke，不在前端持有 token）。
 - 模型发现失败时降级为手动输入模型名（允许多个），不阻塞配置。
 - 新建渠道默认 enabled；首次配置完成后自动设为当前模型（若此前没有当前模型）。
 
 视觉结构（沿用暖纸面设计系统，不引入新色）：
 
-- 三个区块各为一张卡片（`bg-card` + `border-soft` + `radius-lg` + `shadow-sm`）：header 条（serif 标题 + 右侧 muted hint/计数）+ body。模型渠道的行 full-bleed（无内边距留白，行间 `border-soft` 分隔）。
+- **布局吃满内容区宽度**（max-width ~1280）：顶部「当前模型」全宽；其下「模型渠道」「添加渠道」并排两栏（窄屏 < ~1024 自动堆叠为单栏）。目标是桌面端一屏放下、不产生页内竖滚。
+- 区块各为一张卡片（`bg-card` + `border-soft` + `radius-lg` + `shadow-sm`）：header 条（serif 标题 + 右侧 muted hint/计数）+ body。模型渠道的行 full-bleed（行间 `border-soft` 分隔）。
 - provider 头像：取渠道名首字母的方形 `brand-soft` 徽标，用在渠道行最左与预设卡片左侧，给来源一个视觉锚点。
-- 当前模型选择器用一排 channel pill 卡片（model mono + provider muted）；选中态为 `brand` 边框 + `brand-soft` 底 + 右上角 brand Check，明显区别于未选中。
-- 渠道行 key 状态用状态点 + 文字：已配置 = `chart-down` 绿点，未配置 = `fg-faint` 点；当前渠道左侧 3px `brand` 竖条 + 极淡底色。
+- 当前模型选择器用一排 channel pill 卡片（model mono + provider muted）；选中态为 `brand` 描边环 + `brand-soft` 底 + 右上角 brand Check，明显区别于未选中。
+- 渠道行 key 状态用状态点 + 文字：已配置 = `chart-down` 绿点，未配置 = `fg-faint` 点。
 
 ---
 

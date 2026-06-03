@@ -5,7 +5,7 @@
 // 每行：`{model} ({provider})` + wireFormat badge + host + 已配置 key 状态 +
 //        enabled / active 标记 + 删除。apiKey 永不展示明文（只显示 apiKeySet）。
 
-import { Check, Globe, Trash2 } from "lucide-react";
+import { Globe, Trash2 } from "lucide-react";
 import type { ProviderChannelView } from "../../bindings";
 import { WIRE_FORMAT_LABEL, hostOf, providerInitial } from "./types";
 
@@ -27,10 +27,7 @@ export function ChannelList({ channels, onRemove, busy }: ChannelListProps) {
   return (
     <ul className="settings-channel-list">
       {channels.map((ch) => (
-        <li
-          key={ch.channelId}
-          className={`settings-channel-row${ch.isActive ? " active" : ""}`}
-        >
+        <li key={ch.channelId} className="settings-channel-row">
           <span className="settings-avatar" aria-hidden>
             {providerInitial(ch.provider)}
           </span>
@@ -38,14 +35,6 @@ export function ChannelList({ channels, onRemove, busy }: ChannelListProps) {
           <div className="settings-channel-main">
             <span className="settings-channel-name">
               <span className="settings-channel-model">{ch.model}</span>
-              {ch.isActive && (
-                <span
-                  className="settings-active-pill"
-                  title="当前模型"
-                >
-                  <Check size={11} strokeWidth={2.5} /> 当前
-                </span>
-              )}
             </span>
             <span className="settings-channel-provider muted">
               {ch.provider}

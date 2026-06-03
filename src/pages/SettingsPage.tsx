@@ -134,32 +134,35 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        {/* 渠道列表 — 行 full-bleed，不包 body */}
-        <section className="settings-section">
-          <header className="settings-section-head">
-            <h2 className="settings-section-title">模型渠道</h2>
-            {channels.length > 0 && (
-              <span className="muted settings-section-hint">
-                {channels.length} 个
-              </span>
-            )}
-          </header>
-          <ChannelList
-            channels={channels}
-            onRemove={handleRemove}
-            busy={mutating}
-          />
-        </section>
+        {/* 两栏：左 模型渠道（只读管理） / 右 添加渠道 */}
+        <div className="settings-grid">
+          {/* 渠道列表 — 行 full-bleed，不包 body */}
+          <section className="settings-section">
+            <header className="settings-section-head">
+              <h2 className="settings-section-title">模型渠道</h2>
+              {channels.length > 0 && (
+                <span className="muted settings-section-hint">
+                  {channels.length} 个
+                </span>
+              )}
+            </header>
+            <ChannelList
+              channels={channels}
+              onRemove={handleRemove}
+              busy={mutating}
+            />
+          </section>
 
-        {/* 添加渠道 */}
-        <section className="settings-section">
-          <header className="settings-section-head">
-            <h2 className="settings-section-title">添加渠道</h2>
-          </header>
-          <div className="settings-section-body">
-            <AddChannelForm presets={presets} onSaved={handleSaved} />
-          </div>
-        </section>
+          {/* 添加渠道 */}
+          <section className="settings-section">
+            <header className="settings-section-head">
+              <h2 className="settings-section-title">添加渠道</h2>
+            </header>
+            <div className="settings-section-body">
+              <AddChannelForm presets={presets} onSaved={handleSaved} />
+            </div>
+          </section>
+        </div>
       </div>
     </PageShell>
   );
