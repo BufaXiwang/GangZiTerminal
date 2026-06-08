@@ -463,7 +463,8 @@ async agentListReviewReports(limit: number | null) : Promise<Result<ReviewReport
 /**
  * 加载指定对话的全部持久化消息（按 seq 排序；审计真源）。
  * 
- * Spec: agent-infra-module.md §5 `load_conversation`
+ * 加载对话消息（从最近 summary 检查点开始，不加载更早的历史）。
+ * Spec: agent-infra-module.md §5 `load_conversation_view`
  */
 async agentLoadConversation(conversationId: string) : Promise<Result<AgentMessage[], CommandError>> {
     try {

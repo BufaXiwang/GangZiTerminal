@@ -21,6 +21,7 @@ import {
   type AgentStateSnapshot,
   type AnalysisResult,
   type InvestmentStrategy,
+  type ProviderChannelView,
   type ReviewReportRef,
   type StrategyHistoryEntry,
 } from "../bindings";
@@ -376,6 +377,7 @@ function UsageBlockView({
 
 export default function AgentPage() {
   const [hasChannel, setHasChannel] = useState<boolean | null>(null); // null = loading
+  const [channels, setChannels] = useState<ProviderChannelView[]>([]);
   const conversationId = useRef<string>(
     globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`,
   );
@@ -446,21 +448,17 @@ export default function AgentPage() {
 
   const { pathname } = useLocation();
 
-  const checkChannel = useCallback(() => {
-    commands
-      .agentGetActiveChannel()
-      .then((res) => {
-        setHasChannel(res.status === "ok" && res.data !== null);
-      })
-      .catch(() => setHasChannel(false));
-  }, []);
-
-  // 每次路由切到 Agent 页时重新检测通道（keep-alive 不会重新 mount）。
+  // 每次路由切到 Agent 页时加载渠道列表（keep-alive 不会重新 mount）。
   useEffect(() => {
     if (pathname === ROUTES.agent) {
-      checkChannel();
+      commands.agentListChannels().then(res => {
+        if (res.status === "ok") {
+          setChannels(res.data);
+          setHasChannel(res.data.length > 0);
+        }
+      }).catch(() => setHasChannel(false));
     }
-  }, [pathname, checkChannel]);
+  }, [pathname]);
 
   useEffect(() => {
     void refreshState();
@@ -762,6 +760,14 @@ export default function AgentPage() {
     }
   }, []);
 
+  const activeChannel = channels.find(c => c.isActive);
+
+  const switchModel = useCallback(async (channelId: string) => {
+    await commands.agentSetActiveChannel(channelId);
+    const res = await commands.agentListChannels();
+    if (res.status === "ok") setChannels(res.data);
+  }, []);
+
   return (
     <PageShell
       title="Agent"
@@ -791,6 +797,22 @@ export default function AgentPage() {
             <span>投资策略{strategy ? ` V${strategy.version}` : ""}</span>
             <span className="agent-link-btn">查看</span>
           </div>
+
+          {/* Model selector */}
+          {channels.length > 0 && (
+            <div className="agent-sidebar-model">
+              <select
+                value={activeChannel?.channelId ?? ""}
+                onChange={(e) => void switchModel(e.target.value)}
+              >
+                {channels.map(ch => (
+                  <option key={ch.channelId} value={ch.channelId}>
+                    {ch.model} ({ch.provider})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {/* Review reports */}
           <div className="agent-sidebar-section">

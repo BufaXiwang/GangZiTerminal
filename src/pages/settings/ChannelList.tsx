@@ -217,6 +217,30 @@ export function DiscoverMorePanel({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [manualInput, setManualInput] = useState("");
+  const [validationWarning, setValidationWarning] = useState<string[] | null>(null);
+
+  // Extracted add-models helper shared by handleManualAdd and the "仍然添加" confirmation.
+  const doAddModels = useCallback(async (models: string[]) => {
+    setSaving(true);
+    setError(null);
+    for (const model of models) {
+      const input: AddChannelInput = {
+        provider: group.provider,
+        wireFormat: group.wireFormat,
+        baseUrl: group.baseUrl ?? "",
+        apiKey: "",
+        model,
+      };
+      const res = await commands.agentAddChannel(input);
+      if (res.status === "error") {
+        setSaving(false);
+        setError(`添加「${model}」失败：${formatError(res.error)}`);
+        return;
+      }
+    }
+    setSaving(false);
+    onSaved();
+  }, [group, onSaved]);
 
   const handleDiscover = useCallback(async () => {
     setDiscovering(true);
@@ -290,26 +314,29 @@ export function DiscoverMorePanel({
       setError("请输入至少一个新模型名");
       return;
     }
+
+    // Validate: discover available models and check if the input exists
     setSaving(true);
     setError(null);
-    for (const model of models) {
-      const input: AddChannelInput = {
-        provider: group.provider,
-        wireFormat: group.wireFormat,
-        baseUrl: group.baseUrl ?? "",
-        apiKey: "",
-        model,
-      };
-      const res = await commands.agentAddChannel(input);
-      if (res.status === "error") {
-        setSaving(false);
-        setError(`添加「${model}」失败：${formatError(res.error)}`);
-        return;
+
+    const firstChannelId = group.channels[0]?.channelId;
+    if (firstChannelId) {
+      const discoverRes = await commands.agentDiscoverModelsForChannel(firstChannelId);
+      if (discoverRes.status === "ok") {
+        const available = new Set(discoverRes.data.map((m) => m.id));
+        const unknown = models.filter((m) => !available.has(m));
+        if (unknown.length > 0) {
+          // Show confirmation — user can still force-add
+          setValidationWarning(unknown);
+          setSaving(false);
+          return;
+        }
       }
+      // If discover fails, skip validation and proceed
     }
-    setSaving(false);
-    onSaved();
-  }, [manualInput, existingModels, group, onSaved]);
+
+    await doAddModels(models);
+  }, [manualInput, existingModels, group, doAddModels]);
 
   return (
     <div className="settings-discover-panel">
@@ -339,6 +366,33 @@ export function DiscoverMorePanel({
               {saving ? "添加中…" : "添加"}
             </button>
           </div>
+          {validationWarning && (
+            <div className="settings-validation-warn">
+              <p>以下模型未在服务商返回的模型列表中找到：</p>
+              <p className="tabular">{validationWarning.join(", ")}</p>
+              <div className="settings-form-actions">
+                <button
+                  className="btn ghost"
+                  onClick={() => setValidationWarning(null)}
+                >
+                  取消
+                </button>
+                <button
+                  className="btn primary"
+                  onClick={() => {
+                    setValidationWarning(null);
+                    const models = manualInput
+                      .split(/[\n,]/)
+                      .map((s) => s.trim())
+                      .filter((s) => s && !existingModels.has(s));
+                    void doAddModels(models);
+                  }}
+                >
+                  仍然添加
+                </button>
+              </div>
+            </div>
+          )}
           <div className="settings-form-actions">
             <button type="button" className="btn ghost" onClick={onCancel}>
               取消

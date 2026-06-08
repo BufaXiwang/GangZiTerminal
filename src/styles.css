@@ -3557,6 +3557,20 @@ body {
   font-size: 12px;
 }
 
+/* -------- 验证警告 -------- */
+
+.settings-validation-warn {
+  padding: 12px;
+  background: #fdf8ef;
+  border: 1px solid var(--state-warn);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  margin: 8px 0;
+}
+.settings-validation-warn p {
+  margin: 0 0 8px;
+}
+
 /* -------- 表单反馈 / 操作 -------- */
 
 .settings-form-error {
@@ -3644,6 +3658,25 @@ body {
 }
 .agent-sidebar-strategy:hover {
   background: var(--bg-soft);
+}
+.agent-sidebar-model {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.agent-sidebar-model select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  color: var(--fg-default);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+.agent-sidebar-model select:focus {
+  outline: none;
+  border-color: var(--brand);
 }
 .agent-sidebar-section {
   border-bottom: 1px solid var(--border-soft);

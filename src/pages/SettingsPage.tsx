@@ -1,16 +1,16 @@
-// SettingsPage — Agent 模型渠道管理（统一设置页）。
+// SettingsPage — Agent 服务商渠道管理（统一设置页）。
 //
 // Spec: docs/design/frontend-design.md §设置页 + docs/design/agent-infra-module.md §2 ProviderChannel
 //
 // 布局（上→下）：
-//   1. 模型列表 — radio 选择当前模型 + ×删除（仅有模型时显示）
-//   2. 服务商管理 — 按连接分组摘要 + 编辑/发现/删除 + 折叠式添加表单
+//   1. 服务商管理 — 按连接分组摘要 + 编辑/发现/删除 + 折叠式添加表单
 //
 // 数据流：
 //   - mount: agentChannelPresets() + agentListChannels()
-//   - 切当前模型 → agentSetActiveChannel → refetch
 //   - 删除 → agentRemoveChannel → refetch
 //   - 添加（AddChannelForm 内部 agentAddChannel）→ onSaved → refetch
+//
+// 模型选择已移至 AgentPage sidebar（更贴近使用场景）。
 //
 // 红线：全部走 specta 强类型 commands；apiKey 永不回显（列表只显示 apiKeySet）。
 
@@ -90,20 +90,6 @@ export default function SettingsPage() {
     if (!loading && !hasChannels) setAddOpen(true);
   }, [loading, hasChannels]);
 
-  const handleSetActive = useCallback(
-    async (channelId: string) => {
-      setMutating(true);
-      const res = await commands.agentSetActiveChannel(channelId);
-      if (res.status === "error") {
-        setError(formatError(res.error));
-      } else {
-        await loadChannels();
-      }
-      setMutating(false);
-    },
-    [loadChannels],
-  );
-
   const handleRemove = useCallback(
     async (channelId: string) => {
       setMutating(true);
@@ -167,46 +153,6 @@ export default function SettingsPage() {
   return (
     <PageShell title="设置" status={status} statusTone={statusTone}>
       <div className="settings-page">
-        {/* --- 模型列表 --- */}
-        {hasChannels && (
-          <section className="settings-block">
-            <h2 className="settings-block-title">模型</h2>
-            <div className="settings-model-table">
-              {channels.map((ch) => (
-                <label key={ch.channelId} className="settings-model-row">
-                  <input
-                    type="radio"
-                    name="active-model"
-                    checked={ch.isActive}
-                    disabled={mutating}
-                    onChange={() => handleSetActive(ch.channelId)}
-                  />
-                  <span className="model-name">{ch.model}</span>
-                  <span className="model-provider">{ch.provider}</span>
-                  <span className="model-host">{hostOf(ch.baseUrl)}</span>
-                  <button
-                    type="button"
-                    className="model-remove"
-                    disabled={mutating}
-                    onClick={(e) => {
-                      e.preventDefault();
-                      if (confirm(`删除模型「${ch.model}」？`))
-                        handleRemove(ch.channelId);
-                    }}
-                    title={`删除模型 ${ch.model}`}
-                    aria-label={`删除模型 ${ch.model}`}
-                  >
-                    <X size={14} />
-                  </button>
-                </label>
-              ))}
-            </div>
-            <p className="settings-hint">
-              选中的模型将用于 Agent 对话和自动分析。
-            </p>
-          </section>
-        )}
-
         {/* --- 服务商 --- */}
         <section className="settings-block">
           <div className="settings-block-header">

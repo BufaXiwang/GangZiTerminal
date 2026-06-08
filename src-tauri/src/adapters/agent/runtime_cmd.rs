@@ -405,7 +405,8 @@ pub async fn agent_set_news_auto_analysis(
 
 /// 加载指定对话的全部持久化消息（按 seq 排序；审计真源）。
 ///
-/// Spec: agent-infra-module.md §5 `load_conversation`
+/// 加载对话消息（从最近 summary 检查点开始，不加载更早的历史）。
+/// Spec: agent-infra-module.md §5 `load_conversation_view`
 #[tauri::command]
 #[specta::specta]
 pub fn agent_load_conversation(
@@ -414,7 +415,7 @@ pub fn agent_load_conversation(
 ) -> Result<Vec<crate::domain::agent::AgentMessage>, CommandError> {
     infra
         .repo
-        .load_conversation(&conversation_id)
+        .load_conversation_view(&conversation_id)
         .map_err(|e| CommandError::with_message(ErrorCode::DbError, e.to_string()))
 }
 
