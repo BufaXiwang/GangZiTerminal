@@ -97,7 +97,7 @@ impl Default for AccountServiceConfig {
         Self {
             fee_policy: AccountFeePolicy::default(),
             risk_policy: AccountRiskPolicy::default(),
-            initial_cash: Money(Decimal::new(1_000_000, 0)),
+            initial_cash: Money(Decimal::new(20_000, 0)),
         }
     }
 }
