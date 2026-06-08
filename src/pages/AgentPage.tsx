@@ -70,6 +70,17 @@ function fmtTime(iso: string): string {
   } catch { return iso; }
 }
 
+/** Extract a clean one-line title from markdown summary */
+function summarizeLine(summary: string): string {
+  // Strip markdown headers/bold, take first meaningful line
+  const clean = summary
+    .replace(/^#{1,4}\s+/gm, "")
+    .replace(/\*\*/g, "")
+    .trim();
+  const firstLine = clean.split("\n").find((l) => l.trim().length > 0) ?? clean;
+  return firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+}
+
 /** Truncate a string with an ellipsis if it exceeds maxLen */
 function truncate(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
@@ -877,75 +888,15 @@ export default function AgentPage() {
     >
       <div className="agent-page">
         {/* Left sidebar */}
+        {/* Left sidebar: conversations */}
         <aside className="agent-sidebar">
-          {/* Strategy label */}
-          <div
-            className="agent-sidebar-strategy"
-            onClick={() => void openStrategyModal()}
-          >
-            <span>投资策略{strategy ? ` V${strategy.version}` : ""}</span>
-            <span className="agent-link-btn">查看</span>
-          </div>
-
-          {/* Review reports */}
           <div className="agent-sidebar-section">
             <div className="agent-sidebar-section-header">
-              <h3>复盘报告</h3>
-              <button
-                className="agent-link-btn"
-                disabled={reviewing}
-                onClick={() => void runReviewToday()}
-              >
-                {reviewing ? "复盘中…" : "复盘今日"}
-              </button>
+              <h3>对话</h3>
             </div>
-            {reports.map((r) => (
-              <div
-                key={r.path}
-                className={`agent-sidebar-item${detailView?.type === "report" && (detailView as { type: "report"; path: string }).path === r.path ? " active" : ""}`}
-                onClick={() =>
-                  toggleDetail({ type: "report", name: r.name, path: r.path })
-                }
-              >
-                {r.name}
-              </div>
-            ))}
-            {reports.length === 0 && (
-              <div className="agent-empty">暂无复盘报告</div>
-            )}
-          </div>
-
-          {/* Analysis results only (no dialogue/failed runs) */}
-          <div className="agent-sidebar-section">
-            <div className="agent-sidebar-section-header">
-              <h3>资讯分析</h3>
-              <button
-                className="agent-link-btn"
-                disabled={togglingNewsAuto}
-                title="开启后，新资讯会自动进入分析队列（默认关闭）"
-                onClick={() => void toggleNewsAuto()}
-              >
-                {newsAuto ? "自动分析：开" : "自动分析：关"}
-              </button>
+            <div className="agent-sidebar-item active">
+              当前对话
             </div>
-            {analysisItems.map(({ result }) => (
-              <div
-                key={result.resultId}
-                className={`agent-sidebar-item agent-timeline-item${detailView?.type === "analysis" && (detailView as { type: "analysis"; data: AnalysisResult }).data.resultId === result.resultId ? " active" : ""}`}
-                onClick={() => toggleDetail({ type: "analysis", data: result })}
-              >
-                <div className="agent-timeline-top">
-                  <span className={`agent-timeline-kind kind-${result.kind}`}>
-                    {result.kind === "action" ? "操作" : "观望"}
-                  </span>
-                  <span className="agent-timeline-time">{fmtTime(result.createdAt)}</span>
-                </div>
-                <div className="agent-timeline-summary">{result.summary}</div>
-              </div>
-            ))}
-            {analysisItems.length === 0 && (
-              <div className="agent-empty">暂无分析结果</div>
-            )}
           </div>
         </aside>
 
@@ -1115,6 +1066,79 @@ export default function AgentPage() {
             )}
           </div>
         </section>
+
+        {/* Right sidebar: strategy + analysis + reports */}
+        <aside className="agent-right-sidebar">
+          <div
+            className="agent-sidebar-strategy"
+            onClick={() => void openStrategyModal()}
+          >
+            <span>投资策略{strategy ? ` V${strategy.version}` : ""}</span>
+            <span className="agent-link-btn">查看</span>
+          </div>
+
+          <div className="agent-sidebar-section">
+            <div className="agent-sidebar-section-header">
+              <h3>资讯分析</h3>
+              <button
+                className="agent-link-btn"
+                disabled={togglingNewsAuto}
+                title="开启后，新资讯会自动进入分析队列（默认关闭）"
+                onClick={() => void toggleNewsAuto()}
+              >
+                {newsAuto ? "自动分析：开" : "自动分析：关"}
+              </button>
+            </div>
+            {analysisItems.map(({ result }) => {
+              const title = summarizeLine(result.summary);
+              return (
+                <div
+                  key={result.resultId}
+                  className={`agent-sidebar-item agent-timeline-item${detailView?.type === "analysis" && (detailView as { type: "analysis"; data: AnalysisResult }).data.resultId === result.resultId ? " active" : ""}`}
+                  onClick={() => toggleDetail({ type: "analysis", data: result })}
+                >
+                  <div className="agent-timeline-top">
+                    <span className={`agent-timeline-kind kind-${result.kind}`}>
+                      {result.kind === "action" ? "操作" : "观望"}
+                    </span>
+                    <span className="agent-timeline-time">{fmtTime(result.createdAt)}</span>
+                  </div>
+                  <div className="agent-timeline-summary">{title}</div>
+                </div>
+              );
+            })}
+            {analysisItems.length === 0 && (
+              <div className="agent-empty">暂无分析结果</div>
+            )}
+          </div>
+
+          <div className="agent-sidebar-section">
+            <div className="agent-sidebar-section-header">
+              <h3>复盘报告</h3>
+              <button
+                className="agent-link-btn"
+                disabled={reviewing}
+                onClick={() => void runReviewToday()}
+              >
+                {reviewing ? "复盘中…" : "复盘今日"}
+              </button>
+            </div>
+            {reports.map((r) => (
+              <div
+                key={r.path}
+                className={`agent-sidebar-item${detailView?.type === "report" && (detailView as { type: "report"; path: string }).path === r.path ? " active" : ""}`}
+                onClick={() =>
+                  toggleDetail({ type: "report", name: r.name, path: r.path })
+                }
+              >
+                {r.name}
+              </div>
+            ))}
+            {reports.length === 0 && (
+              <div className="agent-empty">暂无复盘报告</div>
+            )}
+          </div>
+        </aside>
       </div>
 
       {/* Strategy modal */}

@@ -3678,9 +3678,18 @@ body {
 
 /* Left sidebar */
 .agent-sidebar {
-  width: 260px;
-  flex: 0 0 260px;
+  width: 200px;
+  flex: 0 0 200px;
   border-right: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  background: var(--bg-card);
+}
+.agent-right-sidebar {
+  width: 280px;
+  flex: 0 0 280px;
+  border-left: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
   overflow-y: auto;
