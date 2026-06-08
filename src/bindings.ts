@@ -461,6 +461,32 @@ async agentListReviewReports(limit: number | null) : Promise<Result<ReviewReport
 }
 },
 /**
+ * 加载指定对话的全部持久化消息（按 seq 排序；审计真源）。
+ * 
+ * Spec: agent-infra-module.md §5 `load_conversation`
+ */
+async agentLoadConversation(conversationId: string) : Promise<Result<AgentMessage[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_load_conversation", { conversationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 加载指定 run 的全部 ToolCall（按 started_at 升序）。
+ * 
+ * Spec: agent-infra-module.md §5
+ */
+async agentLoadToolCalls(runId: string) : Promise<Result<ToolCall[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_load_tool_calls", { runId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 取消一个在跑的 run（dialogue/news/review 等）。
  */
 async agentCancelRun(input: CancelRunInput) : Promise<Result<CancelRunResult, CommandError>> {

@@ -4094,3 +4094,140 @@ body {
 .agent-strategy-history-item:last-child {
   border-bottom: none;
 }
+
+/* -------- Chat block renderers -------- */
+
+/* Text block — rendered markdown inside assistant bubble */
+.chat-block-text {
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+/* Tool call block — collapsible card */
+.chat-block-tool {
+  margin: 8px 0;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  overflow: hidden;
+}
+.chat-block-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg-soft);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  user-select: none;
+}
+.chat-block-tool-header:hover {
+  background: var(--border-soft);
+}
+.chat-block-tool-header .tool-name {
+  font-weight: 500;
+}
+.chat-block-tool-header .tool-duration {
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-size: 11px;
+}
+.chat-block-tool-header .tool-expand-hint {
+  color: var(--fg-faint);
+  display: flex;
+  align-items: center;
+}
+.chat-block-tool-header .tool-spinner {
+  animation: spin 1s linear infinite;
+}
+.chat-block-tool-body {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border-soft);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  max-height: 280px;
+  overflow-y: auto;
+  color: var(--fg-muted);
+}
+.chat-block-tool-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: inherit;
+  font-size: inherit;
+}
+.chat-block-tool-body .tool-io-section {
+  margin-bottom: 8px;
+}
+.chat-block-tool-body .tool-io-section:last-child {
+  margin-bottom: 0;
+}
+.chat-block-tool-body .tool-io-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg-faint);
+  margin-bottom: 4px;
+}
+.chat-block-tool-body .tool-io-label.tool-io-error {
+  color: var(--chart-up);
+}
+.chat-block-tool.is-error .chat-block-tool-header {
+  background: rgba(192, 57, 43, 0.06);
+  border-bottom-color: rgba(192, 57, 43, 0.15);
+}
+
+/* Thinking block — collapsed by default */
+.chat-block-thinking {
+  margin: 8px 0;
+  padding: 8px 12px;
+  background: var(--bg-soft);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.chat-block-thinking:hover {
+  background: var(--border-soft);
+}
+.chat-block-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+.chat-block-thinking-text {
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-default);
+  cursor: text;
+  user-select: text;
+}
+
+/* Usage block — inline token counts */
+.chat-block-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--fg-faint);
+  padding: 4px 0;
+  font-family: var(--font-mono);
+}
+
+/* Override: assistant message body should accommodate rich blocks (no pre-wrap on container) */
+.agent-msg-assistant .agent-msg-body {
+  white-space: normal;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

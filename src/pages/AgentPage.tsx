@@ -5,13 +5,13 @@
 //
 // 数据流（前端不持有业务真源）：
 //   - 命令：agentSendMessage（dialogue run）/ agentFetchState / agentFetchStrategy / agentUpsertStrategy
-//   - 流式：listen("agent-event") → text_delta 增量进当前 assistant 气泡
+//   - 流式：listen("agent-event") → rich blocks（text_delta / thinking_delta / tool_start / tool_end / usage / done）
 //   - 状态推送：listen("agent-run-finished" / "agent-analysis-result") → 刷新总览
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Link, useLocation } from "react-router-dom";
-import { Bot, Send, User, X } from "lucide-react";
+import { Bot, ChevronDown, ChevronRight, Loader, Send, User, X, Zap } from "lucide-react";
 import { PageShell } from "../components/PageShell";
 import { ROUTES } from "../lib/router";
 import { renderMarkdown } from "../lib/simpleMarkdown";
@@ -25,11 +25,42 @@ import {
   type StrategyHistoryEntry,
 } from "../bindings";
 
-interface ChatMsg {
-  role: "user" | "assistant";
-  text: string;
+/* ---------- Rich chat message model ---------- */
+
+type ChatBlock =
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string; collapsed: boolean }
+  | {
+      type: "tool_call";
+      id: string;
+      name: string;
+      input: string;
+      output?: string;
+      isError?: boolean;
+      durationMs?: number;
+      status: "running" | "done";
+    }
+  | { type: "usage"; input: number; output: number; cacheRead?: number };
+
+interface ChatMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  blocks: ChatBlock[];
   streaming?: boolean;
   error?: boolean;
+  timestamp?: string;
+}
+
+/** Format token count: 1200 → "1.2k", 500 → "500" */
+function fmtTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+/** Truncate a string with an ellipsis if it exceeds maxLen */
+function truncate(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + "...";
 }
 
 type DetailView =
@@ -203,6 +234,144 @@ function StrategyModal({
   );
 }
 
+/* ---------- Chat block renderers ---------- */
+
+function ChatBlockView({ block }: { block: ChatBlock }) {
+  switch (block.type) {
+    case "text":
+      return <TextBlockView text={block.text} />;
+    case "thinking":
+      return <ThinkingBlockView text={block.text} defaultCollapsed={block.collapsed} />;
+    case "tool_call":
+      return (
+        <ToolCallBlockView
+          name={block.name}
+          input={block.input}
+          output={block.output}
+          isError={block.isError}
+          durationMs={block.durationMs}
+          status={block.status}
+        />
+      );
+    case "usage":
+      return <UsageBlockView input={block.input} output={block.output} cacheRead={block.cacheRead} />;
+    default:
+      return null;
+  }
+}
+
+function TextBlockView({ text }: { text: string }) {
+  return (
+    <div
+      className="chat-block-text md-content"
+      dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
+    />
+  );
+}
+
+function ThinkingBlockView({
+  text,
+  defaultCollapsed,
+}: {
+  text: string;
+  defaultCollapsed: boolean;
+}) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed);
+  return (
+    <div
+      className="chat-block-thinking"
+      onClick={() => setCollapsed(!collapsed)}
+    >
+      <div className="chat-block-thinking-header">
+        {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+        <span>思考过程</span>
+      </div>
+      {!collapsed && (
+        <div className="chat-block-thinking-text">{text}</div>
+      )}
+    </div>
+  );
+}
+
+function ToolCallBlockView({
+  name,
+  input,
+  output,
+  isError,
+  durationMs,
+  status,
+}: {
+  name: string;
+  input: string;
+  output?: string;
+  isError?: boolean;
+  durationMs?: number;
+  status: "running" | "done";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className={`chat-block-tool${isError ? " is-error" : ""}`}>
+      <div
+        className="chat-block-tool-header"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {status === "running" ? (
+          <Loader size={14} className="tool-spinner" />
+        ) : (
+          <Zap size={14} />
+        )}
+        <span className="tool-name">{name}</span>
+        {status === "done" && durationMs != null && (
+          <span className="tool-duration">{durationMs}ms</span>
+        )}
+        {status === "running" && (
+          <span className="tool-duration">运行中...</span>
+        )}
+        <span className="tool-expand-hint">
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </span>
+      </div>
+      {expanded && (
+        <div className="chat-block-tool-body">
+          <div className="tool-io-section">
+            <span className="tool-io-label">Input</span>
+            <pre>{truncate(input, 800)}</pre>
+          </div>
+          {output != null && (
+            <div className="tool-io-section">
+              <span className={`tool-io-label${isError ? " tool-io-error" : ""}`}>
+                {isError ? "Error" : "Output"}
+              </span>
+              <pre>{truncate(output, 800)}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UsageBlockView({
+  input,
+  output,
+  cacheRead,
+}: {
+  input: number;
+  output: number;
+  cacheRead?: number;
+}) {
+  return (
+    <div className="chat-block-usage">
+      <Zap size={10} />
+      {" "}
+      {fmtTokens(input)} input · {fmtTokens(output)} output
+      {cacheRead != null && cacheRead > 0 && (
+        <> · {fmtTokens(cacheRead)} cache</>
+      )}
+    </div>
+  );
+}
+
 /* ---------- main page ---------- */
 
 export default function AgentPage() {
@@ -210,7 +379,7 @@ export default function AgentPage() {
   const conversationId = useRef<string>(
     globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`,
   );
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [state, setState] = useState<AgentStateSnapshot | null>(null);
@@ -297,25 +466,143 @@ export default function AgentPage() {
     void refreshState();
   }, [refreshState]);
 
-  // 流式 token → 当前 assistant 气泡；run 终态 / 分析产出 → 刷新总览。
+  // Conversation persistence: load persisted messages on mount.
+  useEffect(() => {
+    const cid = conversationId.current;
+    if (!cid) return;
+    commands.agentLoadConversation(cid).then(res => {
+      if (res.status === "ok" && res.data.length > 0) {
+        const converted: ChatMessage[] = res.data
+          .filter(m => m.role === "user" || m.role === "assistant")
+          .map(m => ({
+            id: m.messageId,
+            role: m.role as "user" | "assistant",
+            blocks: m.blocks
+              .filter(b => b.type === "text" || b.type === "thinking")
+              .map(b => {
+                if (b.type === "thinking") return { type: "thinking" as const, text: b.text, collapsed: true };
+                return { type: "text" as const, text: (b as { text: string }).text };
+              }),
+            timestamp: m.createdAt,
+          }));
+        if (converted.length > 0) setMessages(converted);
+      }
+    }).catch(() => { /* first conversation, no history */ });
+  }, []);
+
+  // Helper: immutable update of the last assistant (streaming) message's blocks.
+  const updateCurrentMessage = useCallback(
+    (updater: (blocks: ChatBlock[]) => ChatBlock[]) => {
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === "assistant" && last.streaming) {
+          const newBlocks = updater([...last.blocks]);
+          next[next.length - 1] = { ...last, blocks: newBlocks };
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  // 流式 events → rich blocks；run 终态 / 分析产出 → 刷新总览。
   useEffect(() => {
     const uns: Array<() => void> = [];
     void listen<Record<string, unknown>>("agent-event", (e) => {
       const env = e.payload as Record<string, unknown>;
-      const p = (env?.payload ?? env) as {
-        type?: string;
-        delta?: string;
-      };
-      if (p?.type === "text_delta" && typeof p.delta === "string") {
-        const delta = p.delta;
-        setMessages((prev) => {
-          const next = [...prev];
-          const last = next[next.length - 1];
-          if (last && last.role === "assistant" && last.streaming) {
-            next[next.length - 1] = { ...last, text: last.text + delta };
-          }
-          return next;
-        });
+      const p = (env?.payload ?? env) as Record<string, unknown>;
+      const type = p?.type as string | undefined;
+
+      switch (type) {
+        case "text_delta": {
+          const delta = p.delta as string;
+          updateCurrentMessage((blocks) => {
+            const lastBlock = blocks[blocks.length - 1];
+            if (lastBlock?.type === "text") {
+              blocks[blocks.length - 1] = { ...lastBlock, text: lastBlock.text + delta };
+            } else {
+              blocks.push({ type: "text", text: delta });
+            }
+            return blocks;
+          });
+          break;
+        }
+        case "thinking_delta": {
+          const delta = p.delta as string;
+          updateCurrentMessage((blocks) => {
+            const lastBlock = blocks[blocks.length - 1];
+            if (lastBlock?.type === "thinking") {
+              blocks[blocks.length - 1] = { ...lastBlock, text: lastBlock.text + delta };
+            } else {
+              blocks.push({ type: "thinking", text: delta, collapsed: true });
+            }
+            return blocks;
+          });
+          break;
+        }
+        case "tool_start": {
+          const toolCallId = p.toolCallId as string;
+          const name = p.name as string;
+          const inputSummary = JSON.stringify(p.inputSummary ?? {});
+          updateCurrentMessage((blocks) => {
+            blocks.push({
+              type: "tool_call",
+              id: toolCallId,
+              name,
+              input: inputSummary,
+              status: "running",
+            });
+            return blocks;
+          });
+          break;
+        }
+        case "tool_end": {
+          const toolCallId = p.toolCallId as string;
+          const outputSummary = JSON.stringify(p.outputSummary ?? {});
+          const isError = p.isError as boolean;
+          const durationMs = p.durationMs as number;
+          updateCurrentMessage((blocks) => {
+            return blocks.map((b) => {
+              if (b.type === "tool_call" && b.id === toolCallId) {
+                return {
+                  ...b,
+                  output: outputSummary,
+                  isError,
+                  durationMs,
+                  status: "done" as const,
+                };
+              }
+              return b;
+            });
+          });
+          break;
+        }
+        case "usage": {
+          updateCurrentMessage((blocks) => {
+            blocks.push({
+              type: "usage",
+              input: (p.inputTokens as number) ?? 0,
+              output: (p.outputTokens as number) ?? 0,
+              cacheRead: (p.cacheReadTokens as number | undefined) ?? undefined,
+            });
+            return blocks;
+          });
+          break;
+        }
+        case "done": {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = { ...last, streaming: false };
+            }
+            return next;
+          });
+          break;
+        }
+        default:
+          break;
       }
     }).then((u) => uns.push(u));
     void listen<Record<string, unknown>>("agent-run-started", (e) => {
@@ -341,7 +628,7 @@ export default function AgentPage() {
       },
     ).then((u) => uns.push(u));
     return () => uns.forEach((u) => u());
-  }, [refreshState]);
+  }, [refreshState, updateCurrentMessage]);
 
   const cancelCurrent = useCallback(async () => {
     const id = currentRunId.current;
@@ -363,11 +650,21 @@ export default function AgentPage() {
     setSending(true);
     // Switch back to chat when sending a new message
     setDetailView(null);
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", text },
-      { role: "assistant", text: "", streaming: true },
-    ]);
+
+    const userMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      blocks: [{ type: "text", text }],
+      timestamp: new Date().toISOString(),
+    };
+    const assistantMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      blocks: [],
+      streaming: true,
+    };
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+
     const res = await commands.agentSendMessage({
       content: text,
       images: null,
@@ -378,19 +675,29 @@ export default function AgentPage() {
       const last = next[next.length - 1];
       if (last && last.role === "assistant") {
         if (res.status === "error") {
+          // If no text blocks were streamed, add an error text block
+          const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+          const errorBlocks = hasText
+            ? last.blocks
+            : [
+                ...last.blocks,
+                { type: "text" as const, text: `运行失败：${res.error.message ?? res.error.code}` },
+              ];
           next[next.length - 1] = {
             ...last,
             streaming: false,
             error: true,
-            text:
-              last.text ||
-              `运行失败：${res.error.message ?? res.error.code}`,
+            blocks: errorBlocks,
           };
         } else {
+          const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+          const doneBlocks = hasText
+            ? last.blocks
+            : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
           next[next.length - 1] = {
             ...last,
             streaming: false,
-            text: last.text || "（已完成，无文本输出）",
+            blocks: doneBlocks,
           };
         }
       }
@@ -590,9 +897,9 @@ export default function AgentPage() {
                   对话：让它分析行情/资讯、检查持仓、复盘策略，或在你确认后下单（模拟盘）。
                 </div>
               )}
-              {messages.map((m, i) => (
+              {messages.map((m) => (
                 <div
-                  key={i}
+                  key={m.id}
                   className={`agent-msg agent-msg-${m.role}${m.error ? " agent-msg-error" : ""}`}
                 >
                   <div className="agent-msg-avatar">
@@ -603,8 +910,23 @@ export default function AgentPage() {
                     )}
                   </div>
                   <div className="agent-msg-body">
-                    {m.text || (m.streaming ? "思考中…" : "")}
-                    {m.streaming && <span className="agent-cursor">▋</span>}
+                    {m.role === "user" ? (
+                      // User messages: simple text
+                      <span>{m.blocks[0]?.type === "text" ? m.blocks[0].text : ""}</span>
+                    ) : (
+                      // Assistant messages: render rich blocks
+                      <>
+                        {m.blocks.length === 0 && m.streaming && (
+                          <span className="muted">思考中...</span>
+                        )}
+                        {m.blocks.map((block, bi) => (
+                          <ChatBlockView key={bi} block={block} />
+                        ))}
+                        {m.streaming && (
+                          <span className="agent-cursor">▋</span>
+                        )}
+                      </>
+                    )}
                   </div>
                 </div>
               ))}

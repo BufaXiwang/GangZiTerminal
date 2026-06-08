@@ -180,6 +180,26 @@ impl AgentMessagesRepo {
         })
     }
 
+    /// 加载某 run 的全部 ToolCall（按 started_at 升序）。
+    ///
+    /// Spec: agent-infra-module.md §5 `load_tool_calls_by_run`。
+    pub fn load_tool_calls_by_run(&self, run_id: &str) -> Result<Vec<ToolCall>, RepoError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT tool_call_id, run_id, name,
+                        input_summary_json, input_payload_ref,
+                        output_summary_json, output_payload_ref,
+                        is_error, error_code, started_at, ended_at, duration_ms
+                 FROM agent_tool_calls WHERE run_id = ?1
+                 ORDER BY started_at ASC, tool_call_id ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![run_id], row_to_tool_call)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn load_tool_call(&self, tool_call_id: &str) -> Result<Option<ToolCall>, RepoError> {
         self.db.with(|c| {
             let mut stmt = c.prepare(
