@@ -528,13 +528,18 @@ export function KlineCanvas({
     if (price == null) return;
     const timestamp = tradeDateToMillis(liveQuote?.tradeDate);
     if (timestamp == null) return;
+    // 指数的 security_quotes volume（手→股 ×100）与 security_bars volume 差 100 倍。
+    // 前端补偿：指数标的的实时 quote volume ÷100 对齐历史 K 线。
+    const isIndex = /^(000|399|9{3})\d{3}\.(SH|SZ)$/.test(tsCode);
+    let vol = toNumber(liveQuote?.volume) ?? undefined;
+    if (vol != null && isIndex) vol = Math.round(vol / 100);
     const bar: KLineData = {
       timestamp,
       open: toNumber(liveQuote?.open) ?? price,
       high: toNumber(liveQuote?.high) ?? price,
       low: toNumber(liveQuote?.low) ?? price,
       close: price,
-      volume: toNumber(liveQuote?.volume) ?? undefined,
+      volume: vol,
     };
     chart.updateData(bar);
     // 同步末根最大时间戳，避免与盘中轮询的尾部 merge 打架。
