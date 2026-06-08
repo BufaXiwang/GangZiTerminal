@@ -355,7 +355,10 @@ export default function NewsPage() {
         setError(`${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`);
       }
       setLoadingMore(false);
-      // 等新 section 渲染 + ref 注册后再滚动；跨帧重试直到命中。
+      setActiveDate(dateKey);
+      // 先立即滚到顶部（防止旧滚动位置导致白屏），再尝试精确滚到日期 section。
+      const container = document.querySelector(".news-timeline") as HTMLElement | null;
+      if (container) container.scrollTop = 0;
       let tries = 30;
       const tick = () => {
         if (scrollToDate(dateKey)) return;
