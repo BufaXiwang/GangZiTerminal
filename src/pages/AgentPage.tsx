@@ -94,6 +94,59 @@ function summarizeLine(summary: string): string {
   return firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
 }
 
+/** Parse persisted message text into ChatBlocks (text + tool_call from XML markers) */
+function parsePersistedBlocks(text: string, role: "user" | "assistant"): ChatBlock[] {
+  const blocks: ChatBlock[] = [];
+  // For user messages containing only tool results, parse them as tool_call blocks
+  if (role === "user") {
+    const resultRe = /<tool_(?:result|error)\s+name="([^"]*)"[^>]*call_id="([^"]*)"[^>]*>([\s\S]*?)<\/tool_(?:result|error)>/g;
+    let match;
+    while ((match = resultRe.exec(text)) !== null) {
+      const isError = match[0].startsWith("<tool_error");
+      blocks.push({
+        type: "tool_call",
+        id: match[2],
+        name: match[1],
+        input: "",
+        output: match[3].slice(0, 500),
+        isError,
+        status: "done",
+      });
+    }
+    // If we parsed tool results, skip adding raw text
+    if (blocks.length > 0) return blocks;
+  }
+  // For assistant messages, parse <use_tool> as tool calls
+  if (role === "assistant") {
+    const toolRe = /<use_tool\s+name="([^"]*)">([\s\S]*?)<\/use_tool>/g;
+    let lastIdx = 0;
+    let match;
+    while ((match = toolRe.exec(text)) !== null) {
+      const before = text.slice(lastIdx, match.index).trim();
+      if (before) blocks.push({ type: "text", text: before });
+      blocks.push({
+        type: "tool_call",
+        id: `persisted_${match.index}`,
+        name: match[1],
+        input: match[2].slice(0, 500),
+        status: "done",
+      });
+      lastIdx = match.index + match[0].length;
+    }
+    const after = text.slice(lastIdx).trim();
+    if (after) blocks.push({ type: "text", text: after });
+    if (blocks.length > 0) return blocks;
+  }
+  // Fallback: plain text
+  const cleaned = text
+    .replace(/<use_tool[\s\S]*?<\/use_tool>/g, "")
+    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
+    .replace(/<tool_error[\s\S]*?<\/tool_error>/g, "")
+    .trim();
+  if (cleaned) blocks.push({ type: "text", text: cleaned });
+  return blocks;
+}
+
 /** Truncate a string with an ellipsis if it exceeds maxLen */
 function truncate(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
@@ -534,12 +587,11 @@ export default function AgentPage() {
           .map(m => ({
             id: m.messageId,
             role: m.role as "user" | "assistant",
-            blocks: m.blocks
-              .filter(b => b.type === "text" || b.type === "thinking")
-              .map(b => {
-                if (b.type === "thinking") return { type: "thinking" as const, text: b.text, collapsed: true };
-                return { type: "text" as const, text: (b as { text: string }).text };
-              }),
+            blocks: m.blocks.flatMap(b => {
+              if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
+              if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
+              return [];
+            }),
             timestamp: m.createdAt,
           }));
         setMessages(converted);
@@ -627,12 +679,11 @@ export default function AgentPage() {
           .map(m => ({
             id: m.messageId,
             role: m.role as "user" | "assistant",
-            blocks: m.blocks
-              .filter(b => b.type === "text" || b.type === "thinking")
-              .map(b => {
-                if (b.type === "thinking") return { type: "thinking" as const, text: b.text, collapsed: true };
-                return { type: "text" as const, text: (b as { text: string }).text };
-              }),
+            blocks: m.blocks.flatMap(b => {
+              if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
+              if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
+              return [];
+            }),
             timestamp: m.createdAt,
           }));
         if (converted.length > 0) setMessages(converted);

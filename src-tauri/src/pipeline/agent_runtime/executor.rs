@@ -16,7 +16,8 @@ use crate::domain::agent::loop_request::AgentRunRequest;
 use crate::domain::agent::messages::AgentMessage;
 use crate::domain::agent::runtime::{AgentRun, AgentRunStatus, AgentRunTrigger};
 use crate::domain::agent::AgentStopReason;
-use crate::infrastructure::agent::loop_executor::{run_agent_turn_cancellable, ProviderStream};
+use crate::infrastructure::agent::loop_executor::{run_agent_turn_forked, ProviderStream};
+use crate::infrastructure::agent::subagent::ForkRuntime;
 use tokio_util::sync::CancellationToken;
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
 use crate::infrastructure::agent::tool_registry::ToolRegistry;
@@ -163,6 +164,10 @@ pub async fn execute_run(
     let active = strategy.active()?;
     let ctx = build_context(&run.run_id, run.mode, active.as_ref(), realtime);
 
+    // 2.5) ForkRuntime：sub-agent tool 在 dispatch 时读取真实 channel / is_subagent / parent_run_id。
+    let fork_rt = ForkRuntime::new(channel.clone(), &run.run_id);
+    let fork_ctx = Some(fork_rt.into_ext());
+
     // 3) AgentRunRequest。
     let request = AgentRunRequest {
         run_id: run.run_id.clone(),
@@ -207,7 +212,7 @@ pub async fn execute_run(
         }
     });
 
-    let summary = run_agent_turn_cancellable(request, registry, ctx, providers, tx, repo, cancel)
+    let summary = run_agent_turn_forked(request, registry, ctx, providers, tx, repo, fork_ctx, cancel)
         .await
         .map_err(|e| ExecError::Loop(e.to_string()));
 
