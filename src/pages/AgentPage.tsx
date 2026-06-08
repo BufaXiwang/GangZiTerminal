@@ -451,9 +451,14 @@ function UsageBlockView({
 export default function AgentPage() {
   const [hasChannel, setHasChannel] = useState<boolean | null>(null); // null = loading
   const [channels, setChannels] = useState<ProviderChannelView[]>([]);
-  const conversationId = useRef<string>(
-    globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`,
-  );
+  const [conversationIdValue] = useState<string>(() => {
+    const stored = localStorage.getItem("agent_conversation_id");
+    if (stored) return stored;
+    const id = globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`;
+    localStorage.setItem("agent_conversation_id", id);
+    return id;
+  });
+  const conversationId = useRef(conversationIdValue);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [pendingImages, setPendingImages] = useState<string[]>([]);
