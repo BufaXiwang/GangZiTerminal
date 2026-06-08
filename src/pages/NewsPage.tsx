@@ -143,13 +143,10 @@ export default function NewsPage() {
   }, []);
 
   // === 默认初始加载（mount / filter 变化 / refreshTick）：最新一页 ===
-  // 用户锚定日期后（activeDate != null），refreshTick 变化只刷 dateCounts，不替换窗口内容。
+  const anchoredRef = useRef(false);
   useEffect(() => {
-    if (activeDate && refreshTick > 0) {
-      // 用户在看历史日期，只更新 dateCounts 不覆盖窗口
-      void fetchWindow({ order: "desc" }).then((res) => {
-        if (res.status === "ok") applyDateCounts(res.data.dateCounts);
-      });
+    // 用户锚定了历史日期 → 不覆盖窗口（只在 filter/query 变时才重置）
+    if (anchoredRef.current && refreshTick > 0) {
       return;
     }
     let cancelled = false;
@@ -182,6 +179,7 @@ export default function NewsPage() {
       }
       setLastUpdated(new Date());
       setActiveDate(null);
+      anchoredRef.current = false;
       setLoading(false);
     });
     return () => {
@@ -365,6 +363,7 @@ export default function NewsPage() {
       }
       setLoadingMore(false);
       setActiveDate(dateKey);
+      anchoredRef.current = true;
       // 先立即滚到顶部（防止旧滚动位置导致白屏），再尝试精确滚到日期 section。
       const container = document.querySelector(".news-timeline") as HTMLElement | null;
       if (container) container.scrollTop = 0;
