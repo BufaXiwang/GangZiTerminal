@@ -60,6 +60,7 @@ mod tests {
             success: 9,
             failed_batches: 1,
             captured_at: Utc::now(),
+            is_final: true,
         }
     }
 

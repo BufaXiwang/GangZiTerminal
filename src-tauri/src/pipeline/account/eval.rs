@@ -16,7 +16,7 @@ use crate::domain::account::requests::AccountActor;
 use crate::domain::account::triggers::{AccountTrigger, AccountTriggerResult, AccountTriggerType, TriggerKey};
 use crate::domain::account::types::{
     OrderSide, OrderStatus, OrderType, Position, PositionLot, PositionProtection,
-    PositionStatus, TradeFill, TradingActor,
+    PositionStatus, TradeFill, TradingActor, WatchlistItem,
 };
 use crate::domain::shared::{
     resolve_market_time, FreshnessStatus, InstrumentCategory, Money, OccurredAt, Price, Shares,
@@ -530,6 +530,36 @@ fn commit_limit_fill(
         };
         AccountRepository::append_event(tx, &pos_ev)?;
         event_ids.push(pos_ev.event_id);
+
+        // 持仓 ⊆ 自选不变量：limit 单首次建仓 → 自动加自选（幂等，不覆盖既有 note）。
+        // Spec: account-module.md §2「持仓 ⊆ 自选不变量」。
+        if matches!(position_event, AccountEventType::PositionOpened) {
+            let added = AccountRepository::ensure_watchlist_if_absent(
+                tx,
+                &WatchlistItem {
+                    ts_code: order.ts_code.clone(),
+                    name: Some(position_after.name.clone()),
+                    added_at: now,
+                    note: None,
+                },
+            )?;
+            if added {
+                let wl_ev = AccountEvent {
+                    event_id: new_id("evt"),
+                    event_type: AccountEventType::WatchlistAdded,
+                    order_id: None,
+                    fill_id: None,
+                    position_id: None,
+                    ts_code: Some(order.ts_code.clone()),
+                    reason: Some("auto_add_on_open".into()),
+                    actor: AccountActor::System.as_str().into(),
+                    payload: json!({ "source": "open_position" }),
+                    occurred_at: now,
+                };
+                AccountRepository::append_event(tx, &wl_ev)?;
+                event_ids.push(wl_ev.event_id);
+            }
+        }
 
         // Lots
         // 卖单 FIFO 扣减返回 (lot_id, 消耗量) 明细，供下方按实际消耗收缩 frozen_lots。
@@ -1080,6 +1110,7 @@ mod tests {
             let mut all = Vec::new();
             all.extend(crate::infrastructure::quotes::migrations());
             all.extend(crate::infrastructure::account::migrations());
+            all.extend(crate::infrastructure::account::migrations_tail());
             run_migrations(c, all).unwrap();
         });
         let deps = EvalDeps {
@@ -1471,6 +1502,7 @@ mod tests {
         for i in 0..2 {
             let order = crate::domain::account::types::Order {
                 order_id: format!("ord_{}", i),
+                client_order_id: None,
                 ts_code: code.clone(),
                 side: OrderSide::Buy,
                 order_type: OrderType::Limit,
@@ -1544,6 +1576,7 @@ mod tests {
     ) -> crate::domain::account::types::Order {
         crate::domain::account::types::Order {
             order_id: id.into(),
+            client_order_id: None,
             ts_code: code.clone(),
             side,
             order_type: OrderType::Limit,

@@ -17,8 +17,78 @@
 use rusqlite_migration::M;
 
 pub fn migrations() -> Vec<M<'static>> {
-    vec![M::up(MIGRATION_001_INITIAL)]
+    vec![
+        M::up(MIGRATION_001_INITIAL),
+        M::up(MIGRATION_002_OPERATION_DEDUP),
+        M::up(MIGRATION_003_ORDER_CLIENT_ORDER_ID),
+    ]
 }
+
+/// Account 拥有、但**物理放到全局拼接末尾**的迁移（见 `lib.rs` migration 顺序约束）。
+///
+/// Spec: account-module.md §2「账户财务事实只读 facade（账户为单一所有者）」
+///
+/// 背景：`lib.rs` 全局拼接 `news → account → quotes → agent` 是 append-only——往
+/// `account_migrations()` 中间插表会移位破坏存量 DB 的 user_version 序。但「账户财务事实」
+/// （日初权益基线 / 当日权益高水位）**逻辑归属 Account**。正确做法 = 把该 migration 物理
+/// **追加到全局拼接末尾**（在 agent 之后），表归属仍是 Account（schema 此处定义、读写在
+/// `AccountRepository`/`AccountService`）。migration 物理位置 ≠ 表逻辑归属。
+pub fn migrations_tail() -> Vec<M<'static>> {
+    vec![
+        M::up(MIGRATION_TAIL_001_DAY_EQUITY),
+        M::up(MIGRATION_TAIL_002_ARCHIVE),
+    ]
+}
+
+/// account_archive: 重置账户时旧局的软归档摘要（单行 JSON-free 列）。
+///
+/// Spec: account-module.md §2「账户重置」/ §4 `account_reset` / `list_account_archives`。
+/// 重置 = 重开一局；旧局只存可读摘要（不复制大表），按 `season` 取回。
+const MIGRATION_TAIL_002_ARCHIVE: &str = r#"
+CREATE TABLE account_archive (
+    season                 INTEGER PRIMARY KEY,   -- 局序号（递增）
+    reset_at               TEXT NOT NULL,
+    initial_cash           TEXT NOT NULL,         -- Decimal as string
+    final_cash             TEXT NOT NULL,
+    final_equity           TEXT NOT NULL,
+    realized_pnl           TEXT NOT NULL,
+    fill_count             INTEGER NOT NULL,
+    closed_position_count  INTEGER NOT NULL,
+    event_count            INTEGER NOT NULL
+);
+"#;
+
+/// account_day_equity: 当日组合「日初权益」基线 + 「当日权益高水位」（CN 交易日为键）。
+///
+/// Spec: account-module.md §2「账户财务事实只读 facade」
+/// - `daily_return(now)` = (现权益 − open_equity)/open_equity；首次当日观测幂等落 open_equity。
+/// - `daily_drawdown(now)` = (high_equity − 现权益)/high_equity；每次观测取 max(high_equity, 现权益)，重启安全。
+const MIGRATION_TAIL_001_DAY_EQUITY: &str = r#"
+CREATE TABLE account_day_equity (
+    trade_date   TEXT PRIMARY KEY,           -- YYYYMMDD（CN 交易日）
+    open_equity  TEXT NOT NULL,              -- 当日日初权益基线（Decimal as string）
+    high_equity  TEXT NOT NULL,              -- 当日权益高水位（drawdown 用，Decimal as string）
+    captured_at  TEXT NOT NULL
+);
+"#;
+
+/// MIGRATION_003：account_orders 增 client_order_id 列（account-module.md line87/122：Order 持久化幂等键）。
+/// Agent 单由 operate_account_with_dedup 成功后盖戳；旧单 / system 单为 NULL。
+const MIGRATION_003_ORDER_CLIENT_ORDER_ID: &str = r#"
+ALTER TABLE account_orders ADD COLUMN client_order_id TEXT;
+CREATE INDEX idx_account_orders_client_order ON account_orders (client_order_id);
+"#;
+
+/// MIGRATION_002：clientOrderId 幂等去重表（account-module.md §4：同一 clientOrderId 只对应一个 Order；
+/// 崩溃后用 clientOrderId 确定性对账，无"猜失败"盲区）。键 = clientOrderId，值 = 当次 OperateAccountResponse JSON。
+const MIGRATION_002_OPERATION_DEDUP: &str = r#"
+CREATE TABLE account_operation_dedup (
+    client_order_id TEXT PRIMARY KEY,
+    response_json   TEXT NOT NULL,
+    accepted        INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+"#;
 
 const MIGRATION_001_INITIAL: &str = r#"
 -- account_meta: 单账户元数据。

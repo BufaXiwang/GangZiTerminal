@@ -40,6 +40,12 @@ pub struct ToolSpec {
     pub examples: Vec<String>,
     pub side_effect: SideEffect,
     pub timeout_ms: u64,
+    /// fork 类工具标记（`run_subagent` / `run_skill` 等）。
+    ///
+    /// 构造子 run registry 时**按此剔除**（spec §3.5 无嵌套，不靠 name 白名单），
+    /// 确保任何新增 fork 类工具（含 Runtime 注入的领域 fork 工具）都被覆盖。缺省 false。
+    #[serde(default)]
+    pub is_spawn: bool,
 }
 
 impl ToolSpec {
@@ -58,7 +64,14 @@ impl ToolSpec {
             examples,
             side_effect,
             timeout_ms,
+            is_spawn: false,
         }
+    }
+
+    /// 标记为 fork/spawn 类工具（子 agent registry 构造时被剔除）。
+    pub fn spawn(mut self) -> Self {
+        self.is_spawn = true;
+        self
     }
 }
 

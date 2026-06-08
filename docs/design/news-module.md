@@ -169,8 +169,8 @@ type NewsSource = {
 - `query` 同时检索 title / summary / article。
 - `article` 缺失时只索引 title / summary。
 - 更新 `ArticleContent` 后必须同步更新所有 `NewsItem.url == ArticleContent.url` 的搜索读模型。
-- 搜索读模型必须与 `NewsItem` 保持一致：删除 `NewsItem` 时同步删除其搜索行；删除 `ArticleContent` 不连带删除（按 url 存、可被同 url 其他 item 复用）。
-- 实现自愈：启动时对账，清掉搜索读模型中指向已不存在 `NewsItem` 的孤儿行（防历史删除累积）。当前 FTS 实现是独立 FTS5 表（`article` 列来自 `news_articles` join，不便做 external-content + 触发器），故靠"删除路径 + 启动对账"双重保证一致性。
+- 搜索读模型必须与 `NewsItem` 保持一致。**本阶段 News 不暴露任何删除入口**（不主动删除 `NewsItem` / `ArticleContent`，见 §读模型不变量），因此删除一致性规则（删除 `NewsItem` 时同步删其搜索行、删除 `ArticleContent` 不连带删搜索行）仅为未来维护策略预留，当前无对应触发路径。
+- 实现自愈：启动时对账，清掉搜索读模型中指向已不存在 `NewsItem` 的孤儿行（兜底历史数据 / 外部维护脚本可能造成的不一致）。当前 FTS 实现是独立 FTS5 表（`article` 列来自 `news_articles` join，不便做 external-content + 触发器），故靠启动对账保证一致性。
 
 ---
 
@@ -217,6 +217,7 @@ external read request
 
 ```ts
 type FetchNewsRequest = {
+  ids?: string[];
   query?: string;
   sources?: string[];
   publishedFrom?: OccurredAt;
@@ -269,10 +270,10 @@ type FetchNewsResponse = {
 
 规则：
 
-- `fetch_news` **不提供按 ID 列表查询**：调用方无法预知具体 `NewsItem.id`，按 ID 检索不是产品需求。需要定位特定新闻，按 `query` / `sources` / `publishedFrom-publishedTo` 组合检索。
+- `ids` 与 `query` / `sources` / 时间窗等可组合（同时出现按 AND 收窄）：`ids` 用于按 `NewsItem.id`（newsId）精确取回一批已知主记录（如 Agent Runtime 装载 buffer 批次后按这批 id 取回内容做分析 + drain），`query` 用于关键词检索。`ids` 最多 200 个，超出返回 `invalid_input`；`ids` 中未命中的 id 不报错，按缺失忽略（返回集只含命中的 item）。
 - `dateCounts` 与 `items` 共享同一 filter（`query` / `sources` / 时间范围）但**不分页**：按 `published_at` 转北京时区(UTC+8)后的日期 `GROUP BY` 统计，只计 `publishedAt` 非空的条目。前端日期导航直接用它显示每日真实总数，不得用分页累积的 `items` 重新计数（会随滚动逐步增长，误导用户）。
 - `query` 是唯一文本查询条件，使用全文搜索读模型做相关性搜索；无正文时仍可命中 title / summary。
-- `query` 匹配前必须 trim、折叠连续空白；英文大小写不敏感，中文按全文搜索 tokenizer 规则处理。多词 query 的 AND / OR / phrase 行为由 News FTS 读模型统一定义，不能由调用方或不同 adapter 各自解释。
+- `query` 匹配前必须 trim、折叠连续空白；英文大小写不敏感，中文按全文搜索 tokenizer 规则处理。多词 query 的语义由 News FTS 读模型统一定义，不能由调用方或不同 adapter 各自解释：**默认多词按 AND**（所有词都命中才算命中，跨 title / summary / article 任一字段命中即可）；**不支持引号 phrase 与 OR / NOT 等显式布尔算符**，引号及其它 FTS 元字符在匹配前作为普通文本处理（转义或剥离），调用方无法注入 FTS 查询语法。
 - `query`、`sources`、时间范围同时出现时按 AND 组合。
 - `publishedFrom` / `publishedTo` 是闭区间；`publishedAt` 缺失的新闻不命中发布时间范围过滤。
 - 有 `query` 时默认按 FTS relevance 排序，并以 `publishedAt desc, createdAt desc, id asc` 作为稳定 tie-breaker；无 `query` 时按 `publishedAt desc, createdAt desc, id asc` 排序。`publishedAt` 缺失时用 `createdAt` 参与第一排序位。
@@ -389,6 +390,7 @@ News refresh 由 scheduler 独占触发，不暴露为 Tauri command；warm 通�
 - `batchId` 是本轮的幂等和审计 ID，必须在 refresh / warm 开始时生成并贯穿 warnings / failures / emitted event；同一轮重试不得生成多个 batchId，不同轮不要求稳定复用。
 - `fetchedCount` 表示 provider 返回的原始 item 数量；`skippedCount` 表示 normalize / validate 阶段跳过的 item 数量。
 - `savedCount = newIds.length + updatedIds.length`。`savedCount` 只统计 `NewsItem` 主记录新增 / 更新；`ArticleContent` 写入或更新只计入 `articleUpdatedCount`，两者不重叠。
+- `failedCount = failures.length`，即本轮抓取 / 保存失败的 `NewsFailure` 条数（每个 `NewsFailure` 记一次 provider 级失败：fetch / normalize / save / article 任一阶段失败）。`failedCount` 与 `skippedCount` 不重叠：`skippedCount` 是可跳过的单条 item（进 `warnings`），`failedCount` 是进 `failures` 的失败；单条跳过不得提升为 `failures`。`failures` 为空时 `failedCount = 0`。
 - `newIds` 表示本轮首次插入的 `NewsItem.id`；`updatedIds` 表示已有 `NewsItem` 的 title / summary / url / publishedAt / payload 等主记录字段发生变化。两者互斥。
 - `articleUpdatedNewsIds` 表示本轮正文变化影响到的 `NewsItem.id`，包括共享同一 canonical URL 的多条新闻；仅正文变化时 `newIds` / `updatedIds` 可以为空。
 - 同一 `NewsItem.id` 可以同时出现在 `articleUpdatedNewsIds` 和 `newIds` / `updatedIds` 中；Runtime 侧入队必须按 `newsId` 去重。

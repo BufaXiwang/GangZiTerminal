@@ -9,6 +9,7 @@ export const ROUTES = {
   news: "/",
   market: "/market",
   account: "/account",
+  agent: "/agent",
   settings: "/settings",
 } as const;
 

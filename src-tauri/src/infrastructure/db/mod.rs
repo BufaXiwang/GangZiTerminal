@@ -6,4 +6,4 @@ pub mod connection;
 pub mod migrations;
 
 pub use connection::AppDb;
-pub use migrations::run_migrations;
+pub use migrations::{all_migrations, run_migrations};

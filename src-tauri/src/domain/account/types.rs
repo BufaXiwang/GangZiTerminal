@@ -79,6 +79,10 @@ pub enum OrderIntent {
 #[serde(rename_all = "camelCase")]
 pub struct Order {
     pub order_id: String,
+    /// 调用方幂等键（spec §4 line122）；持久化供反查。Agent 单经 operate_account_with_dedup 盖戳；
+    /// 内部 system 订单 / 旧单为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_order_id: Option<String>,
     pub ts_code: TsCode,
     pub side: OrderSide,
     pub order_type: OrderType,

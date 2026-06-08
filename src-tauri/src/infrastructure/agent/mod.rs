@@ -23,6 +23,7 @@ pub mod loop_executor;
 pub mod messages_repo;
 pub mod migrations;
 pub mod payload_store;
+pub mod runtime_repo;
 pub mod presets;
 pub mod providers;
 pub mod skill_store;
@@ -74,6 +75,7 @@ pub use loop_executor::{
 pub use messages_repo::AgentMessagesRepo;
 pub use migrations::migrations;
 pub use payload_store::{PayloadKind, PayloadStore, PayloadStoreEntry, PAYLOAD_INLINE_LIMIT_BYTES};
+pub use runtime_repo::AgentRuntimeRepo;
 pub use tool_parser::{ParserEvent, ToolCallParser};
 pub use tool_registry::{
     DispatchError, DispatchExt, FnToolHandler, InputValidator, ToolHandler, ToolHandlerFuture,

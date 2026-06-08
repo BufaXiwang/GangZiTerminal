@@ -16,10 +16,11 @@ use crate::domain::account::money::{
 };
 use crate::domain::account::policy::{AccountFeePolicy, AccountRiskPolicy};
 use crate::domain::account::requests::{
-    AccountActor, FetchAccountRequest, FetchAccountResponse, MarkTriggerHandledRequest,
-    MarkTriggerHandledResponse, OperateAccountAction, OperateAccountRequest,
-    OperateAccountResponse, PositionStatusFilter, ScaleSide, TriggerHandledFilter,
-    UpdateWatchlistAction, UpdateWatchlistRequest, UpdateWatchlistResponse,
+    AccountActor, AccountArchive, AccountResetResponse, FetchAccountRequest, FetchAccountResponse,
+    ListAccountArchivesResponse, MarkTriggerHandledRequest, MarkTriggerHandledResponse,
+    OperateAccountAction, OperateAccountRequest, OperateAccountResponse, PositionStatusFilter,
+    ScaleSide, TriggerHandledFilter, UpdateWatchlistAction, UpdateWatchlistRequest,
+    UpdateWatchlistResponse,
 };
 use crate::domain::account::rules::{assert_lot_size, validate_limit_price};
 use crate::domain::account::triggers::{
@@ -33,7 +34,7 @@ use crate::domain::account::types::{
 use crate::domain::quotes::{MarketInstrument, MarketQuoteSnapshot, QuoteFacadeErrorKind};
 use crate::domain::shared::{
     resolve_market_time, ErrorCode, Freshness, FreshnessStatus, InstrumentCategory,
-    InstrumentStatus, Money, OccurredAt, Price, Shares, TsCode, WarningCode,
+    InstrumentStatus, Money, OccurredAt, Price, Shares, TradeDate, TsCode, WarningCode,
 };
 use crate::infrastructure::account::repository::{
     AccountRepository, FreezeEntry, FrozenLot,
@@ -107,6 +108,10 @@ pub struct AccountService {
     config: AccountServiceConfig,
     /// 串行化所有写路径（spec §3 数据流：所有写操作串行化）。
     write_lock: Mutex<()>,
+    /// 当前 operate_account 调用携带的 clientOrderId（spec account-module §clientOrderId：
+    /// 在订单创建时原子写入，非事后盖戳）。仅在持有 `write_lock` 期间有效；建单路径读取它写进
+    /// 同一事务的 Order INSERT。
+    pending_client_order_id: Mutex<Option<String>>,
     updated_sink: RwLock<Option<AccountUpdatedSink>>,
     triggered_sink: RwLock<Option<AccountTriggeredSink>>,
 }
@@ -122,6 +127,7 @@ impl AccountService {
             gateway,
             config,
             write_lock: Mutex::new(()),
+            pending_client_order_id: Mutex::new(None),
             updated_sink: RwLock::new(None),
             triggered_sink: RwLock::new(None),
         }
@@ -129,6 +135,12 @@ impl AccountService {
 
     pub fn db(&self) -> &AppDb {
         &self.db
+    }
+
+    /// 取出并消费当前 operate_account 调用携带的 clientOrderId（建单时调用，写进同一事务的
+    /// Order INSERT）。take 语义：消费一次后置空，避免同一调用里多次建单误用同一键。
+    fn take_pending_client_order_id(&self) -> Option<String> {
+        self.pending_client_order_id.lock().unwrap().take()
     }
 
     pub fn config(&self) -> &AccountServiceConfig {
@@ -451,6 +463,105 @@ impl AccountService {
             }
         }
         out
+    }
+
+    // ====================================================================
+    // 账户财务事实只读 facade（账户为账户财务事实单一所有者）
+    //
+    // Spec: account-module.md §2「账户财务事实只读 facade（账户为单一所有者）」
+    //
+    // 下沉自 Agent Runtime（原 agent_daily_equity 表 + orchestrator 侧计算）：
+    // 「日初权益 / 当日组合收益率 / 当日尾部连亏 / 当日组合回撤」都是对账户财务事实的派生，
+    // 归属 Account；Runtime 改为只调这些 facade 做编排（取阈值 + 比较 + 闸门），不再自扒快照重算。
+    // ====================================================================
+
+    /// CN（Asia/Shanghai）当日交易日 —— A 股财务派生统一以此为键。
+    fn cn_trade_date(now: chrono::DateTime<Utc>) -> TradeDate {
+        TradeDate::from_naive(now.with_timezone(&Shanghai).date_naive())
+    }
+
+    /// 现权益 = `AccountSnapshot.totalAssets`（账户自有估值，部分估值带 data_partial warning）。
+    fn current_equity(&self) -> Option<Decimal> {
+        self.fetch_snapshot_only().ok().map(|s| s.total_assets.0)
+    }
+
+    /// 只读：某 CN 交易日的**日初权益基线**（当日尚未观测过则 None）。
+    /// Spec: account-module.md §2 facade `day_open_equity(trade_date)`。
+    pub fn day_open_equity(&self, trade_date: &TradeDate) -> Option<Money> {
+        let repo = AccountRepository::new(&self.db);
+        repo.get_day_open_equity(trade_date).ok().flatten().map(Money)
+    }
+
+    /// **当日组合收益率** =(现权益 − 日初权益)/日初权益。
+    /// 首次当日估值时幂等记录日初权益基线（内部维护写，不写 account_events）；日初为 0 或权益缺失 → None。
+    /// Spec: account-module.md §2 facade `daily_return(now)`。
+    pub fn daily_return(&self, now: chrono::DateTime<Utc>) -> Option<f64> {
+        let cur = self.current_equity()?;
+        let td = Self::cn_trade_date(now);
+        let repo = AccountRepository::new(&self.db);
+        let (open, _high) = repo.observe_day_equity(&td, cur, now).ok()?;
+        if open.is_zero() {
+            return None;
+        }
+        let cur_f = cur.to_string().parse::<f64>().ok()?;
+        let open_f = open.to_string().parse::<f64>().ok()?;
+        Some((cur_f - open_f) / open_f)
+    }
+
+    /// **当日尾部连续亏损笔数**：当日（CN 交易日）已平仓位中，从最近一笔起连续 `realizedPnl < 0` 的数量。
+    /// Spec: account-module.md §2 facade `consecutive_losses(now)`。
+    pub fn consecutive_losses(&self, now: chrono::DateTime<Utc>) -> u32 {
+        let today = now.with_timezone(&Shanghai).date_naive();
+        let repo = AccountRepository::new(&self.db);
+        let Ok(positions) = repo.list_positions(Some(PositionStatus::Closed), 10_000, 0) else {
+            return 0;
+        };
+        // 收集当日平仓的 (closedAt, realizedPnl)，按 closedAt 降序（最新在前）。
+        let mut closed: Vec<(OccurredAt, Decimal)> = positions
+            .into_iter()
+            .filter_map(|p| {
+                let closed_at = p.closed_at?;
+                if closed_at.with_timezone(&Shanghai).date_naive() != today {
+                    return None;
+                }
+                Some((closed_at, p.realized_pnl.0))
+            })
+            .collect();
+        closed.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut n = 0u32;
+        for (_, pnl) in closed {
+            if pnl < Decimal::ZERO {
+                n += 1;
+            } else {
+                break;
+            }
+        }
+        n
+    }
+
+    /// **当日组合回撤比例**（high-water-mark）=(当日权益高水位 − 现权益)/当日权益高水位，下限 0。
+    /// 当日权益高水位由 Account 持久化、每次估值刷新（重启安全）；权益缺失 → 0。
+    /// Spec: account-module.md §2 facade `daily_drawdown(now)`。
+    pub fn daily_drawdown(&self, now: chrono::DateTime<Utc>) -> f64 {
+        let Some(cur) = self.current_equity() else {
+            return 0.0;
+        };
+        let td = Self::cn_trade_date(now);
+        let repo = AccountRepository::new(&self.db);
+        let Ok((_open, high)) = repo.observe_day_equity(&td, cur, now) else {
+            return 0.0;
+        };
+        let Ok(cur_f) = cur.to_string().parse::<f64>() else {
+            return 0.0;
+        };
+        let Ok(high_f) = high.to_string().parse::<f64>() else {
+            return 0.0;
+        };
+        if high_f > 0.0 {
+            ((high_f - cur_f) / high_f).max(0.0)
+        } else {
+            0.0
+        }
     }
 
     // ====================================================================
@@ -826,8 +937,199 @@ impl AccountService {
     }
 
     // ====================================================================
+    // reset_account / list_account_archives — 重开一局 + 软归档
+    // ====================================================================
+
+    /// 重置账户 = 重开一局模拟盘。
+    ///
+    /// 单事务内：归档旧局摘要 → 清空账户财务 live 表（保留自选）→ 重新初始化（现金=初始本金）。
+    /// 不触碰 Agent 决策链（跨 BC）。
+    ///
+    /// Spec: account-module.md §2「账户重置」/ §4 `account_reset`。
+    pub fn reset_account(&self) -> Result<AccountResetResponse, ErrorCode> {
+        let _g = self.write_lock.lock().unwrap();
+        let repo = AccountRepository::new(&self.db);
+        let now = Utc::now();
+
+        // 旧局摘要（清表前快照；fail closed 用 DbError）。
+        let meta = repo.get_meta().map_err(|_| ErrorCode::DbError)?;
+        let season = repo.next_season().map_err(|_| ErrorCode::DbError)?;
+
+        // 旧局期末现金/权益：有 meta 才有意义；无 meta（从未初始化）则归档 initial_cash 空局。
+        let initial_cash = meta
+            .as_ref()
+            .map(|m| m.initial_cash)
+            .unwrap_or(self.config.initial_cash);
+        let final_cash = meta.as_ref().map(|m| m.cash).unwrap_or(initial_cash);
+        let final_equity = rebuild_snapshot(SnapshotBuildInput {
+            repo: &repo,
+            gateway: self.gateway.as_ref(),
+            now,
+        })
+        .map(|r| r.snapshot.total_assets)
+        .unwrap_or(final_cash);
+        let realized_pnl = rebuild_snapshot(SnapshotBuildInput {
+            repo: &repo,
+            gateway: self.gateway.as_ref(),
+            now,
+        })
+        .map(|r| r.snapshot.realized_pnl)
+        .unwrap_or(Money(Decimal::ZERO));
+        let fill_count = repo.count_fills().map_err(|_| ErrorCode::DbError)?;
+        let closed_position_count = repo
+            .count_closed_positions()
+            .map_err(|_| ErrorCode::DbError)?;
+        let event_count = repo.count_events().map_err(|_| ErrorCode::DbError)?;
+
+        let archive = AccountArchive {
+            season,
+            reset_at: now,
+            initial_cash,
+            final_cash,
+            final_equity,
+            realized_pnl,
+            fill_count,
+            closed_position_count,
+            event_count,
+        };
+
+        // 单事务：归档 → 清财务 live 表（保留 watchlist）→ 重新初始化。
+        repo.tx(|tx| {
+            AccountRepository::insert_archive_in_tx(tx, &archive)?;
+            AccountRepository::reset_financial_tables_in_tx(tx)?;
+            // 新局 account_initialized 起点。
+            let ev = AccountEvent {
+                event_id: new_id("evt"),
+                event_type: AccountEventType::AccountInitialized,
+                order_id: None,
+                fill_id: None,
+                position_id: None,
+                ts_code: None,
+                reason: Some("reset".into()),
+                actor: AccountActor::System.as_str().into(),
+                payload: json!({ "initialCash": initial_cash.0.to_string(), "archivedSeason": season }),
+                occurred_at: now,
+            };
+            AccountRepository::append_event(tx, &ev)?;
+            AccountRepository::insert_meta_in_tx(tx, initial_cash, now)?;
+            Ok(())
+        })
+        .map_err(|_| ErrorCode::DbError)?;
+
+        let snapshot = self.fetch_snapshot_only()?;
+
+        // 通知前端刷新整个账户读模型。
+        self.emit_updated(AccountUpdatedPayloadInner {
+            account_event_ids: vec![],
+            affected_order_ids: vec![],
+            affected_position_ids: vec![],
+            affected_ts_codes: vec![],
+            affected_watchlist_ts_codes: vec![],
+            trigger_ids: vec![],
+            snapshot_captured_at: now,
+        });
+
+        Ok(AccountResetResponse { season, snapshot })
+    }
+
+    /// 列出历史归档局摘要（复盘取回），按 season desc。
+    ///
+    /// Spec: account-module.md §4 `list_account_archives`。
+    pub fn list_account_archives(&self) -> Result<ListAccountArchivesResponse, ErrorCode> {
+        let repo = AccountRepository::new(&self.db);
+        let archives = repo.list_archives().map_err(|_| ErrorCode::DbError)?;
+        Ok(ListAccountArchivesResponse { archives })
+    }
+
+    // ====================================================================
+    // evaluate_account_triggers (单批，含 emit)
+    // ====================================================================
+
+    /// 评估账户触发器 — **单批**。emit 命中的 trigger/event，返回分页游标。
+    ///
+    /// 供 Runtime 在自驱 quote tick（focused refresh → rebuild → eval，spec agent-runtime §6）中
+    /// 驱动评估；调用方按 `has_more`/`next_cursor` 自行分页耗尽。trigger 经 `triggerId` 幂等去重。
+    ///
+    /// Spec: account-module.md §5 调度期望 / agent-runtime-module.md §6 行情/账户维护调度。
+    pub fn evaluate_account_triggers_once(
+        &self,
+        now: chrono::DateTime<Utc>,
+        batch_size: usize,
+        cursor: Option<String>,
+    ) -> crate::domain::account::AccountTriggerResult {
+        use crate::pipeline::account::eval::{evaluate_account_triggers, EvalDeps, EvalInput};
+        let deps = EvalDeps {
+            db: self.db.clone(),
+            gateway: self.gateway.clone(),
+            fee_policy: self.config.fee_policy.clone(),
+        };
+        let r = evaluate_account_triggers(EvalInput {
+            deps: &deps,
+            now,
+            batch_size,
+            cursor,
+        });
+        for t in &r.triggers {
+            self.emit_triggered(t.clone());
+        }
+        if !r.account_event_ids.is_empty() {
+            self.emit_updated(AccountUpdatedPayloadInner {
+                account_event_ids: r.account_event_ids.clone(),
+                affected_order_ids: vec![],
+                affected_position_ids: vec![],
+                affected_ts_codes: vec![],
+                affected_watchlist_ts_codes: vec![],
+                trigger_ids: r.triggers.iter().map(|t| t.trigger_id.clone()).collect(),
+                snapshot_captured_at: now,
+            });
+        }
+        r
+    }
+
+    // ====================================================================
     // operate_account
     // ====================================================================
+
+    /// `operate_account` 的幂等版本（spec §4：同一 `clientOrderId` 只执行一次）。
+    ///
+    /// 命中 dedup 表 → 重放首次结果，**不再执行**（崩溃恢复重提交安全：无"猜失败"盲区）。
+    /// 未命中 → 执行 `operate_account` → 记录 (clientOrderId → response)。记录在 `operate_account`
+    /// 持有 write_lock 期内完成（串行化，无并发双跑）；仅"提交与记 dedup 之间崩溃"有极小窗口
+    /// （模拟盘可接受，下次同 clientOrderId 重提交至多重放/重做一次，不会双重成交因 Account 内仍串行）。
+    pub fn operate_account_with_dedup(
+        &self,
+        req: OperateAccountRequest,
+        actor: AccountActor,
+        client_order_id: &str,
+    ) -> OperateAccountResponse {
+        let repo = AccountRepository::new(&self.db);
+        // 命中 → 重放首次结果。
+        if let Ok(Some(json)) = repo.get_operation_dedup(client_order_id) {
+            if let Ok(resp) = serde_json::from_str::<OperateAccountResponse>(&json) {
+                return resp;
+            }
+        }
+        // clientOrderId 在建单事务里原子写入（spec account-module §clientOrderId：
+        // 订单创建时原子写入，非事后盖戳；崩溃恢复可按 clientOrderId 无盲区反查）。
+        let resp = self.operate_account_inner(req, actor, Some(client_order_id));
+        // 记录首次结果（INSERT OR IGNORE：并发/重入只认首次）。
+        let json = serde_json::to_string(&resp).unwrap_or_default();
+        if let Err(e) =
+            repo.record_operation_dedup(client_order_id, &json, resp.accepted, Utc::now())
+        {
+            tracing::warn!(target: "account.dedup", error = %e, "record operation dedup failed");
+        }
+        resp
+    }
+
+    /// 按 clientOrderId 反查 Order（spec account-module §clientOrderId）。供 Runtime 启动恢复
+    /// 对账：用 clientOrderId 反查 Account 是否已建对应订单，消除"猜失败"盲区。只读。
+    pub fn find_order_by_client_order_id(&self, client_order_id: &str) -> Option<Order> {
+        AccountRepository::new(&self.db)
+            .get_order_by_client_order_id(client_order_id)
+            .ok()
+            .flatten()
+    }
 
     #[instrument(skip(self, req))]
     pub fn operate_account(
@@ -835,11 +1137,26 @@ impl AccountService {
         req: OperateAccountRequest,
         actor: AccountActor,
     ) -> OperateAccountResponse {
+        self.operate_account_inner(req, actor, None)
+    }
+
+    /// `operate_account` 的内部实现，额外携带 `client_order_id`：在建单事务里原子写入 Order
+    /// （spec account-module §clientOrderId：订单创建时原子写入，非事后盖戳）。
+    /// 公开 `operate_account` 传 `None`；`operate_account_with_dedup` 传真值。
+    fn operate_account_inner(
+        &self,
+        req: OperateAccountRequest,
+        actor: AccountActor,
+        client_order_id: Option<&str>,
+    ) -> OperateAccountResponse {
         // 交易意图必须是 agent（spec §4）
         if !matches!(actor, AccountActor::Agent) {
             return self.reject_pre_event(ErrorCode::InvalidInput, "trade actions require agent actor");
         }
         let _g = self.write_lock.lock().unwrap();
+        // 在 write_lock 保护下设置当前调用的 clientOrderId；建单路径读取它写进同一事务，
+        // 返回前清除（见 take_pending_client_order_id）。
+        *self.pending_client_order_id.lock().unwrap() = client_order_id.map(|s| s.to_string());
         match req.action {
             OperateAccountAction::PlaceOrder {
                 ts_code,
@@ -1257,6 +1574,7 @@ impl AccountService {
 
         let mut order = Order {
             order_id: order_id.clone(),
+            client_order_id: self.take_pending_client_order_id(),
             ts_code: ts_code.clone(),
             side,
             order_type: OrderType::Market,
@@ -1338,6 +1656,36 @@ impl AccountService {
             };
             AccountRepository::append_event(tx, &pos_ev)?;
             event_ids.push(pos_ev.event_id);
+
+            // 3b) 持仓 ⊆ 自选不变量：新建仓 → 自动加自选（幂等，不覆盖既有 note）。
+            // Spec: account-module.md §2「持仓 ⊆ 自选不变量」。
+            if matches!(position_event_type, AccountEventType::PositionOpened) {
+                let added = AccountRepository::ensure_watchlist_if_absent(
+                    tx,
+                    &WatchlistItem {
+                        ts_code: ts_code.clone(),
+                        name: Some(position_after.name.clone()),
+                        added_at: now,
+                        note: None,
+                    },
+                )?;
+                if added {
+                    let wl_ev = AccountEvent {
+                        event_id: new_id("evt"),
+                        event_type: AccountEventType::WatchlistAdded,
+                        order_id: None,
+                        fill_id: None,
+                        position_id: None,
+                        ts_code: Some(ts_code.clone()),
+                        reason: Some("auto_add_on_open".into()),
+                        actor: AccountActor::Agent.as_str().into(),
+                        payload: json!({ "source": "open_position" }),
+                        occurred_at: now,
+                    };
+                    AccountRepository::append_event(tx, &wl_ev)?;
+                    event_ids.push(wl_ev.event_id);
+                }
+            }
 
             // 4) lots (buy → new lot；sell → FIFO 扣减)
             match side {
@@ -1677,6 +2025,7 @@ impl AccountService {
             let order_id = new_id("ord");
             let order = Order {
                 order_id: order_id.clone(),
+                client_order_id: self.take_pending_client_order_id(),
                 ts_code: ts_code.clone(),
                 side,
                 order_type: OrderType::Limit,
@@ -1798,6 +2147,7 @@ impl AccountService {
             let order_id = new_id("ord");
             let order = Order {
                 order_id: order_id.clone(),
+                client_order_id: self.take_pending_client_order_id(),
                 ts_code: ts_code.clone(),
                 side: OrderSide::Sell,
                 order_type: OrderType::Limit,
@@ -2136,7 +2486,7 @@ impl AccountService {
                 }
             }
         }
-        let mut response = self.handle_place_order(
+        let response = self.handle_place_order(
             ts_code.clone(),
             OrderSide::Buy,
             ot,
@@ -3124,6 +3474,7 @@ mod tests {
             let mut all = Vec::new();
             all.extend(crate::infrastructure::quotes::migrations());
             all.extend(crate::infrastructure::account::migrations());
+            all.extend(crate::infrastructure::account::migrations_tail());
             run_migrations(c, all).unwrap();
         });
         let gw = Arc::new(MockQuoteGateway::new());
@@ -3144,6 +3495,126 @@ mod tests {
         svc.initialize_account_if_needed(Money(Decimal::from(initial_cash)))
             .unwrap();
         (db, svc, gw)
+    }
+
+    // ====================================================================
+    // 账户财务事实只读 facade（下沉自 Runtime，spec account-module §2）
+    // ====================================================================
+
+    /// 直接插入一条已平仓位（指定 realizedPnl + closedAt）—— 测试 consecutive_losses 用。
+    fn insert_closed_position(
+        db: &AppDb,
+        position_id: &str,
+        realized_pnl: i64,
+        closed_at: OccurredAt,
+    ) {
+        let repo = AccountRepository::new(db);
+        repo.tx(|tx| {
+            let pos = Position {
+                position_id: position_id.into(),
+                ts_code: TsCode::parse("600519.SH").unwrap(),
+                name: "T".into(),
+                status: PositionStatus::Closed,
+                quantity: Shares(0),
+                sellable_quantity: Shares(0),
+                avg_cost: Price(Decimal::ZERO),
+                market_price: None,
+                market_value: None,
+                quote_freshness: None,
+                realized_pnl: Money(Decimal::from(realized_pnl)),
+                unrealized_pnl: None,
+                opened_at: closed_at - chrono::Duration::hours(1),
+                closed_at: Some(closed_at),
+                protection: None,
+                actor: TradingActor::Agent,
+                reasoning: None,
+                warnings: vec![],
+            };
+            AccountRepository::upsert_position(tx, &pos)?;
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn day_open_equity_none_before_observe_then_recorded_idempotently() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let now = Utc::now();
+        let td = AccountService::cn_trade_date(now);
+        // 当日未观测 → None。
+        assert!(svc.day_open_equity(&td).is_none());
+        // 首次 daily_return 观测落基线（现权益 = cash = 1_000_000，return = 0）。
+        let r = svc.daily_return(now);
+        assert_eq!(r, Some(0.0), "首日 cur==open → 收益率 0");
+        let base = svc.day_open_equity(&td).expect("基线已落");
+        assert_eq!(base.0, Decimal::from(1_000_000));
+        // 现金变化（模拟权益涨到 1_020_000）后再观测 → 基线幂等不变，return 反映增幅。
+        AccountRepository::new(&_db)
+            .update_cash(Money(Decimal::from(1_020_000)), now)
+            .unwrap();
+        let r2 = svc.daily_return(now).unwrap();
+        assert!((r2 - 0.02).abs() < 1e-9, "(1.02M-1M)/1M = +2%, got {r2}");
+        assert_eq!(
+            svc.day_open_equity(&td).unwrap().0,
+            Decimal::from(1_000_000),
+            "日初基线当日只记一次，不被后续观测覆盖"
+        );
+    }
+
+    #[test]
+    fn consecutive_losses_counts_trailing_negatives_today_only() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let now = Utc::now();
+        let today = now.with_timezone(&Shanghai).date_naive();
+        let at = |h: u32, day_offset: i64| -> OccurredAt {
+            let day = today - chrono::Duration::days(day_offset);
+            let naive = day.and_hms_opt(h, 0, 0).unwrap();
+            Shanghai
+                .from_local_datetime(&naive)
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        // 今天：最新两笔亏、再前一笔盈 → 连亏 2；昨天的亏损不计入当日。
+        insert_closed_position(&_db, "p_win", 2, at(1, 0)); // 今天 早，盈
+        insert_closed_position(&_db, "p_l1", -3, at(3, 0)); // 今天 中，亏
+        insert_closed_position(&_db, "p_l2", -5, at(5, 0)); // 今天 晚（最新），亏
+        insert_closed_position(&_db, "p_yday", -9, at(2, 1)); // 昨天，亏（不计）
+        assert_eq!(svc.consecutive_losses(now), 2);
+    }
+
+    #[test]
+    fn consecutive_losses_zero_when_latest_is_win() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let now = Utc::now();
+        insert_closed_position(&_db, "p_loss", -4, now - chrono::Duration::hours(2));
+        insert_closed_position(&_db, "p_win", 6, now); // 最新盈 → 连亏 0
+        assert_eq!(svc.consecutive_losses(now), 0);
+    }
+
+    #[test]
+    fn daily_drawdown_high_water_mark() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let now = Utc::now();
+        let td = AccountService::cn_trade_date(now);
+        // 先观测一次（high = 1_000_000）。
+        assert_eq!(svc.daily_drawdown(now), 0.0);
+        // 权益涨到 1_100_000 → high 抬高，回撤 0。
+        AccountRepository::new(&_db)
+            .update_cash(Money(Decimal::from(1_100_000)), now)
+            .unwrap();
+        assert_eq!(svc.daily_drawdown(now), 0.0, "新高 → 无回撤");
+        // 权益回落到 1_045_000 → 回撤 = (1.1M-1.045M)/1.1M = 5%（high 保持 1.1M，重启安全）。
+        AccountRepository::new(&_db)
+            .update_cash(Money(Decimal::from(1_045_000)), now)
+            .unwrap();
+        let dd = svc.daily_drawdown(now);
+        assert!((dd - 0.05).abs() < 1e-9, "回撤应为 5%, got {dd}");
+        // 验证 high 被持久化（重建 repo 仍读到 1.1M）。
+        let (_open, high) = AccountRepository::new(&_db)
+            .observe_day_equity(&td, Decimal::from(1_045_000), now)
+            .unwrap();
+        assert_eq!(high, Decimal::from(1_100_000));
     }
 
     fn seed_inst(db: &AppDb, ts: &str) -> TsCode {
@@ -3241,6 +3712,7 @@ mod tests {
             let mut all = Vec::new();
             all.extend(crate::infrastructure::quotes::migrations());
             all.extend(crate::infrastructure::account::migrations());
+            all.extend(crate::infrastructure::account::migrations_tail());
             run_migrations(c, all).unwrap();
         });
         let gw = Arc::new(MockQuoteGateway::new());
@@ -3263,6 +3735,7 @@ mod tests {
             let mut all = Vec::new();
             all.extend(crate::infrastructure::quotes::migrations());
             all.extend(crate::infrastructure::account::migrations());
+            all.extend(crate::infrastructure::account::migrations_tail());
             run_migrations(c, all).unwrap();
         });
         let gw = Arc::new(MockQuoteGateway::new());
@@ -3317,6 +3790,102 @@ mod tests {
         );
         assert!(!resp.accepted);
         assert_eq!(resp.reason, Some(ErrorCode::QuoteMissing));
+    }
+
+    #[test]
+    fn operate_with_dedup_is_idempotent_on_same_client_order_id() {
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let req = || OperateAccountRequest {
+            action: OperateAccountAction::PlaceOrder {
+                ts_code: code.clone(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                limit_price: Some(Price(Decimal::new(50, 0))),
+                quantity: Shares(100),
+                expires_at: None,
+                reason: "dedup".into(),
+            },
+        };
+        // 首次：执行，建单。
+        let r1 = svc.operate_account_with_dedup(req(), AccountActor::Agent, "co_dedup_1");
+        assert!(r1.accepted, "first should be accepted: {r1:?}");
+        let order_id = r1.order_id.clone().expect("order_id");
+
+        // 同 clientOrderId 重提交：重放首次结果，**不再建第二张单**。
+        let r2 = svc.operate_account_with_dedup(req(), AccountActor::Agent, "co_dedup_1");
+        assert_eq!(r2.order_id, Some(order_id), "重提交应重放同一订单");
+        assert_eq!(r2.accepted, r1.accepted);
+
+        // 账户里只有一张订单（没被双重执行）。
+        let resp = svc.fetch_account(FetchAccountRequest {
+            include: Some(crate::domain::account::requests::FetchAccountInclude {
+                orders: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let orders = resp.orders.expect("orders present");
+        assert_eq!(orders.len(), 1, "同 clientOrderId 不得产生第二张单");
+    }
+
+    #[test]
+    fn dedup_writes_client_order_id_atomically_and_is_reverse_lookupable() {
+        // 证明 clientOrderId 在建单事务里原子写入（非事后盖戳），且能按 clientOrderId 反查到该单。
+        // Spec: account-module §clientOrderId（原子写入 + 反查）。
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(99.0, 10_000)],
+                vec![(100.0, 10_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let req = OperateAccountRequest {
+            action: OperateAccountAction::PlaceOrder {
+                ts_code: code.clone(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                limit_price: Some(Price(Decimal::new(50, 0))),
+                quantity: Shares(100),
+                expires_at: None,
+                reason: "atomic".into(),
+            },
+        };
+        let resp = svc.operate_account_with_dedup(req, AccountActor::Agent, "co_test");
+        assert!(resp.accepted, "should be accepted: {resp:?}");
+        let order_id = resp.order_id.clone().expect("order_id");
+
+        // 反查命中且 client_order_id 正确（原子写入，不依赖事后盖戳）。
+        let found = svc
+            .find_order_by_client_order_id("co_test")
+            .expect("reverse lookup should hit");
+        assert_eq!(found.order_id, order_id, "反查应命中同一订单");
+        assert_eq!(
+            found.client_order_id.as_deref(),
+            Some("co_test"),
+            "Order 应带 clientOrderId（建单事务原子写入）"
+        );
+
+        // 未知 clientOrderId 反查为空。
+        assert!(
+            svc.find_order_by_client_order_id("co_unknown").is_none(),
+            "未命中应返回 None"
+        );
     }
 
     #[test]
@@ -4603,6 +5172,7 @@ mod tests {
             let mut all = Vec::new();
             all.extend(crate::infrastructure::quotes::migrations());
             all.extend(crate::infrastructure::account::migrations());
+            all.extend(crate::infrastructure::account::migrations_tail());
             run_migrations(c, all).unwrap();
         });
         let gw = Arc::new(MockQuoteGateway::new());
@@ -6252,5 +6822,189 @@ mod tests {
         );
         let closed = repo.get_position(&pos_id).unwrap().unwrap();
         assert!(matches!(closed.status, PositionStatus::Closed), "仓位应 closed");
+    }
+
+    // ====================================================================
+    // 持仓 ⊆ 自选不变量 + 账户重置
+    // Spec: account-module.md §2「持仓 ⊆ 自选不变量」/「账户重置」
+    // ====================================================================
+
+    #[test]
+    fn open_position_auto_adds_to_watchlist_idempotent() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+
+        // 开仓前自选为空。
+        assert!(repo.list_watchlist().unwrap().is_empty());
+
+        open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+
+        // 开仓即加自选：ts_code 进自选。
+        let wl = repo.list_watchlist().unwrap();
+        assert_eq!(wl.len(), 1, "开仓应自动加入自选");
+        assert_eq!(wl[0].ts_code, code);
+        // 写了 watchlist_added 事件。
+        let evs = repo.list_events(500, 0).unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e.event_type, AccountEventType::WatchlistAdded)),
+            "应写 watchlist_added 审计事件"
+        );
+
+        // 加仓（已在自选）幂等：不重复，不新增第二条自选。
+        open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        assert_eq!(repo.list_watchlist().unwrap().len(), 1, "加仓不应重复自选");
+    }
+
+    #[test]
+    fn open_position_does_not_clobber_existing_watchlist_note() {
+        let (db, svc, _gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        // 先手动加自选带 note。
+        repo.tx(|tx| {
+            AccountRepository::upsert_watchlist(
+                tx,
+                &WatchlistItem {
+                    ts_code: code.clone(),
+                    name: Some("Test".into()),
+                    added_at: Utc::now(),
+                    note: Some("my thesis".into()),
+                },
+            )
+        })
+        .unwrap();
+
+        open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+
+        // note 不被开仓覆盖。
+        let item = repo.get_watchlist(&code).unwrap().unwrap();
+        assert_eq!(item.note.as_deref(), Some("my thesis"));
+    }
+
+    #[test]
+    fn close_position_keeps_watchlist() {
+        let (db, svc, gw) = setup_account(10_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let pos_id = open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        let repo = AccountRepository::new(&db);
+        assert_eq!(repo.list_watchlist().unwrap().len(), 1);
+
+        // 让 lot 可卖（直接放开 sellable_from 到过去），然后全平。
+        repo.tx(|tx| {
+            tx.execute(
+                "UPDATE account_lots SET sellable_from = '19700101' WHERE position_id = ?",
+                rusqlite::params![pos_id],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })
+        .unwrap();
+        let now = Utc::now();
+        gw.set(
+            &code,
+            Ok(mock_snapshot(
+                &code,
+                vec![(100.0, 100_000)],
+                vec![(100.0, 100_000)],
+                TradeStatus::Trading,
+                FreshnessStatus::Fresh,
+            )),
+        );
+        let instrument = MarketInstrument {
+            ts_code: code.clone(),
+            name: "Test".into(),
+            category: InstrumentCategory::Stock,
+            market: Market::SH,
+            board: None,
+            sector: None,
+            status: Some(InstrumentStatus::Listed),
+            is_st: Some(false),
+            publisher: None,
+            index_category: None,
+            fund_type: None,
+            management: None,
+            list_date: None,
+            source: Q_InstrumentSource::Tushare,
+            updated_at: now,
+        };
+        let s = svc.commit_market_fill(
+            code.clone(),
+            instrument,
+            OrderSide::Sell,
+            Shares(1000),
+            FillExecution { price: Price(Decimal::new(100, 0)), quantity: Shares(1000) },
+            "close".into(),
+            OrderIntent::DirectOrder,
+            Some(pos_id.clone()),
+            now,
+            Freshness {
+                status: FreshnessStatus::Fresh,
+                captured_at: Some(now),
+                exchange_time: None,
+                age_ms: None,
+                source: None,
+                warning: None,
+            },
+        );
+        assert!(s.accepted, "平仓应成功: {:?}", s);
+        // 平仓后自选保留。
+        assert_eq!(repo.list_watchlist().unwrap().len(), 1, "平仓不应移除自选");
+        assert!(repo.get_watchlist(&code).unwrap().is_some());
+    }
+
+    #[test]
+    fn reset_account_clears_financial_keeps_watchlist_and_archives() {
+        let (db, svc, _gw) = setup_account(1_000_000);
+        let code = seed_inst(&db, "600519.SH");
+        let repo = AccountRepository::new(&db);
+        // 制造账户事实：开仓（消耗现金、产生持仓/成交/事件/自选）。
+        open_position_via_buy_fill(&db, &svc, code.clone(), 1000);
+        assert!(!repo.list_positions(None, 100, 0).unwrap().is_empty());
+        assert!(repo.count_fills().unwrap() > 0);
+        assert_eq!(repo.list_watchlist().unwrap().len(), 1);
+        let cash_before = repo.get_meta().unwrap().unwrap().cash;
+        assert!(cash_before.0 < Decimal::from(1_000_000), "开仓应扣现金");
+
+        let resp = svc.reset_account().unwrap();
+        assert_eq!(resp.season, 1, "首次重置归档为 season 1");
+
+        // 财务侧清空回空局。
+        assert!(repo.list_positions(None, 100, 0).unwrap().is_empty(), "持仓应清空");
+        assert!(repo.list_orders(None, 100, 0).unwrap().is_empty(), "订单应清空");
+        assert_eq!(repo.count_fills().unwrap(), 0, "成交应清空");
+        assert_eq!(repo.list_active_orders().unwrap().len(), 0);
+        // 现金回初始本金。
+        let meta = repo.get_meta().unwrap().unwrap();
+        assert_eq!(meta.cash.0, Decimal::from(1_000_000), "现金应回初始本金");
+        assert_eq!(resp.snapshot.cash.0, Decimal::from(1_000_000));
+        assert_eq!(resp.snapshot.total_assets.0, Decimal::from(1_000_000));
+        // events 只剩新局 account_initialized（旧事件清空）。
+        let evs = repo.list_events(500, 0).unwrap();
+        assert_eq!(evs.len(), 1, "新局只应有一条 account_initialized");
+        assert!(matches!(evs[0].event_type, AccountEventType::AccountInitialized));
+
+        // 自选保留（跨局关注池）。
+        assert_eq!(repo.list_watchlist().unwrap().len(), 1, "自选应保留");
+
+        // 旧局可按 season 取回归档摘要。
+        let archives = svc.list_account_archives().unwrap().archives;
+        assert_eq!(archives.len(), 1);
+        let a = &archives[0];
+        assert_eq!(a.season, 1);
+        assert_eq!(a.initial_cash.0, Decimal::from(1_000_000));
+        assert_eq!(a.fill_count, 1);
+        assert!(a.event_count > 0, "归档应记录旧局事件数");
+    }
+
+    #[test]
+    fn reset_account_seasons_increment() {
+        let (_db, svc, _gw) = setup_account(1_000_000);
+        let r1 = svc.reset_account().unwrap();
+        let r2 = svc.reset_account().unwrap();
+        assert_eq!(r1.season, 1);
+        assert_eq!(r2.season, 2);
+        let archives = svc.list_account_archives().unwrap().archives;
+        // season desc。
+        assert_eq!(archives.iter().map(|a| a.season).collect::<Vec<_>>(), vec![2, 1]);
     }
 }

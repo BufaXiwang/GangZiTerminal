@@ -14,7 +14,7 @@
 
 1. **TDX 是 Quotes 数据的主源**：universe / 实时行情 / 日 K / 周 K / 月 K / 分钟 K / 分时 / xdxr 除权数据 全部从 TDX 直接获取。
 2. **本地基于 TDX xdxr 自算复权**：日 / 周 / 月 K 在本地存 unadjusted；`qfq` / `hfq` 由本地 xdxr 事件按需 in-memory 计算，不依赖 TuShare adj_factor。
-3. **TuShare 是 enrich，不是主源**：仅当 token 配置且 `TushareHealthState.is_available = true` 时，才向 TuShare 拉取 universe enrich（行业 / 上市状态 / 基金分类等）、`daily_basic`、公司事件、交易日历校准。
+3. **TuShare 是 enrich，不是主源**：仅当 token 配置且 `TushareHealthState.isAvailable = true` 时，才向 TuShare 拉取 universe enrich（行业 / 上市状态 / 基金分类等）、`daily_basic`、公司事件、交易日历校准。
 4. **TuShare 不可用必须降级而非失败**：token 缺失或健康检查失败时，Quotes 仍能正常提供 TDX 路径的全部能力；只是对应 enrich 字段为空，相应 series 带 freshness warning。
 
 契约强度：
@@ -42,7 +42,7 @@ Quotes 不负责：
 
 - 新闻获取或新闻分析。
 - 持仓、下单、现金、PnL。
-- 投资决策、记忆、episode、学习闭环。
+- 投资决策、记忆、决策记录、学习闭环。
 - 用核心行情读取接口承载龙虎榜、北向资金、融资融券、概念 / 板块等研究扩展能力。
 
 ---
@@ -534,7 +534,7 @@ type TushareHealthState = {
 规则：
 
 - 所有 TuShare 路径（universe enrich、`daily_basic`、公司事件、交易日历校准）调用前必须 check `isAvailable`；为 `false` 时跳过 TuShare 调用，走本地 / TDX 路径并在对应 series / item 返回适用 warning。
-- 健康状态变更（`true ↔ false`）应该向外 emit 事件，便于运维 / UI 提示（事件名 / payload 由 [agent-runtime-module.md](agent-runtime-module.md) 协调）；本 spec 不强制 event 名称。
+- 健康状态变更（`true ↔ false`）**第一阶段只维护内部 state（`TushareHealthState`），不 emit 跨模块事件、不在前端暴露 `providerStatus`；数据缺失通过 `fetch_data` 的 warning（如 `daily_basic_missing` / `events_missing`）反映**。未来如需在设置 / 诊断页展示健康状态，再补 `quotes-provider-health` 事件（事件名 / payload 由 [agent-runtime-module.md](agent-runtime-module.md) 协调）。
 - 健康检查失败不得影响 TDX / 腾讯 / Eastmoney（universe + K线/分时）任何路径的可用性。
 
 ---
@@ -593,6 +593,7 @@ Quotes 对外暴露以下读取 command：
 | `industry_heatmap` | 按行业聚合的涨幅 top N 卡片 | 本地 snapshot / `quote_close_snapshot` |
 | `ensure_chart_data` | 前端切换标的 / 周期时，DB 空就触发后端拉一份 | 触发 `refresh_klines` / `refresh_minute_klines` / `refresh_intraday` |
 | `extend_chart_history` | 前端 K 线图左拉到尽头时扩展更深历史 | 触发 `refresh_klines_extended(target_days)` |
+| `refresh_quotes` | 前端驱动的实时报价 pull（可见 ∪ 自选 ∪ 指数 ∪ 选中 取并集后按 ~3s 节奏调用） | 内部委托 `refresh_market_quotes({ scope: manual })`，写 in-memory snapshot |
 
 #### `list_market`
 
@@ -844,6 +845,49 @@ extend_chart_history(ts_code: TsCode, period: "day" | "week" | "month", target_d
 
 调用频率：UI 每次左拉到边界增加 ~300 天再调一次。建议 UI 内部对 `target_days` 设置上限（如 2000 天）。
 
+### 前端 pull 命令
+
+#### `refresh_quotes`
+
+**用途**：前端驱动的**实时报价 pull**——前端把「可见列表 ∪ 自选 ∪ 核心指数 ∪ 选中」取并集去重后，按自身节奏（~3s）调它，后端 TDX batch 拉这些标的、写 in-memory snapshot 并 emit progress。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）；agent / account pipeline 下单前也可调同一路径取即时报价。
+
+```ts
+type RefreshQuotesRequest = {
+  tsCodes: TsCode[];
+};
+
+type RefreshQuotesResponse = {
+  errors?: ResponseError[];
+  items: Array<{
+    tsCode: TsCode;
+    quote?: StockQuote;
+    quoteFreshness?: Freshness;
+    warnings?: WarningCode[];
+  }>;
+};
+```
+
+```rust
+refresh_quotes(request: RefreshQuotesRequest) -> RefreshQuotesResponse;
+```
+
+语义：
+
+- **内部委托**：`refresh_quotes` 不持有独立的刷新逻辑，内部委托 `refresh_market_quotes({ scope: { kind: "manual", tsCodes }, purpose: "intraday" })`，复用 manual scope 的同步 fallback 语义（用户显式关注的标的需要确定结果）；返回刷新后可得的 quote / freshness。
+- **cap ~120 + 优先级截断**：入参 `tsCodes` 由前端取并集后传入；超过 cap（~120）时按 `account（自选 + 持仓） > selected（选中） > indices（核心指数） > market（可见列表）` 优先级截断，保证最关心的标的不被列表头挤掉。截断在前端完成（实现锚 `src/lib/quotePull.ts`），后端按收到的 `tsCodes` 处理；后端对超限输入按 `invalid_input` 截断或拒绝（与 `fetch_data` 同口径，最多 200 个）。
+- **新鲜度跳过**：对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）；被跳过的标的直接返回 cache 内现有 snapshot。
+- **不受刷新窗限制**：`refresh_quotes` pull 不受 `is_in_quote_refresh_window` 约束——用户任何时候打开都该拉到最新可得快照；非交易时段拉到的即当日 / 最近已完成交易日事实。
+- 内部委托 `refresh_market_quotes` 使用 manual scope，emit 单条 `market-quotes-refreshed`（`final = true`），不走 universe 两段 emit。
+
+Error code 规则：
+
+| 条件 | Code |
+|---|---|
+| `tsCodes` 缺失 / 为空 / `TsCode` 格式非法 / 数量超限 | `invalid_input` |
+| 合法 `TsCode` 不在本地 universe | `not_found` / `instrument_missing` |
+| TDX 主源 + fallback 均失败但部分标的成功 | `provider_partial_failure` |
+| 标的成功路径但当前价 / 关键价格缺失 | `quote_price_missing` |
+
 ### 内部 Rust API
 
 内部 API 以 query facade 为主：
@@ -1028,7 +1072,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | 全市场列表 | 启动 + 每日 08:30：TDX 基础 universe；`TushareHealthState.isAvailable = true` 时 enrich |
 | TuShare 健康探针 | 进程启动时首次 ping；`isAvailable = false` 时每 1 小时重试 |
 | 实时行情（背景基线） | **唯一后台报价任务 = universe 滚动刷新**：把全市场切 80 只/批，**按固定周期（默认 30s，可配 10–60s）滚动轮刷**——每 ~`cycle/批数` 推一批、每只每 `cycle` 轮到一次（不再"每 60s 一次性全量扫"的锯齿）。只在 `is_in_quote_refresh_window` 内跑、占 ~1 连接、负载平滑。职责：屏外行 / 全列表排序基线 / **headless（agent 无前端）兜底**。每批 emit `market-quotes-refresh-progress` 驱动前端增量更新。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
-| 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §前端命令）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。前端取并集后 **cap ~120**（超出按 `account（自选+持仓） > selected（选中） > indices（核心指数） > market（可见列表）` 优先级截断，保证最关心的不被列表头挤掉；实现锚 `src/lib/quotePull.ts`）。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
+| 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §4 前端 pull 命令 `refresh_quotes`）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。前端取并集后 **cap ~120**（超出按 `account（自选+持仓） > selected（选中） > indices（核心指数） > market（可见列表）` 优先级截断，保证最关心的不被列表头挤掉；实现锚 `src/lib/quotePull.ts`）。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
 | K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
 | xdxr 事件 | 启动后预热关注标的；盘后随 K 线刷新一同补拉，按 `tsCode` 幂等 |
@@ -1064,6 +1108,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
   1. 同步首条：TDX 主批结束即 emit，`success` = TDX 命中数，`failedBatches` = 延后进 fallback 的标的数（BJ + TDX 失败/不完整）。TDX 整体故障时 `failedBatches` ≈ total，消费者据此知道本轮 partial，**禁止**误判为全成功。
   2. fallback 完成后由后台任务 emit 修正条：`success` / `failedBatches` 含 腾讯（EM 退出报价、新浪已移除） fallback 结果，作为本轮最终汇总。
   消费者必须容忍同一轮多条 refreshed（以最后一条为准，或按 progress 增量重读）。`subscribed` / `manual` scope 仍只 emit 一条同步 refreshed。
+  - **两段 emit 的 `final` 去重**：universe 两段 emit 时，前一条（TDX 主批同步条）`final = false`、末条（fallback 修正条）`final = true`；两条 `capturedAt` 不同（fallback 修正条更晚）。`subscribed` / `manual` scope 的单条 refreshed 恒为 `final = true`。`final` 字段保留供前端 / 行情读模型识别两段刷新的终态。**注意：账户重建不再以 `final` 为闸门**——账户评估走自有 focused refresh quote tick 自驱（见 [agent-runtime-module.md](agent-runtime-module.md) §6），不消费 universe `market-quotes-refreshed`。
 
 ### 全市场 quote 刷新执行契约
 

@@ -68,6 +68,7 @@ fn make_wired_services() -> (Arc<QuotesService>, Arc<AccountService>) {
         let mut all = Vec::new();
         all.extend(crate::infrastructure::quotes::migrations());
         all.extend(crate::infrastructure::account::migrations());
+        all.extend(crate::infrastructure::account::migrations_tail());
         run_migrations(c, all).unwrap();
     });
     let quotes = Arc::new(QuotesService::new(db.clone(), QuotesConfig::from_env()).unwrap());

@@ -190,6 +190,56 @@ impl<'a> NewsRepository<'a> {
             .with(|conn| count_news_by_date_impl(conn, sources, published_from, published_to, query))
     }
 
+    /// 按 newsId 列表精确取回（Runtime 装载 news buffer 批次用）。
+    ///
+    /// Spec: news-module.md §4 `fetch_news` 的 `ids` 路径。上限 200；按时间倒序；未命中按缺失忽略。
+    pub fn list_news_by_ids(
+        &self,
+        ids: &[String],
+        limit: u32,
+        offset: u32,
+    ) -> rusqlite::Result<ListResult> {
+        if ids.is_empty() {
+            return Ok(ListResult {
+                items: vec![],
+                total: 0,
+            });
+        }
+        let capped: Vec<String> = ids.iter().take(200).cloned().collect();
+        self.db.with(|conn| {
+            let marks: Vec<String> = (0..capped.len()).map(|_| "?".to_string()).collect();
+            let from_with_where = format!("FROM news_items ni WHERE ni.id IN ({})", marks.join(","));
+            let count_sql = format!("SELECT COUNT(*) {}", from_with_where);
+            let select_sql = format!(
+                "SELECT ni.id, ni.source, ni.title, ni.summary, ni.url, ni.published_at,
+                        ni.payload_json, ni.created_at, ni.updated_at
+                 {} ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC
+                 LIMIT ? OFFSET ?",
+                from_with_where
+            );
+            let mut binds: Vec<rusqlite::types::Value> = capped
+                .iter()
+                .map(|s| rusqlite::types::Value::Text(s.clone()))
+                .collect();
+            let total: i64 = {
+                let mut stmt = conn.prepare(&count_sql)?;
+                stmt.query_row(rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?
+            };
+            binds.push(rusqlite::types::Value::Integer(limit as i64));
+            binds.push(rusqlite::types::Value::Integer(offset as i64));
+            let mut stmt = conn.prepare(&select_sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), row_to_news_item)?;
+            let mut items = Vec::new();
+            for r in rows {
+                items.push(r?);
+            }
+            Ok(ListResult {
+                items,
+                total: total.max(0) as u32,
+            })
+        })
+    }
+
     // -- NewsSource ----------------------------------------------------------
 
     pub fn list_sources(&self) -> rusqlite::Result<Vec<NewsSource>> {

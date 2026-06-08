@@ -7,11 +7,11 @@
 Agent 由两层组成：
 
 - [Agent Infra](agent-infra-module.md)：LLM Agent 执行底座，负责消息、Provider / 模型渠道、上下文管理、工具注册 / 调用协议、ToolCall 审计和基础 loop。
-- [Agent Runtime](agent-runtime-module.md)：产品里的 Agent 应用层，负责跨模块事件编排、定时任务、订阅行情注入、触发 Agent run、run profile、工具使用策略、决策审计、策略卡和复盘。
+- [Agent Runtime](agent-runtime-module.md)：产品里的 Agent 应用层，负责跨模块事件编排、定时任务、订阅行情注入、触发 Agent run、运行 mode（对话 / news / 复盘）、工具使用策略、决策审计、投资策略和复盘。
 
 ## 边界
 
-- Agent Infra 是 Agent 的执行基础设施，不拥有投资判断、策略卡或交易意图。
-- Agent Runtime 是 Agent 的业务运行期，拥有 `AgentRun`、`DecisionEpisode`、`EvidenceRef`、`TradeIntent`、`StrategyCard`、`DecisionReview`。
+- Agent Infra 是 Agent 的执行基础设施，不拥有投资判断、投资策略或交易记录。
+- Agent Runtime 是 Agent 的业务运行期，拥有 `AgentRun`、`InvestmentStrategy`、`AnalysisResult`、`AgentTrade`（复盘产物为 workspace 文件）。
 - Quotes / Account / News 不 import Agent Infra 或 Agent Runtime；它们只暴露事实、事件和 facade。
 - Agent Runtime 可以调用各模块公开 facade，但不拥有成交规则、资讯抽取或行情 provider 规则。

@@ -2,18 +2,18 @@
 //!
 //! Spec: docs/design/agent-infra-module.md §2
 //!
-//! 仅放 Agent **Infra** 概念（`AgentMessage` / `ToolSpec` / `ToolCall` / `AgentEvent` /
-//! `ProviderChannel` / `ContextBundle` / loop 请求 / `RunSummary`）。
+//! Infra 概念（`AgentMessage` / `ToolSpec` / `ToolCall` / `AgentEvent` /
+//! `ProviderChannel` / `ContextBundle` / loop 请求 / `RunSummary`）见各 infra 子模块。
 //!
-//! 不放 Runtime 概念（`AgentRun` / `AgentRunProfile` / `DecisionEpisode` /
-//! `EvidenceRef` / `TradeIntent` / `StrategyCard` / `DecisionReview` 等）；
-//! Runtime 由 Phase 3 主 agent 实现。
+//! Runtime 概念（`AgentRun` / `InvestmentStrategy` / `AnalysisResult` / `AgentTrade`）
+//! 见 [`runtime`]（Phase 3 主 agent 实现，spec agent-runtime-module.md §3）。
 
 pub mod channel;
 pub mod context;
 pub mod events;
 pub mod loop_request;
 pub mod messages;
+pub mod runtime;
 pub mod tools;
 
 pub use channel::{ProviderChannel, WireFormat};
@@ -28,5 +28,10 @@ pub use loop_request::{
 pub use messages::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, JsonSummary, MessageKind,
     MessageRoleBlockError,
+};
+pub use runtime::{
+    AccountResultRef, AgentRun, AgentRunMode, AgentRunStatus, AgentRunTrigger, AgentTrade,
+    AgentTradeStatus, AnalysisResult, AnalysisResultKind, InvestmentStrategy, ReviewSuggestion,
+    StrategyStatus,
 };
 pub use tools::{SideEffect, ToolCall, ToolCallId, ToolCallResult, ToolSpec};

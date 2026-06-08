@@ -174,7 +174,7 @@ type ErrorCode =
 - 模块不能临时发明新的机器可读 code；provider 原始错误、调试信息放入 `message` / `details` / `payload`。
 - 批量读取使用 item 级 `warnings` / `errors`。
 - 写接口失败必须返回单一主 `reason` code，可附带 details。
-- `path_outside_workspace` / `command_rejected` 是 Agent 本地通用 tool（`write_file` / `edit_file` / `run_bash`）的约定级沙箱错误码，见 [agent-runtime-module.md](agent-runtime-module.md) §4.2；其余本地 tool 失败复用 `invalid_input` / `not_found` / `parse_error` / `tool_timeout`。
+- `path_outside_workspace` / `command_rejected` 是 Agent 本地通用 tool（`write_file` / `edit_file` / `run_bash`）的约定级沙箱错误码，见 [agent-infra-module.md](agent-infra-module.md) §3.6；其余本地 tool 失败复用 `invalid_input` / `not_found` / `parse_error` / `tool_timeout`。
 
 ---
 
@@ -251,15 +251,16 @@ type MarketQuotesRefreshedPayload = {
   success: number;
   failedBatches: number;
   capturedAt: OccurredAt;
+  final: boolean;            // universe 分段 emit 时，前段 false、末段 true；focused/manual 恒 true。供前端/行情读模型识别终态。账户重建不再以 final 为闸门（账户走自有 focused refresh quote tick 自驱，见 agent-runtime §6）
 };
 
-// market-quotes-refresh-progress：refresh 中间态进度（universe 全市场刷新 +
-// 热点档 hot set 刷新都用它）。emit 节奏见 quotes-module.md §5。
+// market-quotes-refresh-progress：refresh 中间态进度（universe 全市场滚动刷新 +
+// subscribed 前端 pull 刷新都用它）。emit 节奏见 quotes-module.md §5。
 // 消费者订阅做增量 UI 刷新（列表/指数卡/详情/自选），按 affectedTsCodes 或全量重读；
-// 不区分 scope（universe 全市场 batch / subscribed 热点档都触发同样的 UI 刷新）。
+// 不区分 scope（universe batch / subscribed pull 都触发同样的 UI 刷新）。
 // 终态仍以 MarketQuotesRefreshedPayload 为准。
 type MarketQuotesRefreshProgressPayload = {
-  // "universe" = 全市场 60s batch 的中间态；"subscribed" = 热点档 3s 刷新。
+  // "universe" = 全市场滚动 batch 的中间态；"subscribed" = 前端 pull 刷新。
   scope: "universe" | "subscribed";
   purpose: "intraday" | "close";
   tradeDate?: TradeDate;
@@ -280,19 +281,22 @@ type AccountUpdatedPayload = {
   snapshotCapturedAt: OccurredAt;
 };
 
+// AccountTriggerType：跨 BC 单一定义（account-module.md 引用本类型，不再本地重写 union）
+type AccountTriggerType =
+  | "stop_loss"
+  | "take_profit"
+  | "time_stop"
+  | "order_filled"
+  | "order_rejected"
+  | "order_expired"
+  | "invalidated";
+
 type AccountTriggeredPayload = {
   triggerId: string;
   positionId?: string;
   orderId?: string;
   tsCode?: TsCode;
-  triggerType:
-    | "stop_loss"
-    | "take_profit"
-    | "time_stop"
-    | "order_filled"
-    | "order_rejected"
-    | "order_expired"
-    | "invalidated";
+  triggerType: AccountTriggerType;
   quoteFreshness?: Freshness;
   warnings?: WarningCode[];
 };

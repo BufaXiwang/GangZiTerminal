@@ -7,7 +7,7 @@ use crate::domain::account::triggers::AccountTrigger;
 use crate::domain::account::types::{
     AccountSnapshot, Order, OrderStatus, Position, WatchlistItem, WatchlistItemView,
 };
-use crate::domain::shared::{ErrorCode, OccurredAt, Price, Shares, TsCode, WarningCode};
+use crate::domain::shared::{ErrorCode, Money, OccurredAt, Price, Shares, TsCode, WarningCode};
 use serde::{Deserialize, Deserializer, Serialize};
 use specta::Type;
 
@@ -346,6 +346,40 @@ pub struct MarkTriggerHandledResponse {
     pub reason: Option<ErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+// ----------------------------------------------------------------------------
+// account_reset / list_account_archives — 重开一局 + 旧局软归档。
+// Spec: account-module.md §2「账户重置」/ §4。
+// ----------------------------------------------------------------------------
+
+/// 重置账户响应：新局序号 + 新局空局快照。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountResetResponse {
+    pub season: u32,
+    pub snapshot: AccountSnapshot,
+}
+
+/// 单局归档摘要（复盘取回）。
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountArchive {
+    pub season: u32,
+    pub reset_at: OccurredAt,
+    pub initial_cash: Money,
+    pub final_cash: Money,
+    pub final_equity: Money,
+    pub realized_pnl: Money,
+    pub fill_count: u32,
+    pub closed_position_count: u32,
+    pub event_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ListAccountArchivesResponse {
+    pub archives: Vec<AccountArchive>,
 }
 
 #[cfg(test)]

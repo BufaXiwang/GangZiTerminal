@@ -19,7 +19,7 @@ A 股研究 + 模拟交易学习终端。Agent 从市场数据和资讯中识别
 | Quotes | [quotes-module.md](quotes-module.md) | 市场数据本地读模型、行情、K 线、指标、基本面、扫描 |
 | News | [news-module.md](news-module.md) | 多源资讯本地读模型、正文缓存、检索 |
 | Account | [account-module.md](account-module.md) | 模拟券商账户、订单、成交、仓位、账户估值、自选列表 |
-| Agent | [agent-module.md](agent-module.md)；[agent-infra-module.md](agent-infra-module.md)；[agent-runtime-module.md](agent-runtime-module.md) | Infra 负责模型渠道 / 消息 / 上下文 / 工具注册协议 / 基础 loop；Runtime 负责事件路由 / 调度 / 订阅注入 / run profile / 工具使用策略 / 决策审计 |
+| Agent | [agent-module.md](agent-module.md)；[agent-infra-module.md](agent-infra-module.md)；[agent-runtime-module.md](agent-runtime-module.md) | Infra 负责模型渠道 / 消息 / 上下文 / 工具注册协议 / 基础 loop；Runtime 负责事件路由 / 调度 / 订阅注入 / 运行 mode（对话 / news / 复盘）/ 工具使用策略 / 决策审计 |
 
 Spec 写作规范以 [spec-guidelines.md](spec-guidelines.md) 为准。
 

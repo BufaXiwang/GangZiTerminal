@@ -150,18 +150,23 @@ impl NewsService {
             }
         }
 
-        // 查询路径（spec §4：query / sources / 时间范围按 AND 组合）
+        // 查询路径：`ids` 给定 → 按 newsId 精确批量取回（Runtime buffer 批次）；
+        // 否则走 query / sources / 时间范围 AND 组合（spec §4）。
         let repo = self.repo();
         let order = req.order.unwrap_or_default();
-        let result = match repo.list_news_items(
-            req.sources.as_deref(),
-            req.published_from.as_ref(),
-            req.published_to.as_ref(),
-            req.query.as_deref(),
-            order,
-            limit,
-            offset,
-        ) {
+        let query_result = match req.ids.as_deref() {
+            Some(ids) if !ids.is_empty() => repo.list_news_by_ids(ids, limit, offset),
+            _ => repo.list_news_items(
+                req.sources.as_deref(),
+                req.published_from.as_ref(),
+                req.published_to.as_ref(),
+                req.query.as_deref(),
+                order,
+                limit,
+                offset,
+            ),
+        };
+        let result = match query_result {
             Ok(r) => r,
             Err(e) => {
                 return FetchNewsResponse {

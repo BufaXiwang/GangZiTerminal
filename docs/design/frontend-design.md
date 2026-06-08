@@ -41,7 +41,7 @@ Agent 为什么这样判断 / 操作？
 ### 过程可审计
 
 - Agent 的工具调用、读取数据、生成判断、执行账户动作都要在 UI 中可见。
-- 后台 run 不能静默消失，应进入可追溯的 timeline / episode 列表。
+- 后台 run 不能静默消失，应进入可追溯的 timeline / 分析结果列表。
 - 用户应能从一次账户动作追溯到 Agent 判断、工具结果和当时的市场事实。
 
 ### 沿用现有视觉系统
@@ -202,26 +202,28 @@ page-shell
 
 - 账户金额、仓位、盈亏、风险状态必须优先展示。
 - 用户只管理自选和查看账户，不提供人工交易入口。
-- 持仓行必须能追溯到开仓 episode / 策略 / 止损止盈条件。
+- 持仓行必须能追溯到开仓 run（`run_id`）/ 策略版本 / 止损止盈条件。
 
 ### Agent 页
 
 目标：观察 Agent 的思考、工具调用、决策和复盘。
 
-推荐结构：
+推荐结构（三栏）：
 
 ```text
-Agent tabbar
-  -> 对话流 / run timeline
-  -> 策略卡
-  -> 启发式 / 复盘 / episode
+左：复盘报告文件列表（workspace 文件，点开 read_file 渲染）
+中：对话流 / run timeline（dialogue mode）
+右：news 分析结果列表（AnalysisResult：action / no_action）
 ```
 
 规则：
 
-- Chat 不是唯一入口；后台 run、复盘、策略卡同样是一等信息。
+- Chat 不是唯一入口；后台 news run、复盘报告、投资策略同样是一等信息。
+- 右侧 news 分析结果列表按 `agent-analysis-result` 事件增量更新；每条标 action / no_action + 关联标的 + 摘要。
+- 左侧复盘报告是 workspace 文件列表（按交易日），点开用 `read_file` 渲染 markdown。
 - 工具调用使用 timeline row：工具名、输入摘要、输出摘要、耗时、错误状态。
-- Agent 产生账户动作时，必须有醒目的 episode / intent / account result 链接。
+- Agent 产生账户动作时，必须有醒目的 run（`run_id`）/ `AgentTrade` / account result 链接。
+- 投资策略以单独面板展示（当前 active 版本 + 历史版本）；修改须用户在对话中确认后经 `upsert_investment_strategy` 写入。
 
 ### 设置页
 
@@ -261,7 +263,7 @@ Agent tabbar
 
 ### 列表和表格
 
-适用：市场全列表、扫描结果、订单、持仓、策略卡、复盘记录。
+适用：市场全列表、扫描结果、订单、持仓、投资策略版本、复盘报告列表。
 
 规则：
 
@@ -273,7 +275,7 @@ Agent tabbar
 
 ### 卡片
 
-适用：账户摘要、策略卡、复盘摘要、风险提醒。
+适用：账户摘要、投资策略、复盘摘要、风险提醒。
 
 规则：
 

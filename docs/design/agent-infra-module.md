@@ -36,7 +36,7 @@ canonical request
 
 - `AgentMessage`、`ToolSpec`、`ToolCall`、`AgentEvent`、`ProviderChannel`、context compaction 顺序、Tool 调用文本协议（`<use_tool>` / `<tool_result>`）是 `Spec-as-source`。
 - provider wire-format mapping、token 估算策略、Tool 加载方式是 `Spec-anchored`。
-- `AgentRun`、`DecisionEpisode`、`EvidenceRef`、`TradeIntent`、`StrategyCard`、`DecisionReview` 属于 Agent Runtime。
+- `AgentRun`、`InvestmentStrategy`、`AnalysisResult`、`AgentTrade` 属于 Agent Runtime。
 
 共享类型见 [shared-types.md](shared-types.md)。
 
@@ -47,7 +47,7 @@ canonical request
 > **本模块的"可注册原语"在产品里的 canonical 名是 Tool。** 命名已统一——本文档全文用 `Tool*`（`ToolSpec`/`ToolCall`/`ToolRegistry`/`ToolCallParser`/`<use_tool>`/`<tool_result>`/`<tool_error>`），与 [agent-runtime-module.md](agent-runtime-module.md) 的 `Tool`/`ToolRegistry`/`AgentToolName` 一致，指**同一个机制**。两层模型：
 >
 > - **Tool（原语）** = 注册进 registry 的可调用能力（name + input schema + handler），in-process、结构化、经文本协议调用。本文档（Infra 层）只定义此层的注册 / 调用 / 审计机制。
-> - **Skill（playbook）** = 模型驱动的 `SKILL.md` 说明书，编排若干 tool 完成任务，**不是注册 handler**，归 Agent Runtime / 产品层，**初始为空**。详见 [agent-runtime-module.md](agent-runtime-module.md) §Skills。
+> - **Skill（playbook）** = 模型驱动的 `SKILL.md` 说明书，编排若干 tool 完成任务，**不是注册 handler**；子系统（SkillStore + 存盘 + fork 执行）归 Infra，playbook 内容由产品 / 人编写，**初始为空**。详见 §3.6（Skill 子系统）。
 >
 > 两者正交：Tool 是「手」，Skill 是「剧本」。文本协议（XML 标签嵌在纯 chat 里、不使用 provider 原生 tool_use）的设计理由见「一句话定位」下方——此次只是把被调用物从历史命名 `Skill*` 正名为 `Tool*`，**协议设计本身不变**。`SKILL.md`（playbook 文件名）保留 Skill 字样，因为它属 playbook 层、不是原语层。
 
@@ -65,7 +65,7 @@ Agent Infra 负责：
 - 记录所有 tool 调用的 `ToolCall` 审计（input / output 摘要 + payload ref）。
 - 把 provider stream 和 tool lifecycle 转成统一 `AgentEvent` 给前端 / Runtime 消费。
 - 实现 `ToolCallParser`：在 stream 中扫描 `<use_tool>` 闭合 → 缓冲 → 解析 → dispatch。
-- 实现 `PayloadStore`：持久化 ToolCall 的完整 input / output payload，用于 decision episode replay。
+- 实现 `PayloadStore`：持久化 ToolCall 的完整 input / output payload，用于决策回放 / 复盘（Runtime 按 `run_id` 回查）。
 - 执行基础 Agent loop，限制最大 turn 数，避免无限 tool 循环。
 
 Agent Infra 不负责：
@@ -74,8 +74,8 @@ Agent Infra 不负责：
 - 决定某类 run 允许使用哪些 tool。
 - 构造投资决策 packet。
 - 判断新闻重要性、是否交易、是否调仓。
-- 记录 `DecisionEpisode`、`TradeIntent`、`DecisionReview`。
-- 管理策略卡生命周期或策略注入规则。
+- 记录 `AnalysisResult`、`AgentTrade` 或复盘报告。
+- 管理 `InvestmentStrategy` 生命周期或策略注入规则。
 - 直接调用 Quotes / News / Account 内部实现。
 - 直接写账户、持仓、订单、新闻或行情数据。
 - 使用 provider 自带的 server-side tool（web_search / code_interpreter / file_search 等）。
@@ -220,6 +220,7 @@ type ToolSpec = {
   examples: string[];       // 至少 1 个完整 `<use_tool ...>{...}</use_tool>` 示例字符串
   sideEffect: SideEffect;
   timeoutMs: number;        // dispatch 超时
+  isSpawn?: boolean;        // fork 类工具标记（run_subagent/run_skill 等）；子 agent registry 构造时按此剔除（§3.5 无嵌套），缺省 false
 };
 
 type ToolRegistrySnapshot = {
@@ -231,7 +232,7 @@ type ToolRegistrySnapshot = {
 规则：
 
 - Infra 只定义注册协议，不规定产品里必须有哪些 tool。
-- 具体产品在 Runtime spec 中规定 canonical tool name union；本项目使用 Agent Runtime 的 `AgentToolName`。
+- 本产品的 canonical tool name 目录 `AgentToolName` 定义在 §3.6（通用 tool 来自 Infra，领域 tool 由 Runtime §4 注入并登记到此目录）。
 - Runtime 决定每类 run 的 enabled tools，把对应 `ToolSpec` 注册进本次 loop。
 - `sideEffect = "trading_write"` 的 tool 必须由 Runtime 显式允许，Infra 默认不得注册到非交易 run。
 - 同名 tool 只能注册一次；重复注册必须 fail closed。
@@ -262,7 +263,7 @@ Example: <use_tool name="read_file">{"path": "/tmp/notes.md"}</use_tool>
 
 - 注入顺序：固定 protocol 说明 → tool 列表（按 name 字典序，保证 prompt cache hit 一致）→ **skill 索引段**（可选）。
 - 每个 tool 段：`## <name>` + description + `Input:` schema 摘要 + 至少 1 个 example。
-- **skill 索引（渐进披露）**：tool 清单之后可追加「## 可用 Skill」索引段——每条 `- <name>: <description>`（按 name 字典序），**只放索引、不放 skill 正文**；模型经 `run_skill` 触发（fork 子 agent 执行该 skill，正文只进子 agent、不进父 prompt）。索引为空时省略整段。索引来源由 Runtime 从 skill 存盘目录扫描后传入（Builder 仍是纯计算，无 I/O）。详见 [agent-runtime-module.md](agent-runtime-module.md) §Skills、§子 Agent。
+- **skill 索引（渐进披露）**：tool 清单之后可追加「## 可用 Skill」索引段——每条 `- <name>: <description>`（按 name 字典序），**只放索引、不放 skill 正文**；模型经 `run_skill` 触发（fork 子 agent 执行该 skill，正文只进子 agent、不进父 prompt）。索引为空时省略整段。索引来源由 Runtime 从 skill 存盘目录扫描后传入（Builder 仍是纯计算，无 I/O）。详见 §3.5（子 Agent / Fork）、§3.6（Skill 子系统）。
 - system prompt 中的 tool 清单 + skill 索引部分**不允许由 LLM 修改 / 看不见**；Runtime 注入后只读。
 
 ### `ToolCall`
@@ -287,7 +288,7 @@ type ToolCall = {
 规则：
 
 - `name` 必须是本次 `ToolRegistry` 中已注册 tool name。
-- Tool 被业务决策引用时，Runtime 可把 `ToolCall` 转成 `EvidenceRef`；Infra 不决定证据归属。
+- Tool 被业务决策引用时，证据即该 run 的 `ToolCall` 审计（Runtime 按 `run_id` 回查重建"当时看到了什么"）；Infra 只负责记录 `ToolCall`，不决定证据归属。
 - 拒绝型业务结果不一定是 `isError = true`，例如 Account 拒单应由 tool output 表达业务原因（包含 `rejectionReason` 字段）。
 - **PayloadStore 双层存储**（解决 LLM 视野 vs 长期审计的张力）：
   - 任何 tool 调用都会**同时**写入：
@@ -296,7 +297,7 @@ type ToolCall = {
   - 当 input / output JSON 序列化后**超过 8KB** 时，`ToolCall` 行的 `inputSummary` / `outputSummary` 只存截断摘要（前 1KB + `"[truncated, see ref]"`），完整数据走 `inputPayloadRef` / `outputPayloadRef`。
   - 当 input / output 小于阈值时，summary 字段 = 完整 payload 内容，ref 字段为空。
 - 当 context compaction 把某条 `<tool_result>` 在 chat 历史中替换为 stub 时，stub 文本格式必须为 `<tool_result_stub name="..." call_id="..." ref="..." />`，模型可以读 stub 知道历史发生过这次调用，但 inline 数据已折叠；replay 时通过 ref 从 `agent_payloads` 拉回。
-- LLM 视野优先 inline 全文；PayloadStore 是审计 / replay 用的并行存储，**不**给 LLM 当下读，而是给 decision episode 回看 / 用户复盘用。
+- LLM 视野优先 inline 全文；PayloadStore 是审计 / replay 用的并行存储，**不**给 LLM 当下读，而是给决策回放 / 用户复盘用。
 
 ### `AgentEvent`
 
@@ -316,6 +317,7 @@ type AgentStopReason =
   | "provider_stop"
   | "tool_error"
   | "context_limit"
+  | "token_budget_exceeded"      // 累计 token（含 fork 子 run 回灌）超过 request.tokenBudget
   | "error";
 
 type AgentEvent =
@@ -413,7 +415,7 @@ type ContextPart = {
 - 当前交易事实必须来自 Runtime 本次注入的 realtime packet（`systemParts`）或本次 tool 调用。
 - 历史聊天和 summary 只能作为交互上下文，不能替代实时行情 / 账户读取。
 - `droppable = false` 的内容只允许在 hard failure 前保留；如果超限仍无法发送，必须 fail closed（`stop_reason = context_limit`）。
-- Context compaction 只影响本次或后续 provider request 的上下文投影，不修改已经持久化的 `AgentMessage`、`ToolCall`、`DecisionEpisode` 或 evidence snapshot 或 PayloadStore。
+- Context compaction 只影响本次或后续 provider request 的上下文投影，不修改已经持久化的 `AgentMessage`、`ToolCall`、`AnalysisResult` / `AgentTrade` 或 PayloadStore。
 
 ### `PayloadStore`
 
@@ -435,7 +437,7 @@ type PayloadStoreEntry = {
 - 写入触发：
   - tool input/output JSON 序列化后超过 **8KB**
   - 图片 attachment（任何尺寸都进 PayloadStore，AgentMessage 只存 `payload://pl_xxx` 引用）
-- 第一阶段**不实现 GC / retention policy**；payload 永久保留，用于 decision episode replay。后续需要清理时由独立产品策略处理，不在 Infra 隐式删除。
+- 第一阶段**不实现 GC / retention policy**；payload 永久保留，用于决策回放 / 复盘。后续需要清理时由独立产品策略处理，不在 Infra 隐式删除。
 - `payloadId` 在 `ToolCall.inputPayloadRef` / `ToolCall.outputPayloadRef` / `AgentMessageBlock::Image.dataRef`（形如 `payload://pl_xxx`）之间共享；不允许跨 BC 的对象引用 PayloadStore（agent 自闭环）。
 - Provider adapter 在 build wire 时遇到 `dataRef` 必须先从 PayloadStore 拉 bytes，再 base64 编码塞 wire；拉不到返回 `ParseError` 终止本次 dispatch。
 
@@ -472,7 +474,7 @@ Runtime builds AgentRunRequest
 - Tool 有超时（`ToolSpec.timeoutMs`）；超时作为 `<tool_error code="tool_timeout">` 回传给模型，**不**直接终止 loop。
 - 所有 tool 调用都进入统一事件流（`tool_start` / `tool_end`）和 `ToolCall` 审计。
 - Provider 返回 context-too-long 时，按 §4 的 reactive retry 策略：压缩一次 → 重试一次 → 如果仍失败 → `stop_reason = context_limit`，emit `error` event (`code = "provider_context_too_long"`)。
-- Infra 不在 loop 内创建 `DecisionEpisode` 或 `TradeIntent`；这些由 Runtime 根据模型输出和 tool 结果记录。
+- Infra 不在 loop 内创建 `AnalysisResult` 或 `AgentTrade`；这些由 Runtime 根据模型输出和 tool 结果记录。
 - Stream 解析必须**实时**（不等整个 turn 结束）：用户能从 UI 看到 LLM 思考 + tool 调用进度。
 - 同一 turn 内多个 `<use_tool>` 按出现顺序**串行** dispatch；不并行（保证 LLM 看到的 tool_result 顺序与发出顺序一致）。
 
@@ -490,8 +492,8 @@ Runtime builds AgentRunRequest
   - **末轮识别（实现）**：聚合子 run 事件流时，每遇到一个 `ToolStart`（= 当前轮发起了工具调用、不是末轮）就**清空文本累加器**；`TextDelta` 直接 append。子 loop 内每个 turn 的事件顺序固定为「该 turn 的全部 `TextDelta` → 该 turn 的 `ToolStart`/`ToolEnd`」，且只有**没有任何工具调用**的 turn 才是末轮（loop 据此 `break`）——故 loop 结束时累加器里恰好只剩末轮文本。
   - **提示子把结论放最后一条**：`run_forked_agent` 给子 run 的引导（seed user message）末尾**统一拼一句固定提示**，告诉子 agent「只有你的最后一条消息会被返回，请把完整结论 / 产出放进末轮，不要分散在中间轮」。`run_subagent`（自由 prompt）与 `run_skill`（SKILL.md 作 prompt）两条 fork 路径都带上。
   - **隔离上下文**：子 run 用**全新 `conversation_id`**（带 `parent_run_id` 关联），不与父共享消息历史；子的中间 tool 调用 / 试错**不进父上下文**。
-  - **token 上下文**：当前子 run **继承父的上下文窗口 / compaction 配置**（`run_agent_turn` 按 channel 推导阈值）。**独立 token 硬配额**（子从父预算里领一份、子超限只失败子 run）为后续——需给 loop API 加预算 knob 时再做（见实现注记）。
-  - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。**但子工具集一律剔除 spawn 类工具（`run_subagent` / `run_skill`）**——只有顶层 agent 能 spawn，子 agent 不能再 fork（见「不变量」）。`create_skill`（写文件、不递归）不算 spawn，保留。
+  - **token 上下文**：子 run **继承父的上下文窗口 / compaction 配置**（`run_agent_turn` 按 channel 推导阈值）。**token 预算**：`run_agent_turn` 接受 `tokenBudget` 入参；子 run 的 token usage 经 `SubAgentTask.progress.tokens` 累计并**回灌父 run 预算**（父把子消耗计入自己 budget）；父或子任一累计超 budget → 停后续 turn、emit `done(stop_reason="token_budget_exceeded")`。
+  - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。**但子工具集一律剔除全部 spawn-class 工具**——除内置 `run_subagent` / `run_skill` 外，未来 Runtime 若注入 fork 类领域工具同理；剔除**由 `ToolSpec.isSpawn` 标记驱动、不靠 name 白名单**，确保任何新增 fork 类工具都被覆盖。只有顶层 agent 能 spawn（见「不变量」）。`create_skill`（写文件、不递归）`isSpawn=false`，保留。
   - **审计**：子 run 全量消息照常落 `agent_messages`（自己的 `conversation_id` + `parent_run_id`），可单独 replay。
 - 父对话侧：fork 表现为一次 **tool 调用**（`run_subagent` / `run_skill`，§5 工具），其 `<tool_result>` = 子 run 的结果文本。
 
@@ -499,7 +501,7 @@ Runtime builds AgentRunRequest
 
 | 模式 | 上下文 | system prompt / 工具 / model | 用途 |
 |---|---|---|---|
-| **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧，**但一律剔除 spawn 类 `run_subagent`/`run_skill` → 子 agent 不能再 fork**）| 专门子任务 / 跑 skill，父只收结果 |
+| **命名子 agent / skill**（默认）| **全新隔离**上下文 | 给定的（skill = SKILL.md 作 prompt；工具默认继承、可收紧，**但一律剔除全部 spawn-class 工具（`run_subagent`/`run_skill` 等，按 `ToolSpec.isSpawn` 驱动）→ 子 agent 不能再 fork**）| 专门子任务 / 跑 skill，父只收结果 |
 | **隐式 fork**（可选，后续）| **继承父完整上下文 + system prompt + 精确工具池** | 全继承（`inherit`）| "在当前上下文分叉继续干" |
 
 ### 子 Agent 任务管理（注册表 + 生命周期，对齐 CC `LocalAgentTask`）
@@ -535,10 +537,10 @@ type SubAgentTask = {
 
 ### 不变量
 
-- **不允许嵌套（对齐 CC `isInForkChild`，只有顶层能 spawn）**：fork 出的子 agent ——① **工具集不含 `run_subagent` / `run_skill`**，从根上没法再 fork（首选机制，对齐 Claude Code——CC 的 fork child 里再 fork 会被拒）；② 运行时带 `is_subagent` 布尔标记（顶层 run = `false`，`ForkRuntime::child()` 产出的子运行时 = `true`），再 fork 一律拒（兜底守卫：`run_forked_agent` / `spawn_or_run` 见 `is_subagent == true` 即返回 invalid_input，防 spawn 工具未被正确剔除）。**没有深度计数**，只有顶层 agent 能 spawn。`create_skill`（写文件、不递归）不算 spawn，子 agent 保留。
+- **不允许嵌套（对齐 CC `isInForkChild`，只有顶层能 spawn）**：fork 出的子 agent ——① **工具集不含任何 spawn-class 工具（`run_subagent` / `run_skill`（按 `ToolSpec.isSpawn` 标记剔除、不靠 name 白名单，覆盖未来任何新增 fork 类工具））**，从根上没法再 fork（首选机制，对齐 Claude Code——CC 的 fork child 里再 fork 会被拒）；② 运行时带 `is_subagent` 布尔标记（顶层 run = `false`，`ForkRuntime::child()` 产出的子运行时 = `true`），再 fork 一律拒（兜底守卫：`run_forked_agent` / `spawn_or_run` 见 `is_subagent == true` 即返回 invalid_input，防 spawn 工具未被正确剔除）。**没有深度计数**，只有顶层 agent 能 spawn。`create_skill`（写文件、不递归）不算 spawn，子 agent 保留。
 - **只回末轮文本**：父对话只拿子 run **末轮**（不再发起工具调用、给出最终答案那一轮）的 assistant 文本（+ 后台通知 + 可选进度）；子的中间轮铺垫与工具机制**都不回父**（上下文卫生 = fork 的核心价值，对齐 Claude Code「只取最后一条消息」）。实现上靠「每遇 `ToolStart` 清空文本累加器」保留末轮，并在子 system prompt 提示子把完整结论放最后一条消息（见「机制」）。
 - **审计独立**：每个子 run 全量消息按自己的 `conversation_id` + `parentRunId` 落 `agent_messages`，可单独 replay。
-- skill 执行复用本机制：`run_skill` = 以 `SKILL.md` 全文为 `prompt` 调 `run_forked_agent`（见 [agent-runtime-module.md](agent-runtime-module.md) §Skills）。
+- skill 执行复用本机制：`run_skill` = 以 `SKILL.md` 全文为 `prompt` 调 `run_forked_agent`（见 §3.6 Skill 子系统）。
 
 ### 暂不做（CC 有，本项目用不上 / 后续）
 
@@ -547,18 +549,18 @@ type SubAgentTask = {
 
 ### 实现注记（2026-06-02 已落地：`infrastructure/agent/subagent.rs`）
 
-机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入分两层：`ForkHandle` 只持**静态依赖**（ProviderFactory + registry + repo + SkillStore + 任务注册表 + 占位默认配置）；**运行时上下文**（channel / is_subagent / parentRunId / 父 event_tx）由 `ForkRuntime` 在**发起 run 时注入**——经 `DispatchExt`（对 registry 不透明的 `Arc<dyn Any>`）透传给 `run_agent_turn_forked`，fork handler 在 **dispatch 时** downcast 回 `ForkRuntime` 读取。**不允许嵌套（对齐 CC `isInForkChild` 布尔，无深度计数）**：构造子 run registry（`child_registry`）时**无论 `allowedTools` 是否给定，都剔除 spawn 类工具 `run_subagent`/`run_skill`**——子 agent 的 system prompt 里根本没有这两个工具，从根上没法再 fork（首选机制，对齐 CC）。另设兜底布尔守卫：`ForkRuntime` 顶层 run = `is_subagent=false`，`ForkRuntime::child()` 把派生的子运行时置 `is_subagent=true`；`spawn_or_run` 在发起 fork 前预检发起方 `is_subagent`，`run_forked_agent` 再对发起方 `is_subagent` 兜底一次——`is_subagent == true` 即拒（防 spawn 工具未被正确剔除）。hermetic 测试 `subagent_has_no_fork_tools_no_nesting` 覆盖「子 registry 无 spawn 工具 + 子尝试 `<use_tool name="run_subagent">` 被当未注册 tool 拒、不产生第二层子 run」，`subagent_flag_refuses_nested_fork` 覆盖布尔守卫。以下几点**当前为务实折中 / 待补**：
+机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入分两层：`ForkHandle` 只持**静态依赖**（ProviderFactory + registry + repo + SkillStore + 任务注册表 + 占位默认配置）；**运行时上下文**（channel / is_subagent / parentRunId / 父 event_tx）由 `ForkRuntime` 在**发起 run 时注入**——经 `DispatchExt`（对 registry 不透明的 `Arc<dyn Any>`）透传给 `run_agent_turn_forked`，fork handler 在 **dispatch 时** downcast 回 `ForkRuntime` 读取。**不允许嵌套（对齐 CC `isInForkChild` 布尔，无深度计数）**：构造子 run registry（`child_registry`）时**无论 `allowedTools` 是否给定，都剔除全部 spawn-class 工具（按 `ToolSpec.isSpawn` 标记，覆盖 `run_subagent`/`run_skill`（及未来任何 isSpawn 工具））**——子 agent 的 system prompt 里根本没有这些工具，从根上没法再 fork（首选机制，对齐 CC）。另设兜底布尔守卫：`ForkRuntime` 顶层 run = `is_subagent=false`，`ForkRuntime::child()` 把派生的子运行时置 `is_subagent=true`；`spawn_or_run` 在发起 fork 前预检发起方 `is_subagent`，`run_forked_agent` 再对发起方 `is_subagent` 兜底一次——`is_subagent == true` 即拒（防 spawn 工具未被正确剔除）。hermetic 测试 `subagent_has_no_fork_tools_no_nesting` 覆盖「子 registry 无 spawn 工具 + 子尝试 `<use_tool name="run_subagent">` 被当未注册 tool 拒、不产生第二层子 run」，`subagent_flag_refuses_nested_fork` 覆盖布尔守卫。以下几点**当前为务实折中 / 待补**：
 
 - **`parentRunId` 关联**：暂编码在子 `conversation_id`（`fork:<parentRunId>:<uuid>`）+ 内存 `SubAgentTask`，**未加 DB 列**（加列 = migration + domain 改动）。要按父 replay 审计再加列。
 - **`<task-notification>`**：暂以 `AgentEvent::TextDelta` 文本信封发（不新增 event 变体，保协议不变）；后续可加专用变体。
-- **独立 token 预算**：暂未做（`run_agent_turn` 无预算入参）；子继承父 compaction/window。要硬配额需给 loop API 加 knob。
+- **token 预算**：spec 已定义 `run_agent_turn` 的 `tokenBudget` 入参 + `token_budget_exceeded` stop_reason + 子 usage 回灌父累加（见 §6 `run_agent_turn` / `AgentStopReason`）。**执行实现是 Infra 自己的增量（不绑 Phase 3）**——loop 已按 turn 累计 usage（`SubAgentTask.progress.tokens`），只需在 turn 边界加一道预算检查 + 超限 emit stop_reason 即可，可随时独立落地；当前代码尚未接预算检查，子继承父 compaction/window。
 - **生产接线**：fork 上下文已改为 **run 时注入**（`ForkRuntime` → `DispatchExt`），**不再静态捕获、也不需要 registry replace**。`bootstrap` 的 `ForkHandle` 仅装静态依赖 + 占位默认配置；Phase 3 接线只需触发入口（Tauri command / scheduler / Runtime）在发起 run 时构造 `ForkRuntime`（真实 channel / parentRunId / 父 event_tx）传给 `run_agent_turn_forked`。即：**fork 机制已就绪 + 单测通过（含 `is_subagent` 布尔守卫拒绝嵌套的回归）；生产联动随 Phase 3 的 run 触发接入。**
 
 ---
 
 ## 3.6 Infra 默认 Tools + Skill 子系统（业务无关，Infra 注册）
 
-> **归属澄清**：以下通用 tool 与 skill 子系统**全部由 Infra 默认注册、属 Infra 层**（业务无关，代码在 `infrastructure/agent/`，bootstrap 时注册）。**Runtime 不拥有、不重复定义**——Runtime 只负责：触发 Agent、**注入领域 tool**（fetch_quotes / operate_account 等）、联合不同 domain。`AgentToolName` 那个 union（[agent-runtime-module.md](agent-runtime-module.md) §4）是「本产品全部 tool 名的目录」，其中**通用部分来自这里，领域部分由 Runtime 注入**。
+> **归属澄清**：以下通用 tool 与 skill 子系统**全部由 Infra 默认注册、属 Infra 层**（业务无关，代码在 `infrastructure/agent/`，bootstrap 时注册）。**Runtime 不拥有、不重复定义**——Runtime 只负责：触发 Agent、**注入领域 tool**（fetch_quotes / operate_account 等）、联合不同 domain。`AgentToolName`（本产品全部 tool 名的目录）定义在本节末（下方 `AgentToolName` 小节），其中**通用部分来自 Infra，领域部分由 Runtime §4 注入并登记**。
 
 Infra 默认注册的通用 tool：
 
@@ -579,7 +581,69 @@ Infra 默认注册的通用 tool：
 - skill 不依赖、不编排领域 tool；正文不写 `<use_tool>` 标签。
 - **简化（适配本项目）**：不支持 per-skill model/effort 覆盖（继承父）；`allowed-tools` frontmatter 可选（默认继承父工具集，写了收紧）。
 
-详细 input/output schema 见 [agent-runtime-module.md](agent-runtime-module.md) §4.2 / §Skills（那里是「目录 + 契约」的集中呈现，**归属仍是 Infra**）。
+#### 本地通用 tool / skill tool 完整 schema（Infra 自包含，真源在此）
+
+```ts
+// read_file —— 读任意 path（只读，不受工作区限制）
+type ReadFileToolInput = { path: string; offset?: number; limit?: number };
+type ReadFileToolOutput = { content: string; truncated?: boolean };
+// 错误：not_found / invalid_input（目录/不可读/非文本）/ parse_error
+
+// write_file —— 写文件（path 必须在 <workspace> 内）
+type WriteFileToolInput = { path: string; content: string };
+type WriteFileToolOutput = { bytesWritten: number };
+// 错误：path_outside_workspace / invalid_input
+
+// edit_file —— 定向替换（path 必须在 <workspace> 内）
+type EditFileToolInput = { path: string; oldString: string; newString: string; replaceAll?: boolean };
+type EditFileToolOutput = { replaced: number };
+// 错误：path_outside_workspace / not_found / invalid_input（未命中 / replaceAll=false 时非唯一）
+
+// run_bash —— 执行命令（cwd 默认 <workspace>，危险命令门禁）
+type RunBashToolInput = { command: string; cwd?: string; timeoutMs?: number };
+type RunBashToolOutput = { stdout: string; stderr: string; exitCode: number; truncated?: boolean };
+// 错误：command_rejected / tool_timeout / invalid_input
+
+// create_skill —— 写 <skills_dir>/<name>/SKILL.md（isSpawn=false）
+type CreateSkillToolInput = { name: string; description: string; body: string };  // name 为 slug
+type CreateSkillToolOutput = { path: string; created: boolean };
+// 错误：invalid_input（name 非 slug / 越界 / 写盘失败）
+
+// run_skill —— fork 子 agent 跑某 skill（isSpawn=true）
+type RunSkillToolInput = { name: string; args?: string };
+type RunSkillToolOutput = { name: string; result: string };   // 只回子 run 末轮结果
+// 错误：not_found / invalid_input / 子 run 失败透传
+```
+
+```ts
+// run_subagent —— fork 隔离子 agent 跑子任务（isSpawn=true）
+type RunSubagentToolInput = {
+  description: string;        // 一句话任务描述（进子 agent 任务注册表）
+  prompt: string;            // 子 agent 的任务 prompt
+  tools?: AgentToolName[];   // 可选：收紧子工具集（默认继承父；spawn-class 一律剔除）
+  runInBackground?: boolean; // true=异步后台跑，立即返回 agentId；缺省 false=前台阻塞
+};
+type RunSubagentToolOutput = {
+  agentId: string;
+  result?: string;           // 前台：子 run 末轮结果文本；后台：先只回 agentId，完成经 <task-notification>
+};
+// 错误：invalid_input / 子 run 失败透传
+```
+
+#### `AgentToolName`（本产品全部 tool 名目录）
+
+```ts
+type AgentToolName =
+  // ── Infra 默认提供（业务无关，本节定义）──────────────
+  | "read_file" | "write_file" | "edit_file" | "run_bash"
+  | "run_subagent" | "create_skill" | "run_skill"
+  // ── Runtime 注入（领域，定义见 agent-runtime-module.md §4）──
+  | "fetch_quotes" | "fetch_news" | "fetch_account"
+  | "operate_account" | "update_watchlist" | "upsert_investment_strategy";
+```
+
+- spawn-class（`isSpawn=true`，子 agent 内被剔除）：`run_subagent` / `run_skill`。（Runtime 当前不注入 fork 类领域工具；临时复盘复用 `run_subagent` 收紧只读，见 agent-runtime §3。`isSpawn` 机制对未来任何新增 fork 类工具仍自动生效。）
+- Runtime 新增领域 tool 必须先扩展本 union + 对应 spec；`ToolRegistry` 注册名必须取自本 union。
 
 ---
 
@@ -590,7 +654,7 @@ Infra 默认注册的通用 tool：
 | 类型 | 内容 | 承载位置 | 生命周期 |
 |---|---|---|---|
 | Identity / System | Agent 身份、运行纪律、tool 清单（由 SystemPromptBuilder 注入） | `ContextBundle.systemParts`（`kind=system`） | 长期，适合 cache |
-| Realtime Packet | trigger、账户、行情、新闻、策略、近期 episode 摘要 | `ContextBundle.systemParts`（`kind=realtime`，`droppable` 由 Runtime 标） | 每次 run 重建 |
+| 实时上下文（L3） | trigger、账户、行情、新闻、投资策略、近期分析结果摘要 | `ContextBundle.systemParts`（`kind=realtime`，`droppable` 由 Runtime 标） | 每次 run 重建 |
 | Chat Context | 用户最近对话、当前问题、历史 tool_result | 独立 `messages: AgentMessage[]`（repo 自动续接） | 只服务交互 |
 | Review / Memory | 用户偏好、复盘建议、策略说明 | `ContextBundle.systemParts`（`kind=memory`） | 独立存储，按需注入 |
 
@@ -669,7 +733,7 @@ Infra 默认注册的通用 tool：
 不可清理（永远保留 inline，禁止替换 stub）：
 
 - 交易写 tool 结果（operate_account 的 order_id / fill 等审计摘要）
-- 策略卡写入结果（Runtime 的 strategy 操作）
+- 投资策略写入结果（Runtime 的 `upsert_investment_strategy` 操作）
 - 账户确认结果（Account event 主键 + 状态）
 
 原则：
@@ -726,6 +790,11 @@ type AgentRunRequest = {
   compaction?: CompactionConfig;      // 上下文压缩配置（Runtime 提供；缺省用 channel 推导的阈值）
   fallbackChannels?: ProviderChannel[]; // 有序备用渠道（§4 容错）；主渠道瞬时重试耗尽后按序切换。缺省空
   retry?: RetryConfig;                // 瞬时退避重试策略（§4）；缺省内置 3 次 / 500ms / 8000ms
+  tokenBudget?: TokenBudget;          // 本 run 的 token 预算（Runtime 从 settings 传入）；缺省无上限
+};
+
+type TokenBudget = {
+  runTokens: number;                  // 本 run 累计 token 上限（含 fork 子 run 回灌的 usage）
 };
 
 type RetryConfig = {
@@ -878,7 +947,7 @@ discover_models(wire_format: WireFormat, base_url: &str, api_key: &str)
 ## 7. 不纳入范围
 
 - 投资判断记录和复盘模型。
-- 策略卡生命周期。
+- 投资策略生命周期。
 - 触发 Agent run 的调度逻辑。
 - 业务工具选择策略。
 - 行情 provider 接入。

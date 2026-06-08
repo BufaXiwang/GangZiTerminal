@@ -84,6 +84,7 @@ type OrderStatus = "pending" | "partially_filled" | "filled" | "cancelled" | "re
 
 type Order = {
   orderId: string;
+  clientOrderId: string;
   tsCode: TsCode;
   side: "buy" | "sell";
   orderType: "market" | "limit";
@@ -118,6 +119,7 @@ Actor 命名规则：
 | 字段 | 含义 | 规则 |
 |---|---|---|
 | `orderId` | 委托唯一 ID | 创建后不可变 |
+| `clientOrderId` | 调用方生成的幂等键 | **在订单创建时随 `Order` 原子写入**（与建单同一事务，非事后盖戳），供反查与重复提交去重；同一 `clientOrderId` 只对应一个 `Order` |
 | `tsCode` | 标准标的代码 | 必须是 Quotes 已知且 Account 可交易的 `TsCode` |
 | `side` | 买入 / 卖出方向 | 买入冻结现金，卖出冻结可卖数量 |
 | `orderType` | 市价 / 限价 | `market` 即时撮合：盘口量足够则全成交，量不足则按可成交量部分成交、剩余数量立即自动取消并入终态；不进入 `pending`。`limit` 可 pending |
@@ -392,6 +394,31 @@ type WatchlistItem = {
 
 Account 拥有自选列表。Quotes 只提供自选标的的实时行情、涨跌幅、成交量、成交额等市场状态。`WatchlistItem` 不记录是谁添加的；添加 / 删除来源只进入对应 `AccountEvent.actor` 审计。
 
+**持仓 ⊆ 自选不变量**：自选是跨局延续的「关注池」，持仓必属于关注池。
+
+- **开仓即加自选**：任意 `open_position` 成交首次建仓时，该 `tsCode` 自动写入自选（已在则幂等跳过，不覆盖既有 `note`）。成功新增自选时写 `watchlist_added`，actor 跟随建仓 actor（`agent`）。
+- **持仓必在自选内**：任何 open position 的 `tsCode` 一定能在自选列表中找到。
+- **平仓不自动移除**：仓位关闭后该 `tsCode` 仍保留在自选；自选是关注池，不因平仓收缩，需要时由 `update_watchlist(remove)` 显式删除。
+
+### 账户重置
+
+**重置 = 重开一局模拟盘**。用户主动操作（带确认弹窗，避免误触），把账户财务侧清空回初始本金，旧局数据软归档可取回，**不动自选、不动 Agent 决策链**。
+
+语义：
+
+- **清账户财务侧**：现金回初始本金（`initial_cash`），清空持仓 / 挂单 / 成交 / lot / 保护条件 / 冻结 / 触发器 / 账户事件 / 当日权益基线 / `clientOrderId` 去重表。重置后账户读模型 = 空局。
+- **软归档旧局（保留、可取回）**：重置时把旧局的账户摘要（局序号 / 起止时间 / 初始本金 / 期末现金 / 期末权益 / 已实现盈亏 / 成交笔数 / 平仓仓位数 / 事件数）作为单行 JSON 快照写入 `account_archive`，再清空 live 财务表。**不复制大表**——只存可读摘要，旧局逐笔明细不保留（设计取舍：模拟学习终端只需「上一局打成什么样」的复盘摘要，不需要逐单回放）。每局有递增的 `season`（局序号），归档按 `season` 取回。
+- **保留自选**：`account_watchlist` 不清空，跨局延续（关注池语义）。重置后持仓为空，但「持仓 ⊆ 自选」不变量仍成立（空持仓平凡满足）。
+- **不动 Agent 决策链**：`AgentRun` / `AnalysisResult` / `AgentTrade` / `orderId→runId` 索引 / 复盘报告均不属于 Account BC，重置不触碰；它们按 `runId` / 日期历史累积，跨局自然保留、可追溯。
+- 重置写一条 `account_reset` 系统事件作为新局起点前的审计锚？—— 不写：`account_events` 被清空，重置审计落在 `account_archive`（旧局摘要 + `reset_at`）。重置后立即重新 `initialize_account_if_needed`，新局首事件仍是 `account_initialized`。
+
+不变量：
+
+- 重置后 `fetch_account` 的 positions / orders / fills / events / triggers 为空，`snapshot.cash == snapshot.totalEquity == initial_cash`。
+- 自选在重置前后保持一致。
+- 旧局可通过 `list_account_archives` 按 `season` 取回摘要。
+- 重置只清 Account 财务侧；Agent 决策链记录在重置后仍可查询。
+
 ### 账户快照
 
 ```ts
@@ -457,6 +484,25 @@ Account 拥有账户估值计算。Quotes 只提供标的价格、盘口、状�
   - `openPositionCount > 0` 且存在 missing 子 quote（含完全无可估值）→ `missing`
 - `cash`、`frozenCash`、`availableCash`、`totalAssets` 不得由前端或 Agent 自行计算后写回。
 - Account 读取接口可以返回 stale quote 参与展示估值，但交易写路径必须 fail closed，不能用 stale / missing quote 成交。
+- **账户是账户财务事实的单一所有者**：「日初权益」「当日组合收益率」「当日已平仓尾部连亏笔数」「当日组合回撤」都是**对账户财务事实的派生**，因此**归属本 BC**，由 Account 计算并通过下述只读 facade 暴露——消费方（Agent Runtime 复盘 / 风控编排，见 agent-runtime §3/§6）**不得自行从账户快照扒数据重算**这些财务派生，只能调 facade。Runtime 仅负责「何时调 + 跨 BC 编排」（如「超额 = 组合收益率 − 基准涨幅」是 Account facade 事实与 Quotes 事实的相减，留在 Runtime）。
+
+### 账户财务事实只读 facade（账户为单一所有者）
+
+`AccountSnapshot` 只表达**当前**权益（`totalAssets`）。但「当日基线 / 尾部连亏 / 当日回撤」等**当日财务派生**由 Account 持久化基线 + 计算并暴露为只读 facade：
+
+| facade | 签名（概念） | 语义 |
+|---|---|---|
+| `day_open_equity(trade_date)` | `-> Option<Money>` | 该 CN 交易日的**日初权益基线**；当日尚未观测过则 `None` |
+| `daily_return(now)` | `-> Option<f64>` | **当日组合收益率** =`(现权益 − 日初权益)/日初权益`；首次当日估值时幂等记录日初权益基线，之后用 `AccountSnapshot.totalAssets` 当现权益。日初为 0 或缺失 → `None` |
+| `consecutive_losses(now)` | `-> u32` | 当日（CN 交易日）已平仓位中，从最近一笔起的**连续亏损笔数**（`realizedPnl < 0`）；按 `closedAt` 降序统计尾部连续为负的数量 |
+| `daily_drawdown(now)` | `-> f64` | **当日组合回撤比例**（high-water-mark）=`(当日权益高水位 − 现权益)/当日权益高水位`，下限 0；当日权益高水位由 Account 持久化、随每次估值刷新，重启安全 |
+
+规则：
+
+- **日初权益基线幂等、重启安全**：以 CN 交易日为键，**首次当日观测权益时落库一条基线**（`INSERT OR IGNORE`），同一交易日不被后续观测覆盖；进程重启后读已有基线。当日权益高水位（drawdown 用）同样持久化，每次估值取 `max(已存高水位, 现权益)`。
+- 现权益统一取 `AccountSnapshot.totalAssets`（账户自有估值，部分估值时带 `data_partial` warning，facade 不另造数字）。
+- 这些 facade 是**只读 / 幂等观测**：`daily_return` / `daily_drawdown` 在首次观测时落基线属内部维护写（`actor = system` 语义，不产生投资意图、不进 `maxDailyNewOrders`），不写 `account_events`（基线表是辅助派生表，不是账户状态真源；账户读模型仍可由事件 + 行情完整重建）。
+- **持久化归属 Account**：基线表 `account_day_equity`（schema 属 account，读写在 `AccountRepository`/`AccountService`）。其 migration 因 `lib.rs` 全局拼接 append-only 约束被物理放到拼接末尾（见 lib.rs migration 顺序注释 + `account_migrations_tail()`）；**migration 的物理位置 ≠ 表的逻辑归属**——表仍是 Account 拥有的财务事实。
 
 ### 账户事件模型
 
@@ -544,16 +590,9 @@ type AccountEvent = {
 
 ### 触发事件模型
 
-```ts
-type AccountTriggerType =
-  | "stop_loss"
-  | "take_profit"
-  | "time_stop"
-  | "order_filled"
-  | "order_rejected"
-  | "order_expired"
-  | "invalidated";
+`AccountTriggerType` 见 [shared-types.md](shared-types.md)（跨 BC 单一定义）。各取值语义：`stop_loss` / `take_profit` / `time_stop` 为保护条件命中；`order_filled` / `order_rejected` / `order_expired` 为订单终态事实通知；`invalidated` 为命中显式失效信号。
 
+```ts
 type AccountTrigger = {
   triggerId: string;
   triggerType: AccountTriggerType;
@@ -778,6 +817,7 @@ type FetchAccountRequest = {
   positionStatus?: "open" | "closed" | "all";
   orderActive?: boolean;
   orderStatusIn?: OrderStatus[];
+  clientOrderId?: string;
   triggerHandled?: boolean | "all";
   limit?: number;
   offset?: number;
@@ -808,6 +848,7 @@ type FetchAccountResponse = {
 - `positionStatus` 只过滤 `positions`，默认 `open`。
 - `orderActive` 是订单过滤关键字，不是 `Order.status`；`true` 表示 `pending + partially_filled`，`false` 表示非活跃订单。`include.orders = true` 且未传 `orderStatusIn` / `orderActive` 时，默认 `orderActive = true`。
 - `orderStatusIn` 只接受真实 `OrderStatus[]`，用于精确过滤订单状态；如果同时传 `orderStatusIn` 和 `orderActive`，必须取两者交集。
+- `clientOrderId` 只过滤 `orders`，按幂等键精确反查已有 `Order`（崩溃恢复对账用）；命中时返回对应单条订单，未命中返回空。
 - `triggerHandled` 只过滤 `triggers`；`false` 表示未处理 trigger，`true` 表示已处理 trigger，`"all"` 表示不过滤。`include.triggers = true` 且未传时，默认 `false`。
 - `limit` 默认 100，最大 500；`offset` 默认 0。分页应用到 `positions`、`orders`、`events`、`triggers` 这些可增长集合；`snapshot` 和 `watchlist` 不分页。
 - 人工 UI 不能通过 Tauri command 做交易写操作。
@@ -824,6 +865,7 @@ type FetchAccountResponse = {
 type OperateAccountInput =
   | {
       action: "place_order";
+      clientOrderId: string;
       tsCode: TsCode;
       side: "buy" | "sell";
       orderType: "market" | "limit";
@@ -834,11 +876,13 @@ type OperateAccountInput =
     }
   | {
       action: "cancel_order";
+      clientOrderId: string;
       orderId: string;
       reason: string;
     }
   | {
       action: "open_position";
+      clientOrderId: string;
       tsCode: TsCode;
       quantity: Shares;
       orderType?: "market" | "limit";
@@ -851,6 +895,7 @@ type OperateAccountInput =
     }
   | {
       action: "scale_position";
+      clientOrderId: string;
       positionId: string;
       side: "increase" | "decrease";
       quantity: Shares;
@@ -861,6 +906,7 @@ type OperateAccountInput =
     }
   | {
       action: "close_position";
+      clientOrderId: string;
       positionId: string;
       quantity?: Shares;
       orderType?: "market" | "limit";
@@ -912,6 +958,11 @@ type OperateAccountInput =
 - 返回必须包含 `accepted` 布尔值、相关订单或仓位 ID、错误原因和最新 snapshot 摘要。
 - 交易 action 必须先校验标的可交易性；非股票 / 场内基金返回 `instrument_not_tradable`。
 - 即时成交类 action 遇到 stale / missing quote 必须返回 `accepted = false`，reason 使用 `quote_stale` / `quote_missing` / `quote_price_missing`。
+- 交易写类 action（`place_order` / `cancel_order` / `open_position` / `scale_position` / `close_position`）必须携带调用方生成的 `clientOrderId` 幂等键；watchlist 类写入口（`update_watchlist`）不需要。
+- **`clientOrderId` 重复提交去重**：同一 `clientOrderId` 再次提交时，必须返回首次提交的结果（同一 `orderId` / `fillIds` / `accountEventIds` / `snapshot`），不重复创建 `Order` / `TradeFill` / 账户事件。重复提交不报错，等同回放首单结果；这是 `duplicate_event` 错误的对应"安全态"——去重命中返回首单结果，而不是返回 `duplicate_event`。
+- **按 `clientOrderId` 反查已有 `Order`**：`fetch_account` 的订单查询支持 `clientOrderId` 过滤（见 `FetchAccountRequest.clientOrderId`），调用方据此对账已提交的命令是否落库。
+- **去重键持久化**：`clientOrderId` 到首单结果的映射必须随订单一起持久化，跨进程重启仍生效；Agent Runtime 崩溃恢复时靠它重放命令而不产生重复账户事实。
+- **`clientOrderId` 与 `Order` 原子写入**：`clientOrderId` 必须在创建 `Order` 的同一事务里写入，不允许"先建单、后另起一步盖戳"的两步式写法——否则"已建单但未盖戳"的崩溃窗口会让按 `clientOrderId` 反查漏命中，恢复对账退化成"猜失败"。配套提供按 `clientOrderId` 精确反查单条 `Order` 的只读能力，供 Runtime 启动恢复对账。
 
 响应契约：
 
@@ -920,6 +971,7 @@ type OperateAccountResponse = {
   accepted: boolean;
   reason?: ErrorCode;
   message?: string;
+  clientOrderId?: string;
   orderId?: string;
   fillIds?: string[];
   positionId?: string;
@@ -940,6 +992,7 @@ type OperateAccountResponse = {
 - rejected 响应必须有 `reason`。
 - 有副作用的 rejected 操作必须返回对应 `accountEventIds`。
 - `accountEventIds` 的顺序必须等于事件 append 顺序，供审计链展示。
+- 交易写类 action 必须回显本次 `clientOrderId`；重复提交命中去重时回显的也是该幂等键，且其余字段与首单结果一致。
 
 字段矩阵：
 
@@ -996,6 +1049,42 @@ type UpdateWatchlistResponse = {
 - `update_note` 只修改自选备注，不影响订单、仓位、保护条件或 subscribed codes 之外的账户事实。
 - 成功产生变化时必须写 `watchlist_added` / `watchlist_removed` / `watchlist_note_updated`；`accountEventIds` 顺序等于事件 append 顺序。
 
+#### `account_reset`
+
+重开一局模拟盘。用户主动操作（前端带确认弹窗）。语义见 §2「账户重置」。
+
+```ts
+type AccountResetResponse = {
+  season: number;        // 新局序号（旧局归档时占用 season，新局 = season + 1 起算）
+  snapshot: AccountSnapshot;  // 新局空局快照（cash = totalEquity = initial_cash）
+};
+```
+
+规则：
+
+- 单事务内：归档旧局摘要到 `account_archive` → 清空账户财务 live 表（保留 `account_watchlist`）→ 重新初始化账户（现金 = `initial_cash`，写 `account_initialized`）。
+- 不触碰自选；不触碰 Agent 决策链（跨 BC，物理隔离）。
+- 幂等性：重置不是幂等操作（每次都是新的一局），不接受 `clientOrderId`；前端确认弹窗负责防误触。
+
+#### `list_account_archives`
+
+列出历史归档局摘要（复盘取回）。
+
+```ts
+type AccountArchive = {
+  season: number;
+  resetAt: OccurredAt;
+  initialCash: Money;
+  finalCash: Money;
+  finalEquity: Money;
+  realizedPnl: Money;
+  fillCount: number;
+  closedPositionCount: number;
+  eventCount: number;
+};
+type ListAccountArchivesResponse = { archives: AccountArchive[] };  // season desc
+```
+
 ### 内部 Rust API
 
 内部 API 以 command / query facade 为主：
@@ -1008,6 +1097,8 @@ update_watchlist(request, actor: AccountActor) -> UpdateWatchlistResponse;
 evaluate_account_triggers({ now, limit, cursor }) -> AccountTriggerResult;
 mark_trigger_handled(trigger_id, reason) -> MarkTriggerHandledResponse;
 rebuild_account_snapshot() -> AccountSnapshot;
+reset_account() -> AccountResetResponse;
+list_account_archives() -> ListAccountArchivesResponse;
 subscribed_codes() -> Vec<TsCode>;
 ```
 
@@ -1083,7 +1174,7 @@ Error code 规则：
 调度期望：
 
 - Account 不拥有 scheduler；`evaluate_account_triggers` 由 Agent Runtime / 应用调度层调用。
-- 调度层应在 `market-quotes-refreshed` 后触发一次评估，并使用固定 cadence 做兜底；具体间隔和 batch size 以 [agent-runtime-module.md](agent-runtime-module.md) 的 runtime settings 为准。
+- **评估的数据依赖是有界的**：估值 / 保护条件评估 / 限价撮合只需要 `持仓 ∪ 挂单（∪ 自选）= subscribed_codes` 的行情，与全市场无关。因此调度层应在对 `subscribed_codes ∪ core_indexes` 做 **focused refresh**（同步、亚秒级）后立即触发评估，**而非搭全市场 universe 刷新的便车**（universe 后台 fallback 会引入几十秒延时）；并以固定 cadence 兜底。具体由 Agent Runtime 自驱 quote tick 编排（见 [agent-runtime-module.md](agent-runtime-module.md) §6），间隔和 batch size 以其 runtime settings 为准。
 - 每次调用必须尊重 `limit` / `cursor`，若返回 `has_more = true`，调度层应继续分页直到本轮耗尽或达到调度预算。
 
 ### 订阅集合

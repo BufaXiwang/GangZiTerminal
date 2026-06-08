@@ -20,6 +20,11 @@ pub struct MarketQuotesRefreshedPayload {
     pub success: u32,
     pub failed_batches: u32,
     pub captured_at: OccurredAt,
+    /// universe 分段 emit 时，前段 `false`、末段（含 fallback 修正）`true`；消费者**只在 `final=true`
+    /// 时去重 / 触发账户重建**，`final=false` 的中间段只更新行情读模型 / UI。
+    /// Spec: shared-types.md `MarketQuotesRefreshedPayload.final` / quotes-module.md §5。
+    #[serde(rename = "final")]
+    pub is_final: bool,
 }
 
 /// Spec: quotes-module.md §4 — `RefreshMarketQuotesScope` tagged union。

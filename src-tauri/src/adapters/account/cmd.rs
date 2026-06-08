@@ -10,9 +10,9 @@
 
 use crate::adapters::error::CommandError;
 use crate::domain::account::requests::{
-    AccountActor, FetchAccountRequest, FetchAccountResponse, MarkTriggerHandledRequest,
-    MarkTriggerHandledResponse, OperateAccountRequest, OperateAccountResponse,
-    UpdateWatchlistRequest, UpdateWatchlistResponse,
+    AccountActor, AccountResetResponse, FetchAccountRequest, FetchAccountResponse,
+    ListAccountArchivesResponse, MarkTriggerHandledRequest, MarkTriggerHandledResponse,
+    OperateAccountRequest, OperateAccountResponse, UpdateWatchlistRequest, UpdateWatchlistResponse,
 };
 use crate::domain::account::types::AccountSnapshot;
 use crate::domain::shared::ErrorCode;
@@ -68,5 +68,29 @@ pub fn rebuild_account_snapshot(
 ) -> Result<AccountSnapshot, CommandError> {
     service
         .rebuild_account_snapshot()
+        .map_err(|code: ErrorCode| CommandError::new(code))
+}
+
+/// 重置账户 = 重开一局模拟盘（用户主动操作，前端带确认弹窗）。
+/// Spec: account-module.md §4 `account_reset`。
+#[tauri::command]
+#[specta::specta]
+pub fn account_reset(
+    service: State<'_, Arc<AccountService>>,
+) -> Result<AccountResetResponse, CommandError> {
+    service
+        .reset_account()
+        .map_err(|code: ErrorCode| CommandError::new(code))
+}
+
+/// 列出历史归档局摘要（复盘取回）。
+/// Spec: account-module.md §4 `list_account_archives`。
+#[tauri::command]
+#[specta::specta]
+pub fn list_account_archives(
+    service: State<'_, Arc<AccountService>>,
+) -> Result<ListAccountArchivesResponse, CommandError> {
+    service
+        .list_account_archives()
         .map_err(|code: ErrorCode| CommandError::new(code))
 }

@@ -6,6 +6,7 @@
 //! 读取统一使用 `AppDb::with`。
 
 use crate::domain::account::events::{AccountEvent, AccountEventType};
+use crate::domain::account::requests::AccountArchive;
 use crate::domain::account::triggers::{AccountTrigger, AccountTriggerType};
 use crate::domain::account::types::{
     Order, OrderIntent, OrderSide, OrderStatus, OrderType, Position, PositionLot,
@@ -147,6 +148,62 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    // ------------------------------------------------------------------
+    // 当日权益基线（account_day_equity）
+    //
+    // Spec: account-module.md §2「账户财务事实只读 facade（账户为单一所有者）」
+    // - open_equity: 首次当日观测幂等落库（INSERT OR IGNORE，不被后续覆盖）。
+    // - high_equity: 每次观测取 max(已存高水位, 现权益)；重启安全（持久化）。
+    // ------------------------------------------------------------------
+
+    /// 观测当日权益：首次落 open_equity（幂等），刷新 high_equity = max(已存, current)。
+    /// 返回 `(open_equity, high_equity)`（Decimal 字符串）。
+    pub fn observe_day_equity(
+        &self,
+        trade_date: &TradeDate,
+        current_equity: Decimal,
+        now: OccurredAt,
+    ) -> rusqlite::Result<(Decimal, Decimal)> {
+        let td = trade_date.format();
+        let cur = current_equity.to_string();
+        self.db.with(|c| {
+            // 首次当日观测：落 open + high = current（幂等，存在则忽略）。
+            c.execute(
+                "INSERT OR IGNORE INTO account_day_equity (trade_date, open_equity, high_equity, captured_at)
+                 VALUES (?1, ?2, ?2, ?3)",
+                params![td, cur, now.to_rfc3339()],
+            )?;
+            // 刷新高水位：current > high 时抬高。
+            c.execute(
+                "UPDATE account_day_equity
+                 SET high_equity = ?2, captured_at = ?3
+                 WHERE trade_date = ?1
+                   AND CAST(?2 AS REAL) > CAST(high_equity AS REAL)",
+                params![td, cur, now.to_rfc3339()],
+            )?;
+            let (open_s, high_s): (String, String) = c.query_row(
+                "SELECT open_equity, high_equity FROM account_day_equity WHERE trade_date = ?1",
+                params![td],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            Ok((Self::parse_decimal(&open_s), Self::parse_decimal(&high_s)))
+        })
+    }
+
+    /// 只读：当日日初权益基线（无副作用；当日从未观测过则 None）。
+    pub fn get_day_open_equity(&self, trade_date: &TradeDate) -> rusqlite::Result<Option<Decimal>> {
+        let td = trade_date.format();
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT open_equity FROM account_day_equity WHERE trade_date = ?1",
+                params![td],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map(|opt| opt.map(|s| Self::parse_decimal(&s)))
+        })
+    }
+
     /// 同事务内更新 cash。
     ///
     /// Spec: account-module.md §3 数据流: "所有状态变化必须先写 account_events,
@@ -228,6 +285,24 @@ impl<'a> AccountRepository<'a> {
         })
     }
 
+    pub fn count_fills(&self) -> rusqlite::Result<u32> {
+        self.db.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM account_fills", [], |r| {
+                r.get::<_, i64>(0).map(|n| n as u32)
+            })
+        })
+    }
+
+    pub fn count_closed_positions(&self) -> rusqlite::Result<u32> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM account_positions WHERE status = 'closed'",
+                [],
+                |r| r.get::<_, i64>(0).map(|n| n as u32),
+            )
+        })
+    }
+
     /// 检查 account_initialized 是否已存在。
     pub fn has_account_initialized(&self) -> rusqlite::Result<bool> {
         self.db.with(|c| {
@@ -269,14 +344,17 @@ impl<'a> AccountRepository<'a> {
         tx.execute(
             "INSERT INTO account_orders
              (order_id, ts_code, side, order_type, limit_price, quantity, filled_quantity,
-              status, intent, position_id, reason, actor, created_at, updated_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              status, intent, position_id, reason, actor, created_at, updated_at, expires_at,
+              client_order_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(order_id) DO UPDATE SET
                filled_quantity = excluded.filled_quantity,
                status          = excluded.status,
                position_id     = COALESCE(excluded.position_id, account_orders.position_id),
                updated_at      = excluded.updated_at,
-               expires_at      = excluded.expires_at",
+               expires_at      = excluded.expires_at,
+               -- 永不把已有 clientOrderId 覆盖为空（盖戳后续 upsert 保留）。
+               client_order_id = COALESCE(excluded.client_order_id, account_orders.client_order_id)",
             params![
                 order.order_id,
                 order.ts_code.as_str(),
@@ -293,6 +371,7 @@ impl<'a> AccountRepository<'a> {
                 order.created_at.to_rfc3339(),
                 order.updated_at.to_rfc3339(),
                 order.expires_at.map(|t| t.to_rfc3339()),
+                order.client_order_id,
             ],
         )?;
         Ok(())
@@ -303,9 +382,28 @@ impl<'a> AccountRepository<'a> {
             c.query_row(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                         filled_quantity, status, intent, position_id, reason,
-                        created_at, updated_at, expires_at
+                        created_at, updated_at, expires_at, client_order_id
                  FROM account_orders WHERE order_id = ?",
                 params![order_id],
+                Self::map_order_row,
+            )
+            .optional()
+        })
+    }
+
+    /// 按 clientOrderId 反查订单（spec account-module §clientOrderId：供崩溃恢复对账无盲区反查）。
+    /// 走 `idx_account_orders_client_order` 索引。
+    pub fn get_order_by_client_order_id(
+        &self,
+        client_order_id: &str,
+    ) -> rusqlite::Result<Option<Order>> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
+                        filled_quantity, status, intent, position_id, reason,
+                        created_at, updated_at, expires_at, client_order_id
+                 FROM account_orders WHERE client_order_id = ?",
+                params![client_order_id],
                 Self::map_order_row,
             )
             .optional()
@@ -327,7 +425,7 @@ impl<'a> AccountRepository<'a> {
                 let sql = format!(
                     "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                             filled_quantity, status, intent, position_id, reason,
-                            created_at, updated_at, expires_at
+                            created_at, updated_at, expires_at, client_order_id
                      FROM account_orders WHERE status IN ({})
                      ORDER BY updated_at DESC, order_id LIMIT ? OFFSET ?",
                     placeholders
@@ -341,7 +439,7 @@ impl<'a> AccountRepository<'a> {
                 (
                     "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                             filled_quantity, status, intent, position_id, reason,
-                            created_at, updated_at, expires_at
+                            created_at, updated_at, expires_at, client_order_id
                      FROM account_orders ORDER BY updated_at DESC, order_id LIMIT ? OFFSET ?"
                         .into(),
                     vec![limit.to_string(), offset.to_string()],
@@ -371,7 +469,7 @@ impl<'a> AccountRepository<'a> {
             let mut stmt = c.prepare(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                         filled_quantity, status, intent, position_id, reason,
-                        created_at, updated_at, expires_at
+                        created_at, updated_at, expires_at, client_order_id
                  FROM account_orders
                  WHERE status = 'pending'
                     OR (status = 'partially_filled' AND order_type = 'limit')
@@ -399,7 +497,7 @@ impl<'a> AccountRepository<'a> {
             c.query_row(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                         filled_quantity, status, intent, position_id, reason,
-                        created_at, updated_at, expires_at
+                        created_at, updated_at, expires_at, client_order_id
                  FROM account_orders
                  WHERE ts_code = ? AND intent = 'open_position'
                    AND order_type = 'limit'
@@ -449,6 +547,7 @@ impl<'a> AccountRepository<'a> {
             created_at: parse_rfc3339(&row.get::<_, String>(11)?),
             updated_at: parse_rfc3339(&row.get::<_, String>(12)?),
             expires_at: row.get::<_, Option<String>>(13)?.map(|s| parse_rfc3339(&s)),
+            client_order_id: row.get::<_, Option<String>>(14)?,
         })
     }
 
@@ -824,6 +923,27 @@ impl<'a> AccountRepository<'a> {
         Ok(())
     }
 
+    /// 仅当自选不存在时插入（开仓即加自选用）。返回 true = 本次新增。
+    /// 不覆盖既有 `note`（与 `upsert_watchlist` 的 ON CONFLICT 覆盖语义区分）。
+    /// Spec: account-module.md §2「持仓 ⊆ 自选不变量」。
+    pub fn ensure_watchlist_if_absent(
+        tx: &Transaction<'_>,
+        item: &WatchlistItem,
+    ) -> rusqlite::Result<bool> {
+        let n = tx.execute(
+            "INSERT OR IGNORE INTO account_watchlist (ts_code, name, note, added_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                item.ts_code.as_str(),
+                item.name,
+                item.note,
+                item.added_at.to_rfc3339(),
+                item.added_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn remove_watchlist(tx: &Transaction<'_>, ts_code: &TsCode) -> rusqlite::Result<bool> {
         let n = tx.execute(
             "DELETE FROM account_watchlist WHERE ts_code = ?",
@@ -1143,7 +1263,7 @@ impl<'a> AccountRepository<'a> {
             let mut stmt = c.prepare(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                         filled_quantity, status, intent, position_id, reason,
-                        created_at, updated_at, expires_at
+                        created_at, updated_at, expires_at, client_order_id
                  FROM account_orders
                  WHERE ts_code = ? AND side = 'buy'
                    AND (status = 'pending'
@@ -1168,7 +1288,7 @@ impl<'a> AccountRepository<'a> {
             let mut stmt = c.prepare(
                 "SELECT order_id, ts_code, side, order_type, limit_price, quantity,
                         filled_quantity, status, intent, position_id, reason,
-                        created_at, updated_at, expires_at
+                        created_at, updated_at, expires_at, client_order_id
                  FROM account_orders
                  WHERE side = 'buy'
                    AND (status = 'pending'
@@ -1238,6 +1358,123 @@ impl<'a> AccountRepository<'a> {
             tx.commit()?;
             Ok(r)
         })
+    }
+
+    // ----------------------------- clientOrderId 幂等去重 -----------------------------
+
+    /// 查 clientOrderId 是否已处理过 → 返回首次的 OperateAccountResponse JSON（命中即重放，不再执行）。
+    pub fn get_operation_dedup(&self, client_order_id: &str) -> rusqlite::Result<Option<String>> {
+        self.db.with(|c| {
+            c.query_row(
+                "SELECT response_json FROM account_operation_dedup WHERE client_order_id=?1",
+                params![client_order_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+        })
+    }
+
+    /// 记录一次 operate 的结果（键 = clientOrderId）。`INSERT OR IGNORE`：已存在则不覆盖（首次为准）。
+    pub fn record_operation_dedup(
+        &self,
+        client_order_id: &str,
+        response_json: &str,
+        accepted: bool,
+        now: OccurredAt,
+    ) -> rusqlite::Result<()> {
+        self.db.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO account_operation_dedup
+                 (client_order_id, response_json, accepted, created_at) VALUES (?1,?2,?3,?4)",
+                params![client_order_id, response_json, accepted as i64, now.to_rfc3339()],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ----------------------------- 账户重置 / 归档 -----------------------------
+    // Spec: account-module.md §2「账户重置」/ §4 account_reset / list_account_archives。
+
+    /// 下一个归档局序号（max(season)+1，无归档则 1）。
+    pub fn next_season(&self) -> rusqlite::Result<u32> {
+        self.db.with(|c| {
+            let max: Option<i64> =
+                c.query_row("SELECT MAX(season) FROM account_archive", [], |r| r.get(0))?;
+            Ok((max.unwrap_or(0) + 1) as u32)
+        })
+    }
+
+    /// 写一条旧局归档摘要（同 reset 事务内）。
+    pub fn insert_archive_in_tx(
+        tx: &Transaction<'_>,
+        archive: &AccountArchive,
+    ) -> rusqlite::Result<()> {
+        tx.execute(
+            "INSERT INTO account_archive
+             (season, reset_at, initial_cash, final_cash, final_equity,
+              realized_pnl, fill_count, closed_position_count, event_count)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                archive.season as i64,
+                archive.reset_at.to_rfc3339(),
+                archive.initial_cash.0.to_string(),
+                archive.final_cash.0.to_string(),
+                archive.final_equity.0.to_string(),
+                archive.realized_pnl.0.to_string(),
+                archive.fill_count as i64,
+                archive.closed_position_count as i64,
+                archive.event_count as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 列出全部归档局摘要，按 season desc。
+    pub fn list_archives(&self) -> rusqlite::Result<Vec<AccountArchive>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT season, reset_at, initial_cash, final_cash, final_equity,
+                        realized_pnl, fill_count, closed_position_count, event_count
+                 FROM account_archive ORDER BY season DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(AccountArchive {
+                    season: row.get::<_, i64>(0)? as u32,
+                    reset_at: parse_rfc3339(&row.get::<_, String>(1)?),
+                    initial_cash: Money(Self::parse_decimal(&row.get::<_, String>(2)?)),
+                    final_cash: Money(Self::parse_decimal(&row.get::<_, String>(3)?)),
+                    final_equity: Money(Self::parse_decimal(&row.get::<_, String>(4)?)),
+                    realized_pnl: Money(Self::parse_decimal(&row.get::<_, String>(5)?)),
+                    fill_count: row.get::<_, i64>(6)? as u32,
+                    closed_position_count: row.get::<_, i64>(7)? as u32,
+                    event_count: row.get::<_, i64>(8)? as u32,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// 清空账户财务 live 表（同 reset 事务内）。**保留** `account_watchlist`（跨局关注池）
+    /// 和 `account_archive`（归档）。事件序列发号表重置为 1。
+    /// Spec: account-module.md §2「账户重置」。
+    pub fn reset_financial_tables_in_tx(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        for table in [
+            "account_meta",
+            "account_events",
+            "account_orders",
+            "account_fills",
+            "account_positions",
+            "account_lots",
+            "account_protections",
+            "account_triggers",
+            "account_freezes",
+            "account_operation_dedup",
+            "account_day_equity",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        tx.execute("UPDATE account_event_seq SET next = 1 WHERE id = 1", [])?;
+        Ok(())
     }
 }
 
@@ -1355,6 +1592,49 @@ mod tests {
         let db = AppDb::open_in_memory().unwrap();
         db.with(|c| run_migrations(c, super::super::migrations::migrations()).unwrap());
         db
+    }
+
+    /// 含 migrations_tail（account_day_equity）的 setup —— 财务 facade 基线测试用。
+    fn setup_with_tail() -> AppDb {
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| {
+            let mut all = super::super::migrations::migrations();
+            all.extend(super::super::migrations::migrations_tail());
+            run_migrations(c, all).unwrap();
+        });
+        db
+    }
+
+    #[test]
+    fn observe_day_equity_open_idempotent_high_water_mark() {
+        let db = setup_with_tail();
+        let repo = AccountRepository::new(&db);
+        let td = TradeDate::parse("20260605").unwrap();
+        let now = Utc::now();
+        // 当日未观测 → 只读 None。
+        assert!(repo.get_day_open_equity(&td).unwrap().is_none());
+        // 首次观测：open = high = 1_000_000。
+        let (o1, h1) = repo
+            .observe_day_equity(&td, Decimal::from(1_000_000), now)
+            .unwrap();
+        assert_eq!(o1, Decimal::from(1_000_000));
+        assert_eq!(h1, Decimal::from(1_000_000));
+        // 涨：high 抬高，open 不变（幂等）。
+        let (o2, h2) = repo
+            .observe_day_equity(&td, Decimal::from(1_100_000), now)
+            .unwrap();
+        assert_eq!(o2, Decimal::from(1_000_000), "open 当日只记一次");
+        assert_eq!(h2, Decimal::from(1_100_000), "high 取 max");
+        // 跌：high 保持高水位，open 仍不变。
+        let (o3, h3) = repo
+            .observe_day_equity(&td, Decimal::from(1_050_000), now)
+            .unwrap();
+        assert_eq!(o3, Decimal::from(1_000_000));
+        assert_eq!(h3, Decimal::from(1_100_000), "回落不降 high");
+        assert_eq!(
+            repo.get_day_open_equity(&td).unwrap(),
+            Some(Decimal::from(1_000_000))
+        );
     }
 
     #[test]
@@ -1607,6 +1887,7 @@ mod tests {
                 use crate::domain::account::types::{OrderIntent, OrderType, TradingActor};
                 let order = Order {
                     order_id: format!("ord_{}", i),
+                    client_order_id: None,
                     ts_code: code.clone(),
                     side: OrderSide::Buy,
                     order_type: OrderType::Limit,

@@ -356,6 +356,143 @@ async rebuildAccountSnapshot() : Promise<Result<AccountSnapshot, CommandError>> 
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * 重置账户 = 重开一局模拟盘（用户主动操作，前端带确认弹窗）。
+ * Spec: account-module.md §4 `account_reset`。
+ */
+async accountReset() : Promise<Result<AccountResetResponse, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("account_reset") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 列出历史归档局摘要（复盘取回）。
+ * Spec: account-module.md §4 `list_account_archives`。
+ */
+async listAccountArchives() : Promise<Result<ListAccountArchivesResponse, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_account_archives") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 提交一条用户消息，跑一次 dialogue run（同步等到终态；流式经 `agent-event`）。
+ */
+async agentSendMessage(input: SendMessageInput) : Promise<Result<SendMessageResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_send_message", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Agent 总览快照（按 `include` 选择器返回各段；未选的省略）。
+ * 
+ * 未传 `include` → 默认返回 strategy + runs + analysisResults + circuitBreaker（向后兼容）。
+ */
+async agentFetchState(input: FetchStateInput | null) : Promise<Result<AgentStateSnapshot, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_fetch_state", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 当前 active 投资策略（+ 可选历史版本，+ status 过滤）。
+ */
+async agentFetchStrategy(input: FetchStrategyInput | null) : Promise<Result<FetchStrategyResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_fetch_strategy", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 写一个策略新版本（用户在对话中确认后调；版本化 + 乐观并发）。
+ */
+async agentUpsertStrategy(input: UpsertStrategyInput) : Promise<Result<UpsertStrategyResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_upsert_strategy", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 解除/恢复熔断（spec §9：`resume=true` 解除，须对话确认；不自动解除）。返回新熔断状态。
+ */
+async agentSetCircuitBreaker(input: SetCircuitBreakerInput) : Promise<Result<boolean, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_set_circuit_breaker", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 手动触发一次收盘复盘（只读 review run → 落盘 markdown 报告）。流式经 `agent-event`。
+ */
+async agentRunReview(input: RunReviewInput) : Promise<Result<RunReviewResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_run_review", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 列出已落盘的复盘报告（最新在前）。`limit` 截断返回条数（spec §9 `ListReviewReportsRequest`）。
+ */
+async agentListReviewReports(limit: number | null) : Promise<Result<ReviewReportRef[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_list_review_reports", { limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 取消一个在跑的 run（dialogue/news/review 等）。
+ */
+async agentCancelRun(input: CancelRunInput) : Promise<Result<CancelRunResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_cancel_run", { input }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 读 news 自动分析开关当前状态（spec §5：默认关闭）。
+ */
+async agentGetNewsAutoAnalysis() : Promise<Result<boolean, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_get_news_auto_analysis") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * 开/关 news 自动分析（spec §5）。开启（false→true）时回填最近 `news_buffer_window_secs`
+ * 内的 news 入 buffer。返回新状态 + 回填条数。
+ */
+async agentSetNewsAutoAnalysis(enabled: boolean) : Promise<Result<SetNewsAutoAnalysisResult, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_set_news_auto_analysis", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -370,6 +507,10 @@ async rebuildAccountSnapshot() : Promise<Result<AccountSnapshot, CommandError>> 
 /** user-defined types **/
 
 /**
+ * 单局归档摘要（复盘取回）。
+ */
+export type AccountArchive = { season: number; resetAt: string; initialCash: Money; finalCash: Money; finalEquity: Money; realizedPnl: Money; fillCount: number; closedPositionCount: number; eventCount: number }
+/**
  * Spec: account-module.md §2 AccountEvent。
  */
 export type AccountEvent = { eventId: string; eventType: AccountEventType; orderId?: string | null; fillId?: string | null; positionId?: string | null; tsCode?: TsCode | null; reason?: string | null; 
@@ -381,6 +522,16 @@ actor: string; payload: JsonValue; occurredAt: string }
  * Spec: account-module.md §2 AccountEventType。
  */
 export type AccountEventType = "account_initialized" | "order_placed" | "order_cancelled" | "order_rejected" | "order_expired" | "order_partially_filled" | "order_filled" | "position_opened" | "position_scaled" | "position_closed" | "protection_adjusted" | "watchlist_added" | "watchlist_removed" | "watchlist_note_updated" | "cash_frozen" | "cash_released" | "shares_frozen" | "shares_released" | "invalidation_signal_recorded" | "trigger_created" | "trigger_handled" | "snapshot_rebuilt"
+/**
+ * 重置账户响应：新局序号 + 新局空局快照。
+ */
+export type AccountResetResponse = { season: number; snapshot: AccountSnapshot }
+/**
+ * 指向 Account 返回的稳定 ID（spec §3 `AccountResultRef`）。
+ * 
+ * Account 不知 `tradeId/runId/strategyVersion`；只回这些自有 ID。
+ */
+export type AccountResultRef = { accepted: boolean; orderId?: string | null; fillIds: string[]; positionId?: string | null; accountEventIds: string[]; rejectionEventId?: string | null; reason?: ErrorCode | null; message?: string | null }
 /**
  * Spec: account-module.md §2 账户快照
  */
@@ -408,10 +559,166 @@ provider: string; wireFormat: WireFormat; baseUrl?: string | null; apiKey: strin
 supportsVision?: boolean | null; supportsThinking?: boolean | null; maxOutputTokens?: number | null; contextWindowTokens?: number | null }
 export type Adjust = "none" | "qfq" | "hfq"
 /**
+ * 一条 Agent 消息（context / 持久化对话历史）。
+ * 
+ * Spec: agent-infra-module.md §2 `AgentMessage`
+ */
+export type AgentMessage = { messageId: string; runId?: string | null; 
+/**
+ * 多轮会话标识（Runtime 提供）；跨 run 续接靠它分组（spec §2）。
+ */
+conversationId?: string | null; 
+/**
+ * 会话内单调序号；持久化排序用（spec §2）。
+ */
+seq?: number | null; 
+/**
+ * 消息种类：默认 chat；summary = 压缩检查点（durable，不再被压缩）（spec §2）。
+ */
+kind?: MessageKind | null; role: AgentMessageRole; blocks: AgentMessageBlock[]; createdAt: string }
+/**
+ * AgentMessage block 类型。
+ * 
+ * Spec: agent-infra-module.md §2 `AgentMessageBlock`
+ * 
+ * Tool 调用 / 结果（`<use_tool>` / `<tool_result>` / `<tool_error>`）嵌在 text block 中。
+ */
+export type AgentMessageBlock = { type: "text"; text: string } | { type: "image"; mimeType: string; dataRef: string } | { type: "thinking"; text: string; provider?: string | null; metadata?: JsonValue | null }
+/**
+ * AgentMessage 角色枚举。
+ * 
+ * Spec: agent-infra-module.md §2
+ * 
+ * 注：`tool` role 不存在；tool_result 以 `user` role + text block（含 `<tool_result>` XML）形式回写。
+ */
+export type AgentMessageRole = "system" | "user" | "assistant"
+/**
+ * 一次 Agent run —— 决策链主键。
+ * 
+ * Spec: agent-runtime-module.md §3 `AgentRun`
+ * 
+ * 规则：
+ * - `run_id` 是事件 / 工具调用 / 模型 turn / AnalysisResult / AgentTrade 的关联键。
+ * - **策略版本冻结**：run 创建时把 active `version` 写入 `strategy_version`，全程不变。
+ * - `review` run 可由收盘调度起（顶层，`trigger=eod_review`），也可被对话/news fork
+ * （`parent_run_id` 指向父 run）；两种都只读、不下单。
+ */
+export type AgentRun = { runId: string; mode: AgentRunMode; trigger: AgentRunTrigger; 
+/**
+ * review 被对话/news fork 时指向父 run。
+ */
+parentRunId?: string | null; provider: string; wireFormat: WireFormat; model: string; 
+/**
+ * run 创建时冻结的 active 策略版本（无策略时缺省）。
+ */
+strategyVersion?: number | null; 
+/**
+ * account_trigger run 经 `orderId → runId` 反查关联到原始建仓 run。
+ */
+causationRunId?: string | null; status: AgentRunStatus; startedAt?: string | null; endedAt?: string | null; error?: string | null }
+/**
+ * 四种运行模式（spec §3 mode 表）。trigger 与 mode 一一对应。
+ */
+export type AgentRunMode = 
+/**
+ * 用户消息驱动的连续对话线程。
+ */
+"dialogue" | 
+/**
+ * news buffer M/N 触发的隔离单次分析。
+ */
+"news" | 
+/**
+ * `account-triggered` 实时唤起（止损/成交等）。
+ */
+"account_trigger" | 
+/**
+ * 收盘调度 / 被对话·news fork 的只读复盘（永不下单）。
+ */
+"review"
+/**
+ * run 生命周期状态。
+ */
+export type AgentRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled"
+/**
+ * run 的触发来源（spec §3 `AgentRunTrigger`）。
+ */
+export type AgentRunTrigger = { kind: "user_chat"; message_id: string } | { kind: "news_batch"; news_ids: string[] } | { kind: "account_trigger"; trigger_id: string } | { kind: "eod_review"; trade_date: string }
+/**
+ * Agent 总览快照（spec §9 fetch_agent_state）。
+ */
+export type AgentStateSnapshot = { activeStrategy?: InvestmentStrategy | null; recentRuns: AgentRun[]; recentResults: AnalysisResult[]; recentTrades: AgentTrade[]; recentMessages: AgentMessage[]; recentToolCalls: ToolCall[]; circuitBreakerActive?: boolean | null }
+/**
+ * 每次 `operate_account` 的审计戳 —— runtime 侧、不耦合 Account。
+ * 
+ * Spec: agent-runtime-module.md §3 `AgentTrade`
+ * 
+ * 崩溃恢复：调 Account 前先落 `submitting`，返回后填 `account_result_ref` 转 `settled`；
+ * 启动恢复用 `client_order_id` 反查对账（Account 侧去重为延后加固项）。
+ */
+export type AgentTrade = { tradeId: string; runId: string; 
+/**
+ * 幂等键：下单前生成，传给 Account 去重 + 恢复对账。
+ */
+clientOrderId: string; 
+/**
+ * 来自 `AgentRun.strategy_version`（冻结值）。
+ */
+strategyVersion?: number | null; reason: string; 
+/**
+ * `OperateAccountInput` 的可读摘要（不重定义账户命令）。
+ */
+accountInputSummary: string; status: AgentTradeStatus; accountResultRef?: AccountResultRef | null; createdAt: string; updatedAt: string }
+/**
+ * AgentTrade 两态（spec §3）：`submitting`=调用前已落库；`settled`=拿到 Account 结果。
+ */
+export type AgentTradeStatus = "submitting" | "settled"
+/**
  * 成交额，CNY。
  */
 export type Amount = string
+/**
+ * news 分析产物 —— 前端右侧列表。
+ * 
+ * Spec: agent-runtime-module.md §3 `AnalysisResult`
+ * 
+ * `no_action` 也要 emit；证据按 `run_id` 拉 `fetch_news` ToolCall，不另存快照。
+ */
+export type AnalysisResult = { resultId: string; runId: string; kind: AnalysisResultKind; 
+/**
+ * 结论 + 理由（含「为什么现在进还来得及 / 已 price-in」判断）。
+ */
+summary: string; relatedCodes: TsCode[]; 
+/**
+ * 若 kind=action 且下单，关联 AgentTrade。
+ */
+tradeIds: string[]; createdAt: string }
+export type AnalysisResultKind = 
+/**
+ * 触发了动作（下单 / 改自选）。
+ */
+"action" | 
+/**
+ * 明确不行动（大多数 news 应是此）。
+ */
+"no_action"
 export type ArticleSnippet = { title?: string | null; content: string; fetchedAt?: string | null }
+/**
+ * spec §9 `CancelAgentRunRequest = { runId; reason? }`。
+ */
+export type CancelRunInput = { runId: string; 
+/**
+ * 取消理由（审计）。
+ */
+reason?: string | null }
+/**
+ * spec §9 `CancelAgentRunResponse = { accepted; runId; status }`。
+ */
+export type CancelRunResult = { accepted: boolean; runId: string; status: CancelRunStatusDto }
+/**
+ * spec §9 `CancelAgentRunResponse.status`。
+ */
+export type CancelRunStatusDto = "cancelled" | "completed" | "failed" | "not_found"
 /**
  * 快速预设视图（返回给设置页）。
  */
@@ -453,7 +760,13 @@ export type FetchLimits = { kline?: number | null; minuteKline?: number | null; 
 export type FetchNewsError = { field?: string | null; code: ErrorCode; message?: string | null }
 export type FetchNewsItem = { id: string; source: string; title: string; summary?: string | null; url?: string | null; publishedAt?: string | null; articleExcerpt?: string | null; article?: ArticleSnippet | null; freshness?: NewsItemFreshness | null; warnings?: WarningCode[]; errors?: ErrorCode[] }
 export type FetchNewsPage = { limit: number; offset: number; hasMore: boolean }
-export type FetchNewsRequest = { query?: string | null; sources?: string[] | null; publishedFrom?: string | null; publishedTo?: string | null; includeArticle?: boolean | null; limit?: number | null; offset?: number | null; 
+export type FetchNewsRequest = { 
+/**
+ * 按 newsId 列表精确取回（如 Runtime 装载 news buffer 批次）。
+ * 可与 `query` / `sources` / 时间窗 AND 组合；上限 ≤200；未命中按缺失忽略。
+ * Spec: news-module.md §4 `fetch_news`。
+ */
+ids?: string[] | null; query?: string | null; sources?: string[] | null; publishedFrom?: string | null; publishedTo?: string | null; includeArticle?: boolean | null; limit?: number | null; offset?: number | null; 
 /**
  * 排序方向，默认 `desc`。详见 [`NewsOrder`] 与 spec §4 双向 keyset 读取。
  */
@@ -464,6 +777,30 @@ export type FetchNewsResponse = { items: FetchNewsItem[]; errors: FetchNewsError
  * 资讯页日期导航用它显示每天真实数量，而非分页累积。
  */
 dateCounts?: NewsDateCount[] }
+/**
+ * spec §9 fetch_agent_state `include` 选择器（未选的段省略）。
+ */
+export type FetchStateInclude = { strategy?: boolean | null; runs?: boolean | null; analysisResults?: boolean | null; trades?: boolean | null; messages?: boolean | null; toolCalls?: boolean | null; circuitBreaker?: boolean | null }
+/**
+ * spec §9 `FetchAgentStateRequest = { include?; limit?; offset? }`。
+ */
+export type FetchStateInput = { include?: FetchStateInclude | null; limit?: number | null; offset?: number | null }
+/**
+ * spec §9 `FetchInvestmentStrategyRequest = { status?; includeHistory? }`。
+ */
+export type FetchStrategyInput = { 
+/**
+ * 过滤：仅当 active 策略的 status 匹配时返回（None = 不过滤）。
+ */
+status?: StrategyStatus | null; 
+/**
+ * true = 附带 active strategyId 的历史版本列表。
+ */
+includeHistory?: boolean | null }
+/**
+ * spec §9 `FetchInvestmentStrategyResponse = { active?; history? }`。
+ */
+export type FetchStrategyResult = { active?: InvestmentStrategy | null; history?: StrategyHistoryEntry[] | null }
 /**
  * Spec: shared-types.md §4
  * - `missing` 表示本地读模型没有可用数据，或数据已超过模块定义的硬过期阈值而不可再作为可用事实返回。
@@ -552,6 +889,18 @@ export type InstrumentCategory = "stock" | "index" | "fund"
 export type InstrumentSource = "builtin" | "tdx" | "eastmoney" | "tushare" | "mixed"
 export type InstrumentStatus = "listed" | "suspended" | "delisted" | "unknown"
 export type IntradaySeries = { tradeDate: string; points: MinutePoint[]; freshness: Freshness; warnings?: WarningCode[] }
+/**
+ * 投资策略（一段自然语言）——版本化，只在对话中用户确认后写。
+ * 
+ * Spec: agent-runtime-module.md §3 `InvestmentStrategy`
+ * 
+ * 本阶段纯自然语言（不结构化硬约束）；硬风控由 Account fail-closed + Runtime 编排兜底。
+ */
+export type InvestmentStrategy = { strategyId: string; version: number; 
+/**
+ * 自然语言：投资理念 / 选股 / 风控 / 仓位 / 止盈止损纪律。
+ */
+strategy: string; status: StrategyStatus; createdAt: string; updatedAt: string }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 export type KlinePageResult = { added: number; hasMore: boolean }
 /**
@@ -560,6 +909,7 @@ export type KlinePageResult = { added: number; hasMore: boolean }
 export type KlinePeriod = "day" | "week" | "month"
 export type KlinePoint = { date: string; open: Price; close: Price; high: Price; low: Price; volume?: Volume | null; amount?: Amount | null }
 export type KlineSeries = { period: KlinePeriod; adjust: Adjust; points: KlinePoint[]; freshness: Freshness; warnings?: WarningCode[] }
+export type ListAccountArchivesResponse = { archives: AccountArchive[] }
 export type ListMarketItem = ({ tsCode: TsCode; name: string; category: InstrumentCategory; market: Market; board?: string | null; sector?: string | null; status?: InstrumentStatus | null; isSt?: boolean | null; publisher?: string | null; indexCategory?: string | null; fundType?: string | null; management?: string | null; listDate?: string | null; source: InstrumentSource; updatedAt: string }) & { quote?: ListMarketQuoteSummary | null; quoteFreshness?: Freshness | null; warnings?: WarningCode[] }
 export type ListMarketPage = { limit: number; offset: number; hasMore: boolean }
 export type ListMarketQuoteSummary = { tradeDate?: string | null; price?: number | null; change?: number | null; changePercent?: number | null; open?: number | null; high?: number | null; low?: number | null; previousClose?: number | null; volume?: number | null; amount?: number | null }
@@ -613,6 +963,14 @@ tradeDate: string;
  * 计算完成时间。
  */
 computedAt: string }
+/**
+ * 消息种类（spec §2 `AgentMessage.kind`）。
+ * 
+ * Spec: agent-infra-module.md §2
+ * - `Chat`（默认）= 普通对话消息。
+ * - `Summary` = §4 Summarize 产出的压缩检查点；durable，不再被 MicroClear / Drop / 再次 Summarize 触碰。
+ */
+export type MessageKind = "chat" | "summary"
 export type MinuteKlinePeriod = "1m" | "5m" | "15m" | "30m" | "60m"
 export type MinuteKlinePoint = { timestampMs: number; open: Price; close: Price; high: Price; low: Price; volume: Volume; amount: Amount }
 export type MinuteKlineSeries = { period: MinuteKlinePeriod; points: MinuteKlinePoint[]; freshness: Freshness; warnings?: WarningCode[] }
@@ -650,7 +1008,12 @@ export type NewsSourceLastError = { code: ErrorCode; message?: string | null; oc
 /**
  * Spec: account-module.md §2 订单模型
  */
-export type Order = { orderId: string; tsCode: TsCode; side: OrderSide; orderType: OrderType; limitPrice?: Price | null; quantity: Shares; filledQuantity: Shares; status: OrderStatus; intent: OrderIntent; positionId?: string | null; reason?: string | null; actor: TradingActor; createdAt: string; updatedAt: string; expiresAt?: string | null }
+export type Order = { orderId: string; 
+/**
+ * 调用方幂等键（spec §4 line122）；持久化供反查。Agent 单经 operate_account_with_dedup 盖戳；
+ * 内部 system 订单 / 旧单为 None。
+ */
+clientOrderId?: string | null; tsCode: TsCode; side: OrderSide; orderType: OrderType; limitPrice?: Price | null; quantity: Shares; filledQuantity: Shares; status: OrderStatus; intent: OrderIntent; positionId?: string | null; reason?: string | null; actor: TradingActor; createdAt: string; updatedAt: string; expiresAt?: string | null }
 export type OrderIntent = "open_position" | "scale_in" | "scale_out" | "close_position" | "direct_order"
 export type OrderSide = "buy" | "sell"
 export type OrderStatus = "pending" | "partially_filled" | "filled" | "cancelled" | "rejected" | "expired"
@@ -695,6 +1058,13 @@ export type QuoteSource = "tdx" | "eastmoney" | "tencent" | "sina" | "mixed"
  * 跨 BC 复用（News / Account / Quotes 都可以返回）。
  */
 export type ResponseError = { code: ErrorCode; message?: string | null; field?: string | null; tsCode?: TsCode | null }
+export type ReviewReportRef = { name: string; path: string }
+export type RunReviewInput = { 
+/**
+ * 复盘交易日（YYYYMMDD 或 YYYY-MM-DD）。
+ */
+tradeDate: string }
+export type RunReviewResult = { runId: string; reportPath?: string | null }
 export type ScanCondition = { field: ScanConditionField; op: ScanOp; value: ScanConditionValue }
 export type ScanConditionField = "change_percent" | "amount" | "volume" | "turnover_rate" | "volume_ratio" | "pe_ttm" | "pb" | "total_mv" | "circ_mv"
 export type ScanConditionValue = number | [number, number]
@@ -706,6 +1076,43 @@ export type ScanMarketResponse = ({ generatedAt: string; universe: ScanUniverse;
 export type ScanOp = "gt" | "gte" | "lt" | "lte" | "eq" | "between"
 export type ScanSortBy = "change_pct_desc" | "change_pct_asc" | "amount_desc" | "volume_desc" | "turnover_rate_desc"
 export type ScanUniverse = { category?: InstrumentCategory | null; total: number; validQuoteCount?: number | null; excludedMissingQuoteCount?: number | null; excludedExpiredQuoteCount?: number | null; matched: number }
+/**
+ * spec §9 `SendAgentMessageRequest = { content; images?; conversationId? }`。
+ * 
+ * `conversationId?`（spec §9 补充）：dialogue 是独立连续对话线程（§3），传入续接已有线程；
+ * 不传则后端新开一个匿名线程。
+ */
+export type SendMessageInput = { 
+/**
+ * 用户消息文本（spec `content`）。
+ */
+content: string; 
+/**
+ * 多模态附件（base64/URL）；当前 loop 仅消费文本，images 接受但未透传（见模块注）。
+ */
+images?: string[] | null; 
+/**
+ * 续接的对话线程 id（spec §9 补充）；不传则后端新开匿名线程。
+ */
+conversationId?: string | null }
+/**
+ * spec §9 `SendAgentMessageResponse = { messageId; runId }`。
+ */
+export type SendMessageResult = { messageId: string; runId: string }
+export type SetCircuitBreakerInput = { 
+/**
+ * true = 解除/恢复熔断（恢复自动下单）。熔断只由系统自动触发，用户只能解除——无手动激活路径。
+ */
+resume: boolean; 
+/**
+ * 操作理由（审计）。
+ */
+reason: string }
+export type SetNewsAutoAnalysisResult = { enabled: boolean; 
+/**
+ * false→true 开启时回填最近窗口内 news 入 buffer 的条数（spec §5）。
+ */
+backfilled: number }
 /**
  * 股 / 份数量。
  * 
@@ -727,6 +1134,21 @@ export type StockProfile = { tsCode: TsCode; name: string; category: InstrumentC
  */
 export type StockQuote = { tsCode: TsCode; name?: string | null; category: InstrumentCategory; tradeDate: string; price?: Price | null; previousClose?: Price | null; open?: Price | null; high?: Price | null; low?: Price | null; change?: Price | null; changePercent?: number | null; volume?: Volume | null; amount?: Amount | null; turnoverRate?: number | null; volumeRatio?: number | null; limitUp?: Price | null; limitDown?: Price | null; bid?: QuoteDepthLevel[]; ask?: QuoteDepthLevel[]; tradeStatus: TradeStatus; source: QuoteSource; capturedAt: string; exchangeTime?: string | null; freshness: Freshness; warnings?: WarningCode[] }
 /**
+ * spec §9 历史版本条目。
+ */
+export type StrategyHistoryEntry = { version: number; updatedAt: string; reason: string }
+export type StrategyStatus = "active" | "paused"
+/**
+ * 一次 tool 调用审计。
+ * 
+ * Spec: agent-infra-module.md §2 `ToolCall`
+ * 
+ * PayloadStore 双层存储规则：
+ * - input / output JSON 序列化后 ≤ 8KB 时 `inputSummary` = 完整 payload，`inputPayloadRef = None`。
+ * - > 8KB 时 `inputSummary` 是截断摘要（前 1KB + `"[truncated, see ref]"`），完整数据通过 ref。
+ */
+export type ToolCall = { toolCallId: string; runId: string; name: string; inputSummary: JsonValue; inputPayloadRef?: string | null; outputSummary?: JsonValue | null; outputPayloadRef?: string | null; isError: boolean; errorCode?: ErrorCode | null; startedAt: string; endedAt?: string | null; durationMs?: number | null }
+/**
  * 一个 Tool 的协议描述。
  * 
  * Spec: agent-infra-module.md §2 `ToolSpec`
@@ -740,7 +1162,14 @@ export type ToolSpec = { name: string; description: string;
 /**
  * JSON Schema（dispatch 前校验）。
  */
-inputSchema: JsonValue; examples: string[]; sideEffect: SideEffect; timeoutMs: number }
+inputSchema: JsonValue; examples: string[]; sideEffect: SideEffect; timeoutMs: number; 
+/**
+ * fork 类工具标记（`run_subagent` / `run_skill` 等）。
+ * 
+ * 构造子 run registry 时**按此剔除**（spec §3.5 无嵌套，不靠 name 白名单），
+ * 确保任何新增 fork 类工具（含 Runtime 注入的领域 fork 工具）都被覆盖。缺省 false。
+ */
+isSpawn?: boolean }
 /**
  * Spec: quotes-module.md §2 — query facade 派生 trade status。
  */
@@ -774,6 +1203,31 @@ export type UpdateChannelInput = { channelId: string; provider: string; wireForm
 apiKey?: string | null; enabled?: boolean | null; supportsVision?: boolean | null; supportsThinking?: boolean | null; maxOutputTokens?: number | null; contextWindowTokens?: number | null }
 export type UpdateWatchlistRequest = ({ action: "add"; ts_code: TsCode; note?: string | null; reason?: string | null } | { action: "remove"; ts_code: TsCode; reason?: string | null } | { action: "update_note"; ts_code: TsCode; note?: string | null; reason?: string | null })
 export type UpdateWatchlistResponse = { accepted: boolean; reason?: ErrorCode | null; message?: string | null; item?: WatchlistItem | null; accountEventIds: string[]; warnings?: WarningCode[] }
+/**
+ * spec §9 `UpsertInvestmentStrategyRequest = { strategyId?; baseVersion?; strategy; status; reason }`。
+ */
+export type UpsertStrategyInput = { 
+/**
+ * 目标策略 id；不传 = 更新当前 active 策略的 id（无 active 时用 baseline id）。
+ */
+strategyId?: string | null; 
+/**
+ * 乐观并发基线版本（前端拿当前 active.version 回填）；不传 = 不校验。
+ */
+baseVersion?: number | null; 
+/**
+ * 策略自然语言全文。
+ */
+strategy: string; 
+/**
+ * 写入后状态（spec：`"active" | "paused"`）。
+ */
+status: StrategyStatus; 
+/**
+ * 写入理由（审计）。
+ */
+reason: string }
+export type UpsertStrategyResult = { strategyId: string; version: number }
 /**
  * 成交量，股或份。Provider 单位必须 normalize 到最小交易数量单位，不使用"手"。
  */

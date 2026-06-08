@@ -5,5 +5,5 @@
 pub mod migrations;
 pub mod repository;
 
-pub use migrations::migrations;
+pub use migrations::{migrations, migrations_tail};
 pub use repository::AccountRepository;

@@ -63,7 +63,7 @@ CLI 不负责：
 | `gangzi quote <ts_code>...` | 取一/多只标的实时报价快照 | `StockQuote` + freshness（[quotes-module.md](quotes-module.md)）|
 | `gangzi scan [筛选项]` | 市场扫描 / 列表（涨跌幅、市场宽度等）| scan 读模型（[quotes-module.md#scan_market](quotes-module.md)）|
 | `gangzi kline <ts_code> [--period day]` | 取 K 线序列（只读已落库 + facade）| `KlineSeries`（[quotes-module.md](quotes-module.md)）|
-| `gangzi news [--query ...] [--source ...]` | 查资讯（FTS / 来源过滤）| `FetchNewsPage`（[news-module.md](news-module.md)）|
+| `gangzi news [--query ...] [--source ...]` | 查资讯（FTS / 来源过滤）| `FetchNewsResponse`（[news-module.md](news-module.md)）|
 | `gangzi account [--positions] [--orders]` | 模拟账户快照 / 持仓 / 挂单（只读）| `AccountSnapshot` 等（[account-module.md](account-module.md)）|
 
 规则：
@@ -76,7 +76,7 @@ CLI 不负责：
 
 ## 4. 与 Agent 的关系
 
-- **Agent 不通过 CLI 取数**：Agent 用进程内领域 tool（`fetch_quotes` / `fetch_news` / `fetch_account`，见 [agent-runtime-module.md](agent-runtime-module.md) §AgentToolName），结构化、快、共享活状态。
+- **Agent 不通过 CLI 取数**：Agent 用进程内领域 tool（`fetch_quotes` / `fetch_news` / `fetch_account`，见 [agent-infra-module.md](agent-infra-module.md) §3.6 `AgentToolName`），结构化、快、共享活状态。
 - 让 Agent 走 `run_bash → gangzi` 是反模式（多一层进程 + 文本解析），**禁止**。CLI 纯粹是给人 / 外部脚本的旁路。
 - 写操作只在 Agent / GUI 的进程内结构化 tool（带校验 + 审计）；CLI 只读是**有意的安全边界**——把危险的写留在结构化、可审计的通道。
 

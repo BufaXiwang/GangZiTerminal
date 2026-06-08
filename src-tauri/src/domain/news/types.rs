@@ -80,6 +80,11 @@ pub enum NewsOrder {
 #[derive(Debug, Clone, Deserialize, Serialize, Type, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchNewsRequest {
+    /// 按 newsId 列表精确取回（如 Runtime 装载 news buffer 批次）。
+    /// 可与 `query` / `sources` / 时间窗 AND 组合；上限 ≤200；未命中按缺失忽略。
+    /// Spec: news-module.md §4 `fetch_news`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

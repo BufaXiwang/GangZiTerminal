@@ -1055,6 +1055,7 @@ impl QuotesService {
                         success: 0,
                         failed_batches: 0,
                         captured_at: now,
+                        is_final: true,
                     };
                     return Ok(payload);
                 }
@@ -1126,6 +1127,9 @@ impl QuotesService {
         let mut success: u32 = 0;
         let mut failed_batches: u32 = 0;
         let mut affected: Vec<TsCode> = Vec::new();
+        // universe 有 fallback 队列时会后台 emit 一条修正 refreshed（final=true）；那时同步这条是
+        // partial（final=false）。universe 无 fallback / 非 universe → 同步条即终态（final=true）。
+        let mut corrected_emit_pending = false;
 
         if matches!(scope_kind, RefreshScopeKind::Universe) {
             // ============================================================
@@ -1268,6 +1272,7 @@ impl QuotesService {
             failed_batches = fallback_queue.len() as u32;
 
             if !fallback_queue.is_empty() {
+                corrected_emit_pending = true;
                 let this = Arc::clone(self);
                 let purpose = req.purpose;
                 let base_completed = completed;
@@ -1349,6 +1354,8 @@ impl QuotesService {
             success,
             failed_batches,
             captured_at: now,
+            // universe 且后台 fallback 修正将随后 emit → 本条为 partial（final=false）；否则终态。
+            is_final: !corrected_emit_pending,
         };
         self.emit_refreshed(payload.clone());
         Ok(payload)
@@ -1379,6 +1386,7 @@ impl QuotesService {
             success,
             failed_batches: total.saturating_sub(success),
             captured_at: Utc::now(),
+            is_final: true,
         };
         self.emit_refreshed(payload.clone());
         Ok(payload)
@@ -1638,6 +1646,7 @@ impl QuotesService {
             success,
             failed_batches: total.saturating_sub(success),
             captured_at: now,
+            is_final: true, // universe 末段（含 fallback 修正）；纯 UI / 行情读模型事件，账户不再据此重建（spec §6/§8）
         });
         tracing::info!(
             target: "quotes.refresh.universe",

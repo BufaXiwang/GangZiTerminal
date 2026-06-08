@@ -469,8 +469,9 @@ impl ForkHandle {
         let allow: Option<std::collections::HashSet<&str>> =
             allowed.map(|a| a.iter().map(|s| s.as_str()).collect());
         for spec in self.registry.list_tools() {
-            // 从根上剔除 spawn 类工具，禁止嵌套 fork。
-            if is_spawn_tool(&spec.name) {
+            // 从根上剔除 spawn 类工具（按 `ToolSpec.is_spawn` 标记，不靠 name 白名单 →
+            // 覆盖 run_subagent / run_skill 等 fork 类工具），禁止嵌套 fork。
+            if spec.is_spawn {
                 continue;
             }
             if allow
@@ -936,12 +937,6 @@ fn new_agent_id() -> String {
     format!("sub_{}", Uuid::new_v4())
 }
 
-/// spawn 类工具（会再起一个子 run，构成嵌套 fork）。子 registry 一律剔除这些，禁止嵌套。
-/// 注意：`create_skill` 是写文件、不递归，**不算** spawn，保留给子 agent。
-fn is_spawn_tool(name: &str) -> bool {
-    matches!(name, "run_subagent" | "run_skill")
-}
-
 fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     line.chars().take(max).collect()
@@ -1056,6 +1051,7 @@ fn tool_spec_run_subagent() -> ToolSpec {
         SUBAGENT_TIMEOUT_MS,
         SideEffect::None,
     )
+    .spawn()
 }
 
 fn tool_spec_run_skill() -> ToolSpec {
@@ -1076,6 +1072,7 @@ fn tool_spec_run_skill() -> ToolSpec {
         SKILL_TIMEOUT_MS,
         SideEffect::None,
     )
+    .spawn()
 }
 
 // ───────────────────────── tests (hermetic, no network) ─────────────────────────
@@ -1686,9 +1683,9 @@ mod tests {
         let handler: Arc<dyn ToolHandler> = Arc::new(FnToolHandler(|inv: ToolInvocation| {
             Box::pin(async move { ToolHandlerOutput::ok(inv.input) }) as ToolHandlerFuture
         }));
-        // Parent carries spawn tools + non-spawn tools.
-        parent.register_tool(mk("run_subagent"), handler.clone()).unwrap();
-        parent.register_tool(mk("run_skill"), handler.clone()).unwrap();
+        // Parent carries spawn tools (marked is_spawn) + non-spawn tools.
+        parent.register_tool(mk("run_subagent").spawn(), handler.clone()).unwrap();
+        parent.register_tool(mk("run_skill").spawn(), handler.clone()).unwrap();
         parent.register_tool(mk("create_skill"), handler.clone()).unwrap();
         parent.register_tool(mk("read_file"), handler).unwrap();
 

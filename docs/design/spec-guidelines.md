@@ -269,7 +269,7 @@ Spec 的逻辑描述必须完整到“实现者不需要猜”的程度。每个
 默认规则：
 
 - 账户状态变化先写 append-only event，再更新读模型。
-- Agent 交易动作必须能从 `TradeIntent -> Account result -> DecisionEpisode` 追溯。
+- Agent 交易动作必须能按 `run_id` 追溯（`AgentRun -> AgentTrade -> Account result`）。
 - Agent Runtime 负责跨模块事件消费幂等。
 
 ---

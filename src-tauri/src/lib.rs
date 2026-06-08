@@ -24,18 +24,12 @@ use crate::adapters::quotes::events::{
     MARKET_QUOTES_REFRESHED_EVENT, MARKET_QUOTES_REFRESH_PROGRESS_EVENT,
 };
 use crate::domain::shared::Money;
-use crate::infrastructure::account::migrations as account_migrations;
 use crate::infrastructure::agent::{
     bootstrap as bootstrap_agent_infra, default_skills_dir, default_workspace_dir,
-    migrations as agent_migrations,
 };
-use crate::infrastructure::db::{run_migrations, AppDb};
-use crate::infrastructure::news::{migrations as news_migrations, NewsRepository, SourceRegistry};
-use crate::infrastructure::quotes::{migrations as quotes_migrations, QuotesConfig};
-use crate::pipeline::account::scheduler::{
-    spawn_account_eval_scheduler, AccountSchedulerHandle, ACCOUNT_EVAL_BATCH_SIZE,
-    ACCOUNT_EVAL_INTERVAL_SECS,
-};
+use crate::infrastructure::db::{all_migrations, run_migrations, AppDb};
+use crate::infrastructure::news::{NewsRepository, SourceRegistry};
+use crate::infrastructure::quotes::QuotesConfig;
 use crate::pipeline::account::{
     AccountQuoteGateway, AccountService, AccountServiceConfig, QuotesFacadeGateway,
 };
@@ -87,6 +81,18 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::account::cmd::update_watchlist,
         adapters::account::cmd::mark_trigger_handled,
         adapters::account::cmd::rebuild_account_snapshot,
+        adapters::account::cmd::account_reset,
+        adapters::account::cmd::list_account_archives,
+        adapters::agent::runtime_cmd::agent_send_message,
+        adapters::agent::runtime_cmd::agent_fetch_state,
+        adapters::agent::runtime_cmd::agent_fetch_strategy,
+        adapters::agent::runtime_cmd::agent_upsert_strategy,
+        adapters::agent::runtime_cmd::agent_set_circuit_breaker,
+        adapters::agent::runtime_cmd::agent_run_review,
+        adapters::agent::runtime_cmd::agent_list_review_reports,
+        adapters::agent::runtime_cmd::agent_cancel_run,
+        adapters::agent::runtime_cmd::agent_get_news_auto_analysis,
+        adapters::agent::runtime_cmd::agent_set_news_auto_analysis,
     ])
 }
 
@@ -122,24 +128,9 @@ pub fn run() {
             let db_path = resolve_db_path(app.handle())?;
             let db = AppDb::open(&db_path).expect("failed to open AppDb");
             db.with(|conn| {
-                // rusqlite_migration 用 user_version 跟踪"已 apply 第 N 个 migration"，
-                // **按全局位置 (0-indexed) 判定**，不感知 BC 拆分。所以这里的拼接顺序
-                // 必须是 append-only：新增 BC migration 时只能加到当前列表末尾，
-                // 否则会把后面 BC 的旧 migration 错位变成"需要重跑"，CREATE TABLE 直接 panic。
-                //
-                // 当前固定顺序（不要重排）：news → account → quotes → agent
-                // 规则：新增 migration 的 BC 必须排在拼接末尾，让该 migration 落到全局
-                // 最后一个 index——否则 user_version 之后的 index 会指向其他 BC 已应用的
-                // migration（CREATE TABLE 重跑 → panic）。
-                // 既有 DB(user_version=5: news1+agent1+account1+quotes2)：agent 新增 M002 后
-                // 把 agent 移到末尾，agent-002 落到 index 5 = user_version，恰好只补它一条；
-                // agent-001 移到 index 4(<5) 不重跑。新装 DB 顺序无依赖，全量建表 OK。
-                let mut all = Vec::new();
-                all.extend(news_migrations());
-                all.extend(account_migrations());
-                all.extend(quotes_migrations());
-                all.extend(agent_migrations());
-                run_migrations(conn, all).expect("failed to apply migrations");
+                // 全局 migration 列表由 `all_migrations()` 统一维护（infrastructure/db/migrations.rs）。
+                // append-only：新增 migration 只能追加到 `all_migrations()` 尾部。
+                run_migrations(conn, all_migrations()).expect("failed to apply migrations");
             });
 
             // -- News BC bootstrap
@@ -159,9 +150,57 @@ pub fn run() {
             app.manage(Arc::clone(&news_service));
 
             // -- News Event sink
+            // 除了向前端 emit，还把新入库的 newsId 灌进 Runtime 的 news buffer（滚动 4h），
+            // 让 news agent 能被 M/N 触发（spec: agent-runtime-module.md §5 / §6）。
+            // NewsBufferService 无状态、只读写 agent_news_buffer 表，故独立 new 一个共享同一 db 即可。
+            let nb_repo = Arc::new(
+                crate::infrastructure::agent::runtime_repo::AgentRuntimeRepo::new(db.clone()),
+            );
+            let news_buffer_ingest = Arc::new(
+                crate::pipeline::agent_runtime::NewsBufferService::new(
+                    Arc::clone(&nb_repo),
+                    crate::pipeline::agent_runtime::NewsBufferConfig::default(),
+                ),
+            );
+            // 自动分析开关门 facade（spec §5：关闭时不 ingest）。
+            let nb_settings = Arc::new(
+                crate::pipeline::agent_runtime::settings::RuntimeSettings::new(Arc::clone(&nb_repo)),
+            );
             let app_handle = app.handle().clone();
+            let nb_for_sink = Arc::clone(&news_buffer_ingest);
+            let settings_for_sink = Arc::clone(&nb_settings);
+            let db_for_sink = db.clone();
             let sink: crate::pipeline::news::scheduler::EventSink =
                 Arc::new(move |payload| {
+                    // 开关门：自动分析关闭时不入队（spec §5 默认关闭）。
+                    if settings_for_sink.news_auto_analysis_enabled() {
+                        // 合并 newIds ∪ updatedIds ∪ articleUpdatedNewsIds 去重（spec §5 生产者）。
+                        // 纯 failed/warnings 变化的 id 不在这三组里，自然不入队。
+                        let ids = crate::pipeline::agent_runtime::news_buffer::merge_refreshed_ids(
+                            &payload.new_ids,
+                            &payload.updated_ids,
+                            &payload.article_updated_news_ids,
+                        );
+                        if !ids.is_empty() {
+                            // 批量查 published_at（newest-first 排序锚点，spec §5）。
+                            let repo = crate::infrastructure::news::NewsRepository::new(&db_for_sink);
+                            let pub_ats = repo.get_news_items_by_ids(&ids).unwrap_or_default();
+                            let items: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> = ids
+                                .iter()
+                                .enumerate()
+                                .map(|(i, id)| {
+                                    let pa = pub_ats
+                                        .get(i)
+                                        .and_then(|o| o.as_ref())
+                                        .and_then(|it| it.published_at);
+                                    (id.clone(), pa)
+                                })
+                                .collect();
+                            if let Err(e) = nb_for_sink.ingest(&items, chrono::Utc::now()) {
+                                tracing::warn!(target: "runtime.news_buffer", error = %e, "ingest news ids failed");
+                            }
+                        }
+                    }
                     let envelope = wrap_news_refreshed(payload, None);
                     if let Err(e) = app_handle.emit(NEWS_REFRESHED_EVENT, envelope) {
                         tracing::warn!(target: "news.refresh.emit", error = %e, "failed to emit news-refreshed");
@@ -189,7 +228,15 @@ pub fn run() {
             );
             app.manage(Arc::clone(&quotes_service));
 
-            // -- Quotes Event sink
+            // Runtime 句柄占位（OnceLock）：RuntimeServices 在 Account 块之后才构造，但 account
+            // event sink 在它之前接线。sink 捕获 holder，runtime 构造后填入；触发时读 holder。
+            // Spec: docs/design/agent-runtime-module.md §6 账户自驱 quote tick + §8 幂等。
+            let rt_holder: Arc<std::sync::OnceLock<Arc<crate::pipeline::agent_runtime::RuntimeServices>>> =
+                Arc::new(std::sync::OnceLock::new());
+
+            // -- Quotes Event sink（纯 UI emit）
+            // 账户重建已与 universe 解耦：账户走自有 focused refresh quote tick 自驱（spec §6），
+            // 不再消费 `market-quotes-refreshed` 重建账户。此 sink 只把刷新事件透传给前端 / 行情读模型。
             let app_handle = app.handle().clone();
             let quotes_sink: crate::pipeline::quotes::service::RefreshEventSink =
                 Arc::new(move |payload| {
@@ -370,6 +417,10 @@ pub fn run() {
                 .map(|d| d.join("gangzi").join("skills"))
                 .unwrap_or_else(|_| default_skills_dir());
             let agent_infra = bootstrap_agent_infra(db.clone(), workspace_dir, skills_dir);
+            // Runtime（Phase 3）复用 Infra 的消息持久化 / payload / channels（克隆句柄，便宜）。
+            let runtime_agent_messages_repo = agent_infra.repo.clone();
+            let runtime_payload_store = agent_infra.payload_store.clone();
+            let runtime_channels_repo = agent_infra.channels_repo.clone();
             app.manage(agent_infra);
 
             // -- Account BC bootstrap（Phase 2）
@@ -410,9 +461,64 @@ pub fn run() {
                     }
                 });
             account_service.set_updated_sink(updated_sink);
+            // 账户触发 → Runtime account_trigger run（实时消费）。复用上方 quotes 块声明的 rt_holder。
+            let rt_for_trigger = Arc::clone(&rt_holder);
             let app_handle_b = app.handle().clone();
             let triggered_sink: crate::pipeline::account::service::AccountTriggeredSink =
                 Arc::new(move |inner| {
+                    // 先消费（去重 → 起 account_trigger run，异步），再 emit 给前端。
+                    if let Some(rt) = rt_for_trigger.get() {
+                        let t = &inner.trigger;
+                        let trigger_id = t.trigger_id.clone();
+                        let order_id = t.order_id.clone();
+                        let summary = format!(
+                            "{:?} {} {}",
+                            t.trigger_type,
+                            t.ts_code.as_ref().map(|c| c.as_str()).unwrap_or(""),
+                            t.threshold.clone().unwrap_or_default(),
+                        );
+                        match rt.triggers.begin_account_trigger(&trigger_id) {
+                            Ok(true) => {
+                                let rt2 = Arc::clone(rt);
+                                tauri::async_runtime::spawn(async move {
+                                    match rt2
+                                        .run_account_trigger(trigger_id.clone(), order_id, summary)
+                                        .await
+                                    {
+                                        Ok(run) => {
+                                            // run 终态后才标 Account 侧 handled（spec §3/§6/§11）：
+                                            // execute_run 返回即 run 已终态。失败仅记日志，不阻断 consumption 收尾。
+                                            if let Err(e) = rt2
+                                                .deps
+                                                .account
+                                                .mark_trigger_handled(&trigger_id)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    target: "runtime.account_trigger",
+                                                    trigger_id = %trigger_id,
+                                                    error = %e.message,
+                                                    "mark_trigger_handled failed (non-fatal)"
+                                                );
+                                            }
+                                            let _ = rt2.triggers.mark_account_trigger_consumed(
+                                                &trigger_id,
+                                                Some(&run.run_id),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            let _ = rt2
+                                                .triggers
+                                                .mark_account_trigger_failed(&trigger_id, &e.to_string());
+                                            tracing::warn!(target: "runtime.account_trigger", error = %e, "account_trigger run failed");
+                                        }
+                                    }
+                                });
+                            }
+                            Ok(false) => {} // 已消费 / 处理中 → 不重触发
+                            Err(e) => tracing::warn!(target: "runtime.account_trigger", error = %e, "begin_account_trigger failed"),
+                        }
+                    }
                     let env = wrap_account_triggered(inner, None);
                     if let Err(e) = app_handle_b.emit(ACCOUNT_TRIGGERED_EVENT, env) {
                         tracing::warn!(target: "account.emit", error = %e, "failed to emit account-triggered");
@@ -421,16 +527,9 @@ pub fn run() {
             account_service.set_triggered_sink(triggered_sink);
             app.manage(Arc::clone(&account_service));
 
-            // Account eval scheduler — 同样需要 runtime context 包装
-            let account_handle: AccountSchedulerHandle =
-                tauri::async_runtime::block_on(async {
-                    spawn_account_eval_scheduler(
-                        Arc::clone(&account_service),
-                        std::time::Duration::from_secs(ACCOUNT_EVAL_INTERVAL_SECS),
-                        ACCOUNT_EVAL_BATCH_SIZE,
-                    )
-                });
-            app.manage(account_handle);
+            // 账户触发评估 cadence 统一由 Runtime 自驱 quote tick 承担
+            // （spawn_account_eval_tick_scheduler，spec agent-runtime §6/§8）——
+            // 旧的 Account BC 60s 纯兜底 eval scheduler 已退役。
 
             // -- Quotes Scheduler（multi-tick）— 同样需要 runtime context 包装
             let quotes_handle: QuotesSchedulerHandle =
@@ -441,6 +540,153 @@ pub fn run() {
                     )
                 });
             app.manage(quotes_handle);
+
+            // -- Agent Runtime bootstrap（Phase 3）
+            // Spec: docs/design/agent-runtime-module.md §10 实现映射
+            {
+                use crate::infrastructure::agent::runtime_repo::AgentRuntimeRepo;
+                use crate::pipeline::agent_runtime::executor::AgentEventSink;
+                use crate::pipeline::agent_runtime::recovery::RecoveryService;
+                use crate::pipeline::agent_runtime::runs::{RuntimeEvent, RuntimeEventSink};
+                use crate::pipeline::agent_runtime::{
+                    build_runtime_services, spawn_account_eval_tick_scheduler,
+                    spawn_news_buffer_scheduler, RuntimeBootstrap,
+                };
+
+                // 启动恢复（§8）：submitting 用 clientOrderId 对账 / running→failed / news 孤儿回 pending。
+                // 对账闭包：用 clientOrderId 反查 Account 是否已有对应订单（spec §3/§8「无猜失败盲区」）。
+                let recovery_repo = Arc::new(AgentRuntimeRepo::new(db.clone()));
+                let recon_account = Arc::clone(&account_service);
+                let reconciler = move |coid: &str| -> Option<String> {
+                    recon_account
+                        .find_order_by_client_order_id(coid)
+                        .map(|o| o.order_id)
+                };
+                match RecoveryService::new(recovery_repo)
+                    .recover_on_startup_with(Some(&reconciler))
+                {
+                    Ok(s) => tracing::info!(
+                        target: "runtime.recovery",
+                        interrupted = s.interrupted_runs,
+                        reconciled = s.reconciled_trades,
+                        reconciled_accepted = s.reconciled_accepted,
+                        reconciled_failed = s.reconciled_failed,
+                        news_reset = s.reset_news_items,
+                        consumptions_recovered = s.recovered_consumptions,
+                        "runtime startup recovery done"
+                    ),
+                    Err(e) => tracing::warn!(target: "runtime.recovery", error = %e, "recovery failed"),
+                }
+
+                // AgentEvent（token/tool/run 流）→ 前端 agent-event。
+                let ah_evt = app.handle().clone();
+                let agent_event_sink: AgentEventSink = Arc::new(move |ev| {
+                    let env = crate::adapters::agent::wrap_agent_event(ev, None);
+                    if let Err(e) = ah_evt.emit(crate::adapters::agent::AGENT_EVENT, env) {
+                        tracing::warn!(target: "runtime.emit", error = %e, "emit agent-event failed");
+                    }
+                });
+
+                // RuntimeEvent（run 起止 / AnalysisResult）→ 前端 kebab 事件。
+                let ah_run = app.handle().clone();
+                let runtime_event_sink: RuntimeEventSink = Arc::new(move |ev| {
+                    let (name, payload) = match ev {
+                        RuntimeEvent::RunStarted { run_id, run } => (
+                            "agent-run-started",
+                            serde_json::json!({"runId": run_id, "mode": run.mode, "trigger": run.trigger}),
+                        ),
+                        RuntimeEvent::RunFinished { run_id, status, error } => (
+                            "agent-run-finished",
+                            serde_json::json!({"runId": run_id, "status": status, "error": error}),
+                        ),
+                        RuntimeEvent::AnalysisResultEmitted { result_id, run_id, kind } => (
+                            "agent-analysis-result",
+                            serde_json::json!({"resultId": result_id, "runId": run_id, "kind": kind}),
+                        ),
+                    };
+                    if let Err(e) = ah_run.emit(name, payload) {
+                        tracing::warn!(target: "runtime.emit", error = %e, "emit runtime event failed");
+                    }
+                });
+
+                // 熔断状态变更 → 前端 agent-circuit-breaker。
+                let ah_cb = app.handle().clone();
+                let circuit_breaker_sink: Arc<dyn Fn(bool, String) + Send + Sync> =
+                    Arc::new(move |active, reason| {
+                        let payload = serde_json::json!({"active": active, "reason": reason});
+                        if let Err(e) = ah_cb.emit("agent-circuit-breaker", payload) {
+                            tracing::warn!(target: "runtime.emit", error = %e, "emit agent-circuit-breaker failed");
+                        }
+                    });
+
+                // news buffer age-out 丢弃计数 → 前端 agent-news-buffer-dropped（spec §5/§7）。
+                let ah_drop = app.handle().clone();
+                let buffer_dropped_sink: Arc<dyn Fn(u32, u32) + Send + Sync> =
+                    Arc::new(move |count, window_secs| {
+                        let payload = serde_json::json!({
+                            "count": count,
+                            "windowSecs": window_secs,
+                            "occurredAt": chrono::Utc::now().to_rfc3339(),
+                        });
+                        if let Err(e) = ah_drop.emit("agent-news-buffer-dropped", payload) {
+                            tracing::warn!(target: "runtime.emit", error = %e, "emit agent-news-buffer-dropped failed");
+                        }
+                    });
+
+                let runtime_services = Arc::new(build_runtime_services(RuntimeBootstrap {
+                    db: db.clone(),
+                    agent_messages_repo: runtime_agent_messages_repo,
+                    payload_store: runtime_payload_store,
+                    channels: runtime_channels_repo,
+                    quotes: Arc::clone(&quotes_service),
+                    news: Arc::clone(&news_service),
+                    account: Arc::clone(&account_service),
+                    agent_event_sink: Some(agent_event_sink),
+                    runtime_event_sink: Some(runtime_event_sink),
+                    // max_turns / token_budget / review_min_sample_trades / eval_batch_size
+                    // 已改由 Runtime settings（spec §8）提供，缺失用缺省。
+                    // 当日额度 cap 已改从账户 gateway `max_daily_new_orders()` 取（spec §6），不再硬编码注入。
+                    reports_dir: app
+                        .handle()
+                        .path()
+                        .app_data_dir()
+                        .map(|d| d.join("gangzi").join("workspace").join("reviews"))
+                        .unwrap_or_else(|_| std::env::temp_dir().join("gangzi-reviews")),
+                    circuit_breaker_sink: Some(circuit_breaker_sink),
+                    buffer_dropped_sink: Some(buffer_dropped_sink),
+                }));
+
+                // 填入 OnceLock：账户触发 sink 自此可起 account_trigger run。
+                let _ = rt_holder.set(Arc::clone(&runtime_services));
+
+                // 启动恢复 ⑤（spec §8）：从 Account 补扫未 handled trigger，经既有 account_trigger 路由
+                // （dedupe 保证不重复）。需 active channel + runtime_services 就绪，故放在此处异步起。
+                let rescan_rt = Arc::clone(&runtime_services);
+                tauri::async_runtime::spawn(async move {
+                    let n = rescan_rt.rescan_unhandled_triggers(200).await;
+                    if n > 0 {
+                        tracing::info!(target: "runtime.recovery", routed = n, "startup rescan of unhandled triggers done");
+                    }
+                });
+
+                // news buffer 调度（M/N 触发 + age-out）；基础轮询 60s。
+                let news_buffer_handle = tauri::async_runtime::block_on(async {
+                    spawn_news_buffer_scheduler(
+                        Arc::clone(&runtime_services),
+                        std::time::Duration::from_secs(60),
+                    )
+                });
+                app.manage(news_buffer_handle);
+
+                // 账户自驱 quote tick（spec §6）：每 `account_trigger_eval_interval_secs`（缺省 10s）
+                // 对 subscribed_codes ∪ core_indexes 做 focused refresh → rebuild → eval 分页耗尽。
+                // 账户与 universe 全市场刷新解耦——不再搭 universe 便车。
+                let account_tick_handle = tauri::async_runtime::block_on(async {
+                    spawn_account_eval_tick_scheduler(Arc::clone(&runtime_services))
+                });
+                app.manage(account_tick_handle);
+                app.manage(runtime_services);
+            }
 
             Ok(())
         })
@@ -473,12 +719,7 @@ mod specta_export_tests {
     fn full_migration_list_applies_clean() {
         let db = AppDb::open_in_memory().unwrap();
         db.with(|conn| {
-            let mut all = Vec::new();
-            all.extend(news_migrations());
-            all.extend(account_migrations());
-            all.extend(quotes_migrations());
-            all.extend(agent_migrations());
-            run_migrations(conn, all).expect("full migration list must apply clean");
+            run_migrations(conn, all_migrations()).expect("full migration list must apply clean");
             // agent M002 列存在
             let cols: Vec<String> = conn
                 .prepare("PRAGMA table_info(agent_provider_channels)")
@@ -489,6 +730,57 @@ mod specta_export_tests {
                 .unwrap();
             assert!(cols.iter().any(|c| c == "api_key"));
             assert!(cols.iter().any(|c| c == "is_active"));
+            // 全局末尾追加的 Account-owned 表存在。
+            let day_eq_cols: Vec<String> = conn
+                .prepare("PRAGMA table_info(account_day_equity)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(day_eq_cols.iter().any(|c| c == "open_equity"));
+            assert!(day_eq_cols.iter().any(|c| c == "high_equity"));
+        });
+    }
+
+    /// 存量 DB 升级路径：先 apply 到 agent 末尾（模拟旧版本 DB），再追加 tail，
+    /// 验证只补 account_day_equity 一条、不重跑既有建表（CREATE TABLE 不 panic）。
+    #[test]
+    fn migration_tail_safe_on_existing_db() {
+        use crate::infrastructure::account::migrations as account_mig;
+        use crate::infrastructure::agent::migrations as agent_mig;
+        use crate::infrastructure::news::migrations as news_mig;
+        use crate::infrastructure::quotes::migrations as quotes_mig;
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|conn| {
+            // ① 旧版本：news → account → quotes → agent（无 tail）。
+            let mut old = Vec::new();
+            old.extend(news_mig::migrations());
+            old.extend(account_mig::migrations());
+            old.extend(quotes_mig::migrations());
+            old.extend(agent_mig::migrations());
+            let old_len = old.len();
+            run_migrations(conn, old).expect("old migration set applies");
+            let uv_before: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(uv_before as usize, old_len, "旧 DB user_version = 旧 migration 数");
+
+            // ② 升级：全量 all_migrations() 再 apply —— 只补 tail，既有建表不重跑。
+            let full = all_migrations();
+            let full_len = full.len();
+            run_migrations(conn, full).expect("升级追加 tail 不破存量 DB");
+            let uv_after: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(uv_after as usize, full_len, "升级后只前进 tail 长度");
+            // 新表可用。
+            conn.execute(
+                "INSERT INTO account_day_equity (trade_date, open_equity, high_equity, captured_at)
+                 VALUES ('20260605', '1000000', '1000000', '2026-06-05T00:00:00Z')",
+                [],
+            )
+            .unwrap();
         });
     }
 
@@ -505,12 +797,7 @@ mod specta_export_tests {
         let db = AppDb::open(&std::path::PathBuf::from(&db_path)).unwrap();
         // 应用全量 migration（与 run() 同序）——既有 DB 只补未应用的尾部。
         db.with(|conn| {
-            let mut all = Vec::new();
-            all.extend(news_migrations());
-            all.extend(account_migrations());
-            all.extend(quotes_migrations());
-            all.extend(agent_migrations());
-            run_migrations(conn, all).expect("migrations apply clean on seed DB");
+            run_migrations(conn, all_migrations()).expect("migrations apply clean on seed DB");
         });
         let repo = ProviderChannelsRepo::new(db.clone());
 

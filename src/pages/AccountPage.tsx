@@ -16,7 +16,7 @@
 //                右：WatchlistPanel
 //   AddWatchlistModal（条件渲染）
 
-import { RefreshCcw } from "lucide-react";
+import { RefreshCcw, RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { PageShell } from "../components/PageShell";
@@ -170,6 +170,28 @@ export default function AccountPage() {
 
   const triggerCount = triggers.filter((t) => !t.handled).length;
 
+  // 重置账户 = 重开一局模拟盘（spec account-module.md §4 account_reset）。
+  // 带确认弹窗避免误触：清账户财务侧、回初始本金，保留自选；旧局归档可取回。
+  const handleReset = useCallback(async () => {
+    const ok = window.confirm(
+      "重置账户将重开一局模拟盘：清空持仓 / 挂单 / 成交 / 账户事件，现金回初始本金。\n" +
+        "自选股保留，旧局数据会归档（可取回）。Agent 决策记录不受影响。\n\n" +
+        "确定要重置吗？",
+    );
+    if (!ok) return;
+    setLoading(true);
+    setError(null);
+    const res = await commands.accountReset();
+    if (res.status === "error") {
+      setError(
+        `${res.error.code}${res.error.message ? `: ${res.error.message}` : ""}`,
+      );
+      setLoading(false);
+      return;
+    }
+    await refresh();
+  }, [refresh]);
+
   return (
     <>
       <PageShell
@@ -185,16 +207,28 @@ export default function AccountPage() {
           ) : undefined
         }
         actions={
-          <button
-            type="button"
-            className="btn"
-            onClick={() => void refresh()}
-            disabled={loading}
-            title="刷新"
-          >
-            <RefreshCcw size={14} />
-            <span>刷新</span>
-          </button>
+          <>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void refresh()}
+              disabled={loading}
+              title="刷新"
+            >
+              <RefreshCcw size={14} />
+              <span>刷新</span>
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => void handleReset()}
+              disabled={loading}
+              title="重置账户（重开一局，保留自选）"
+            >
+              <RotateCcw size={14} />
+              <span>重置账户</span>
+            </button>
+          </>
         }
       >
         <AccountSummary snapshot={snapshot} loading={loading} error={error} />

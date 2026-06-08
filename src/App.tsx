@@ -15,6 +15,7 @@ import { useWatchlistStore } from "./lib/watchlistStore";
 import MarketPage from "./pages/MarketPage";
 import NewsPage from "./pages/NewsPage";
 import AccountPage from "./pages/AccountPage";
+import AgentPage from "./pages/AgentPage";
 import SettingsPage from "./pages/SettingsPage";
 
 // Keep-alive，但**懒挂载**：一个 tab 的内容只在「首次被激活」时挂载，之后靠 display 切换、
@@ -39,9 +40,11 @@ export default function App() {
       ? "news"
       : pathname === ROUTES.account
         ? "account"
-        : pathname === ROUTES.settings
-          ? "settings"
-          : "market";
+        : pathname === ROUTES.agent
+          ? "agent"
+          : pathname === ROUTES.settings
+            ? "settings"
+            : "market";
 
   // 记录已激活过的 tab；当前 active 同步标记（首次渲染即挂载，无空帧）。
   // 之后该 tab 一直保留在树里（keep-alive），只是用 display 隐藏。
@@ -59,6 +62,9 @@ export default function App() {
       </div>
       <div style={{ display: active === "account" ? "contents" : "none" }}>
         {mounted("account") && <AccountPage />}
+      </div>
+      <div style={{ display: active === "agent" ? "contents" : "none" }}>
+        {mounted("agent") && <AgentPage />}
       </div>
       <div style={{ display: active === "settings" ? "contents" : "none" }}>
         {mounted("settings") && <SettingsPage />}

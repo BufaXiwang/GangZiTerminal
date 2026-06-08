@@ -11,5 +11,6 @@
 
 pub mod cmd;
 pub mod events;
+pub mod runtime_cmd;
 
 pub use events::{wrap_agent_event, AGENT_EVENT};
