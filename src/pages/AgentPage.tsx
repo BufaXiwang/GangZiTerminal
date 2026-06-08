@@ -359,10 +359,16 @@ function ChatBlockView({ block }: { block: ChatBlock }) {
 }
 
 function TextBlockView({ text }: { text: string }) {
+  const cleaned = text
+    .replace(/<use_tool[\s\S]*?<\/use_tool>/g, "")
+    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
+    .replace(/<tool_error[\s\S]*?<\/tool_error>/g, "")
+    .trim();
+  if (!cleaned) return null;
   return (
     <div
       className="chat-block-text md-content"
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
+      dangerouslySetInnerHTML={{ __html: renderMarkdown(cleaned) }}
     />
   );
 }
