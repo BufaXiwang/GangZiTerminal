@@ -16,7 +16,7 @@ use crate::domain::agent::tools::{SideEffect, ToolSpec};
 const READ_TIMEOUT_MS: u64 = 15_000;
 const WRITE_TIMEOUT_MS: u64 = 20_000;
 
-// ---- 领域工具名（= agent-infra §3.6 AgentToolName 的领域部分）---------------
+// ---- Runtime 领域工具名（真源：agent-runtime-module.md §4；Infra 只认 opaque ToolName）----
 pub const FETCH_QUOTES: &str = "fetch_quotes";
 pub const FETCH_NEWS: &str = "fetch_news";
 pub const FETCH_ACCOUNT: &str = "fetch_account";

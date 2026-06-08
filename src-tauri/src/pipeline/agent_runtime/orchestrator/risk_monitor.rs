@@ -1,10 +1,6 @@
-//! Risk monitoring + circuit breaker + run cancellation。
+//! Run cancellation.
 //!
-//! Spec: docs/design/agent-runtime-module.md §6 熔断 / §9 cancel_agent_run
-
-use std::sync::atomic::Ordering;
-
-use chrono::Utc;
+//! Spec: docs/design/agent-runtime-module.md §9 cancel_agent_run
 
 use crate::domain::agent::runtime::AgentRunStatus;
 
@@ -55,64 +51,5 @@ impl RuntimeServices {
             }
             _ => CancelRunOutcome { accepted: false, status: CancelRunStatus::NotFound },
         }
-    }
-
-    /// 解除/恢复熔断（spec §9 set_circuit_breaker）。
-    pub fn set_circuit_breaker(&self, resume: bool) -> bool {
-        if resume {
-            self.flip_circuit_breaker(false);
-        }
-        self.circuit_breaker_active()
-    }
-
-    /// 内部翻转熔断状态并 emit 可观测。
-    pub(super) fn flip_circuit_breaker(&self, active: bool) {
-        let prev = self.circuit_breaker.swap(active, Ordering::Relaxed);
-        if prev != active {
-            if let Err(e) = self.settings.set_circuit_breaker_active(active) {
-                tracing::warn!(
-                    target: "runtime.circuit_breaker",
-                    error = %e,
-                    active,
-                    "persist circuit_breaker_active failed"
-                );
-            }
-            if let Some(sink) = self.circuit_breaker_sink.as_ref() {
-                sink(
-                    active,
-                    if active {
-                        "熔断激活".to_string()
-                    } else {
-                        "熔断解除".to_string()
-                    },
-                );
-            }
-        }
-    }
-
-    /// 当前熔断是否激活。
-    pub fn circuit_breaker_active(&self) -> bool {
-        self.circuit_breaker.load(Ordering::Relaxed)
-    }
-
-    /// 自动熔断监控（spec §6）。
-    pub async fn monitor_risk(&self) -> Option<String> {
-        if self.circuit_breaker_active() {
-            return None;
-        }
-        let now = Utc::now();
-        let losses = self.deps.account.consecutive_losses(now);
-        let drawdown = self.deps.account.daily_drawdown(now);
-
-        let reason = super::super::risk::circuit_breaker_tripped(losses, drawdown, &self.risk)?;
-        self.flip_circuit_breaker(true);
-        tracing::warn!(
-            target: "runtime.circuit_breaker",
-            losses,
-            drawdown,
-            reason = %reason,
-            "自动熔断激活（需对话确认解除）"
-        );
-        Some(reason)
     }
 }

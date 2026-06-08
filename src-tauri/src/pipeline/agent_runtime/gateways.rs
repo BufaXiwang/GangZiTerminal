@@ -135,10 +135,9 @@ pub trait AccountGateway: Send + Sync {
 
     // ----------------------------------------------------------------
     // 账户财务事实只读 facade（账户为单一所有者，下沉自 Runtime）
-    // Spec: account-module.md §2「账户财务事实只读 facade」/ agent-runtime §3②/§6 熔断
+    // Spec: account-module.md §2「账户财务事实只读 facade」/ agent-runtime §3②
     //
-    // Runtime 只「取阈值 + 比较 + 编排」，财务派生由 Account 计算。复盘超额 = `daily_return`
-    // 与 `core_indexes` 涨幅相减（跨 BC 编排）仍在 Runtime。
+    // 复盘超额 = `daily_return` 与 `core_indexes` 涨幅相减（跨 BC 编排）仍在 Runtime。
     // ----------------------------------------------------------------
 
     /// 当日组合收益率（→ Account `daily_return(now)`）；首次当日估值幂等落日初基线。
@@ -147,15 +146,6 @@ pub trait AccountGateway: Send + Sync {
         None
     }
 
-    /// 当日尾部连续亏损笔数（→ Account `consecutive_losses(now)`）。默认 0。
-    fn consecutive_losses(&self, _now: chrono::DateTime<chrono::Utc>) -> u32 {
-        0
-    }
-
-    /// 当日组合回撤比例（high-water-mark，→ Account `daily_drawdown(now)`）。默认 0。
-    fn daily_drawdown(&self, _now: chrono::DateTime<chrono::Utc>) -> f64 {
-        0.0
-    }
 }
 
 /// 未 handled 的账户触发器（启动恢复 ⑤ 补扫用，spec §8）。

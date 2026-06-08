@@ -1,156 +1,94 @@
-// ChannelList — 已配置渠道列表 + 行内编辑。
+// ChannelList — 按渠道连接分组的工具函数 + 子组件。
 //
-// Spec: docs/design/frontend-design.md §设置页 — 渠道/模型列表（每个保留模型一行）
+// Spec: docs/design/frontend-design.md §设置页 — 渠道/模型列表
 //        docs/design/agent-infra-module.md §5 前端命令 — agent_update_channel
 //
-// 每行：`{model} ({provider})` + wireFormat badge + host + 已配置 key 状态 +
-//        enabled / active 标记 + 编辑 + 删除。apiKey 永不展示明文（只显示 apiKeySet）。
-// 编辑：点编辑 → 该行原地展开紧凑表单（渠道名/消息格式/Host/model/apiKey/enabled）。
-//        apiKey 不预填，留空 = 保留原 key（spec §5）。
+// 概念分离：
+//   渠道 (Channel) = provider connection (provider + wireFormat + baseUrl + apiKey)
+//   模型 (Model)   = 该连接下的单个 model 记录
+//
+// 导出：
+//   - ChannelGroup 类型 + groupChannels() + channelStats()
+//   - GroupEditForm — 编辑渠道连接 modal 内容
+//   - DiscoverMorePanel — 发现更多模型 modal 内容
 
-import { Check, Globe, Pencil, Trash2, X } from "lucide-react";
-import { useState } from "react";
-import { commands, type ProviderChannelView } from "../../bindings";
+import { Check, Loader2, X } from "lucide-react";
+import { useCallback, useState } from "react";
+import {
+  commands,
+  type ProviderChannelView,
+  type DiscoveredModel,
+  type AddChannelInput,
+} from "../../bindings";
 import {
   WIRE_FORMAT_LABEL,
   WIRE_FORMAT_OPTIONS,
   formatError,
-  hostOf,
-  providerInitial,
 } from "./types";
 import type { WireFormat } from "../../bindings";
 
-interface ChannelListProps {
+// ---------------------------------------------------------------------------
+// Grouping
+// ---------------------------------------------------------------------------
+
+export type ChannelGroup = {
+  key: string;
+  provider: string;
+  wireFormat: WireFormat;
+  baseUrl: string | null;
+  apiKeySet: boolean;
   channels: ProviderChannelView[];
-  onRemove: (channelId: string) => void;
-  /** 编辑保存成功后回调：父组件 refetch 列表。 */
-  onSaved: () => void;
-  busy?: boolean;
-}
+};
 
-export function ChannelList({
-  channels,
-  onRemove,
-  onSaved,
-  busy,
-}: ChannelListProps) {
-  // 当前处于编辑态的 channelId（至多一行）。
-  const [editingId, setEditingId] = useState<string | null>(null);
-
-  if (channels.length === 0) {
-    return (
-      <div className="settings-empty muted">
-        还没有配置渠道。使用下方「添加渠道」连接服务商并发现模型。
-      </div>
-    );
+export function groupChannels(channels: ProviderChannelView[]): ChannelGroup[] {
+  const map = new Map<string, ChannelGroup>();
+  for (const ch of channels) {
+    const key = `${ch.provider}|${ch.wireFormat}|${ch.baseUrl ?? ""}`;
+    let group = map.get(key);
+    if (!group) {
+      group = {
+        key,
+        provider: ch.provider,
+        wireFormat: ch.wireFormat,
+        baseUrl: ch.baseUrl ?? null,
+        apiKeySet: ch.apiKeySet,
+        channels: [],
+      };
+      map.set(key, group);
+    }
+    group.channels.push(ch);
+    if (ch.apiKeySet) group.apiKeySet = true;
   }
-
-  return (
-    <ul className="settings-channel-list">
-      {channels.map((ch) => {
-        const editing = editingId === ch.channelId;
-        return (
-          <li key={ch.channelId} className="settings-channel-row">
-            <div className="settings-channel-line">
-              <span className="settings-avatar" aria-hidden>
-                {providerInitial(ch.provider)}
-              </span>
-
-              <div className="settings-channel-main">
-                <span className="settings-channel-name">
-                  <span className="settings-channel-model">{ch.model}</span>
-                </span>
-                <span className="settings-channel-provider muted">
-                  {ch.provider}
-                </span>
-              </div>
-
-              <div className="settings-channel-meta">
-                <span className="settings-wire-badge" title="消息格式">
-                  {WIRE_FORMAT_LABEL[ch.wireFormat]}
-                </span>
-                <span
-                  className="settings-channel-host tabular"
-                  title={ch.baseUrl ?? ""}
-                >
-                  <Globe
-                    size={11}
-                    className="settings-channel-host-icon"
-                    aria-hidden
-                  />
-                  <span className="settings-channel-host-text">
-                    {hostOf(ch.baseUrl)}
-                  </span>
-                </span>
-                <span
-                  className={`settings-key-status${ch.apiKeySet ? " set" : ""}`}
-                  title={ch.apiKeySet ? "已配置 API Key" : "未配置 API Key"}
-                >
-                  <span className="settings-key-dot" aria-hidden />
-                  {ch.apiKeySet ? "已配置" : "无 key"}
-                </span>
-                {!ch.enabled && (
-                  <span className="settings-disabled-tag">已禁用</span>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="btn ghost settings-edit-btn"
-                onClick={() =>
-                  setEditingId(editing ? null : ch.channelId)
-                }
-                disabled={busy}
-                title="编辑渠道"
-                aria-label={`编辑渠道 ${ch.model} (${ch.provider})`}
-                aria-expanded={editing}
-              >
-                <Pencil size={14} />
-              </button>
-              <button
-                type="button"
-                className="btn ghost settings-remove-btn"
-                onClick={() => onRemove(ch.channelId)}
-                disabled={busy}
-                title="删除渠道"
-                aria-label={`删除渠道 ${ch.model} (${ch.provider})`}
-              >
-                <Trash2 size={14} />
-              </button>
-            </div>
-
-            {editing && (
-              <ChannelEditForm
-                channel={ch}
-                onCancel={() => setEditingId(null)}
-                onSaved={() => {
-                  setEditingId(null);
-                  onSaved();
-                }}
-              />
-            )}
-          </li>
-        );
-      })}
-    </ul>
-  );
+  return Array.from(map.values());
 }
 
-interface ChannelEditFormProps {
-  channel: ProviderChannelView;
+/** 统计 channel groups 数量和总 model 数。 */
+export function channelStats(channels: ProviderChannelView[]): {
+  groupCount: number;
+  modelCount: number;
+} {
+  const groups = groupChannels(channels);
+  return { groupCount: groups.length, modelCount: channels.length };
+}
+
+// ---------------------------------------------------------------------------
+// GroupEditForm — 编辑渠道连接（不含 model）
+// ---------------------------------------------------------------------------
+
+interface GroupEditFormProps {
+  group: ChannelGroup;
   onCancel: () => void;
   onSaved: () => void;
 }
 
-/** 行内编辑表单：apiKey 不预填（留空 = 保留原 key）。 */
-function ChannelEditForm({ channel, onCancel, onSaved }: ChannelEditFormProps) {
-  const [provider, setProvider] = useState(channel.provider);
-  const [wireFormat, setWireFormat] = useState<WireFormat>(channel.wireFormat);
-  const [baseUrl, setBaseUrl] = useState(channel.baseUrl ?? "");
-  const [model, setModel] = useState(channel.model);
+/** 编辑渠道连接信息：provider / wireFormat / host / apiKey。
+ *  保存时批量更新 group 下所有 channel。model 字段不可编辑。 */
+export function GroupEditForm({ group, onCancel, onSaved }: GroupEditFormProps) {
+  const [provider, setProvider] = useState(group.provider);
+  const [wireFormat, setWireFormat] = useState<WireFormat>(group.wireFormat);
+  const [baseUrl, setBaseUrl] = useState(group.baseUrl ?? "");
   // apiKey 不回读：留空提交则保留原 key。
   const [apiKey, setApiKey] = useState("");
-  const [enabled, setEnabled] = useState(channel.enabled);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -159,27 +97,27 @@ function ChannelEditForm({ channel, onCancel, onSaved }: ChannelEditFormProps) {
       setError("请填写渠道名");
       return;
     }
-    if (!model.trim()) {
-      setError("请填写 model");
-      return;
-    }
     setError(null);
     setSaving(true);
     const trimmedKey = apiKey.trim();
-    const res = await commands.agentUpdateChannel({
-      channelId: channel.channelId,
-      provider: provider.trim(),
-      wireFormat,
-      baseUrl: baseUrl.trim() || undefined,
-      model: model.trim(),
-      apiKey: trimmedKey || undefined,
-      enabled,
-    });
-    setSaving(false);
-    if (res.status === "error") {
-      setError(formatError(res.error));
-      return;
+    // 批量更新 group 下每个 channel。
+    for (const ch of group.channels) {
+      const res = await commands.agentUpdateChannel({
+        channelId: ch.channelId,
+        provider: provider.trim(),
+        wireFormat,
+        baseUrl: baseUrl.trim() || undefined,
+        model: ch.model, // model 保持不变
+        apiKey: trimmedKey || undefined,
+        enabled: ch.enabled,
+      });
+      if (res.status === "error") {
+        setSaving(false);
+        setError(`更新「${ch.model}」失败：${formatError(res.error)}`);
+        return;
+      }
     }
+    setSaving(false);
     onSaved();
   };
 
@@ -217,15 +155,7 @@ function ChannelEditForm({ channel, onCancel, onSaved }: ChannelEditFormProps) {
             onChange={(e) => setBaseUrl(e.target.value)}
           />
         </label>
-        <label className="settings-field">
-          <span className="settings-field-label">model</span>
-          <input
-            className="settings-input"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-          />
-        </label>
-        <label className="settings-field">
+        <label className="settings-field settings-field-wide">
           <span className="settings-field-label">API Key</span>
           <input
             className="settings-input"
@@ -234,16 +164,6 @@ function ChannelEditForm({ channel, onCancel, onSaved }: ChannelEditFormProps) {
             placeholder="留空保留原 key"
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
-          />
-        </label>
-        <label className="settings-field settings-field-toggle">
-          <span className="settings-field-label">启用</span>
-          <input
-            type="checkbox"
-            className="settings-toggle"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            aria-label="启用该渠道"
           />
         </label>
       </div>
@@ -272,6 +192,265 @@ function ChannelEditForm({ channel, onCancel, onSaved }: ChannelEditFormProps) {
           <Check size={14} /> {saving ? "保存中…" : "保存"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DiscoverMorePanel — 复用已有连接发现并批量添加更多模型
+// ---------------------------------------------------------------------------
+
+export function DiscoverMorePanel({
+  group,
+  existingModels,
+  onCancel,
+  onSaved,
+}: {
+  group: ChannelGroup;
+  existingModels: Set<string>;
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  const [discovering, setDiscovering] = useState(false);
+  const [discovered, setDiscovered] = useState<DiscoveredModel[] | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [manualInput, setManualInput] = useState("");
+
+  const handleDiscover = useCallback(async () => {
+    setDiscovering(true);
+    setError(null);
+    const firstChannelId = group.channels[0]?.channelId;
+    const res = firstChannelId
+      ? await commands.agentDiscoverModelsForChannel(firstChannelId)
+      : await commands.agentDiscoverModels(
+          group.wireFormat,
+          group.baseUrl ?? "",
+          "",
+        );
+    setDiscovering(false);
+    if (res.status === "ok") {
+      const sorted = [...res.data].sort((a, b) => a.id.localeCompare(b.id));
+      setDiscovered(sorted);
+      const fresh = sorted.filter((m) => !existingModels.has(m.id));
+      setSelected(new Set(fresh.map((m) => m.id)));
+    } else {
+      setError(formatError(res.error));
+    }
+  }, [group, existingModels]);
+
+  const toggle = useCallback((id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleSave = useCallback(async () => {
+    const models = Array.from(selected).filter((m) => !existingModels.has(m));
+    if (models.length === 0) {
+      setError("没有选中新模型");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    for (const model of models) {
+      const input: AddChannelInput = {
+        provider: group.provider,
+        wireFormat: group.wireFormat,
+        baseUrl: group.baseUrl ?? "",
+        apiKey: "",
+        model,
+      };
+      const res = await commands.agentAddChannel(input);
+      if (res.status === "error") {
+        setSaving(false);
+        setError(`添加「${model}」失败：${formatError(res.error)}`);
+        return;
+      }
+    }
+    setSaving(false);
+    onSaved();
+  }, [selected, existingModels, group, onSaved]);
+
+  const newModels =
+    discovered?.filter((m) => !existingModels.has(m.id)) ?? [];
+  const oldModels =
+    discovered?.filter((m) => existingModels.has(m.id)) ?? [];
+
+  const handleManualAdd = useCallback(async () => {
+    const models = manualInput
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter((s) => s && !existingModels.has(s));
+    if (models.length === 0) {
+      setError("请输入至少一个新模型名");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    for (const model of models) {
+      const input: AddChannelInput = {
+        provider: group.provider,
+        wireFormat: group.wireFormat,
+        baseUrl: group.baseUrl ?? "",
+        apiKey: "",
+        model,
+      };
+      const res = await commands.agentAddChannel(input);
+      if (res.status === "error") {
+        setSaving(false);
+        setError(`添加「${model}」失败：${formatError(res.error)}`);
+        return;
+      }
+    }
+    setSaving(false);
+    onSaved();
+  }, [manualInput, existingModels, group, onSaved]);
+
+  return (
+    <div className="settings-discover-panel">
+      {!discovered ? (
+        <>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+            <input
+              className="settings-input"
+              style={{ flex: 1 }}
+              placeholder="手动输入模型名（逗号分隔）"
+              value={manualInput}
+              onChange={(e) => setManualInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && manualInput.trim()) {
+                  e.preventDefault();
+                  void handleManualAdd();
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="btn primary"
+              onClick={handleManualAdd}
+              disabled={saving || !manualInput.trim()}
+              style={{ whiteSpace: "nowrap" }}
+            >
+              {saving ? "添加中…" : "添加"}
+            </button>
+          </div>
+          <div className="settings-form-actions">
+            <button type="button" className="btn ghost" onClick={onCancel}>
+              取消
+            </button>
+            <button
+              type="button"
+              className="btn primary"
+              onClick={handleDiscover}
+              disabled={discovering}
+            >
+              {discovering ? (
+                <>
+                  <Loader2 size={14} className="settings-spin" /> 发现中…
+                </>
+              ) : (
+                <>接口发现</>
+              )}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          {newModels.length > 0 && (
+            <div className="settings-model-picker">
+              <div className="settings-model-picker-head muted">
+                <label className="settings-model-toggle-all">
+                  <input
+                    type="checkbox"
+                    checked={
+                      newModels.length > 0 &&
+                      selected.size === newModels.length
+                    }
+                    ref={(el) => {
+                      if (el)
+                        el.indeterminate =
+                          selected.size > 0 &&
+                          selected.size < newModels.length;
+                    }}
+                    onChange={() => {
+                      if (selected.size === newModels.length) {
+                        setSelected(new Set());
+                      } else {
+                        setSelected(new Set(newModels.map((m) => m.id)));
+                      }
+                    }}
+                  />
+                  {newModels.length} 个新模型可添加：
+                </label>
+              </div>
+              <ul className="settings-model-list">
+                {newModels.map((m) => (
+                  <li key={m.id} className="settings-model-item">
+                    <label className="settings-model-label">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(m.id)}
+                        onChange={() => toggle(m.id)}
+                      />
+                      <span className="settings-model-id">{m.id}</span>
+                      {m.displayName && m.displayName !== m.id && (
+                        <span className="muted settings-model-display">
+                          {m.displayName}
+                        </span>
+                      )}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {oldModels.length > 0 && (
+            <div
+              className="muted"
+              style={{ fontSize: 12, padding: "4px 0" }}
+            >
+              已添加：{oldModels.map((m) => m.id).join("、")}
+            </div>
+          )}
+          {newModels.length === 0 && (
+            <div
+              className="muted"
+              style={{ fontSize: 13, padding: "8px 0" }}
+            >
+              该服务商的所有模型都已添加。
+            </div>
+          )}
+        </>
+      )}
+
+      {error && (
+        <div className="settings-form-error" role="alert">
+          <span>{error}</span>
+        </div>
+      )}
+
+      {discovered && (
+        <div className="settings-form-actions">
+          <button type="button" className="btn ghost" onClick={onCancel}>
+            取消
+          </button>
+          {newModels.length > 0 && (
+            <button
+              type="button"
+              className="btn primary"
+              onClick={handleSave}
+              disabled={saving || selected.size === 0}
+            >
+              {saving ? "添加中…" : `添加 ${selected.size} 个模型`}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

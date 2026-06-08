@@ -281,6 +281,22 @@ impl AgentRuntimeRepo {
         })
     }
 
+    /// 指定时间范围内的 AnalysisResult（review 按 trade_date 取当日决策链用），按 created_at 倒序。
+    pub fn list_analysis_results_in_range(
+        &self,
+        from: OccurredAt,
+        to: OccurredAt,
+    ) -> rusqlite::Result<Vec<AnalysisResult>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT result_id, run_id, kind, summary, related_codes_json, trade_ids_json, created_at
+                 FROM agent_analysis_results WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map(params![ts(&from), ts(&to)], row_to_analysis)?;
+            rows.collect()
+        })
+    }
+
     /// 某 run 的全部 AnalysisResult（account_trigger 的「原始建仓 run 摘要」用，spec §3/§6）。
     pub fn list_analysis_results_by_run(
         &self,
@@ -382,6 +398,23 @@ impl AgentRuntimeRepo {
                  FROM agent_trades WHERE created_at >= ?1 ORDER BY created_at ASC",
             )?;
             let rows = stmt.query_map(params![ts(&since)], row_to_trade)?;
+            rows.collect()
+        })
+    }
+
+    /// 指定时间范围内的 AgentTrade（review 按 trade_date 取当日交易用），按 created_at 升序。
+    pub fn list_trades_in_range(
+        &self,
+        from: OccurredAt,
+        to: OccurredAt,
+    ) -> rusqlite::Result<Vec<AgentTrade>> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT trade_id, run_id, client_order_id, strategy_version, reason,
+                        account_input_summary, status, account_result_json, created_at, updated_at
+                 FROM agent_trades WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![ts(&from), ts(&to)], row_to_trade)?;
             rows.collect()
         })
     }

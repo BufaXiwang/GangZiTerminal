@@ -57,7 +57,6 @@ const CATEGORY_OPTIONS: { value: InstrumentCategory; label: string }[] = [
   { value: "fund", label: "基金" },
 ];
 
-// 不分页：一次性拉到（universe ~7500，listMarket 是 in-memory + DB 读，不会爆）
 const LIST_LIMIT = 10000;
 
 const DEFAULT_SELECTED: TsCode = "000001.SH";
@@ -129,10 +128,17 @@ export default function MarketPage() {
     }).then((un) => {
       unlisten = un;
     });
+    // 30s 定时兜底：即使 progress 事件丢失也能刷新
+    const fallback = window.setInterval(() => {
+      invalidateAllListCache();
+      setRefreshTick((t) => t + 1);
+    }, 30_000);
+
     return () => {
       if (pendingProgressTimerRef.current != null) {
         window.clearTimeout(pendingProgressTimerRef.current);
       }
+      window.clearInterval(fallback);
       unlisten?.();
     };
   }, []);
@@ -157,6 +163,7 @@ export default function MarketPage() {
           category,
           query: query || undefined,
           includeQuote: true,
+          sort: null,
           limit: LIST_LIMIT,
           offset: 0,
         })

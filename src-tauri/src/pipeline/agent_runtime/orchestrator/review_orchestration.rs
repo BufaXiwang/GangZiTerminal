@@ -4,12 +4,29 @@
 
 use std::sync::Arc;
 
-use chrono::{FixedOffset, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Timelike, Utc};
 
 use crate::domain::agent::runtime::{AgentRun, AgentRunStatus, AgentRunTrigger};
 use crate::domain::shared::{OccurredAt, TradeDate};
 
-use super::{autonomous_task_msg, china_day_start, OrchestrationError, RuntimeServices};
+use super::{autonomous_task_msg, OrchestrationError, RuntimeServices};
+
+/// 把 `TradeDate`（CN 日期）→ 当日 00:00:00..23:59:59 的 UTC 范围。
+fn trade_date_range(td: &TradeDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    let cn = FixedOffset::east_opt(8 * 3600).expect("valid offset");
+    let naive = td.as_naive();
+    let start = cn
+        .from_local_datetime(&naive.and_hms_opt(0, 0, 0).unwrap())
+        .single()
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = cn
+        .from_local_datetime(&naive.and_hms_opt(23, 59, 59).unwrap())
+        .single()
+        .unwrap()
+        .with_timezone(&Utc);
+    (start, end)
+}
 use crate::pipeline::agent_runtime::context::RealtimeSection;
 use crate::pipeline::agent_runtime::executor::{execute_run, AgentEventSink, ExecuteRunParams};
 
@@ -177,8 +194,8 @@ impl RuntimeServices {
     }
 
     pub(super) async fn collect_review_determinism(&self, trade_date: &TradeDate) -> ReviewDeterminism {
-        let day_start = china_day_start(Utc::now());
-        let trades = self.deps.records.list_trades_since(day_start).unwrap_or_default();
+        let (day_start, day_end) = trade_date_range(trade_date);
+        let trades = self.deps.records.list_trades_in_range(day_start, day_end).unwrap_or_default();
 
         let benchmark = self.collect_benchmark(trade_date).await;
         let followup = self.collect_followup(trade_date);
@@ -259,11 +276,11 @@ impl RuntimeServices {
         det: &ReviewDeterminism,
         prev_report: Option<&str>,
     ) -> Vec<RealtimeSection> {
-        let day_start = china_day_start(Utc::now());
-        let trades = self.deps.records.list_trades_since(day_start).unwrap_or_default();
+        let (day_start, day_end) = trade_date_range(trade_date);
+        let trades = self.deps.records.list_trades_in_range(day_start, day_end).unwrap_or_default();
         let results = self
             .runtime_repo
-            .list_recent_analysis_results(100)
+            .list_analysis_results_in_range(day_start, day_end)
             .unwrap_or_default();
 
         let mut chain = String::new();

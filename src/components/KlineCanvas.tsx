@@ -480,7 +480,7 @@ export function KlineCanvas({
   // 盘中近实时轮询：每 15s 触发后端重拉最新 bar（minute → refresh_minute_klines
   // 增量；day → fetch_kline_page(0) 拉今日），再读尾部用 updateData merge
   // （时间戳 == 末根 → 更新当前 bar；> 末根 → append 新 bar）。
-  // 只在交易时段轮询；分时(intraday)已下线不轮询。
+  // 只在交易时段轮询；分时(intraday)第一阶段隐藏 / 暂缓产品化，不轮询。
   useEffect(() => {
     if (period === "intraday") return;
     let cancelled = false;

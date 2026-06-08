@@ -5,9 +5,8 @@
 // 两组分隔：
 //   [1m 5m 15m 30m 60m]  |  [日K 周K 月K]
 //
-// 「分时」已下线：当前 TDX 服务器返回的 minute_time 响应为非标准格式
-// （body 回显 code + per-point 结构与 pytdx/mootdx 假设不一致，无法可靠解码）。
-// 分时是 nice-to-have，不影响 K线 / 报价 / 资讯主线。详见 quotes-module.md §5。
+// 「分时」是 Quotes 规划能力，但第一阶段隐藏 / 暂缓产品化：
+// 当前 TDX minute_time 响应非标准，尚不能作为可靠产品能力。详见 quotes-module.md §5。
 
 import type { ChartPeriod } from "../../lib/useKlineData";
 

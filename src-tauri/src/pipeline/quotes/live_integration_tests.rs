@@ -1065,6 +1065,7 @@ async fn quotes_live_pipeline_refresh_manual_then_list() {
                 category: None,
                 query: None,
                 include_quote: Some(true),
+                sort: None,
                 limit: Some(50),
                 offset: None,
             });

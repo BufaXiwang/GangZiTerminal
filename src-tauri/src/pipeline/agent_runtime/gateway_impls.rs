@@ -263,13 +263,6 @@ impl AccountGateway for AccountGatewayImpl {
         self.service.daily_return(now)
     }
 
-    fn consecutive_losses(&self, now: chrono::DateTime<chrono::Utc>) -> u32 {
-        self.service.consecutive_losses(now)
-    }
-
-    fn daily_drawdown(&self, now: chrono::DateTime<chrono::Utc>) -> f64 {
-        self.service.daily_drawdown(now)
-    }
 }
 
 /// `OperateAccountResponse` → `OperateOutcome`：稳定 ID 进 `result`（→ AgentTrade 审计戳）；

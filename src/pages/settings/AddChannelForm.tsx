@@ -137,10 +137,11 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
     );
     setDiscovering(false);
     if (res.status === "ok") {
-      setDiscovered(res.data);
+      const sorted = [...res.data].sort((a, b) => a.id.localeCompare(b.id));
+      setDiscovered(sorted);
       setManualMode(false);
       // 默认全选发现到的模型，方便一键保存。
-      setSelectedModels(new Set(res.data.map((m) => m.id)));
+      setSelectedModels(new Set(sorted.map((m) => m.id)));
       if (res.data.length === 0) {
         // 没发现到任何模型 → 也允许手填。
         setManualMode(true);
@@ -391,7 +392,23 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
           {!manualMode && discovered && (
             <div className="settings-model-picker">
               <div className="settings-model-picker-head muted">
-                发现 {discovered.length} 个模型，勾选要保留的：
+                <label className="settings-model-toggle-all">
+                  <input
+                    type="checkbox"
+                    checked={discovered.length > 0 && selectedModels.size === discovered.length}
+                    ref={(el) => {
+                      if (el) el.indeterminate = selectedModels.size > 0 && selectedModels.size < discovered.length;
+                    }}
+                    onChange={() => {
+                      if (selectedModels.size === discovered.length) {
+                        setSelectedModels(new Set());
+                      } else {
+                        setSelectedModels(new Set(discovered.map((m) => m.id)));
+                      }
+                    }}
+                  />
+                  发现 {discovered.length} 个模型，已选 {selectedModels.size} 个：
+                </label>
               </div>
               <ul className="settings-model-list">
                 {discovered.map((m) => {
@@ -448,7 +465,7 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
         </div>
       )}
 
-      {/* actions */}
+      {/* actions — sticky at bottom so save button is always visible */}
       <div className="settings-form-actions">
         {!inDiscovery ? (
           <button
@@ -501,7 +518,13 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
               ) : (
                 <>
                   <Plus size={14} />{" "}
-                  {manualMode ? "保存" : "保存选中模型"}
+                  {manualMode
+                    ? manualCount > 0
+                      ? `保存 ${manualCount} 个模型`
+                      : "保存"
+                    : selectedModels.size > 0
+                      ? `保存 ${selectedModels.size} 个模型`
+                      : "保存选中模型"}
                 </>
               )}
             </button>

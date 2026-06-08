@@ -165,19 +165,26 @@ impl QuotesService {
     // ====================================================================== list_market
 
     pub fn list_market(&self, req: ListMarketRequest) -> ListMarketResponse {
-        let limit = clamp(req.limit, 100, 500);
+        let limit = clamp(req.limit, 100, 10_000);
         let offset = req.offset.unwrap_or(0);
         let ctx = self.market_time_now();
         let repo = self.repo();
-        let (instruments, total) = repo
-            .list_instruments(req.category, req.query.as_deref(), limit, offset)
-            .unwrap_or_default();
-
-        // spec §4：has_more = total > offset + len
-        let has_more = (offset as u64) + (instruments.len() as u64) < (total as u64);
+        let sort = req.sort.unwrap_or_default();
         let include_quote = req.include_quote.unwrap_or(false);
+        let need_sort = sort != ListMarketSort::Default;
 
-        let items: Vec<ListMarketItem> = instruments
+        // When sorting by quote fields, load ALL matching instruments first (DB can't sort by
+        // in-memory quote), attach quotes, sort in Rust, then slice for pagination.
+        // When default sort, use DB-level limit/offset (fast path).
+        let (instruments, total) = if need_sort {
+            repo.list_instruments(req.category, req.query.as_deref(), 99_999, 0)
+                .unwrap_or_default()
+        } else {
+            repo.list_instruments(req.category, req.query.as_deref(), limit, offset)
+                .unwrap_or_default()
+        };
+
+        let mut items: Vec<ListMarketItem> = instruments
             .into_iter()
             .map(|inst| {
                 let mut item = ListMarketItem {
@@ -186,7 +193,7 @@ impl QuotesService {
                     quote_freshness: None,
                     warnings: Vec::new(),
                 };
-                if include_quote {
+                if include_quote || need_sort {
                     let (q, f, w) =
                         self.resolve_quote_summary(&inst, &ctx, FreshnessIntent::Universe);
                     item.quote = q;
@@ -199,16 +206,45 @@ impl QuotesService {
             })
             .collect();
 
-        ListMarketResponse {
-            items,
-            page: ListMarketPage {
-                limit,
-                offset,
-                has_more,
-            },
+        if need_sort {
+            items.sort_by(|a, b| {
+                let av = sort_key(a, sort);
+                let bv = sort_key(b, sort);
+                av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let start = (offset as usize).min(items.len());
+            let end = (start + limit as usize).min(items.len());
+            let page_items = items[start..end].to_vec();
+            let has_more = end < items.len();
+            ListMarketResponse {
+                items: page_items,
+                page: ListMarketPage { limit, offset, has_more },
+            }
+        } else {
+            let has_more = (offset as u64) + (items.len() as u64) < (total as u64);
+            ListMarketResponse {
+                items,
+                page: ListMarketPage { limit, offset, has_more },
+            }
         }
     }
 
+}
+
+fn sort_key(item: &ListMarketItem, sort: ListMarketSort) -> f64 {
+    let val = match sort {
+        ListMarketSort::ChangePercentDesc => item.quote.as_ref().and_then(|q| q.change_percent),
+        ListMarketSort::ChangePercentAsc => {
+            return item.quote.as_ref().and_then(|q| q.change_percent).unwrap_or(f64::MAX);
+        }
+        ListMarketSort::AmountDesc => item.quote.as_ref().and_then(|q| q.amount),
+        ListMarketSort::Default => return 0.0,
+    };
+    // Desc: negate so larger values sort first; null → push to end
+    -(val.unwrap_or(f64::NEG_INFINITY))
+}
+
+impl QuotesService {
     fn resolve_quote_summary(
         &self,
         inst: &MarketInstrument,
@@ -2963,6 +2999,16 @@ fn sort_str(s: ScanSortBy) -> String {
 
 // ============================================================================= DTOs
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ListMarketSort {
+    #[default]
+    Default,
+    ChangePercentDesc,
+    ChangePercentAsc,
+    AmountDesc,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ListMarketRequest {
@@ -2972,6 +3018,8 @@ pub struct ListMarketRequest {
     pub query: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_quote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<ListMarketSort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

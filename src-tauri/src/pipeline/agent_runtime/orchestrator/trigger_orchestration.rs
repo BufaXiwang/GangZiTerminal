@@ -2,7 +2,7 @@
 //!
 //! Spec: docs/design/agent-runtime-module.md §6 编排流（account_trigger / eval tick）
 
-use crate::domain::agent::runtime::{AgentRun, AgentRunTrigger};
+use crate::domain::agent::runtime::{AgentRun, AgentRunStatus, AgentRunTrigger};
 
 use super::{autonomous_task_msg, OrchestrationError, RuntimeServices, MAX_EVAL_DRAIN_BATCHES};
 use crate::pipeline::agent_runtime::context::RealtimeSection;
@@ -125,7 +125,7 @@ impl RuntimeServices {
                 .run_account_trigger(t.trigger_id.clone(), t.order_id.clone(), t.summary.clone())
                 .await
             {
-                Ok(run) => {
+                Ok(run) if run.status == AgentRunStatus::Completed => {
                     if let Err(e) = self.deps.account.mark_trigger_handled(&t.trigger_id).await {
                         tracing::warn!(
                             target: "runtime.recovery",
@@ -138,6 +138,19 @@ impl RuntimeServices {
                         .triggers
                         .mark_account_trigger_consumed(&t.trigger_id, Some(&run.run_id));
                     routed += 1;
+                }
+                Ok(run) => {
+                    // Non-Completed → mark failed in Runtime consumption, don't mark Account handled
+                    tracing::warn!(
+                        target: "runtime.recovery",
+                        trigger_id = %t.trigger_id,
+                        run_id = %run.run_id, status = ?run.status,
+                        "rescan account_trigger run non-Completed → trigger not marked handled"
+                    );
+                    let _ = self.triggers.mark_account_trigger_failed(
+                        &t.trigger_id,
+                        &format!("run {} ended with {:?}", run.run_id, run.status),
+                    );
                 }
                 Err(e) => {
                     let _ = self

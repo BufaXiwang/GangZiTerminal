@@ -55,9 +55,26 @@ impl RecordService {
         self.repo.list_trades_since(since)
     }
 
+    /// 指定时间范围内的 AgentTrades（review 按 trade_date 取当日交易用）。
+    pub fn list_trades_in_range(
+        &self,
+        from: chrono::DateTime<Utc>,
+        to: chrono::DateTime<Utc>,
+    ) -> rusqlite::Result<Vec<AgentTrade>> {
+        self.repo.list_trades_in_range(from, to)
+    }
+
     /// 本 run 已记的 AgentTrades（record_analysis 关联 tradeIds 用，spec §3 产生机制）。
     pub fn list_trades_by_run(&self, run_id: &str) -> rusqlite::Result<Vec<AgentTrade>> {
         self.repo.list_trades_by_run(run_id)
+    }
+
+    /// 某 run 的全部 AnalysisResult（drain_news_batch 校验 spec §3 必 emit 用）。
+    pub fn list_analysis_results_by_run(
+        &self,
+        run_id: &str,
+    ) -> rusqlite::Result<Vec<AnalysisResult>> {
+        self.repo.list_analysis_results_by_run(run_id)
     }
 
     /// news mode 分析产出 —— 落库 + emit `agent-analysis-result`。

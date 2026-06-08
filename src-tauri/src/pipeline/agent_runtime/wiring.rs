@@ -9,7 +9,6 @@
 //! 临时复盘不另设 `run_review` 工具：对话/news 直接用 Infra `run_subagent`（allowedTools 收紧只读
 //! `fetch_*`）拿回结论文本（spec §3/§4/§11）。
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::domain::agent::runtime::{AgentRunMode, AgentRunTrigger};
@@ -19,9 +18,9 @@ use crate::infrastructure::agent::tool_registry::{ToolHandler, ToolRegistry};
 
 use super::gateways::{AccountGateway, NewsGateway, QuotesGateway};
 use super::handlers::{
-    FetchAccountHandler, FetchNewsHandler, FetchQuotesHandler, OperateAccountHandler,
-    RecordAnalysisHandler, RecordReviewSuggestionHandler, UpdateWatchlistHandler,
-    UpsertStrategyHandler,
+    FetchAccountHandler, FetchNewsHandler, FetchQuotesHandler,
+    OperateAccountHandler, RecordAnalysisHandler, RecordReviewSuggestionHandler,
+    UpdateWatchlistHandler, UpsertStrategyHandler,
 };
 use super::records::RecordService;
 use super::strategy::StrategyService;
@@ -41,10 +40,6 @@ pub struct RuntimeToolDeps {
     /// 持久化 tool_call 证据（run_id→ToolCall，spec §4「证据 = ToolCall 审计」）。
     /// `Some` → per-run registry 走持久化构造；`None` → 不持久化（单测）。
     pub persist: Option<(AgentMessagesRepo, PayloadStore)>,
-    /// 编排级风控配置（阈值）。
-    pub risk: super::risk::RiskConfig,
-    /// 熔断标志（进程级共享）：operate_account handler 在自动 mode 下据此降级拒绝。
-    pub circuit_breaker: Arc<AtomicBool>,
     /// 账户作用域 operate 串行锁（spec §4「按账户全局串行」）：本产品单一模拟账户 →
     /// 单个进程级全局锁；handler 在「记 submitting→operate→settle」临界区持锁，
     /// 保证并发 run 的 operate 不交错。
@@ -73,22 +68,10 @@ pub fn build_domain_registry_for_mode(
             UPDATE_WATCHLIST => Some(Arc::new(UpdateWatchlistHandler::new(deps.account.clone()))),
             OPERATE_ACCOUNT => Some(Arc::new(OperateAccountHandler::new(
                 deps.account.clone(),
-                deps.quotes.clone(),
                 deps.records.clone(),
                 deps.operate_lock.clone(),
                 run_id,
                 strategy_version,
-                super::handlers::OperateGate {
-                    circuit_breaker: deps.circuit_breaker.clone(),
-                    // dialogue 在用户明确指令下仍可交易（spec §6）→ 不强制熔断/额度闸门；其余自动 mode 强制。
-                    enforce_circuit_breaker: !matches!(mode, AgentRunMode::Dialogue),
-                    // 当日额度（spec §6「自动 mode 不再开新仓」）：dialogue 不限，其余自动 mode 强制。
-                    // cap 值由 handler 从账户 gateway `max_daily_new_orders()` 取，不在此硬编码。
-                    enforce_daily_quota: !matches!(mode, AgentRunMode::Dialogue),
-                    // 追高保护只对 news 触发的开仓生效（spec §6）。
-                    enforce_chasing: matches!(mode, AgentRunMode::News),
-                    chasing_guard_pct: deps.risk.chasing_guard_pct,
-                },
             ))),
             // record_analysis 仅 news mode 暴露（domain_tools_for_mode 已保证），per-run 绑定 run_id。
             RECORD_ANALYSIS => Some(Arc::new(RecordAnalysisHandler::new(
@@ -170,8 +153,6 @@ mod tests {
             strategy: Arc::new(StrategyService::new(repo.clone())),
             records: Arc::new(RecordService::new(repo)),
             persist: None,
-            risk: super::super::risk::RiskConfig::default(),
-            circuit_breaker: Arc::new(AtomicBool::new(false)),
             operate_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }

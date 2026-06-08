@@ -112,8 +112,6 @@ pub fn spawn_news_buffer_scheduler(
             tokio::select! {
                 _ = stop_rx.recv() => break,
                 _ = ticker.tick() => {
-                    // 自动熔断监控（连亏/回撤 → 激活熔断；只激活不自动解除）。
-                    let _ = services.monitor_risk().await;
                     // 收盘后自动复盘（CN ≥15:30 且当日未复盘）。
                     services.maybe_run_eod_review().await;
 
@@ -162,7 +160,6 @@ mod tests {
         ProviderFactory, RuntimeServicesConfig,
     };
     use crate::pipeline::agent_runtime::records::RecordService;
-    use crate::pipeline::agent_runtime::risk::RiskConfig;
     use crate::pipeline::agent_runtime::runs::RunService;
     use crate::pipeline::agent_runtime::strategy::StrategyService;
     use crate::pipeline::agent_runtime::triggers::TriggerRouter;
@@ -197,8 +194,10 @@ mod tests {
         }
     }
 
+    /// 两轮 provider：Turn 1 发 record_analysis tool call（使 news run 产出 AnalysisResult，
+    /// 满足 spec §3 drain 校验），Turn 2 无工具直接完成。
     struct FakeProvider {
-        used: bool,
+        turn: u32,
     }
     #[async_trait::async_trait]
     impl ProviderStream for FakeProvider {
@@ -209,17 +208,28 @@ mod tests {
             _tx: &Sender<AgentEvent>,
             _r: &str,
         ) -> Result<ProviderTurnOutcome, LoopError> {
-            if self.used {
-                return Err(LoopError::Provider("exhausted".into()));
+            use crate::infrastructure::agent::tool_parser::ParserEvent;
+            self.turn += 1;
+            if self.turn == 1 {
+                Ok(ProviderTurnOutcome {
+                    text: r#"<use_tool name="record_analysis">{"kind":"no_action","summary":"观望"}</use_tool>"#.into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                    tool_events: vec![ParserEvent::UseTool {
+                        name: "record_analysis".into(),
+                        input: json!({"kind": "no_action", "summary": "观望"}),
+                    }],
+                })
+            } else {
+                Ok(ProviderTurnOutcome {
+                    text: "完成。".into(),
+                    usage_input: 1,
+                    usage_output: 1,
+                    stop_reason: AgentStopReason::Completed,
+                    tool_events: vec![],
+                })
             }
-            self.used = true;
-            Ok(ProviderTurnOutcome {
-                text: "no_action".into(),
-                usage_input: 1,
-                usage_output: 1,
-                stop_reason: AgentStopReason::Completed,
-                tool_events: vec![],
-            })
         }
     }
 
@@ -260,12 +270,11 @@ mod tests {
             strategy: strategy.clone(),
             records: Arc::new(RecordService::new(repo.clone())),
             persist: Some((messages_repo.clone(), PayloadStore::new(db))),
-            risk: RiskConfig::default(),
-            circuit_breaker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+
             operate_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let factory: ProviderFactory =
-            Arc::new(|_| Ok(vec![Box::new(FakeProvider { used: false }) as Box<dyn ProviderStream>]));
+            Arc::new(|_| Ok(vec![Box::new(FakeProvider { turn: 0 }) as Box<dyn ProviderStream>]));
         let svc = Arc::new(RuntimeServices::new(RuntimeServicesConfig {
             runs: Arc::new(RunService::new(repo.clone())),
             strategy,
@@ -279,20 +288,18 @@ mod tests {
                 },
             )),
             deps,
-            risk: RiskConfig::default(),
+
             runtime_repo: repo.clone(),
             channels,
             messages_repo,
             provider_factory: factory,
             augment: None,
             event_sink: None,
-            circuit_breaker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_turns: 2,
             token_budget: None,
             reports_dir: std::env::temp_dir().join("gangzi-test-reviews"),
             review_min_sample_trades: 30,
             eval_batch_size: 200,
-        circuit_breaker_sink: None,
             settings: std::sync::Arc::new(
                 crate::pipeline::agent_runtime::settings::RuntimeSettings::new(repo.clone()),
             ),

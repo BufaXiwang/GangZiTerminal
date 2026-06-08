@@ -70,7 +70,7 @@ A 股研究 + 模拟交易学习终端。Agent 自驱动：从市场数据 + 资
 |---|---|---|
 | 桌面壳 | **Tauri v2** | Rust 后端 + WKWebView，IPC 通信 |
 | 前端 | **React 19 + Vite + TypeScript** | UI 层，**不持有业务真源** |
-| K 线图 | **lightweight-charts** | TradingView 出品；技术指标自绘 |
+| K 线图 | **KLineChart 产品组件** | 页面统一复用产品级封装；当前实现可继续用 `klinecharts`，底层引擎以 `frontend-design.md` 为准 |
 | 后端 | **Rust 2021** | 全部业务逻辑 + I/O |
 | 持久化 | **SQLite via `rusqlite`** | 嵌入式，单文件 |
 | Schema 迁移 | **`rusqlite_migration`**（推荐）或 `refinery` | 一个改动一个 `.sql`，启动自动 apply |

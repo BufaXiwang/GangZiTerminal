@@ -147,6 +147,23 @@ pub async fn agent_discover_models(
         .map_err(|e| CommandError::with_message(ErrorCode::ProviderUnavailable, e.to_string()))
 }
 
+/// 用已有渠道的存储凭据发现模型（API key 不回显，复用服务端存储的 key）。
+#[tauri::command]
+#[specta::specta]
+pub async fn agent_discover_models_for_channel(
+    infra: State<'_, AgentInfra>,
+    channel_id: String,
+) -> Result<Vec<DiscoveredModel>, CommandError> {
+    let channels = infra.channels_repo.list().map_err(map_repo_err)?;
+    let ch = channels
+        .iter()
+        .find(|c| c.channel_id == channel_id)
+        .ok_or_else(|| CommandError::with_message(ErrorCode::NotFound, "channel not found"))?;
+    discover_models(ch.wire_format, ch.base_url.as_deref().unwrap_or(""), &ch.api_key)
+        .await
+        .map_err(|e| CommandError::with_message(ErrorCode::ProviderUnavailable, e.to_string()))
+}
+
 /// 添加一条渠道。生成 channelId（`ch_<uuid>`），stream=true，能力缺省 false。
 /// 若是首条渠道，自动设为 active。
 ///

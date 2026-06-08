@@ -15,7 +15,6 @@ pub struct StateInclude {
     pub trades: bool,
     pub messages: bool,
     pub tool_calls: bool,
-    pub circuit_breaker: bool,
 }
 
 impl Default for StateInclude {
@@ -27,7 +26,6 @@ impl Default for StateInclude {
             trades: false,
             messages: false,
             tool_calls: false,
-            circuit_breaker: true,
         }
     }
 }
@@ -48,8 +46,6 @@ pub struct AgentStateSnapshot {
     pub recent_messages: Vec<crate::domain::agent::AgentMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_tool_calls: Vec<crate::domain::agent::ToolCall>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub circuit_breaker_active: Option<bool>,
 }
 
 impl RuntimeServices {
@@ -96,11 +92,6 @@ impl RuntimeServices {
             recent_trades,
             recent_messages: Vec::new(),
             recent_tool_calls: Vec::new(),
-            circuit_breaker_active: if include.circuit_breaker {
-                Some(self.circuit_breaker_active())
-            } else {
-                None
-            },
         })
     }
 }

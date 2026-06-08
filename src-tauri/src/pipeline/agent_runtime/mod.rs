@@ -22,7 +22,6 @@ pub mod news_buffer;
 pub mod orchestrator;
 pub mod records;
 pub mod recovery;
-pub mod risk;
 pub mod runs;
 pub mod scheduler;
 pub mod settings;
@@ -48,7 +47,6 @@ pub use orchestrator::{
 };
 pub use records::RecordService;
 pub use recovery::{RecoveryService, RecoverySummary};
-pub use risk::{evaluate_open_gate, OpenGateInput, RiskConfig, RiskGateDecision};
 pub use settings::RuntimeSettings;
 pub use scheduler::{
     drain_news_buffer, spawn_account_eval_tick_scheduler, spawn_news_buffer_scheduler,

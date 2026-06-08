@@ -250,6 +250,17 @@ async agentDiscoverModels(wireFormat: WireFormat, baseUrl: string, apiKey: strin
 }
 },
 /**
+ * 用已有渠道的存储凭据发现模型（API key 不回显，复用服务端存储的 key）。
+ */
+async agentDiscoverModelsForChannel(channelId: string) : Promise<Result<DiscoveredModel[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_discover_models_for_channel", { channelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 添加一条渠道。生成 channelId（`ch_<uuid>`），stream=true，能力缺省 false。
  * 若是首条渠道，自动设为 active。
  * 
@@ -395,7 +406,7 @@ async agentSendMessage(input: SendMessageInput) : Promise<Result<SendMessageResu
 /**
  * Agent 总览快照（按 `include` 选择器返回各段；未选的省略）。
  * 
- * 未传 `include` → 默认返回 strategy + runs + analysisResults + circuitBreaker（向后兼容）。
+ * 未传 `include` → 默认返回 strategy + runs + analysisResults（向后兼容）。
  */
 async agentFetchState(input: FetchStateInput | null) : Promise<Result<AgentStateSnapshot, CommandError>> {
     try {
@@ -422,17 +433,6 @@ async agentFetchStrategy(input: FetchStrategyInput | null) : Promise<Result<Fetc
 async agentUpsertStrategy(input: UpsertStrategyInput) : Promise<Result<UpsertStrategyResult, CommandError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("agent_upsert_strategy", { input }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * 解除/恢复熔断（spec §9：`resume=true` 解除，须对话确认；不自动解除）。返回新熔断状态。
- */
-async agentSetCircuitBreaker(input: SetCircuitBreakerInput) : Promise<Result<boolean, CommandError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("agent_set_circuit_breaker", { input }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -647,7 +647,7 @@ export type AgentRunTrigger = { kind: "user_chat"; message_id: string } | { kind
 /**
  * Agent 总览快照（spec §9 fetch_agent_state）。
  */
-export type AgentStateSnapshot = { activeStrategy?: InvestmentStrategy | null; recentRuns: AgentRun[]; recentResults: AnalysisResult[]; recentTrades: AgentTrade[]; recentMessages: AgentMessage[]; recentToolCalls: ToolCall[]; circuitBreakerActive?: boolean | null }
+export type AgentStateSnapshot = { activeStrategy?: InvestmentStrategy | null; recentRuns: AgentRun[]; recentResults: AnalysisResult[]; recentTrades: AgentTrade[]; recentMessages: AgentMessage[]; recentToolCalls: ToolCall[] }
 /**
  * 每次 `operate_account` 的审计戳 —— runtime 侧、不耦合 Account。
  * 
@@ -780,7 +780,7 @@ dateCounts?: NewsDateCount[] }
 /**
  * spec §9 fetch_agent_state `include` 选择器（未选的段省略）。
  */
-export type FetchStateInclude = { strategy?: boolean | null; runs?: boolean | null; analysisResults?: boolean | null; trades?: boolean | null; messages?: boolean | null; toolCalls?: boolean | null; circuitBreaker?: boolean | null }
+export type FetchStateInclude = { strategy?: boolean | null; runs?: boolean | null; analysisResults?: boolean | null; trades?: boolean | null; messages?: boolean | null; toolCalls?: boolean | null }
 /**
  * spec §9 `FetchAgentStateRequest = { include?; limit?; offset? }`。
  */
@@ -913,8 +913,9 @@ export type ListAccountArchivesResponse = { archives: AccountArchive[] }
 export type ListMarketItem = ({ tsCode: TsCode; name: string; category: InstrumentCategory; market: Market; board?: string | null; sector?: string | null; status?: InstrumentStatus | null; isSt?: boolean | null; publisher?: string | null; indexCategory?: string | null; fundType?: string | null; management?: string | null; listDate?: string | null; source: InstrumentSource; updatedAt: string }) & { quote?: ListMarketQuoteSummary | null; quoteFreshness?: Freshness | null; warnings?: WarningCode[] }
 export type ListMarketPage = { limit: number; offset: number; hasMore: boolean }
 export type ListMarketQuoteSummary = { tradeDate?: string | null; price?: number | null; change?: number | null; changePercent?: number | null; open?: number | null; high?: number | null; low?: number | null; previousClose?: number | null; volume?: number | null; amount?: number | null }
-export type ListMarketRequest = { category?: InstrumentCategory | null; query?: string | null; includeQuote?: boolean | null; limit?: number | null; offset?: number | null }
+export type ListMarketRequest = { category?: InstrumentCategory | null; query?: string | null; includeQuote?: boolean | null; sort?: ListMarketSort | null; limit?: number | null; offset?: number | null }
 export type ListMarketResponse = { items: ListMarketItem[]; page: ListMarketPage }
+export type ListMarketSort = "default" | "changePercentDesc" | "changePercentAsc" | "amountDesc"
 export type ListNewsSourcesResponse = { items: NewsSource[] }
 export type MarkTriggerHandledRequest = { triggerId: string; reason: string }
 export type MarkTriggerHandledResponse = { accepted: boolean; trigger?: AccountTrigger | null; accountEventIds?: string[]; reason?: ErrorCode | null; message?: string | null }
@@ -1099,15 +1100,6 @@ conversationId?: string | null }
  * spec §9 `SendAgentMessageResponse = { messageId; runId }`。
  */
 export type SendMessageResult = { messageId: string; runId: string }
-export type SetCircuitBreakerInput = { 
-/**
- * true = 解除/恢复熔断（恢复自动下单）。熔断只由系统自动触发，用户只能解除——无手动激活路径。
- */
-resume: boolean; 
-/**
- * 操作理由（审计）。
- */
-reason: string }
 export type SetNewsAutoAnalysisResult = { enabled: boolean; 
 /**
  * false→true 开启时回填最近窗口内 news 入 buffer 的条数（spec §5）。

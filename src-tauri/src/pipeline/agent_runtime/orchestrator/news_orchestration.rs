@@ -162,11 +162,28 @@ impl RuntimeServices {
         }
         match self.run_news_batch(batch.clone()).await {
             Ok(run) if run.status == AgentRunStatus::Completed => {
-                // 成功：drain（标 analyzed）。
-                if let Err(e) = self.news_buffer.mark_analyzed(&batch) {
-                    tracing::warn!(target: "runtime.sched.news", error = %e, "mark_analyzed failed");
+                // 校验本 run 是否产出了 AnalysisResult（spec §3：news mode 必 emit）。
+                let has_result = self.deps.records
+                    .list_analysis_results_by_run(&run.run_id)
+                    .map(|r| !r.is_empty())
+                    .unwrap_or(false);
+                if has_result {
+                    if let Err(e) = self.news_buffer.mark_analyzed(&batch) {
+                        tracing::warn!(target: "runtime.sched.news", error = %e, "mark_analyzed failed");
+                    }
+                    Some(run.run_id)
+                } else {
+                    // Completed 但无 AnalysisResult → 审计链断裂，回 pending 重试（spec §3 / §5）。
+                    tracing::warn!(
+                        target: "runtime.sched.news",
+                        run_id = %run.run_id,
+                        "news run Completed but no AnalysisResult produced → revert to pending"
+                    );
+                    if let Err(e) = self.news_buffer.revert_to_pending(&batch) {
+                        tracing::warn!(target: "runtime.sched.news", error = %e, "revert_to_pending failed");
+                    }
+                    None
                 }
-                Some(run.run_id)
             }
             Ok(run) => {
                 // run 落到非 Completed 终态（failed/cancelled）→ 视为可恢复，本批回 pending 重试（spec §5）。

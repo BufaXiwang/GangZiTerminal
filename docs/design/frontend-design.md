@@ -1,426 +1,745 @@
-# Frontend Design Spec
+# Frontend Design
 
-> 本文档是前端体验和视觉系统的设计契约。模块级领域契约仍以 `docs/design/*-module.md` 为准。
+> 前端体验与视觉系统规范。所有前端开发以本文档为准，不得脱离规范自由发挥。
 >
-> 本文档只描述最新设计目标和约束，用于后续页面、组件、交互改造。
+> 本文档层级为 **Spec-anchored + Guidance**（见 spec-guidelines.md §1）：
+> 视觉 token、布局骨架、数据流模式和交互契约是约束；具体像素微调和动效细节是指导。
 
-## 一句话定位
+---
 
-前端是 **A 股研究 + 模拟账户 + Agent 决策闭环的工作台**，不是营销页，也不是通用聊天壳。
+## §1 设计哲学
 
-界面要帮助用户快速回答三个问题：
+### 1.1 产品定位
 
-```text
-现在市场发生了什么？
-Agent 为什么这样判断 / 操作？
-模拟账户验证结果如何？
+**A 股研究 + 模拟交易学习终端。** 用户是学习型交易者，核心循环：
+
+```
+看行情 → 读资讯 → 与 Agent 对话 → Agent 下单模拟交易 → 复盘决策链 → 调整策略 → 下一轮
 ```
 
----
+前端是 **Rust 应用的 UI 层**，不是独立前端应用。所有业务真源在后端，前端只做：
+- 展示后端推送的数据
+- 收集用户输入发给后端
+- 流式渲染 Agent 回复
 
-## 1. 设计原则
+### 1.2 核心原则
 
-### 决策优先
+| 原则 | 含义 | 反例 |
+|---|---|---|
+| **决策优先** | 所有 UI 服务于「看→想→做→验」的决策循环 | 为好看加装饰性动画 |
+| **信息密度** | 桌面端不是手机；在合理的密度下展示尽量多的有效信息 | 大面积留白、一屏只放一个卡片 |
+| **数据即装饰** | 涨跌色、行业热度色块、K 线本身就是视觉节奏；不需要额外装饰元素 | 给每个卡片加渐变背景和阴影 |
+| **克制** | 不加不需要的东西；每个元素都要能回答「用户决策时需要这个吗？」 | 加 loading 骨架屏、加欢迎引导、加成就系统 |
+| **一致** | 同类元素在所有页面表现相同 | 行情在市场页红涨绿跌，在账户页反过来 |
 
-- 页面首屏优先展示会影响判断和操作的内容：市场状态、账户风险、Agent 当前动作、关键新闻。
-- 详情、历史、解释、调参入口放在下钻区域，不挤占核心视野。
-- 每个页面最多突出 1 个主任务；其余内容作为上下文辅助。
+### 1.3 气质
 
-### 数据密集但克制
+**专业工具感，不是消费品光泽。**
 
-- 本软件是金融工作台，信息密度可以高，但视觉噪声要低。
-- 优先使用列表、表格、分栏、时间线、指标条，不使用大面积 hero、插画、营销式卡片堆叠。
-- 一屏内模块数量保持可扫描；超过 5-9 个同级模块时，应分组、折叠或下钻。
-
-### 实时性可见
-
-- 行情、新闻、账户、Agent run 都必须暴露更新时间或 freshness。
-- stale / loading / partial / failed 状态要直接可见，不能只在 console 里报错。
-- 涉及交易判断的界面必须显示数据是否新鲜。
-
-### 过程可审计
-
-- Agent 的工具调用、读取数据、生成判断、执行账户动作都要在 UI 中可见。
-- 后台 run 不能静默消失，应进入可追溯的 timeline / 分析结果列表。
-- 用户应能从一次账户动作追溯到 Agent 判断、工具结果和当时的市场事实。
-
-### 沿用现有视觉系统
-
-- 保留当前暖白纸面风格、窄侧栏、Lucide 图标、CN 红涨绿跌语义。
-- 不引入新的 UI 组件库，除非先形成单独设计决策。
-- 新组件优先复用 `page-shell`、`section-head`、`ghost`、`primary`、`chip`、`segmented`、`switch`、`agent-card` 等既有模式。
+像 Bloomberg Terminal 的克制 + 好的排版。不追求「哇好漂亮」，追求「信息清晰、用起来顺手」。暖色调纸面底色避免长时间看屏的视觉疲劳，但不是为了「温馨」——是为了可读性。
 
 ---
 
-## 2. 视觉系统
+## §2 视觉系统
 
-### 色彩
+### 2.1 色彩
 
-使用 `src/styles.css` 里的 CSS variables 作为唯一色彩入口：
+所有色值通过 CSS custom properties 定义在 `:root`。组件和页面**不得硬编码色值**。
 
-- 背景：`--bg-app`、`--bg-card`、`--bg-soft`
-- 文字：`--fg-strong`、`--fg-default`、`--fg-muted`、`--fg-faint`
-- 边框：`--border-strong`、`--border-default`、`--border-soft`
-- 品牌：`--brand`、`--brand-strong`、`--brand-soft`
-- 行情：`--chart-up`、`--chart-down`
+#### 背景
 
-规则：
+| Token | 值 | 用途 |
+|---|---|---|
+| `--bg-app` | `#faf6ee` | 全局底色（暖白纸面） |
+| `--bg-card` | `#ffffff` | 卡片、弹窗、输入框底 |
+| `--bg-soft` | `#f3ede0` | 分隔带、hover 背景、次级区域 |
 
-- 不在组件里硬编码大段新颜色；动态涨跌、状态色也应落到 tone class 或 token。
-- A 股行情语义固定为 **红涨绿跌**。
-- 同一页面不能被单一色相统治；暖白底色是基础，不再叠加大面积渐变、光斑、装饰图形。
+#### 文字
 
-### 字体和数字
+| Token | 值 | 用途 |
+|---|---|---|
+| `--fg-strong` | `#2f2618` | 标题、关键数字 |
+| `--fg-default` | `#5c5042` | 正文 |
+| `--fg-muted` | `#897866` | 二级文字、标签 |
+| `--fg-faint` | `#b8a995` | 三级文字、placeholder、禁用态 |
 
-- 正文使用 `--font-body`。
-- 标题可以使用 `--font-display`，但工作台内标题不做 hero 级放大。
-- 金额、价格、涨跌幅、成交量、代码、时间优先使用 tabular / mono 风格，保证纵向可比较。
-- 中文 UI 文案保持短句，避免解释软件功能的长段说明。
+#### 边框
 
-### 间距和圆角
+| Token | 值 | 用途 |
+|---|---|---|
+| `--border-strong` | `#d8c9b3` | 分割线、选中边框 |
+| `--border-default` | `#e5d9c5` | 默认边框 |
+| `--border-soft` | `#efe7d7` | 淡分隔 |
 
-- 基础间距使用 4 / 8 / 12 / 16 / 24 px 阶梯。
-- 密集列表和工具栏优先用 6-8px gap。
-- 新增卡片默认使用 `--radius-sm`；只有沿用现有容器或 modal 时使用更大圆角。
-- 不新增卡片套卡片；重复项可以是 card，页面 section 不做漂浮卡片。
-- **例外——配置/设置类页面**（如设置页）：内容是分组的配置项而非数据工作面，**允许**把页面 section 做成 `radius-lg` + 轻 `shadow-sm` 的卡片来分组（见 §4 设置页 视觉结构）。数据工作面（市场 / 资讯 / 模拟账户）仍保持扁平、不漂浮。
+#### 品牌
 
-### 图标
+| Token | 值 | 用途 |
+|---|---|---|
+| `--brand` | `#8a6532` | 主操作、active 态、链接 |
+| `--brand-strong` | `#5e4220` | 按钮 hover、重强调 |
+| `--brand-soft` | `#ead9be` | 选中背景、badge 底色 |
 
-- 操作按钮使用 `lucide-react` 图标。
-- 常见动作优先用图标 + tooltip / title：刷新、搜索、筛选、排序、全屏、关闭、保存、删除。
-- 只有语义不清或高风险动作需要图标 + 文本。
+#### 行情语义
+
+| Token | 值 | 含义 |
+|---|---|---|
+| `--chart-up` | `#c0392b` | **红涨**（A 股语义） |
+| `--chart-down` | `#1f8a47` | **绿跌** |
+
+所有展示涨跌的地方必须统一使用这两个 token。正收益 = 红，负收益 = 绿，零 = `--fg-muted`。
+
+#### 状态
+
+| Token | 值 | 用途 |
+|---|---|---|
+| `--state-warn` | `#c98a1e` | 警告（熔断、stale 数据、触发器） |
+| `--state-info` | `#5e7b9a` | 信息提示 |
+| `--state-stale` | `#b8a995` | 过期数据标记 |
+
+### 2.2 字体
+
+| Token | 栈 | 用途 |
+|---|---|---|
+| `--font-body` | Inter, -apple-system, PingFang SC, sans-serif | 正文、按钮、标签 |
+| `--font-display` | Source Serif 4, Georgia, serif | 页面标题（仅 section head） |
+| `--font-mono` | IBM Plex Mono, SF Mono, Menlo, monospace | 价格、代码、数量、时间戳 |
+
+数字展示规则：
+- 价格、金额、百分比：`font-variant-numeric: tabular-nums` + `--font-mono`（等宽对齐）
+- 股票代码：`--font-mono`
+- 普通计数：`--font-body` 即可
+
+#### 字号
+
+| 场景 | 大小 | 行高 |
+|---|---|---|
+| 页面标题 | 20px, `--font-display`, 600 weight | 1.3 |
+| 区域标题 | 15px, `--font-body`, 600 weight | 1.4 |
+| 正文 | 14px | 1.5 |
+| 紧凑正文 | 13px | 1.4 |
+| 小标签 | 12px | 1.3 |
+| 指标大数字 | 24–28px, `--font-mono`, 600 weight | 1.2 |
+
+### 2.3 间距与圆角
+
+基础间距单位 4px，所有间距为 4 的倍数。
+
+| Token | 值 | 用途 |
+|---|---|---|
+| `--radius-sm` | 4px | chip、小按钮 |
+| `--radius-md` | 8px | 卡片、输入框 |
+| `--radius-lg` | 12px | 弹窗、大面板 |
+
+| Token | 值 |
+|---|---|
+| `--shadow-sm` | `0 1px 2px rgba(47,38,24,0.05)` |
+| `--shadow-md` | `0 2px 6px rgba(47,38,24,0.08)` |
+
+阴影用量极少，只用在浮层（弹窗、下拉、context menu）。卡片之间用边框区分，不用阴影。
+
+### 2.4 暗色模式
+
+**不纳入当前范围。** 所有色值走 token 是为将来做准备，但不要求现在实现暗色主题。
 
 ---
 
-## 3. 全局布局
+## §3 全局布局
 
-### App Shell
+### 3.1 AppShell 骨架
 
-```text
-72px sidebar
-  -> main content
-    -> main-scroll
-      -> page-shell
+```
+┌─────────────────────────────────────────────────────┐
+│ macOS titlebar overlay zone (28px)                  │
+├──────┬──────────────────────────────────────────────┤
+│      │                                              │
+│  S   │           main-content                       │
+│  i   │                                              │
+│  d   │  ┌──────────────────────────────────────┐    │
+│  e   │  │  PageShell                           │    │
+│  b   │  │    SectionHead (可选)                │    │
+│  a   │  │    workspace (flex:1, overflow:auto)  │    │
+│  r   │  └──────────────────────────────────────┘    │
+│      │                                              │
+│ 72px │              flex: 1                         │
+└──────┴──────────────────────────────────────────────┘
+```
+
+| 区域 | 规格 |
+|---|---|
+| Sidebar | 固定 72px 宽，全高，icon-only 导航 |
+| main-content | `flex: 1`，内部滚动 |
+| titlebar zone | macOS `titleBarStyle: overlay` 需要 28px 上边距让红绿灯按钮不被遮挡 |
+
+### 3.2 Sidebar
+
+**窄图标导航**，不展开文字。从上到下：
+
+| 位置 | 内容 |
+|---|---|
+| 顶部 | Logo mark「G」（`--font-display`，24px，品牌色） |
+| 导航区 | 5 个图标按钮，垂直排列，48px 触控区 |
+
+导航项（固定顺序）：
+
+| 图标 | 路由 | 含义 |
+|---|---|---|
+| TrendingUp | `/market` | 市场 |
+| Newspaper | `/` | 资讯（默认落地页） |
+| Wallet | `/account` | 模拟账户 |
+| Bot | `/agent` | Agent |
+| Settings | `/settings` | 设置 |
+
+状态：
+- 默认：`--fg-muted`
+- hover：`--bg-soft` 背景 + `--fg-default` 图标
+- active（当前页）：`--brand-soft` 背景 + `--brand` 图标
+
+**落地页是资讯页（`/`）**，因为用户打开终端第一件事是看今天有什么新闻。
+
+### 3.3 PageShell
+
+页面级通用包装：
+
+- padding: 24px
+- 可选 SectionHead（标题 + 副信息 + 操作按钮）
+- workspace: `flex: 1; overflow: auto`
+
+SectionHead 高度固定 56px，避免页面抖动。
+
+### 3.4 Keep-alive
+
+页面使用 lazy mount + CSS `display: none` 隐藏策略：首次访问时 mount，切走后隐藏而非 unmount。保持页面内部状态（滚动位置、输入、展开态）。
+
+---
+
+## §4 页面设计
+
+### 4.1 资讯页（NewsPage, `/`）
+
+**目标：** 快速扫描今天和近期的资讯，发现值得深入研究的信号。
+
+#### 结构
+
+```
+PageShell
+├─ control strip (SectionHead 区域)
+│    FTS搜索框 + 来源多选chips + 刷新按钮
+├─ 日期导航条 (横向滚动)
+│    [06-08] [06-07] [06-06] ... (最近14天，带新闻数)
+└─ workspace: 时间线
+     ┌─ 06-08 (sticky 日期头) ────────────────┐
+     │  14:30  [新浪]  标题文本预览...           │
+     │  13:15  [东方财富]  标题文本预览...       │
+     ├─ 06-07 (sticky 日期头) ────────────────┤
+     │  ...                                    │
+     └─────────────────────────────────────────┘
+```
+
+#### 交互契约
+
+| 交互 | 行为 |
+|---|---|
+| mount / filter 变化 | `fetchNews({ order: "desc", limit: 50 })` → 最新一页 |
+| 下滑到底 | 加载更早：`publishedTo = oldest.publishedAt, order: "desc"` |
+| 上滑到顶 | 加载更新：`publishedFrom = newest.publishedAt, order: "asc"` → reverse → prepend |
+| 点击日期锚点 | 替换窗口：`publishedTo = 该日 23:59:59.999, order: "desc"` |
+| 搜索 | 300ms debounce FTS，重置窗口 |
+
+#### 性能要求
+
+- DOM 窗口上限 **200 条**（超限裁远端，游标可回滚重拉）
+- 新闻行使用 `content-visibility: auto`（屏外跳过布局 + 绘制）
+- 向更新方向 prepend 时做滚动锚定补偿，视口不跳动
+- 去重一律按 id Set（闭区间游标会带回边界条）
+
+#### 新闻行样式
+
+- 单行紧凑：时间 + 来源 badge + 标题（不折行，`text-overflow: ellipsis`）
+- hover 背景 `--bg-soft`
+- 来源 badge 使用 chip 样式，不同来源可有不同底色
+- 正文 > 3 行时折叠，展开按钮
+
+---
+
+### 4.2 市场页（MarketPage, `/market`）
+
+**目标：** 一屏看到市场全貌（指数、涨跌分布、行业热度），快速定位个股看 K 线。
+
+#### 结构
+
+```
+PageShell (紧凑模式：标题行仅 lastUpdated + 全局刷新)
+├─ metrics row (横向排列，等高卡片)
+│    [上证] [深证] [创业板] [科创50] [涨跌分布] [行业热度]
+└─ workspace (两栏)
+     ├─ list panel (280px, 左)
+     │    ├─ 排序 tabs: 涨跌 | 成交
+     │    ├─ 类别 chips: 股票 | 指数 | 基金
+     │    ├─ 搜索框
+     │    └─ 列表 (react-window 虚拟滚动)
+     └─ detail panel (flex:1, 右)
+          ├─ 标的 header (name + code + 实时报价)
+          ├─ 周期 tabs: 日 | 周 | 月 | 1m | 5m | 15m | 30m | 60m
+          └─ K线图 (klinecharts)
+```
+
+#### 指数卡片 (IndexCard)
+
+- 标题：指数名称
+- 主数字：当前点位，`--font-mono`, 24px
+- 涨跌：绝对值 + 百分比，涨跌色
+- 迷你日 K sparkline（可选，不强制）
+
+#### 涨跌分布卡片 (BreadthCard)
+
+- 标题：市场宽度
+- 横向堆叠条：涨停（深红）| 涨（红）| 平（灰）| 跌（绿）| 跌停（深绿）
+- 数字标注：上涨 N / 下跌 N / 平盘 N
+
+#### 行业热度卡片 (HeatmapCard)
+
+- 标题：行业热度
+- top 3 涨 + top 3 跌，色块 + 百分比
+
+#### 列表项样式
+
+- 双行紧凑：行 1: 名称 + 代码 | 行 2: 价格 + 涨跌% + 成交额
+- 价格和百分比使用 `--font-mono` + tabular-nums
+- 涨跌色全局一致
+- 自选标记：⭐ 在名称前
+- hover / selected 背景
+
+#### K 线面板
+
+- 默认选中 `000001.SH`（上证指数，有预热数据）
+- 周期切换：重新请求 `ensureChartData`
+- 无数据状态：显示「暂无 K 线数据」提示
+- 深度历史：`extendChartHistory` 延伸加载
+- K 线颜色遵循 `--chart-up` / `--chart-down`
+
+#### 数据流
+
+- 列表一次性加载（`listMarket({ limit: 10000 })`，universe ~7500 条，内存 + DB 读）
+- 行情刷新走 `market-quotes-refresh-progress` 事件，**2.5s 节流**
+- 缓存策略：stale-while-revalidate（30s cache，miss = loading，stale = 静默后台刷新）
+
+---
+
+### 4.3 模拟账户页（AccountPage, `/account`）
+
+**目标：** 清楚看到「我有多少钱、持了什么仓、赚还是亏」，管理自选股。
+
+#### 结构
+
+```
+PageShell (紧凑模式)
+├─ AccountSummary (全宽概览条)
+│    总资产 | 现金 | 持仓市值 | 已实现盈亏 | 未实现盈亏 | 持仓数 | ...
+└─ workspace (两栏)
+     ├─ main (flex:1, 左)
+     │    ├─ PositionsPanel (持仓表)
+     │    └─ 选中持仓的 K 线 (可选展示)
+     └─ side (280px, 右)
+          └─ WatchlistPanel (自选股列表)
+```
+
+#### AccountSummary
+
+- 横向一行关键指标，指标大数字 + 标签
+- 总资产和盈亏使用涨跌色
+- 可选 grid 展开更多字段
+
+#### PositionsPanel
+
+- 表格布局：代码 | 名称 | 数量 | 成本 | 现价 | 盈亏 | 盈亏% | 保护条件
+- 保护条件（止损/止盈/时间止损）以 chip 形式展示在行内
+- 空仓时显示空状态文案
+- 点击行 → 下方展示该股 K 线
+
+#### WatchlistPanel
+
+- 紧凑列表：名称 + 代码 + 最新价 + 涨跌%
+- 操作：添加（弹窗输入代码）、移除、编辑备注
+- 点击行 → 弹出 K 线 modal
+- 与市场页共享 `watchlistStore`（⭐ 同步）
+
+#### 重置账户
+
+- 「重置账户」按钮在页面操作区
+- 点击弹出确认对话框：说明将清空持仓/订单/成交，保留自选股
+- 确认后调 `accountReset()`
+- 可查看历史归档：`listAccountArchives()`
+
+#### 红线
+
+- **用户没有交易写入口**（spec §4：人工 UI 不能下单/调仓），只能管自选
+- 所有交易由 Agent 通过 `operate_account` 工具执行
+
+---
+
+### 4.4 Agent 页（AgentPage, `/agent`）
+
+**目标：** 与 Agent 对话、管理投资策略、审阅决策链。
+
+#### 结构
+
+```
+PageShell (minimal header)
+├─ left panel (240px)
+│    ├─ Runs 列表 (近期 run，mode badge + 状态)
+│    ├─ 复盘报告列表
+│    └─ 资讯自动分析开关
+├─ center panel (flex:1)
+│    ├─ 对话区 (message bubbles，滚动)
+│    │    [user bubble]
+│    │    [assistant bubble, streaming...]
+│    └─ 输入区
+│         textarea + 发送按钮 + 图片附件
+└─ right panel (280px)
+     ├─ 投资策略面板 (查看/编辑)
+     ├─ 分析结果列表 (AnalysisResult)
+     └─ 熔断状态条
+```
+
+#### 对话区
+
+- 角色区分：用户消息右对齐、品牌底色；Agent 消息左对齐、白底
+- 流式渲染：`listen("agent-event")` 增量 text_delta → 逐 token 追加到当前 assistant bubble
+- markdown 渲染（后续需求，当前纯文本即可）
+- 图片支持：用户可附带图片（data-URL → 后端 PayloadStore）
+- 发送：Enter 发送（Shift+Enter 换行），或点击发送按钮
+
+#### 投资策略面板
+
+- 显示当前策略文本 + 版本号 + 状态（active/draft/archived）
+- 编辑模式：textarea，保存时 `agentUpsertStrategy`
+- 策略是自然语言描述（不是结构化参数）
+- 版本历史可查看（`includeHistory: true`）
+
+#### Runs 列表
+
+- 每行：mode badge（对话/资讯/账户触发/复盘）+ 状态 + 时间
+- mode badge 颜色按类型区分
+- 点击 run → 在对话区展示该 run 的消息历史（未来需求）
+
+#### 分析结果列表
+
+- 每行：相关标的 + action/no_action 判定 + 简要理由
+- 新结果通过 `agent-analysis-result` 事件实时追加
+
+#### 熔断状态条
+
+- 熔断激活时：顶部或右侧显示警告条（`--state-warn` 底色）
+- 显示：熔断原因 + 「恢复交易」按钮
+- 恢复需要确认
+
+#### 资讯自动分析
+
+- 开关 toggle：`agentSetNewsAutoAnalysis(enabled)`
+- 开启后 Agent 自动分析新入资讯（news buffer → news mode run）
+
+---
+
+### 4.5 设置页（SettingsPage, `/settings`）
+
+**目标：** 配置 LLM 服务商通道（让 Agent 能对话）。
+
+#### 结构
+
+```
+PageShell
+├─ 当前模型选择器 (CurrentModelSelector)
+│    已配置 channel 的单选列表
+├─ 添加通道 (AddChannelForm)
+│    ├─ 快速预设 chips (DeepSeek / OpenAI / Anthropic Relay)
+│    └─ 自定义表单: wire format + base URL + API key + model
+└─ 通道列表 (ChannelList)
+     每行: channel name + model + 状态 + 编辑/删除
+```
+
+#### 安全红线
+
+- API key **永远不回显**，列表只显示 `apiKeySet: boolean`
+- 编辑时 API key 字段为空表示保留原值
+- API key 通过 Tauri secure storage 持久化，不写入 SQLite 明文
+
+---
+
+## §5 通用组件契约
+
+### 5.1 按钮 (`.btn`)
+
+| 变体 | 样式 | 用途 |
+|---|---|---|
+| default (ghost) | 透明底 + 文字色边框 | 次要操作 |
+| primary | `--brand` 底色 + 白字 | 主操作（每个视图最多 1 个） |
+| danger | `--chart-up` 底色 + 白字 | 破坏性操作（删除、重置） |
+| icon-only | 无边框 + icon | 工具栏操作 |
+
+状态：hover（加深底色 5%）、focus（`outline: 2px solid var(--brand)`）、disabled（opacity 0.5）。
+
+尺寸：默认 32px 高、padding 8px 16px；compact 28px 高。
+
+### 5.2 Chip (`.chip`)
+
+小型标签/筛选器：
+
+- 默认：`--bg-soft` 底 + `--fg-muted` 文字
+- active：`--brand-soft` 底 + `--brand` 文字
+- 圆角 `--radius-sm`
+- 高度 24px，padding 4px 8px，font-size 12px
+
+### 5.3 输入框 (`.input`)
+
+- `--bg-card` 底色
+- `--border-default` 边框，focus 时 `--brand` 边框
+- `--radius-md` 圆角
+- 高度 36px，padding 8px 12px
+- placeholder 使用 `--fg-faint`
+
+### 5.4 状态点 (`.status-dot`)
+
+行内小圆点（8px），用于表示在线/告警/错误等状态：
+
+| 状态 | 颜色 |
+|---|---|
+| ok | `--chart-down` (绿) |
+| warn | `--state-warn` |
+| error | `--chart-up` (红) |
+| loading | `--state-info` + pulse 动画 |
+| stale | `--state-stale` |
+
+### 5.5 表格
+
+- 表头：`--fg-muted` 文字，12px，`text-transform: uppercase` 可选
+- 行高：40px（默认）或 32px（紧凑）
+- hover：`--bg-soft` 背景
+- 选中行：`--brand-soft` 背景 + 左侧 2px `--brand` 边框
+- 数字列右对齐，`tabular-nums`
+- 不使用斑马纹（边框分隔足够）
+
+### 5.6 弹窗 / Modal
+
+- 居中显示，backdrop `rgba(47,38,24,0.3)`
+- `--bg-card` 底色，`--radius-lg` 圆角
+- `--shadow-md` 阴影
+- 标题 + 内容 + 底部按钮区（右对齐：取消 + 确认）
+- ESC / 点击 backdrop 关闭
+
+### 5.7 Context Menu
+
+- 右键触发，绝对定位
+- `--bg-card` 底色，`--shadow-md`
+- 每项 32px 高，hover `--bg-soft`
+- 支持分隔线
+
+### 5.8 空状态
+
+当列表 / 面板无数据时：
+
+- 居中显示图标（lucide icon，48px，`--fg-faint`）+ 一行文案
+- 不用插画、不用大面积留白
+- 文案示例：「暂无持仓」「暂无新闻」「尚未配置服务商」
+
+### 5.9 加载状态
+
+- **不使用骨架屏**（过度设计，且数据通常 <1s 返回）
+- 首次加载：居中 spinner（简单 CSS 旋转圆环，16px，`--brand`）
+- 后台刷新：不显示加载态（stale-while-revalidate）
+- 按钮操作中：按钮内 spinner + disabled
+
+---
+
+## §6 数据流模式
+
+### 6.1 核心原则
+
+```
+前端不持有业务真源。
+所有业务状态（持仓、报价、订阅、策略）= Rust 真源 → event 推送 → 前端缓存。
+```
+
+| 数据流 | 机制 |
+|---|---|
+| 查询 / 命令 | `invoke('cmd', args)` → **走 specta 生成的强类型 wrapper**，不裸调 `invoke` |
+| 流式数据 | Rust `app.emit(event, payload)` → 前端 `listen(event)` |
+| 取消长任务 | Rust 持有 `CancellationToken`，前端通过另一 command 触发取消 |
+| 业务状态 | Rust 真源 → event 推送 → zustand 缓存 |
+| UI 状态 | 留 React 本地 state |
+
+### 6.2 红线
+
+- 前端**不做业务计算**（PnL / 估值 / 信号）——由 Rust 算好推过来
+- 前端**不直接发外部 HTTP**——所有 provider 调用走 Rust
+- 前端**不裸调 `invoke`**——只使用 `bindings.ts` 导出的强类型函数
+- 前端**不做乐观更新**——命令成功后才更新 UI
+
+### 6.3 状态管理
+
+| 类别 | 方案 |
+|---|---|
+| 跨页面共享业务缓存 | zustand store（例：`watchlistStore`） |
+| 页面内数据 | React `useState` / `useRef` |
+| 表单输入 | React `useState`（受控组件） |
+
+**不使用 Redux / Redux-Toolkit / Context 做状态管理。** zustand 只用于真正需要跨页面共享的数据。
+
+### 6.4 事件监听
+
+前端监听的 Tauri 事件：
+
+| 事件 | 来源 | 前端行为 |
+|---|---|---|
+| `market-quotes-refresh-progress` | Quotes | 行情刷新进度，2.5s 节流后 refetch list |
+| `agent-event` | Agent Runtime | 流式 text_delta → 追加到 assistant bubble |
+| `agent-run-finished` | Agent Runtime | 刷新 Agent state |
+| `agent-analysis-result` | Agent Runtime | 追加分析结果到列表 |
+
+---
+
+## §7 性能契约
+
+| 指标 | 目标 |
+|---|---|
+| 页面首次有意义渲染 | < 500ms（keep-alive 复访 < 50ms） |
+| 行情列表渲染 7500 行 | 虚拟滚动，可见区域外不渲染 |
+| 新闻时间线 | DOM 上限 200 条，`content-visibility: auto` |
+| 行情刷新重渲染 | 2.5s 节流，不逐条触发 |
+| K 线图切换周期 | < 300ms 显示已缓存数据，后台拉取最新 |
+| 前端 JS bundle | 关注但不强制 500KB 限制（桌面端，非 web） |
+
+### 7.1 Keep-alive 策略
+
+页面 lazy mount + `display: none` 隐藏。首次访问 mount，切走隐藏不卸载。保持：
+- 滚动位置
+- 输入框内容
+- 展开/折叠状态
+- K 线图实例
+
+### 7.2 虚拟滚动
+
+长列表（市场页 > 100 行、新闻页 > 50 行）使用 `react-window` 虚拟化。
+
+### 7.3 预热
+
+App 启动时预热核心指数日 K（`000001.SH` day），避免首次打开市场页白屏等待。
+
+---
+
+## §8 可访问性
+
+| 要求 | 说明 |
+|---|---|
+| 语义化 HTML | `<nav>`, `<main>`, `<section>`, `<table>`, `<button>` |
+| 键盘导航 | 所有可交互元素可 Tab 到达 |
+| ARIA 标签 | sidebar 导航、context menu、modal |
+| 焦点指示器 | `outline: 2px solid var(--brand)`，不用 `outline: none` |
+| 颜色对比度 | 正文文字与背景 contrast ratio >= 4.5:1 |
+
+不要求 screen reader 完整适配（桌面专业工具，目标用户群体）。
+
+---
+
+## §9 技术约束
+
+### 9.1 技术栈（已锁定）
+
+| 库 | 版本 | 用途 |
+|---|---|---|
+| React | 19 | UI 框架 |
+| Vite | 6 | 构建 |
+| TypeScript | 5.6+ | 类型安全 |
+| React Router | 7 | HashRouter 路由 |
+| react-window | 2 | 虚拟滚动 |
+| klinecharts | 9 | K 线图 |
+| lightweight-charts | 5 | TradingView 图表（备用 / sparkline） |
+| lucide-react | latest | 图标 |
+| zustand | 5 | 轻量状态管理 |
+| tauri-specta | — | Rust → TS 类型生成 |
+
+### 9.2 路由
+
+HashRouter（`/#/market`），因为 Tauri 使用 `file://` 协议加载前端，不支持 `pushState`。
+
+### 9.3 类型安全
+
+- 所有 Tauri command 调用走 `src/bindings.ts`（specta 自动生成）
+- 不手写 `invoke` 调用
+- DTO 类型从 bindings 导入，不自行定义
+
+### 9.4 文件组织
+
+```
+src/
+├─ App.tsx              # 路由 + keep-alive mount
+├─ main.tsx             # entry point
+├─ bindings.ts          # specta 生成（不手动编辑）
+├─ styles.css           # 全局样式 + design tokens
+├─ components/          # 跨页面共享组件
+│    AppShell.tsx
+│    PageShell.tsx
+│    SectionHead.tsx
+│    Sidebar.tsx
+│    KlineCanvas.tsx
+│    KlineModal.tsx
+├─ lib/                 # 工具函数 + hooks + stores
+│    router.ts
+│    watchlistStore.ts
+│    quotePull.ts
+│    beijingTime.ts
+│    newsWindow.ts       # 双向窗口纯函数
+│    scrollAnchor.ts
+│    marketListCache.ts
+│    perfLog.ts
+│    useCoreIndexes.ts
+│    useKlineData.ts
+│    useMarketBreadth.ts
+│    useIndustryHeatmap.ts
+│    tradingSession.ts
+├─ pages/               # 页面组件
+│    NewsPage.tsx
+│    MarketPage.tsx
+│    AccountPage.tsx
+│    AgentPage.tsx
+│    SettingsPage.tsx
+│    news/              # 页面内子组件
+│    market/
+│    account/
+│    settings/
 ```
 
 规则：
-
-- 侧栏保持窄图标导航，不在侧栏塞复杂状态。
-- 主内容区是工作区，不做营销页头。
-- 页面高度和滚动边界必须清晰；避免多个无意义嵌套滚动容器。
-
-### 页面骨架
-
-标准页面结构：
-
-```text
-page-shell
-  section-head: 标题 + 状态/更新时间 + 主操作
-  optional control strip: filter / search / segment / refresh
-  workspace: list + detail / chart + table / timeline + inspector
-```
-
-规则：
-
-- 标题区只放当前页面的操作状态和少数主操作。
-- 筛选、排序、搜索放在 control strip，不能散落在不同卡片里。
-- 数据列表和详情应保持同屏联动，减少页面跳转。
-
-### 响应式
-
-- Desktop 首要优化宽度：1280 / 1440 / 1728 px。
-- 窄屏优先保持可读和可操作，不追求完整多列并排。
-- 固定格式元素，如行情行、K 线容器、工具栏、按钮、标签，要有稳定尺寸，不能因内容变化导致布局跳动。
+- 页面内子组件放 `pages/<page>/` 目录下
+- 跨页面组件放 `components/`
+- 数据 hooks 和工具函数放 `lib/`
+- 不建立 `utils/`、`helpers/`、`services/` 等模糊目录
 
 ---
 
-## 4. 核心页面模式
+## §10 开发红线
 
-### 市场页
-
-目标：快速扫市场、筛候选、下钻标的。
-
-推荐结构：
-
-```text
-市场状态 / 核心指数 / breadth
-  -> 筛选和排序
-  -> 股票 / 指数 / 基金列表
-  -> 选中标的详情 + KLineChart
-```
-
-规则：
-
-- 列表必须能按涨跌幅、成交额、量比、PE/PB、类别、是否自选过滤或排序。
-- 每个标的最少展示：名称、代码、类别、价格、涨跌幅、成交额、更新时间。
-- 空值显示 `-`，不要显示 `null` / `undefined` / `NaN`。
-- 行情列表使用紧凑行，不用大卡片堆叠。
-- 市场页提供「数据源(TDX)连接延时」诊断 popup（小按钮触发，列各 host 延时 + 标注在用），用于排查行情慢/卡。
-
-### 资讯页
-
-目标：按时间和影响快速阅读新闻。
-
-推荐结构：
-
-```text
-更新时间 / 刷新状态
-  -> 来源 / 日期 / 关键词筛选
-  -> 时间线
-  -> 展开正文 / 关联标的 / Agent 分析入口
-```
-
-规则：
-
-- 时间线适合资讯流；默认倒序。
-- **日期导航 = 双向窗口流**：列表是全局倒序时间线的一段连续窗口。点顶部任意一天 → 以那天为锚做一次干净加载（取那天最新一页），快速定位；**往上滑加载更新、往下滑加载更早**，两端都用 keyset 游标按需取**一页**（见 news-module.md `fetch_news`「双向 keyset 读取」）。**严禁**为定位某天而把它与当前位置之间的所有天全量拉取（高频源单日可达数千条，会卡顿且可能定位不到）。长列表渲染用 `content-visibility` 等原生窗口化，屏外行不绘制。
-- 每日真实条数取后端 `dateCounts`，不用分页累积的 items 计数。**`dateCounts` 只由无游标请求（初始/筛选/刷新）维护**——带 keyset 游标的窗口翻页/锚定请求返回的 `dateCounts` 被时间游标截断，必须忽略，否则越往回滑日期计数越少、较新的天会错误地变 0 不可点。
-- **窗口有界**：保留的 items 有上限（滑动窗口），向一端扩展超限即裁掉远端（被裁端可回滚重拉），裁剪/prepend 都做滚动锚定。避免数千常驻 DOM 节点导致切 tab / 滚动卡顿（`content-visibility` 只省绘制不省布局重算）。详见 news-module §`fetch_news` 双向 keyset 读取。
-- 新闻正文可渐进展开，避免首屏塞满长文本。
-- 关联标的、重要性、Agent 是否已分析要成为可扫描字段。
-- 资讯行支持右键浮层：「用浏览器打开原文」「复制链接」。原文走 Rust `open_external`
-  命令调用系统默认浏览器（仅放行 http/https），前端不裸调 plugin invoke。无 url 的条目禁用。
-- 全局屏蔽 WebView 原生右键菜单（后退/重载/检查），改由各列表自定义浮层接管；
-  输入框 / 文本域 / contenteditable 例外，保留原生复制粘贴菜单。
-
-### 模拟账户页
-
-目标：看清账户状态、持仓风险、Agent 操作后果。
-
-推荐结构：
-
-```text
-账户总览
-  -> 自选列表
-  -> 风控提醒
-  -> 当前持仓 + 选中持仓 KLineChart
-  -> 最近平仓 / 复盘入口
-```
-
-规则：
-
-- 账户金额、仓位、盈亏、风险状态必须优先展示。
-- 用户只管理自选和查看账户，不提供人工交易入口。
-- 持仓行必须能追溯到开仓 run（`run_id`）/ 策略版本 / 止损止盈条件。
-
-### Agent 页
-
-目标：观察 Agent 的思考、工具调用、决策和复盘。
-
-推荐结构（三栏）：
-
-```text
-左：复盘报告文件列表（workspace 文件，点开 read_file 渲染）
-中：对话流 / run timeline（dialogue mode）
-右：news 分析结果列表（AnalysisResult：action / no_action）
-```
-
-规则：
-
-- Chat 不是唯一入口；后台 news run、复盘报告、投资策略同样是一等信息。
-- 右侧 news 分析结果列表按 `agent-analysis-result` 事件增量更新；每条标 action / no_action + 关联标的 + 摘要。
-- 左侧复盘报告是 workspace 文件列表（按交易日），点开用 `read_file` 渲染 markdown。
-- 工具调用使用 timeline row：工具名、输入摘要、输出摘要、耗时、错误状态。
-- Agent 产生账户动作时，必须有醒目的 run（`run_id`）/ `AgentTrade` / account result 链接。
-- 投资策略以单独面板展示（当前 active 版本 + 历史版本）；修改须用户在对话中确认后经 `upsert_investment_strategy` 写入。
-
-### 设置页
-
-目标：管理 Agent 模型渠道（服务商连接 + 模型）。契约见 [agent-infra-module.md §2](agent-infra-module.md) `ProviderChannel`。
-
-推荐结构（两栏吃满宽，桌面端一屏不滚）：
-
-```text
-当前模型（顶部全宽）：channel 选择器，单选，run 走选中渠道 —— 唯一的「设为当前」入口
-两栏：
-  左 模型渠道（只读管理）：每个保留模型一行（avatar + {model} / {渠道名} + 消息格式 + host + key 状态 + 删除）
-  右 添加渠道：[快速预设 | 自定义]
-       快速预设：选 DeepSeek/OpenAI/Anthropic 官方 → 只填 API Key
-       自定义：渠道名 + 消息格式(Messages/Chat Completions/Responses) + Host + API Key
-       → 保存后自动发现模型 → 勾选确认保留（发现失败则手动输入一个/多个模型名确认）
-```
-
-规则：
-
-- 渠道按**消息格式**抽象，不按厂商写死；「渠道名」即展示用 provider name，列表与当前模型选择器都用 `{model} ({渠道名})` 文案。
-- **职责分离，避免重复**：「当前模型」是**唯一**的 active 切换入口（选哪个渠道跑 run）；「模型渠道」是**只读管理**视图（看配置 / 删除），**不再标「当前」徽章、不做 active 行高亮**——active 状态只在「当前模型」里表达，两块各司其职不重复标记。
-- API Key **只提交不回显**：保存后列表只显示"已配置"状态，不回传明文（走 specta 强类型 command，不裸调 invoke，不在前端持有 token）。
-- 模型发现失败时降级为手动输入模型名（允许多个），不阻塞配置。
-- 新建渠道默认 enabled；首次配置完成后自动设为当前模型（若此前没有当前模型）。
-
-视觉结构（沿用暖纸面设计系统，不引入新色）：
-
-- **布局吃满内容区宽度**（max-width ~1280）：顶部「当前模型」全宽；其下「模型渠道」「添加渠道」并排两栏（窄屏 < ~1024 自动堆叠为单栏）。目标是桌面端一屏放下、不产生页内竖滚。
-- 区块各为一张卡片（`bg-card` + `border-soft` + `radius-lg` + `shadow-sm`）：header 条（serif 标题 + 右侧 muted hint/计数）+ body。模型渠道的行 full-bleed（行间 `border-soft` 分隔）。
-- provider 头像：取渠道名首字母的方形 `brand-soft` 徽标，用在渠道行最左与预设卡片左侧，给来源一个视觉锚点。
-- 当前模型选择器用一排 channel pill 卡片（model mono + provider muted）；选中态为 `brand` 描边环 + `brand-soft` 底 + 右上角 brand Check，明显区别于未选中。
-- 渠道行 key 状态用状态点 + 文字：已配置 = `chart-down` 绿点，未配置 = `fg-faint` 点。
+| 禁止 | 原因 |
+|---|---|
+| 在前端做业务计算 | Rust 是真源，前端只展示 |
+| 直接发 HTTP 请求 | 所有外部调用走 Rust provider |
+| 裸调 `invoke()` | 用 specta 生成的 `commands.*` |
+| 使用 Redux | zustand 足够，不需要 Redux 的复杂度 |
+| 引入 CSS-in-JS | 项目使用全局 CSS + token |
+| 引入 UI 框架 (MUI/Ant Design/Chakra) | 自建组件系统，保持轻量和一致性 |
+| 硬编码色值 | 使用 CSS variables |
+| 添加 emoji 到 UI | 专业工具感，不用 emoji（代码注释中也不加） |
+| 乐观更新 | 命令成功后才更新 UI |
+| 引入 i18n | 当前只做中文 |
 
 ---
 
-## 5. 数据展示组件
+## §11 不纳入当前范围
 
-### 列表和表格
-
-适用：市场全列表、扫描结果、订单、持仓、投资策略版本、复盘报告列表。
-
-规则：
-
-- 结构化可比较数据优先用 table-like list，不用自由排版卡片。
-- 支持搜索、筛选、排序、分页或虚拟列表；大列表不能一次渲染全部复杂节点。
-- 数字右对齐，名称左对齐，状态和操作列保持不换行。
-- 空值显示 `-`。
-- 行 hover、selected、active、stale 状态要有明确视觉差异。
-
-### 卡片
-
-适用：账户摘要、投资策略、复盘摘要、风险提醒。
-
-规则：
-
-- 卡片用于承载一个独立对象，不用于包裹整个页面 section。
-- 卡片最多突出 1 个主值，其他字段降级为 meta。
-- 卡片内容过长时截断或折叠，详情放 inspector / modal / expanded row。
-
-### 时间线
-
-适用：新闻、Agent run、工具调用、账户事件、复盘链。
-
-规则：
-
-- 时间线默认倒序，最新事件在上。
-- 每条事件显示时间、来源、状态和主内容。
-- 系统事件、工具事件、账户事件、用户消息要用不同 tone，但不能过度彩色。
-
-### K 线图
-
-K 线图统一使用 **lightweight-charts** 库（TradingView 出品，已锁定在 `package.json`）。**不包 wrapper 组件，页面直接调 lightweight-charts API**。
-
-规则：
-
-- 使用 lightweight-charts 的 `createChart` + `addCandlestickSeries` / `addLineSeries` / `addHistogramSeries` 等原生 API。
-- K 线和成交量分两个 series（candle + histogram），通过 priceScale / pane 分离展示（参考 lightweight-charts docs/panes）。
-- 周期切换器（分时 / 1m / 5m / 15m / 30m / 60m / 日 / 周 / 月，默认日 K）作为页面 control strip 的一部分，切换时调对应后端 command 重拉数据并 `setData()`。
-- 页面层负责为图表提供稳定容器尺寸（一般 fixed height，例如 480 / 600px），不能让图表因列表切换或按钮 hover 发生高度跳动。
-- 涨跌颜色按 CSS variables `--chart-up` / `--chart-down` 配置（A 股语义红涨绿跌）。
-- **日 K「今日 forming bar」由实时 quote 驱动**：后端日 K 只维护到已完成交易日（盘后 16:00 预热），不维护今日盘中这根。前端在 `period = day` 时用详情已有的实时 `quote`（开 / 高 / 低 / 现价 / 量）**合成或更新日 K 的最后一根「今日 bar」**（timestamp = 今日北京日历日），使图表最后一根与详情 header 的实时价**始终一致**，不依赖盘中轮询时机 / 午休。quote 刷新 → 今日 bar 随之 `updateData`；收盘后该日由后端转为已完成 bar、与之吻合。
-- 不同页面需要 K 线时各自调 lightweight-charts；如果出现明显重复逻辑（例如周期切换 + 数据拉取 + 错误态），允许在 `src/lib/` 抽 hook（如 `useKlineData`），但不抽完整 UI 组件 wrapper。
-
----
-
-## 6. 表单和控制
-
-### 控制类型
-
-- 二元设置使用 switch / checkbox。
-- 多选一模式使用 segmented control 或 tabs。
-- 数值设置使用 number stepper / slider / input。
-- 多条件筛选使用 filter strip，不用把筛选项散落进多个卡片。
-- 高风险动作使用 danger button，并在动作前明确对象和影响。
-
-### 交互状态
-
-每个可交互控件至少覆盖：
-
-- default
-- hover
-- active / selected
-- disabled
-- loading
-- error when relevant
-- keyboard focus
-
-### 可访问性
-
-- 使用真实 `button`、`input`、`select`、`nav`、`section` 等语义元素。
-- 自定义 tabs、menus、dialogs、toolbars 时遵循 WAI-ARIA APG 的键盘模式。
-- 所有可聚焦元素必须有可见 focus 样式。
-- 桌面密集按钮建议可点击区域不小于 32px；移动或高频关键操作不小于 40px。
-- 图标按钮必须有 `title` 或 `aria-label`。
-
----
-
-## 7. 状态和反馈
-
-### 数据状态
-
-所有数据视图必须设计：
-
-- loading：正在加载，但保留已知旧数据时要标明。
-- empty：没有数据，说明下一步可做什么。
-- error：展示错误摘要和重试入口。
-- stale：数据过期，明确更新时间。
-- partial：部分 provider / 工具失败，但仍可展示可用数据。
-
-### 实时状态
-
-- 自动刷新、手动刷新和后台任务要有明确状态。
-- 交易相关 action 在行情 stale 时应禁用或要求重新拉取。
-- Agent 后台运行时，页面应显示 run 状态，而不是只在 chat 内出现。
-
-### Motion
-
-- 动效只用于状态过渡、展开收起、刷新中、流式生成。
-- 不使用装饰性大动画。
-- 尊重 `prefers-reduced-motion`。
-
----
-
-## 8. 文案
-
-规则：
-
-- 页面文案使用操作语言，不写产品宣传。
-- 空状态说明当前状态和下一步，不解释整个系统。
-- 错误文案说明失败对象、失败原因和可恢复动作。
-- 金融判断要避免保证收益式表达；使用“判断 / 可能 / 风险 / 需复盘”。
-
-示例：
-
-```text
-好：行情已过期，请刷新后再让 Agent 生成交易意图。
-坏：为了保障您的财富增值，请立即刷新行情。
-```
-
----
-
-## 9. 实现约束
-
-- 新页面先复用现有 shell、tokens、按钮、卡片、时间线和表单模式。
-- 不新增外部 UI 组件库。
-- 不在组件里散落 inline style，除非是动态宽度、图表尺寸、涨跌条这类数据驱动样式。
-- 新增组件命名按领域命名，不写通用但不可复用的 `Box1` / `Card2`。
-- 组件内部状态只管理 UI 状态；业务状态通过 hooks / Tauri commands 获取。
-- 大列表要注意渲染成本，必要时虚拟化或分页。
-- 任何新图表能力优先评估是否应进入 `KLineChart`，而不是页面旁路实现。
-
----
-
-## 10. 验收标准
-
-- 新页面在 1280px 和 1440px 宽度下没有文字重叠、按钮挤压或无意义横向滚动。
-- 所有数字字段格式化一致，空值显示 `-`。
-- 所有列表支持必要的排序 / 筛选 / 搜索或明确说明为什么不需要。
-- K 线展示统一使用 `KLineChart`。
-- Agent 工具调用、账户动作、后台 run 在 UI 中可追溯。
-- loading / empty / error / stale / partial 状态都有明确界面。
-- 键盘可访问：主导航、tabs、表单、modal、菜单可聚焦和操作。
-- 颜色、圆角、间距、字体遵循 `src/styles.css` token，不引入冲突风格。
-
----
-
-## 11. 参考来源
-
-- Ant Design Data Display：数据展示应按重要性、操作频率和关联度组织，表格适合结构化比较数据。
-  https://ant.design/docs/spec/data-display/
-- Ant Design Visualization Page：分析页面应 summary first、filters next、details on demand，并控制模块数量。
-  https://ant.design/docs/spec/visualization-page/
-- W3C WCAG 2.2：focus、target size、可访问性基础约束。
-  https://www.w3.org/TR/WCAG22/
-- WAI-ARIA Authoring Practices：tabs、menus、dialogs、toolbar 等复杂组件键盘模式。
-  https://www.w3.org/WAI/ARIA/apg/
-- TradingView Charting Library UI Elements：金融图表常见 toolbar、周期、指标、画线、截图等能力组织。
-  https://www.tradingview.com/charting-library-docs/latest/ui_elements/
-- TradingView Lightweight Charts Panes：价格、成交量和指标可通过 pane 分离展示。
-  https://tradingview.github.io/lightweight-charts/docs/panes
+- 暗色模式
+- 响应式 / 移动端适配（桌面专用）
+- Screen reader 完整适配
+- 多语言 i18n
+- 可拖拽面板布局
+- 可定制快捷键
+- 欢迎引导 / onboarding
+- 通知中心 / toast 系统（简单操作反馈用按钮状态即可）

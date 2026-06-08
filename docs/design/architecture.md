@@ -27,7 +27,7 @@ Spec 写作规范以 [spec-guidelines.md](spec-guidelines.md) 为准。
 
 Provider / channel adapter 细节以 [references/](references/) 下的文档为准；模块 spec 只写 provider 选择策略和 canonical contract。
 
-跨模块前端体验和视觉系统以 [../frontend-design.md](../frontend-design.md) 为准。
+跨模块前端体验和视觉系统以 [frontend-design.md](frontend-design.md) 为准。
 
 跨模块事件路由、后台任务和订阅集注入以 [agent-runtime-module.md](agent-runtime-module.md) 为准。
 

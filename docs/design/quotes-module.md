@@ -6,20 +6,20 @@
 
 ## 一句话定位
 
-**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，**腾讯**作为 TDX 实时行情 fallback（兼 BJ 实时主路径），**Eastmoney** 作 BJ universe 枚举 + K 线 / 分时 / 日线兜底（不参与实时报价）；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
+**市场数据本地读模型**：后台任务以 **TDX 为主源**持续补数据，**腾讯**作为 TDX 实时行情 fallback（兼 BJ 实时主路径），**Eastmoney** 作 BJ universe 枚举 + K 线 / 日线兜底（不参与实时报价）；**TuShare 仅在 token 配置且健康检查通过时**作 enrich 补充（`daily_basic`、公司事件、交易日历校准）。对外读取只访问本地 `MARKET_SNAPSHOT`、cache 和读模型。
 
 远端 provider 是 Quotes 内部实现细节，不暴露给对外读取 API。
 
 ### 数据主源原则
 
-1. **TDX 是 Quotes 数据的主源**：universe / 实时行情 / 日 K / 周 K / 月 K / 分钟 K / 分时 / xdxr 除权数据 全部从 TDX 直接获取。
+1. **TDX 是 Quotes 数据的主源**：universe / 实时行情 / 日 K / 周 K / 月 K / 分钟 K / xdxr 除权数据 全部从 TDX 直接获取。分时（intraday）属于原始规划能力；第一阶段暂缓产品化、前端隐藏，不纳入验收。
 2. **本地基于 TDX xdxr 自算复权**：日 / 周 / 月 K 在本地存 unadjusted；`qfq` / `hfq` 由本地 xdxr 事件按需 in-memory 计算，不依赖 TuShare adj_factor。
 3. **TuShare 是 enrich，不是主源**：仅当 token 配置且 `TushareHealthState.isAvailable = true` 时，才向 TuShare 拉取 universe enrich（行业 / 上市状态 / 基金分类等）、`daily_basic`、公司事件、交易日历校准。
 4. **TuShare 不可用必须降级而非失败**：token 缺失或健康检查失败时，Quotes 仍能正常提供 TDX 路径的全部能力；只是对应 enrich 字段为空，相应 series 带 freshness warning。
 
 契约强度：
 
-- `MarketInstrument`、`MarketQuoteSnapshot`、K 线 / 分时 / 基本面 / 公司事件读模型、`list_market`、`fetch_data`、`scan_market` 是 `Spec-as-source`。
+- `MarketInstrument`、`MarketQuoteSnapshot`、K 线 / 分钟 K / 基本面 / 公司事件读模型、`list_market`、`fetch_data`、`scan_market` 是 `Spec-as-source`。分时读模型是原始规划能力的占位 / 实验路径，不纳入第一阶段产品验收。
 - provider fallback 顺序、后台刷新频率是 `Spec-anchored`。
 - 新增市场研究能力必须先扩展本 spec 或单独新增模块 spec，不能塞进现有统一读取接口。
 
@@ -33,7 +33,7 @@ Quotes 负责：
 
 - 维护股票 / 指数 / 场内基金的统一标的 universe。
 - 维护实时行情 snapshot。
-- 维护日 / 周 / 月 K、分钟 K、分时、技术指标所需的本地读模型。
+- 维护日 / 周 / 月 K、分钟 K、技术指标所需的本地读模型；保留分时读模型占位与实验实现，第一阶段产品入口暂缓开放。
 - 维护 `daily_basic` 和公司事件的本地读模型。
 - 提供统一行情读取和扫描能力。
 - 提供扫描能力：涨跌幅、成交额、成交量、量比、PE/PB、市值等。
@@ -57,7 +57,7 @@ Quotes 不负责：
 | `MarketQuoteSnapshot` | 某个标的的行情快照 | `ts_code` |
 | `KlineSeries` | 日 / 周 / 月 OHLCV 序列 | `(ts_code, period, adjust)` |
 | `MinuteKlineSeries` | 1m/5m/15m/30m/60m OHLCV 序列 | `(ts_code, period)` |
-| `IntradaySeries` | 当日分时价格线 | `(ts_code, trade_date)` |
+| `IntradaySeries` | 当日分时价格线（规划能力；第一阶段 UI 隐藏 / Agent 不主动使用） | `(ts_code, trade_date)` |
 | `DailyBasic` | 每日估值 / 换手 / 市值基础指标 | `(ts_code, trade_date)` |
 | `CompanyEvent` | 分红、停复牌、ST、业绩预告、解禁等公司动作 | `id` |
 | `ScanResult` | 基于本地行情和基本面的筛选结果 | 查询派生 |
@@ -232,7 +232,9 @@ K 线和分时是 Quotes 的本地读模型，不是 provider 原始数据直出
 - 分时点：`(tsCode, tradeDate, time)` 唯一。
 - 本地读模型必须记录 source / fetchedAt；对外 K 线、分钟 K 和分时都通过 series-level `freshness` 暴露统一 freshness。
 
-> **分时（intraday）当前已下线（descoped）**。原因：实测当前 TDX 服务器池返回的 `minute_time`（`get_minute_time_data` / cmd 0x051d）响应为**非标准格式** —— body 在 `num` 之后回显了请求的 6 位 code，且 per-point 字节结构与 pytdx/mootdx 假设的 `(price, reversed1, vol)×N` 不一致（前 2 个点能解出正确价，第 3 点起 varint 失步）。pytdx/mootdx 在该服务器上同样无法可靠解码。分时是 nice-to-have，不属于研究 / 模拟核心（K 线 / 报价 / 资讯不受影响），故前端移除「分时」tab、不再展示。后端 `refresh_intraday` / `IntradaySeries` 读模型代码保留为 dormant，待将来找到返回标准格式的服务器或完成专项逆向再启用。`ChartPeriod` 仍保留 `"intraday"` 变体但 UI 不可达。
+> **分时（intraday）是原始规划能力，但第一阶段暂缓产品化 / 前端隐藏**。原因：实测当前 TDX 服务器池返回的 `minute_time`（`get_minute_time_data` / cmd 0x051d）响应为**非标准格式** —— body 在 `num` 之后回显了请求的 6 位 code，且 per-point 字节结构与 pytdx/mootdx 假设的 `(price, reversed1, vol)×N` 不一致（前 2 个点能解出正确价，第 3 点起 varint 失步）。pytdx/mootdx 在该服务器上同样无法可靠解码。分时是有价值的行情视图，但不是研究 / 模拟交易第一阶段的核心依赖（K 线 / 报价 / 资讯不受影响），故前端暂不展示「分时」tab。后端可保留 `refresh_intraday` / `IntradaySeries` 作为规划能力的实验实现，待找到稳定 provider / 完成解码验证后，再通过 spec 明确 UI、Agent 和验收口径后开放。`ChartPeriod` 可保留 `"intraday"` 变体但 UI 不可达。
+>
+> 第一阶段产品契约：前端不展示「分时」tab；Agent / 业务工具不主动请求 `include.intraday`；验收标准不要求分时可用。`refresh_intraday` / `IntradaySeries` 若存在，属于暂未开放的规划能力 / 实验路径，不得作为行情 / 交易 / Agent 判断的必要依赖。
 
 ### 本地复权计算（基于 TDX xdxr）
 
@@ -535,7 +537,7 @@ type TushareHealthState = {
 
 - 所有 TuShare 路径（universe enrich、`daily_basic`、公司事件、交易日历校准）调用前必须 check `isAvailable`；为 `false` 时跳过 TuShare 调用，走本地 / TDX 路径并在对应 series / item 返回适用 warning。
 - 健康状态变更（`true ↔ false`）**第一阶段只维护内部 state（`TushareHealthState`），不 emit 跨模块事件、不在前端暴露 `providerStatus`；数据缺失通过 `fetch_data` 的 warning（如 `daily_basic_missing` / `events_missing`）反映**。未来如需在设置 / 诊断页展示健康状态，再补 `quotes-provider-health` 事件（事件名 / payload 由 [agent-runtime-module.md](agent-runtime-module.md) 协调）。
-- 健康检查失败不得影响 TDX / 腾讯 / Eastmoney（universe + K线/分时）任何路径的可用性。
+- 健康检查失败不得影响 TDX / 腾讯 / Eastmoney（universe + K线）任何路径的可用性。
 
 ---
 
@@ -587,11 +589,11 @@ Quotes 对外暴露以下读取 command：
 | Command | 用途 | 读取路径 |
 |---|---|---|
 | `list_market` | 股票 / 指数 / 场内基金全列表，可选携带实时行情摘要 | `MarketInstrument` 本地读模型 + `MARKET_SNAPSHOT` |
-| `fetch_data` | 按 `tsCodes` 读取行情、K 线、分时、分钟 K、详情、基本面、公司事件 | 本地 snapshot / cache / DB |
+| `fetch_data` | 按 `tsCodes` 读取行情、K 线、分钟 K、详情、基本面、公司事件；分时字段为暂缓开放的规划能力 | 本地 snapshot / cache / DB |
 | `scan_market` | 从本地 universe 扫描候选标的，返回轻量排名结果 | 本地 snapshot / `daily_basic` / K 线派生数据 |
 | `market_breadth` | 全市场涨跌家数 + 涨停 / 跌停统计 | 本地 snapshot / `quote_close_snapshot` |
 | `industry_heatmap` | 按行业聚合的涨幅 top N 卡片 | 本地 snapshot / `quote_close_snapshot` |
-| `ensure_chart_data` | 前端切换标的 / 周期时，DB 空就触发后端拉一份 | 触发 `refresh_klines` / `refresh_minute_klines` / `refresh_intraday` |
+| `ensure_chart_data` | 前端切换标的 / 周期时，DB 空就触发后端拉一份 | 触发 `refresh_klines` / `refresh_minute_klines`；`intraday` 分支为暂缓开放的规划能力 |
 | `extend_chart_history` | 前端 K 线图左拉到尽头时扩展更深历史 | 触发 `refresh_klines_extended(target_days)` |
 | `refresh_quotes` | 前端驱动的实时报价 pull（可见 ∪ 自选 ∪ 指数 ∪ 选中 取并集后按 ~3s 节奏调用） | 内部委托 `refresh_market_quotes({ scope: manual })`，写 in-memory snapshot |
 
@@ -705,7 +707,7 @@ type FetchDataResponse = {
 - 名称模糊搜索必须走 `list_market({ query })`；`fetch_data` 不做名称匹配，避免详情读取出现多义结果。
 - `include` 缺失时默认等同于 `{ profile: true, quote: true }`。
 - `include.klines` / `include.minuteKlines` 只返回调用方请求的周期；未请求的周期 key 不出现在响应中，不能用空数组伪装为“已请求但无数据”。
-- `include.intraday = true` 只返回一个交易日的 `IntradaySeries`：交易时段内为 `currentTradeDate`，非交易时段为 `latestCompletedTradeDate`。多日分时不属于当前 `fetch_data` 契约；如需扩展必须先调整响应 DTO。
+- `include.intraday = true` 属于暂缓开放的规划能力：若本地已有对应交易日 `IntradaySeries` 可以返回；第一阶段 UI / Agent 不应传该字段，缺分时不构成产品错误。是否允许该读取路径触发远端刷新，需等分时 provider / decoder 稳定后在本 spec 明确。
 - `include.klines` 默认优先返回 `adjust = "qfq"`；缺少 qfq 时可降级为 `adjust = "none"`，必须在对应 `KlineSeries.warnings` 和 item `warnings` 返回 `using_unadjusted_kline`。
 - `include.quote = true` 时，如果 snapshot 缺失，`quote` 为空并返回 `quote_missing` warning。
 - `include.quote = true` 时，必须返回 `quoteFreshness`；有可用 `quote` 时它与 `quote.freshness` 语义一致，`quote` 为空时它承载缺失 / 过期原因。
@@ -825,7 +827,7 @@ ensure_chart_data(ts_code: TsCode, period: ChartPeriod): Promise<void>
   - 代价 / 边界：若用户在后台分页跑完前离开详情页，DB 不保证有该 ts_code 的全量历史。需要全量历史的场景（盘后扫描 / agent 长周期分析）由调度路径 `refresh_klines` / `refresh_klines_extended(history_days > 800)` 保证，不依赖 `ensure_chart_data` 这一次前台触发。
   - `refresh_klines_full`（一次性分页全量）仍保留实现（`service.rs::refresh_klines_full`），供需要"同步落全量"的调用方（如显式补段）使用，但**不是** `ensure_chart_data` 的默认路径。
 - `period ∈ {1m, 5m, 15m, 30m, 60m}` → `refresh_minute_klines(...)`（同步全量当日 catch-up）。
-- `period == intraday` → `refresh_intraday(...)`（分时已 descope，dormant）。
+- `period == intraday` → 第一阶段 UI 不可达；后端 `refresh_intraday(...)` 分支属于暂缓开放的规划能力 / 实验实现。
 - 已有数据时也会重新拉首屏（upsert 幂等，PK = `(ts_code, period, adjust, trade_date)`）；UI 调用方决定何时触发。
 - 首屏页失败由底层 abort 并返回 `Err`（partial 落库无意义）；前端后台分页的单页失败不影响首屏。
 
@@ -934,7 +936,7 @@ core_indexes() -> Vec<TsCode>;
 Provider reference：
 
 - [TDX](references/quotes/tdx.md)
-- [Eastmoney](references/quotes/eastmoney.md) — 仅 BJ universe + K 线 / 分时 / 日线兜底，不参与实时报价
+- [Eastmoney](references/quotes/eastmoney.md) — 仅 BJ universe + K 线 / 日线兜底，不参与实时报价
 - [TuShare](references/quotes/tushare.md)
 - [Tencent](references/quotes/tencent.md) — 实时行情唯一 HTTP fallback + BJ 实时主路径
 
@@ -942,7 +944,7 @@ Provider reference：
 
 - 本 spec 定义 provider 选择策略和 canonical contract。
 - 具体连接方式、字段映射、单位转换、timeout、retry 写在 provider reference。
-- 所有 provider 输出必须 normalize 到 `MarketInstrument`、`StockQuote`、K 线 / 分钟 K / 分时读模型行、`DailyBasic` 或 `CompanyEvent`，对外由对应 series DTO 暴露。
+- 所有 provider 输出必须 normalize 到 `MarketInstrument`、`StockQuote`、K 线 / 分钟 K 读模型行、`DailyBasic` 或 `CompanyEvent`，对外由对应 series DTO 暴露；分时 normalize 属于暂缓开放的规划能力路径。
 - Provider 失败默认是 item / batch 级 partial failure，不改变对外读取契约。
 - 当前 provider 集合：TDX / 腾讯 / Eastmoney / TuShare（**Sina 已于 2026-06-01 移除**）。后续可以继续扩展 provider，但新增 provider 必须先补 reference 文档，并 normalize 到本 spec 的 canonical model。
 
@@ -966,7 +968,7 @@ TDX > 腾讯
 
 - TDX 是 SH / SZ 实时报价主路径。
 - **腾讯是唯一的 HTTP 实时行情 fallback**（TDX 失败 / 缺字段时），也是 **BJ 实时报价主路径**（BJ 不走 TDX，直接腾讯）。腾讯实测覆盖股票 / 指数 / 场内基金 / BJ，含五档盘口 + 换手率 + 成交额，价格为真值（无缩放问题）。
-- **Eastmoney 不参与实时报价**：EM 的 push2 `stock/get` 价格按 `10^f59` 缩放（实现曾硬编码 `/100`，对 3 位小数 ETF 产生 10× 错价），且其五档字段映射 / BJ secid 前缀无法在受限环境实测确认。为「避免数据源错误」，EM 退出实时报价路径，仅保留它不可替代 / 低风险的角色：**BJ universe 枚举** + **K 线 / 分时 / 日线兜底**（这些走 CSV 真值解析，不受 f59 缩放影响）。
+- **Eastmoney 不参与实时报价**：EM 的 push2 `stock/get` 价格按 `10^f59` 缩放（实现曾硬编码 `/100`，对 3 位小数 ETF 产生 10× 错价），且其五档字段映射 / BJ secid 前缀无法在受限环境实测确认。为「避免数据源错误」，EM 退出实时报价路径，仅保留它不可替代 / 低风险的角色：**BJ universe 枚举** + **K 线 / 日线兜底**（这些走 CSV 真值解析，不受 f59 缩放影响）。
 - **Sina 已移除**（2026-06-01）：字段严格弱于腾讯（无盘口、无换手、exchange_time 解析依赖末位字段而实际 date/time 在固定索引、status 字段尾随导致恒失败），且只在腾讯也失败时才轮到的末位冗余，价值不足以维护。
 - fallback 选择以单个 provider 的完整 normalized quote 为单位；默认不做跨 provider 字段拼接。若未来引入 field-level merge，必须显式标记 `source = "mixed"` 并提供字段来源审计。
 - quote 写入 snapshot 前先判断该 provider 输出是否满足当前用途的必需字段：展示至少需要 `price/tradeDate/capturedAt`，成交模拟还需要可用买一 / 卖一盘口。多个 provider 同时可用时，先比较 eligible trade date 和 freshness，再比较字段完整度，最后按 `TDX > 腾讯` tie-breaker。
@@ -1022,15 +1024,15 @@ TDX > Eastmoney
   - skip 路径不计入 `total`，保留 `success + failed == total` 不变量。
 - 跨日切换时不主动清理旧分钟 K；读取按 `ts_ms` 自然排序、按调用方 `limit` 取最近的 N 点即可。
 
-分时：
+分时（规划能力；第一阶段隐藏 / 暂缓产品化）：
 
 ```text
 TDX (minute_time 0x0fb4) > Eastmoney
 ```
 
-- TDX `minute_time` 协议返回当日 240 点分时（09:30–14:59，每分钟一点），覆盖连续竞价段；**不含**集合竞价（09:15–09:25 / 14:57–15:00）。集合竞价价格由 `MARKET_SNAPSHOT` 的实时 quote 单独承载，不进 `IntradaySeries`。
-- Eastmoney 仅作 TDX 失败 / BJ 的 fallback。
-- 分时只返回一个交易日的 `IntradaySeries`，与 §4 `fetch_data` 契约一致。
+- 本段描述分时的规划目标和当前实验路径，不作为第一阶段验收标准。
+- 前端不展示「分时」tab；Agent / 业务工具不主动请求 `include.intraday`；缺分时不得影响 K 线、报价、资讯、账户或 Agent 决策链。
+- 若专项调试启用：TDX `minute_time` 协议理论返回当日分时点；Eastmoney 可作为 fallback。但当前 TDX 服务器池实测响应非标准，不能把该路径作为可靠产品能力。
 
 基本面 / 公司事件 / 交易日历：
 
@@ -1074,7 +1076,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 | 实时行情（背景基线） | **唯一后台报价任务 = universe 滚动刷新**：把全市场切 80 只/批，**按固定周期（默认 30s，可配 10–60s）滚动轮刷**——每 ~`cycle/批数` 推一批、每只每 `cycle` 轮到一次（不再"每 60s 一次性全量扫"的锯齿）。只在 `is_in_quote_refresh_window` 内跑、占 ~1 连接、负载平滑。职责：屏外行 / 全列表排序基线 / **headless（agent 无前端）兜底**。每批 emit `market-quotes-refresh-progress` 驱动前端增量更新。读取 freshness 按 `detail = 30s`、`universe = 90s` 判断 stale |
 | 实时行情（聚焦按需）| **前端驱动 pull：`refresh_quotes(tsCodes)`**（见 §4 前端 pull 命令 `refresh_quotes`）。前端把「可见 ∪ 自选 ∪ 核心指数 ∪ 选中」**取并集去重**后按自身节奏（~3s）调它 → 后端 TDX batch 拉这些 → 写 in-memory snapshot → emit progress。前端取并集后 **cap ~120**（超出按 `account（自选+持仓） > selected（选中） > indices（核心指数） > market（可见列表）` 优先级截断，保证最关心的不被列表头挤掉；实现锚 `src/lib/quotePull.ts`）。这是用户**实际在看**的那一小撮的实时路径（替代原 hot/subscribed 档与 hotset 机制）。agent / account pipeline 下单前也可调同一 use case 取即时报价。**新鲜度跳过**：`refresh_quotes` 对 cache 内 `capturedAt` 仍很新（< ~1.5s）的 code 跳过不重拉，天然去重 + 限流（无需 in-flight 合并队列）|
 | 收盘快照 | 收盘后执行全市场 quote refresh，写入 `tradeDate = latestCompletedTradeDate` 的最终行情；失败时可低频重试直到获得最新已完成交易日快照，不做整夜持续刷新 |
-| K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；TDX 单次根数不够且 TuShare 可用时按需扩展长历史段 |
+| K 线（unadjusted） | 启动后预热关注标的；盘后 16:00 走 TDX 补日 / 周 / 月；更深历史走 TDX 分页 `refresh_klines_full`，不调 TuShare |
 | xdxr 事件 | 启动后预热关注标的；盘后随 K 线刷新一同补拉，按 `tsCode` 幂等 |
 | `daily_basic` | 每个交易日盘后刷新，仅在 `TushareHealthState.isAvailable = true` 时触发；不可用时跳过并保留上次结果 |
 | `company_events` | 每日低频刷新，覆盖未来 N 天事件窗口；仅在 `TushareHealthState.isAvailable = true` 时触发 |
@@ -1086,7 +1088,7 @@ Quotes 提供 refresh use case；触发节奏和 scope 由模块外运行时传�
 - **`is_in_quote_refresh_window`**：universe 滚动刷新的节奏判据 = **连续竞价 + 每个 session 收盘后 30min 尾窗**，即交易日的 **09:30–12:00 ∪ 13:00–15:30**（北京时）。窗内才滚动刷新并写 in-memory snapshot（读路径照常服务最新 snapshot），以捕获收盘后稍晚落定的最终价、并让行情不在 11:30 / 15:00 整点冻结。与 `is_trading_time`（可交易性）解耦——尾窗内**不**可交易、Account 仍 fail closed。15:30 收盘快照 / 16:00 K 线预热不变。前端 `refresh_quotes` pull **不受**此窗限制（用户任何时候打开都该拉到最新可得快照；非交易时段拉到的即当日/最近已完成交易日事实）。
 
 - **冷启动 universe burst 首刷**：启动 catch-up 在刷新窗内**先跑一次性全量 universe burst**（用满连接池 ~2.5s 填满全市场），**之后转入 30s 滚动稳态**。burst 解决"冷启动全列表填充快"，滚动解决"稳态平滑、不占满连接"。与 close-snapshot catch-up（仅非刷新窗 / 快照不全时补最新已完成交易日收盘）互补、不重复。
-- **`is_in_trading_session`**：是否处于**分时 / 分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_intraday` / `refresh_minute_klines` 的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
+- **`is_in_trading_session`**：是否处于**分钟 K 数据可能变化的时段**（09:15 集合竞价开始 ~ 15:00 收盘集合竞价结束），用于 `refresh_minute_klines`（以及暂缓开放的 `refresh_intraday` 实验路径）的盘前 / 盘后 guard。15:00:00 整点视为**仍在 session 内**（避免与最后一个分钟 K bar 写入冲突）。
 
 规则：
 
@@ -1149,7 +1151,7 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 规则：
 
 - 若接入这些 provider adapter，必须走独立读取能力，例如 `fetch_market_research`，或新增单独模块 spec。
-- `fetch_data` 只承载本 spec 定义的行情、K 线、分时、指标、基础估值和公司事件。
+- `fetch_data` 只承载本 spec 定义的行情、K 线、分钟 K、指标、基础估值和公司事件；分时字段属于暂缓开放的规划能力。
 - `scan_market` 只承载本 spec 定义的本地行情 / 基本面扫描。
 - 研究扩展能力不能改变 `MarketInstrument`、`MarketQuoteSnapshot`、`DailyBasic` 的核心语义。
 - 研究扩展能力返回的 provider 原始字段必须 normalize 到独立 canonical model，不能临时扩展 `StockQuote` 或 `DailyBasic` 的核心 DTO。
@@ -1161,8 +1163,8 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 - 股票 / 指数 / 基金 universe 统一建模为 `MarketInstrument`；实现中不新增互不兼容的平行主模型。
 - `list_market`、`fetch_data` 和 `scan_market` 是读取 quotes 的统一入口。
 - 对外读取路径默认不直接请求 TDX / EM / TuShare / 腾讯。
-- TDX 是 Quotes 数据主源；腾讯是 TDX 实时行情 fallback；Eastmoney 作 BJ universe + K线/分时/日线兜底；TuShare 仅在 `TushareHealthState.isAvailable = true` 时作为 enrich 调用。
-- TuShare token 缺失 / 健康检查失败时，Quotes 仍能基于 TDX 提供 universe、实时行情、K 线、xdxr、复权、分时、分钟 K 的完整能力；只是 `daily_basic` / 公司事件 / TuShare-only 字段为空。
+- TDX 是 Quotes 数据主源；腾讯是 TDX 实时行情 fallback；Eastmoney 作 BJ universe + K线/日线兜底；TuShare 仅在 `TushareHealthState.isAvailable = true` 时作为 enrich 调用。
+- TuShare token 缺失 / 健康检查失败时，Quotes 仍能基于 TDX 提供 universe、实时行情、K 线、xdxr、复权、分钟 K 的完整能力；只是 `daily_basic` / 公司事件 / TuShare-only 字段为空。分时第一阶段隐藏 / 暂缓产品化，不纳入完整能力承诺。
 - `qfq` / `hfq` K 线在本地基于 TDX xdxr 现算，不依赖 TuShare `adj_factor`。
 - 进程启动时执行 cold-start seed（`BUILTIN_INSTRUMENTS`），保证 UI 第一帧非空。
 - `list_market({ includeQuote: true })` 只读取 `MarketInstrument` 本地读模型 + `MARKET_SNAPSHOT`，缺实时字段时 `quote` 为空，不触发远端补拉。
@@ -1173,7 +1175,7 @@ Quotes 拥有默认 headline 核心指数集合，并通过 `core_indexes()` 暴
 - `market_breadth` 仅统计 `category == stock`；涨停 / 跌停判定与 `compute_limit_band` 阈值一致（主板 10% / 创业板 / 科创板 20% / 北交所 30% / ST 5%）。
 - `industry_heatmap` 按 `MarketInstrument.sector` 聚合 stock 标的；sector 缺失 / 空串归入"未分类"且不参与 top 列表。
 - `MARKET_SNAPSHOT` item 带 `category/tradeDate/capturedAt/source`，对外 freshness 由 query facade 派生；breadth 只统计 `category == stock`。
-- 分钟 K / 分时通过 series-level freshness 表达，不在每个点位重复 freshness。
+- 分钟 K 通过 series-level freshness 表达，不在每个点位重复 freshness；分时作为暂缓开放的规划能力也必须沿用 series-level freshness。
 - K 线读取必须使用 `TsCode`；已知 `ts_code` 必须贯穿到 provider/cache。
 - `DailyBasic` 和 `CompanyEvent` 由本地读模型读取，远端拉取只发生在后台刷新 / 显式 refresh 路径。
 - 所有批量返回都是 per-item warning/error；单个标的缺数据不让整批失败。

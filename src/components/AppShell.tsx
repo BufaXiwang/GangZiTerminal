@@ -4,7 +4,8 @@
 //
 // 提供 main-scroll 容器；页面 PageShell 渲染在 main-scroll 内部。
 
-import { useEffect, type ReactNode } from "react";
+import { useCallback, useEffect, type ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Sidebar } from "./Sidebar";
 
 interface AppShellProps {
@@ -12,8 +13,6 @@ interface AppShellProps {
 }
 
 export function AppShell({ children }: AppShellProps) {
-  // 屏蔽 WebView 原生右键菜单（后退/重载/检查）——改由各列表自定义浮层接管。
-  // 例外：输入框 / 文本域 / contenteditable 保留原生菜单（复制粘贴）。
   useEffect(() => {
     const onContextMenu = (e: MouseEvent) => {
       const t = e.target as HTMLElement | null;
@@ -24,8 +23,15 @@ export function AppShell({ children }: AppShellProps) {
     return () => document.removeEventListener("contextmenu", onContextMenu);
   }, []);
 
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    if ((e.target as HTMLElement).closest("button, a, input, select")) return;
+    e.preventDefault();
+    void getCurrentWindow().startDragging();
+  }, []);
+
   return (
     <div className="app-shell">
+      <div className="app-drag-region" onMouseDown={onDragStart} />
       <Sidebar />
       <div className="main-content">
         <div className="main-scroll">{children}</div>

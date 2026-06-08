@@ -8,8 +8,7 @@
 //! - `agent_fetch_state`：总览快照（active 策略 + 最近 runs + 最近 AnalysisResults）。
 //! - `agent_fetch_strategy` / `agent_upsert_strategy`：投资策略读 / 写（写仅经对话用户确认，§3）。
 //!
-//! `cancel_agent_run` / `list_review_reports` / `set_circuit_breaker` 待取消令牌 / review fork /
-//! 熔断状态接线后补（见 §WP2 余 / §WP3）。
+//! `cancel_agent_run` / `list_review_reports` 待取消令牌 / review fork 接线后补（见 §WP2 余 / §WP3）。
 
 use std::sync::Arc;
 
@@ -107,8 +106,6 @@ pub struct FetchStateInclude {
     pub messages: Option<bool>,
     #[serde(default)]
     pub tool_calls: Option<bool>,
-    #[serde(default)]
-    pub circuit_breaker: Option<bool>,
 }
 
 /// spec §9 `FetchAgentStateRequest = { include?; limit?; offset? }`。
@@ -125,7 +122,7 @@ pub struct FetchStateInput {
 
 /// Agent 总览快照（按 `include` 选择器返回各段；未选的省略）。
 ///
-/// 未传 `include` → 默认返回 strategy + runs + analysisResults + circuitBreaker（向后兼容）。
+/// 未传 `include` → 默认返回 strategy + runs + analysisResults（向后兼容）。
 #[tauri::command]
 #[specta::specta]
 pub fn agent_fetch_state(
@@ -141,7 +138,6 @@ pub fn agent_fetch_state(
             trades: sel.trades.unwrap_or(false),
             messages: sel.messages.unwrap_or(false),
             tool_calls: sel.tool_calls.unwrap_or(false),
-            circuit_breaker: sel.circuit_breaker.unwrap_or(false),
         },
         None => StateInclude::default(),
     };
@@ -366,28 +362,6 @@ pub fn agent_list_review_reports(
         }
     }
     Ok(reports)
-}
-
-// ---------------------------------------------------------------- 熔断
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-#[serde(rename_all = "camelCase")]
-pub struct SetCircuitBreakerInput {
-    /// true = 解除/恢复熔断（恢复自动下单）。熔断只由系统自动触发，用户只能解除——无手动激活路径。
-    pub resume: bool,
-    /// 操作理由（审计）。
-    pub reason: String,
-}
-
-/// 解除/恢复熔断（spec §9：`resume=true` 解除，须对话确认；不自动解除）。返回新熔断状态。
-#[tauri::command]
-#[specta::specta]
-pub fn agent_set_circuit_breaker(
-    services: State<'_, Arc<RuntimeServices>>,
-    input: SetCircuitBreakerInput,
-) -> Result<bool, CommandError> {
-    tracing::info!(target: "runtime.circuit_breaker", resume = input.resume, reason = %input.reason, "set circuit breaker");
-    Ok(services.set_circuit_breaker(input.resume))
 }
 
 // ---------------------------------------------------------------- news 自动分析开关

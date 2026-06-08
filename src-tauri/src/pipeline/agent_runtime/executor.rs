@@ -316,8 +316,6 @@ mod tests {
             strategy: Arc::new(StrategyService::new(repo.clone())),
             records: Arc::new(RecordService::new(repo.clone())),
             persist: None,
-            risk: crate::pipeline::agent_runtime::risk::RiskConfig::default(),
-            circuit_breaker: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operate_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }

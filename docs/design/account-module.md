@@ -1147,7 +1147,7 @@ Error code 规则：
 - stale / missing quote 不得触发成交；pending 订单保持 pending 并等待下一次 fresh quote。
 - `tradeStatus = "halted"` 时即时成交类动作必须返回 `instrument_suspended`；`tradeStatus = "closed"` 或非交易时段即时成交必须返回 `outside_trading_session`。
 - 买入遇到涨停且卖盘不可成交、卖出遇到跌停且买盘不可成交时，新提交的即时成交类命令必须返回 `accepted = false` / `limit_up_down_blocked`；既有 pending limit 订单评估时保持 pending，不写成交事件。若 `limitUp` / `limitDown` 缺失导致无法判断，返回或记录 `quote_price_missing`。
-- 盘口量不足时允许部分成交，剩余数量保持 pending；部分成交只写 `order_partially_filled` / `position_scaled` 等账户事件并 emit `account-updated`，不创建 `AccountTrigger`，也不 emit `account-triggered`。
+- 盘口量不足时允许部分成交，但市价单和限价单的剩余量语义不同：`market` 订单部分成交后剩余数量立即自动取消，`partially_filled` 是终态，并同步写 `order_cancelled` 表达剩余取消；`limit` 订单部分成交后剩余数量继续保持 pending，可继续撮合 / 撤单 / 过期。部分成交只写 `order_partially_filled` / `position_scaled` 等账户事件并 emit `account-updated`，不创建 `AccountTrigger`，也不 emit `account-triggered`。
 - 过期订单变为 `expired`，并释放冻结现金 / 冻结持仓。
 - 评估大量订单 / 仓位时必须分批处理；每 tick 最多处理 `account_trigger_eval_batch_size` 条，结果返回 `has_more` / `next_cursor` 供下次继续。
 - 批处理顺序必须稳定：先 pending orders，再 open positions；同一类按 `updated_at asc` / `created_at asc` 排序。

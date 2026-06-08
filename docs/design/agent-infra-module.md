@@ -44,7 +44,7 @@ canonical request
 
 ## 术语：Tool vs Skill（已统一）
 
-> **本模块的"可注册原语"在产品里的 canonical 名是 Tool。** 命名已统一——本文档全文用 `Tool*`（`ToolSpec`/`ToolCall`/`ToolRegistry`/`ToolCallParser`/`<use_tool>`/`<tool_result>`/`<tool_error>`），与 [agent-runtime-module.md](agent-runtime-module.md) 的 `Tool`/`ToolRegistry`/`AgentToolName` 一致，指**同一个机制**。两层模型：
+> **本模块的"可注册原语"在产品里的 canonical 名是 Tool。** 命名已统一——本文档全文用 `Tool*`（`ToolSpec`/`ToolCall`/`ToolRegistry`/`ToolCallParser`/`<use_tool>`/`<tool_result>`/`<tool_error>`），与 [agent-runtime-module.md](agent-runtime-module.md) 的 `Tool` / `ToolRegistry` 一致，指**同一个机制**。两层模型：
 >
 > - **Tool（原语）** = 注册进 registry 的可调用能力（name + input schema + handler），in-process、结构化、经文本协议调用。本文档（Infra 层）只定义此层的注册 / 调用 / 审计机制。
 > - **Skill（playbook）** = 模型驱动的 `SKILL.md` 说明书，编排若干 tool 完成任务，**不是注册 handler**；子系统（SkillStore + 存盘 + fork 执行）归 Infra，playbook 内容由产品 / 人编写，**初始为空**。详见 §3.6（Skill 子系统）。
@@ -232,7 +232,7 @@ type ToolRegistrySnapshot = {
 规则：
 
 - Infra 只定义注册协议，不规定产品里必须有哪些 tool。
-- 本产品的 canonical tool name 目录 `AgentToolName` 定义在 §3.6（通用 tool 来自 Infra，领域 tool 由 Runtime §4 注入并登记到此目录）。
+- Infra 不维护本产品的全局 tool name 目录；tool name 在 `ToolRegistry` 中以 opaque `ToolName` 注册。Infra 默认 tool 名见 §3.6 `InfraToolName`，Runtime 领域 tool 名见 [agent-runtime-module.md §4](agent-runtime-module.md#4-工具)。
 - Runtime 决定每类 run 的 enabled tools，把对应 `ToolSpec` 注册进本次 loop。
 - `sideEffect = "trading_write"` 的 tool 必须由 Runtime 显式允许，Infra 默认不得注册到非交易 run。
 - 同名 tool 只能注册一次；重复注册必须 fail closed。
@@ -560,7 +560,7 @@ type SubAgentTask = {
 
 ## 3.6 Infra 默认 Tools + Skill 子系统（业务无关，Infra 注册）
 
-> **归属澄清**：以下通用 tool 与 skill 子系统**全部由 Infra 默认注册、属 Infra 层**（业务无关，代码在 `infrastructure/agent/`，bootstrap 时注册）。**Runtime 不拥有、不重复定义**——Runtime 只负责：触发 Agent、**注入领域 tool**（fetch_quotes / operate_account 等）、联合不同 domain。`AgentToolName`（本产品全部 tool 名的目录）定义在本节末（下方 `AgentToolName` 小节），其中**通用部分来自 Infra，领域部分由 Runtime §4 注入并登记**。
+> **归属澄清**：以下通用 tool 与 skill 子系统**全部由 Infra 默认注册、属 Infra 层**（业务无关，代码在 `infrastructure/agent/`，bootstrap 时注册）。**Runtime 不拥有、不重复定义**——Runtime 只负责：触发 Agent、**注入领域 tool**（fetch_quotes / operate_account 等）、联合不同 domain。Infra 只定义 `ToolRegistry` / `ToolSpec` / 调用审计 / spawn-class 等通用协议，以及 Infra 自己默认注册的 tool 名；Runtime 的领域 tool 名和 schema 只定义在 [agent-runtime-module.md §4](agent-runtime-module.md#4-工具)。Infra 不维护“全产品工具枚举”，对 Runtime 注入的 tool name 只按已注册的 opaque `ToolName` 处理。
 
 Infra 默认注册的通用 tool：
 
@@ -620,7 +620,7 @@ type RunSkillToolOutput = { name: string; result: string };   // 只回子 run �
 type RunSubagentToolInput = {
   description: string;        // 一句话任务描述（进子 agent 任务注册表）
   prompt: string;            // 子 agent 的任务 prompt
-  tools?: AgentToolName[];   // 可选：收紧子工具集（默认继承父；spawn-class 一律剔除）
+  tools?: ToolName[];        // 可选：收紧子工具集（默认继承父；spawn-class 一律剔除）
   runInBackground?: boolean; // true=异步后台跑，立即返回 agentId；缺省 false=前台阻塞
 };
 type RunSubagentToolOutput = {
@@ -630,20 +630,21 @@ type RunSubagentToolOutput = {
 // 错误：invalid_input / 子 run 失败透传
 ```
 
-#### `AgentToolName`（本产品全部 tool 名目录）
+#### `ToolName` / `InfraToolName`
 
 ```ts
-type AgentToolName =
-  // ── Infra 默认提供（业务无关，本节定义）──────────────
+// ToolName 是 ToolRegistry 里的已注册 tool 名，Infra 对 Runtime 注入的领域名保持 opaque。
+// 领域 tool 名与 schema 由 agent-runtime-module.md §4 定义。
+type ToolName = string;
+
+type InfraToolName =
   | "read_file" | "write_file" | "edit_file" | "run_bash"
-  | "run_subagent" | "create_skill" | "run_skill"
-  // ── Runtime 注入（领域，定义见 agent-runtime-module.md §4）──
-  | "fetch_quotes" | "fetch_news" | "fetch_account"
-  | "operate_account" | "update_watchlist" | "upsert_investment_strategy";
+  | "run_subagent" | "create_skill" | "run_skill";
 ```
 
 - spawn-class（`isSpawn=true`，子 agent 内被剔除）：`run_subagent` / `run_skill`。（Runtime 当前不注入 fork 类领域工具；临时复盘复用 `run_subagent` 收紧只读，见 agent-runtime §3。`isSpawn` 机制对未来任何新增 fork 类工具仍自动生效。）
-- Runtime 新增领域 tool 必须先扩展本 union + 对应 spec；`ToolRegistry` 注册名必须取自本 union。
+- Runtime 新增领域 tool 必须先扩展 [agent-runtime-module.md §4](agent-runtime-module.md#4-工具) 或对应模块 spec，再通过 `ToolRegistry` 注册；Infra 不在本文件重复列举 Runtime tool。
+- `allowedTools` / `RunSubagentToolInput.tools` 中出现未注册 tool name 时，按 `invalid_input` 拒绝；已注册 tool 的归属由注册方 spec 负责。
 
 ---
 

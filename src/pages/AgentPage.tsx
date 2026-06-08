@@ -1,24 +1,28 @@
-// AgentPage — Agent Runtime 交互页（三栏：左 runs / 中 对话 / 右 策略 + 分析）。
+// AgentPage — Agent Runtime 交互页（两栏：左 sidebar / 中 对话+详情）。
 //
-// Spec: docs/design/agent-runtime-module.md §9 对外接口（前端：中间 chat + 右侧 AnalysisResult +
-//        左侧 runs/报告 + 投资策略面板 + 熔断状态条）
+// Spec: docs/design/agent-runtime-module.md §9 对外接口（前端：中间 chat + 左侧 sidebar
+//        含策略/复盘/runs/分析）
 //
 // 数据流（前端不持有业务真源）：
 //   - 命令：agentSendMessage（dialogue run）/ agentFetchState / agentFetchStrategy / agentUpsertStrategy
 //   - 流式：listen("agent-event") → text_delta 增量进当前 assistant 气泡
 //   - 状态推送：listen("agent-run-finished" / "agent-analysis-result") → 刷新总览
-//
-// 注：复盘报告列表 / 熔断状态条待后端 review fork + 熔断状态接线后补（见 runtime §WP2 余 / §WP3）。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { Bot, Send, User } from "lucide-react";
+import { Link, useLocation } from "react-router-dom";
+import { Bot, Send, User, X } from "lucide-react";
 import { PageShell } from "../components/PageShell";
+import { ROUTES } from "../lib/router";
+import { renderMarkdown } from "../lib/simpleMarkdown";
 import {
   commands,
+  type AgentRun,
   type AgentStateSnapshot,
+  type AnalysisResult,
   type InvestmentStrategy,
   type ReviewReportRef,
+  type StrategyHistoryEntry,
 } from "../bindings";
 
 interface ChatMsg {
@@ -28,9 +32,10 @@ interface ChatMsg {
   error?: boolean;
 }
 
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
-}
+type DetailView =
+  | { type: "analysis"; data: AnalysisResult }
+  | { type: "report"; name: string; path: string }
+  | null;
 
 const MODE_LABEL: Record<string, string> = {
   dialogue: "对话",
@@ -45,22 +50,178 @@ const STATUS_LABEL: Record<string, string> = {
   cancelled: "已取消",
 };
 
+/* ---------- inline sub-components ---------- */
+
+function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[] }) {
+  const [codeNames, setCodeNames] = useState<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    if (!data.relatedCodes?.length) return;
+    // Fetch instrument names via fetchData (supports tsCodes filter).
+    commands.fetchData({
+      tsCodes: data.relatedCodes,
+      include: { quote: false },
+      limit: null,
+    }).then(res => {
+      if (res.status === "ok") {
+        const map = new Map<string, string>();
+        for (const item of res.data.items) {
+          if (item.name) map.set(item.tsCode, item.name);
+        }
+        setCodeNames(map);
+      }
+    });
+  }, [data.relatedCodes]);
+
+  // Find related news IDs from the run's trigger (news_batch mode).
+  const relatedRun = useMemo(
+    () => runs.find(r => r.runId === data.runId),
+    [runs, data.runId],
+  );
+  const newsIds = useMemo(() => {
+    if (!relatedRun) return null;
+    const trigger = relatedRun.trigger as Record<string, unknown>;
+    if (trigger?.kind === "news_batch" && Array.isArray(trigger.news_ids)) {
+      return trigger.news_ids as string[];
+    }
+    return null;
+  }, [relatedRun]);
+
+  return (
+    <div className="agent-analysis-detail">
+      <div className="detail-field">
+        <span className="detail-label">判定</span>
+        <span className={`detail-kind kind-${data.kind}`}>
+          {data.kind === "action" ? "操作" : "观望"}
+        </span>
+      </div>
+      <div className="detail-field">
+        <span className="detail-label">摘要</span>
+        <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(data.summary) }} />
+      </div>
+      {data.relatedCodes?.length > 0 && (
+        <div className="detail-field">
+          <span className="detail-label">相关标的</span>
+          <div className="detail-codes">
+            {data.relatedCodes.map((code: string) => (
+              <Link key={code} to={ROUTES.market} className="detail-code-link">
+                {codeNames.get(code) ? `${codeNames.get(code)} ${code}` : code}
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+      {data.tradeIds?.length > 0 && (
+        <div className="detail-field">
+          <span className="detail-label">关联交易</span>
+          <span className="tabular">{data.tradeIds.join(", ")}</span>
+        </div>
+      )}
+      {/* Related news: show if trigger is news_batch */}
+      {newsIds && newsIds.length > 0 && (
+        <div className="detail-field">
+          <span className="detail-label">相关新闻</span>
+          <span className="muted" style={{ fontSize: 12 }}>
+            {newsIds.length} 条资讯触发（暂未支持跳转详情）
+          </span>
+        </div>
+      )}
+      <div className="detail-field">
+        <span className="detail-label">时间</span>
+        <span>{data.createdAt}</span>
+      </div>
+    </div>
+  );
+}
+
+function ReportDetail({ name, path }: { name: string; path: string }) {
+  return (
+    <div className="agent-report-detail">
+      <div className="detail-field">
+        <span className="detail-label">文件名</span>
+        <span>{name}</span>
+      </div>
+      <div className="detail-field">
+        <span className="detail-label">路径</span>
+        <span className="tabular" style={{ fontSize: 12, wordBreak: "break-all" }}>{path}</span>
+      </div>
+      <div className="detail-field">
+        <span className="detail-label muted" style={{ fontStyle: "italic", marginTop: 12 }}>
+          复盘报告已落盘为 Markdown 文件，可在文件系统中查看完整内容。
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function StrategyModal({
+  strategy,
+  history,
+  onClose,
+}: {
+  strategy: InvestmentStrategy | null;
+  history: StrategyHistoryEntry[] | null;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  return (
+    <div className="agent-modal-backdrop" onClick={onClose}>
+      <div className="agent-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="agent-modal-header">
+          <h2>投资策略{strategy ? ` V${strategy.version}` : ""}</h2>
+          <span className="muted" style={{ fontSize: 12 }}>
+            通过对话修改
+          </span>
+          <button className="agent-modal-close" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="agent-modal-body">
+          <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(strategy?.strategy ?? "（未设置策略）") }} />
+          {history && history.length > 0 && (
+            <div className="agent-strategy-history">
+              <h4 className="agent-strategy-history-title">版本历史</h4>
+              {history.map((h) => (
+                <div key={h.version} className="agent-strategy-history-item">
+                  <span className="tabular">V{h.version}</span>
+                  <span className="muted">{h.updatedAt}</span>
+                  <span className="muted">{h.reason}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- main page ---------- */
+
 export default function AgentPage() {
+  const [hasChannel, setHasChannel] = useState<boolean | null>(null); // null = loading
   const conversationId = useRef<string>(
-    (globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`),
+    globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`,
   );
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [state, setState] = useState<AgentStateSnapshot | null>(null);
   const [strategy, setStrategy] = useState<InvestmentStrategy | null>(null);
-  const [strategyDraft, setStrategyDraft] = useState("");
-  const [editingStrategy, setEditingStrategy] = useState(false);
-  const [savingStrategy, setSavingStrategy] = useState(false);
   const [reports, setReports] = useState<ReviewReportRef[]>([]);
   const [reviewing, setReviewing] = useState(false);
   const [newsAuto, setNewsAuto] = useState(false);
   const [togglingNewsAuto, setTogglingNewsAuto] = useState(false);
+  const [detailView, setDetailView] = useState<DetailView>(null);
+  const [strategyModalOpen, setStrategyModalOpen] = useState(false);
+  const [strategyHistory, setStrategyHistory] = useState<StrategyHistoryEntry[] | null>(null);
   const currentRunId = useRef<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -73,7 +234,6 @@ export default function AgentPage() {
         trades: null,
         messages: null,
         toolCalls: null,
-        circuitBreaker: true,
       },
       limit: 50,
       offset: null,
@@ -83,13 +243,12 @@ export default function AgentPage() {
     if (sres.status === "ok") {
       const active = sres.data.active ?? null;
       setStrategy(active);
-      if (!editingStrategy) setStrategyDraft(active?.strategy ?? "");
     }
     const rres = await commands.agentListReviewReports(null);
     if (rres.status === "ok") setReports(rres.data);
     const nres = await commands.agentGetNewsAutoAnalysis();
     if (nres.status === "ok") setNewsAuto(nres.data);
-  }, [editingStrategy]);
+  }, []);
 
   // news 自动分析开关（spec §5：默认关闭；开启时后端回填最近窗口内 news 入 buffer）。
   const toggleNewsAuto = useCallback(async () => {
@@ -100,7 +259,6 @@ export default function AgentPage() {
     if (res.status === "ok") {
       setNewsAuto(res.data.enabled);
       if (next && res.data.backfilled > 0) {
-        // 提示回填了多少条（可选）。
         console.info(`已回填最近 ${res.data.backfilled} 条资讯入分析队列`);
       }
     }
@@ -117,6 +275,24 @@ export default function AgentPage() {
     void refreshState();
   }, [reviewing, refreshState]);
 
+  const { pathname } = useLocation();
+
+  const checkChannel = useCallback(() => {
+    commands
+      .agentGetActiveChannel()
+      .then((res) => {
+        setHasChannel(res.status === "ok" && res.data !== null);
+      })
+      .catch(() => setHasChannel(false));
+  }, []);
+
+  // 每次路由切到 Agent 页时重新检测通道（keep-alive 不会重新 mount）。
+  useEffect(() => {
+    if (pathname === ROUTES.agent) {
+      checkChannel();
+    }
+  }, [pathname, checkChannel]);
+
   useEffect(() => {
     void refreshState();
   }, [refreshState]);
@@ -126,7 +302,10 @@ export default function AgentPage() {
     const uns: Array<() => void> = [];
     void listen<Record<string, unknown>>("agent-event", (e) => {
       const env = e.payload as Record<string, unknown>;
-      const p = (env?.payload ?? env) as { type?: string; delta?: string };
+      const p = (env?.payload ?? env) as {
+        type?: string;
+        delta?: string;
+      };
       if (p?.type === "text_delta" && typeof p.delta === "string") {
         const delta = p.delta;
         setMessages((prev) => {
@@ -140,26 +319,37 @@ export default function AgentPage() {
       }
     }).then((u) => uns.push(u));
     void listen<Record<string, unknown>>("agent-run-started", (e) => {
-      const p = ((e.payload as Record<string, unknown>)?.payload ?? e.payload) as { runId?: string };
+      const p = ((e.payload as Record<string, unknown>)?.payload ??
+        e.payload) as { runId?: string };
       if (p?.runId) currentRunId.current = p.runId;
     }).then((u) => uns.push(u));
     void listen("agent-run-finished", () => {
       currentRunId.current = null;
       void refreshState();
     }).then((u) => uns.push(u));
-    void listen("agent-analysis-result", () => void refreshState()).then((u) => uns.push(u));
-    void listen("agent-circuit-breaker", () => void refreshState()).then((u) => uns.push(u));
+    void listen("agent-analysis-result", () => void refreshState()).then((u) =>
+      uns.push(u),
+    );
     // news age-out 丢弃计数（spec §5/§7）：提示用户丢了多少。
-    void listen<Record<string, unknown>>("agent-news-buffer-dropped", (e) => {
-      const p = ((e.payload as Record<string, unknown>)?.payload ?? e.payload) as { count?: number };
-      if (p?.count) console.warn(`资讯分析队列丢弃 ${p.count} 条（超时未分析）`);
-    }).then((u) => uns.push(u));
+    void listen<Record<string, unknown>>(
+      "agent-news-buffer-dropped",
+      (e) => {
+        const p = ((e.payload as Record<string, unknown>)?.payload ??
+          e.payload) as { count?: number };
+        if (p?.count)
+          console.warn(`资讯分析队列丢弃 ${p.count} 条（超时未分析）`);
+      },
+    ).then((u) => uns.push(u));
     return () => uns.forEach((u) => u());
   }, [refreshState]);
 
   const cancelCurrent = useCallback(async () => {
     const id = currentRunId.current;
-    if (id) await commands.agentCancelRun({ runId: id, reason: "用户停止当前 run" });
+    if (id)
+      await commands.agentCancelRun({
+        runId: id,
+        reason: "用户停止当前 run",
+      });
   }, []);
 
   useEffect(() => {
@@ -171,6 +361,8 @@ export default function AgentPage() {
     if (!text || sending) return;
     setInput("");
     setSending(true);
+    // Switch back to chat when sending a new message
+    setDetailView(null);
     setMessages((prev) => [
       ...prev,
       { role: "user", text },
@@ -190,7 +382,9 @@ export default function AgentPage() {
             ...last,
             streaming: false,
             error: true,
-            text: last.text || `运行失败：${res.error.message ?? res.error.code}`,
+            text:
+              last.text ||
+              `运行失败：${res.error.message ?? res.error.code}`,
           };
         } else {
           next[next.length - 1] = {
@@ -206,189 +400,123 @@ export default function AgentPage() {
     void refreshState();
   }, [input, sending, refreshState]);
 
-  const saveStrategy = useCallback(async () => {
-    const text = strategyDraft.trim();
-    if (!text || savingStrategy) return;
-    setSavingStrategy(true);
-    const res = await commands.agentUpsertStrategy({
-      strategyId: null,
-      strategy: text,
-      baseVersion: strategy?.version ?? null,
-      reason: "对话页手动更新",
-      status: "active",
-    });
-    setSavingStrategy(false);
-    if (res.status === "ok") {
-      setEditingStrategy(false);
-      void refreshState();
-    } else {
-      // 版本冲突等：保持编辑态，提示。
-      alert(`策略保存失败：${res.error.message ?? res.error.code}`);
-    }
-  }, [strategyDraft, savingStrategy, strategy, refreshState]);
-
   const runningCount = useMemo(
-    () => state?.recentRuns.filter((r) => r.status === "running").length ?? 0,
+    () =>
+      state?.recentRuns?.filter((r) => r.status === "running").length ?? 0,
     [state],
   );
-  const circuitBroken = state?.circuitBreakerActive ?? false;
 
-  // 熔断只由系统自动触发；用户只能解除（spec §9 set_circuit_breaker resume=true）。
-  const resumeCircuitBreaker = useCallback(async () => {
-    const res = await commands.agentSetCircuitBreaker({
-      resume: true,
-      reason: "对话页手动解除熔断",
-    });
-    if (res.status === "ok") void refreshState();
-  }, [refreshState]);
+  // Build a unified timeline merging runs with analysis results (by runId).
+  const timeline = useMemo(() => {
+    const runs = state?.recentRuns ?? [];
+    const results = state?.recentResults ?? [];
+    const resultsByRun = new Map(results.map(r => [r.runId, r]));
+
+    return runs.map(run => ({
+      run,
+      analysis: resultsByRun.get(run.runId) ?? null,
+    }));
+  }, [state]);
+
+  // Toggle detail: clicking the same item closes it, clicking a different one switches.
+  const toggleDetail = useCallback(
+    (next: NonNullable<DetailView>) => {
+      setDetailView((prev) => {
+        if (prev === null) return next;
+        if (prev.type === next.type) {
+          if (
+            prev.type === "analysis" &&
+            next.type === "analysis" &&
+            prev.data.resultId === next.data.resultId
+          ) {
+            return null;
+          }
+          if (
+            prev.type === "report" &&
+            next.type === "report" &&
+            prev.path === next.path
+          ) {
+            return null;
+          }
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  // Open strategy modal and fetch history
+  const openStrategyModal = useCallback(async () => {
+    setStrategyModalOpen(true);
+    const res = await commands.agentFetchStrategy({ includeHistory: true });
+    if (res.status === "ok") {
+      if (res.data.active) setStrategy(res.data.active);
+      setStrategyHistory(res.data.history ?? null);
+    }
+  }, []);
 
   return (
     <PageShell
       title="Agent"
-      status={runningCount > 0 ? `${runningCount} 个 run 运行中` : "空闲"}
-      statusTone={circuitBroken ? "error" : runningCount > 0 ? "loading" : "ok"}
+      status={
+        hasChannel === false
+          ? "未配置服务商"
+          : runningCount > 0
+            ? `${runningCount} 个 run 运行中`
+            : "空闲"
+      }
+      statusTone={
+        hasChannel === false
+          ? "warn"
+          : runningCount > 0
+            ? "loading"
+            : "ok"
+      }
     >
       <div className="agent-page">
-      {circuitBroken ? (
-        <div className="agent-cb-bar agent-cb-on">
-          <span>⚠ 熔断激活：自动下单已降级为 no_action/建议。</span>
-          <button className="agent-cb-btn" onClick={() => void resumeCircuitBreaker()}>
-            解除熔断
-          </button>
-        </div>
-      ) : (
-        <div className="agent-cb-bar">
-          <span>风控正常，自动下单已启用。</span>
-        </div>
-      )}
-      <div className="agent-grid">
-        {/* 左：复盘报告 + 最近 runs */}
-        <aside className="agent-col agent-runs">
-          <div className="agent-col-title-row">
-            <h3 className="agent-col-title">复盘报告</h3>
-            <button className="agent-link-btn" disabled={reviewing} onClick={() => void runReviewToday()}>
-              {reviewing ? "复盘中…" : "复盘今日"}
-            </button>
+        {/* Left sidebar */}
+        <aside className="agent-sidebar">
+          {/* Strategy label */}
+          <div
+            className="agent-sidebar-strategy"
+            onClick={() => void openStrategyModal()}
+          >
+            <span>投资策略{strategy ? ` V${strategy.version}` : ""}</span>
+            <span className="agent-link-btn">查看</span>
           </div>
-          <div className="agent-reports-list">
-            {reports.map((r) => (
-              <div key={r.path} className="agent-report-file" title={r.path}>
-                📄 {r.name}
-              </div>
-            ))}
-            {reports.length === 0 && <div className="agent-empty">暂无复盘报告</div>}
-          </div>
-          <h3 className="agent-col-title">最近运行</h3>
-          <div className="agent-runs-list">
-            {(state?.recentRuns ?? []).map((r) => (
-              <div key={r.runId} className={`agent-run-item status-${r.status}`}>
-                <div className="agent-run-top">
-                  <span className="agent-run-mode">{MODE_LABEL[r.mode] ?? r.mode}</span>
-                  <span className={`agent-run-status status-${r.status}`}>
-                    {STATUS_LABEL[r.status] ?? r.status}
-                  </span>
-                </div>
-                <div className="agent-run-id">{shortId(r.runId)}</div>
-              </div>
-            ))}
-            {(!state || state.recentRuns.length === 0) && (
-              <div className="agent-empty">暂无运行记录</div>
-            )}
-          </div>
-        </aside>
 
-        {/* 中：对话 */}
-        <section className="agent-col agent-chat">
-          <div className="agent-chat-scroll">
-            {messages.length === 0 && (
-              <div className="agent-empty agent-chat-hint">
-                和 Agent 对话：让它分析行情/资讯、检查持仓、复盘策略，或在你确认后下单（模拟盘）。
-              </div>
-            )}
-            {messages.map((m, i) => (
-              <div key={i} className={`agent-msg agent-msg-${m.role}${m.error ? " agent-msg-error" : ""}`}>
-                <div className="agent-msg-avatar">
-                  {m.role === "user" ? <User size={15} /> : <Bot size={15} />}
-                </div>
-                <div className="agent-msg-body">
-                  {m.text || (m.streaming ? "思考中…" : "")}
-                  {m.streaming && <span className="agent-cursor">▋</span>}
-                </div>
-              </div>
-            ))}
-            <div ref={chatEndRef} />
-          </div>
-          <div className="agent-input-row">
-            <textarea
-              className="agent-input"
-              value={input}
-              placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
-              rows={2}
-              disabled={sending}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void send();
-                }
-              }}
-            />
-            {sending ? (
-              <button className="agent-send-btn agent-stop-btn" onClick={() => void cancelCurrent()} title="停止当前 run">
-                ■
+          {/* Review reports */}
+          <div className="agent-sidebar-section">
+            <div className="agent-sidebar-section-header">
+              <h3>复盘报告</h3>
+              <button
+                className="agent-link-btn"
+                disabled={reviewing}
+                onClick={() => void runReviewToday()}
+              >
+                {reviewing ? "复盘中…" : "复盘今日"}
               </button>
-            ) : (
-              <button className="agent-send-btn" disabled={!input.trim()} onClick={() => void send()}>
-                <Send size={16} />
-              </button>
-            )}
-          </div>
-        </section>
-
-        {/* 右：策略 + 分析结果 */}
-        <aside className="agent-col agent-side">
-          <div className="agent-strategy">
-            <div className="agent-col-title-row">
-              <h3 className="agent-col-title">投资策略{strategy ? ` v${strategy.version}` : ""}</h3>
-              {!editingStrategy && (
-                <button className="agent-link-btn" onClick={() => setEditingStrategy(true)}>
-                  编辑
-                </button>
-              )}
             </div>
-            {editingStrategy ? (
-              <>
-                <textarea
-                  className="agent-strategy-edit"
-                  value={strategyDraft}
-                  rows={6}
-                  onChange={(e) => setStrategyDraft(e.target.value)}
-                />
-                <div className="agent-strategy-actions">
-                  <button
-                    className="agent-link-btn"
-                    onClick={() => {
-                      setEditingStrategy(false);
-                      setStrategyDraft(strategy?.strategy ?? "");
-                    }}
-                  >
-                    取消
-                  </button>
-                  <button className="agent-save-btn" disabled={savingStrategy} onClick={() => void saveStrategy()}>
-                    保存新版本
-                  </button>
-                </div>
-              </>
-            ) : (
-              <div className="agent-strategy-text">
-                {strategy?.strategy ?? "（未设置 active 策略，自动下单默认禁用）"}
+            {reports.map((r) => (
+              <div
+                key={r.path}
+                className={`agent-sidebar-item${detailView?.type === "report" && (detailView as { type: "report"; path: string }).path === r.path ? " active" : ""}`}
+                onClick={() =>
+                  toggleDetail({ type: "report", name: r.name, path: r.path })
+                }
+              >
+                {r.name}
               </div>
+            ))}
+            {reports.length === 0 && (
+              <div className="agent-empty">暂无复盘报告</div>
             )}
           </div>
 
-          <div className="agent-results">
-            <div className="agent-col-title-row">
-              <h3 className="agent-col-title">分析结果</h3>
+          {/* Unified run timeline (merges runs + analysis results) */}
+          <div className="agent-sidebar-section">
+            <div className="agent-sidebar-section-header">
+              <h3>运行记录</h3>
               <button
                 className="agent-link-btn"
                 disabled={togglingNewsAuto}
@@ -398,23 +526,146 @@ export default function AgentPage() {
                 {newsAuto ? "自动分析：开" : "自动分析：关"}
               </button>
             </div>
-            <div className="agent-results-list">
-              {(state?.recentResults ?? []).map((a) => (
-                <div key={a.resultId} className={`agent-result-item kind-${a.kind}`}>
-                  <span className={`agent-result-kind kind-${a.kind}`}>
-                    {a.kind === "action" ? "操作" : "观望"}
-                  </span>
-                  <span className="agent-result-summary">{a.summary}</span>
+            {timeline.map(({ run, analysis }) => (
+              <div
+                key={run.runId}
+                className={`agent-sidebar-item agent-timeline-item${analysis && detailView?.type === "analysis" && (detailView as { type: "analysis"; data: AnalysisResult }).data.resultId === analysis.resultId ? " active" : ""}`}
+                onClick={() => analysis && toggleDetail({ type: "analysis", data: analysis })}
+                style={{ cursor: analysis ? "pointer" : "default" }}
+              >
+                <div className="agent-timeline-top">
+                  <span className="agent-timeline-mode">{MODE_LABEL[run.mode] ?? run.mode}</span>
+                  {analysis ? (
+                    <span className={`agent-timeline-kind kind-${analysis.kind}`}>
+                      {analysis.kind === "action" ? "操作" : "观望"}
+                    </span>
+                  ) : (
+                    <span className={`agent-timeline-status status-${run.status}`}>
+                      {STATUS_LABEL[run.status] ?? run.status}
+                    </span>
+                  )}
                 </div>
-              ))}
-              {(!state || state.recentResults.length === 0) && (
-                <div className="agent-empty">暂无分析结果</div>
-              )}
-            </div>
+                {analysis && (
+                  <div className="agent-timeline-summary">{analysis.summary}</div>
+                )}
+              </div>
+            ))}
+            {timeline.length === 0 && (
+              <div className="agent-empty">暂无运行记录</div>
+            )}
           </div>
         </aside>
+
+        {/* Center area */}
+        <section className="agent-center">
+          {detailView ? (
+            <div className="agent-detail">
+              <div className="agent-detail-header">
+                <h3>
+                  {detailView.type === "analysis" ? "分析详情" : "复盘报告"}
+                </h3>
+                <button
+                  className="agent-detail-close"
+                  onClick={() => setDetailView(null)}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="agent-detail-body">
+                {detailView.type === "analysis" ? (
+                  <AnalysisDetail data={detailView.data} runs={state?.recentRuns ?? []} />
+                ) : (
+                  <ReportDetail
+                    name={detailView.name}
+                    path={detailView.path}
+                  />
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="agent-chat-scroll">
+              {messages.length === 0 && (
+                <div className="agent-empty agent-chat-hint">
+                  和 Agent
+                  对话：让它分析行情/资讯、检查持仓、复盘策略，或在你确认后下单（模拟盘）。
+                </div>
+              )}
+              {messages.map((m, i) => (
+                <div
+                  key={i}
+                  className={`agent-msg agent-msg-${m.role}${m.error ? " agent-msg-error" : ""}`}
+                >
+                  <div className="agent-msg-avatar">
+                    {m.role === "user" ? (
+                      <User size={15} />
+                    ) : (
+                      <Bot size={15} />
+                    )}
+                  </div>
+                  <div className="agent-msg-body">
+                    {m.text || (m.streaming ? "思考中…" : "")}
+                    {m.streaming && <span className="agent-cursor">▋</span>}
+                  </div>
+                </div>
+              ))}
+              <div ref={chatEndRef} />
+            </div>
+          )}
+          <div className="agent-input-row">
+            {hasChannel === false ? (
+              <Link
+                to={ROUTES.settings}
+                className="agent-input agent-input-placeholder-link"
+              >
+                尚未配置 AI 服务商，点此前往设置
+              </Link>
+            ) : (
+              <>
+                <textarea
+                  className="agent-input"
+                  value={input}
+                  placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
+                  rows={2}
+                  disabled={sending}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      void send();
+                    }
+                  }}
+                />
+                {sending ? (
+                  <button
+                    className="agent-send-btn agent-stop-btn"
+                    onClick={() => void cancelCurrent()}
+                    title="停止当前 run"
+                  >
+                    ■
+                  </button>
+                ) : (
+                  <button
+                    className="agent-send-btn"
+                    disabled={!input.trim()}
+                    onClick={() => void send()}
+                  >
+                    <Send size={16} />
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        </section>
       </div>
-      </div>
+
+      {/* Strategy modal */}
+      {strategyModalOpen && (
+        <StrategyModal
+          strategy={strategy}
+          history={strategyHistory}
+          onClose={() => setStrategyModalOpen(false)}
+        />
+      )}
     </PageShell>
   );
 }

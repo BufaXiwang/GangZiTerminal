@@ -23,6 +23,7 @@ use crate::adapters::quotes::events::{
     wrap_market_quotes_refresh_progress, wrap_market_quotes_refreshed,
     MARKET_QUOTES_REFRESHED_EVENT, MARKET_QUOTES_REFRESH_PROGRESS_EVENT,
 };
+use crate::domain::agent::runtime::AgentRunStatus;
 use crate::domain::shared::Money;
 use crate::infrastructure::agent::{
     bootstrap as bootstrap_agent_infra, default_skills_dir, default_workspace_dir,
@@ -67,6 +68,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::agent::cmd::agent_list_tools,
         adapters::agent::cmd::agent_channel_presets,
         adapters::agent::cmd::agent_discover_models,
+        adapters::agent::cmd::agent_discover_models_for_channel,
         adapters::agent::cmd::agent_add_channel,
         adapters::agent::cmd::agent_update_channel,
         adapters::agent::cmd::agent_list_channels,
@@ -87,7 +89,6 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::agent::runtime_cmd::agent_fetch_state,
         adapters::agent::runtime_cmd::agent_fetch_strategy,
         adapters::agent::runtime_cmd::agent_upsert_strategy,
-        adapters::agent::runtime_cmd::agent_set_circuit_breaker,
         adapters::agent::runtime_cmd::agent_run_review,
         adapters::agent::runtime_cmd::agent_list_review_reports,
         adapters::agent::runtime_cmd::agent_cancel_run,
@@ -417,10 +418,11 @@ pub fn run() {
                 .map(|d| d.join("gangzi").join("skills"))
                 .unwrap_or_else(|_| default_skills_dir());
             let agent_infra = bootstrap_agent_infra(db.clone(), workspace_dir, skills_dir);
-            // Runtime（Phase 3）复用 Infra 的消息持久化 / payload / channels（克隆句柄，便宜）。
+            // Runtime（Phase 3）复用 Infra 的消息持久化 / payload / channels / registry（克隆句柄，便宜）。
             let runtime_agent_messages_repo = agent_infra.repo.clone();
             let runtime_payload_store = agent_infra.payload_store.clone();
             let runtime_channels_repo = agent_infra.channels_repo.clone();
+            let runtime_infra_registry = agent_infra.registry.clone();
             app.manage(agent_infra);
 
             // -- Account BC bootstrap（Phase 2）
@@ -485,9 +487,9 @@ pub fn run() {
                                         .run_account_trigger(trigger_id.clone(), order_id, summary)
                                         .await
                                     {
-                                        Ok(run) => {
-                                            // run 终态后才标 Account 侧 handled（spec §3/§6/§11）：
-                                            // execute_run 返回即 run 已终态。失败仅记日志，不阻断 consumption 收尾。
+                                        Ok(run) if run.status == AgentRunStatus::Completed => {
+                                            // Only mark handled on successful completion（spec §3/§6/§11）。
+                                            // Failed/Cancelled runs should NOT consume the trigger so it can retry.
                                             if let Err(e) = rt2
                                                 .deps
                                                 .account
@@ -504,6 +506,20 @@ pub fn run() {
                                             let _ = rt2.triggers.mark_account_trigger_consumed(
                                                 &trigger_id,
                                                 Some(&run.run_id),
+                                            );
+                                        }
+                                        Ok(run) => {
+                                            // run returned but not Completed (Failed/Cancelled) → don't consume, let it retry
+                                            tracing::warn!(
+                                                target: "runtime.account_trigger",
+                                                trigger_id = %trigger_id,
+                                                run_id = %run.run_id,
+                                                status = ?run.status,
+                                                "account_trigger run non-Completed → trigger not marked handled"
+                                            );
+                                            let _ = rt2.triggers.mark_account_trigger_failed(
+                                                &trigger_id,
+                                                &format!("run {} ended with {:?}", run.run_id, run.status),
                                             );
                                         }
                                         Err(e) => {
@@ -609,16 +625,6 @@ pub fn run() {
                     }
                 });
 
-                // 熔断状态变更 → 前端 agent-circuit-breaker。
-                let ah_cb = app.handle().clone();
-                let circuit_breaker_sink: Arc<dyn Fn(bool, String) + Send + Sync> =
-                    Arc::new(move |active, reason| {
-                        let payload = serde_json::json!({"active": active, "reason": reason});
-                        if let Err(e) = ah_cb.emit("agent-circuit-breaker", payload) {
-                            tracing::warn!(target: "runtime.emit", error = %e, "emit agent-circuit-breaker failed");
-                        }
-                    });
-
                 // news buffer age-out 丢弃计数 → 前端 agent-news-buffer-dropped（spec §5/§7）。
                 let ah_drop = app.handle().clone();
                 let buffer_dropped_sink: Arc<dyn Fn(u32, u32) + Send + Sync> =
@@ -645,14 +651,13 @@ pub fn run() {
                     runtime_event_sink: Some(runtime_event_sink),
                     // max_turns / token_budget / review_min_sample_trades / eval_batch_size
                     // 已改由 Runtime settings（spec §8）提供，缺失用缺省。
-                    // 当日额度 cap 已改从账户 gateway `max_daily_new_orders()` 取（spec §6），不再硬编码注入。
+                    infra_registry: runtime_infra_registry,
                     reports_dir: app
                         .handle()
                         .path()
                         .app_data_dir()
                         .map(|d| d.join("gangzi").join("workspace").join("reviews"))
                         .unwrap_or_else(|_| std::env::temp_dir().join("gangzi-reviews")),
-                    circuit_breaker_sink: Some(circuit_breaker_sink),
                     buffer_dropped_sink: Some(buffer_dropped_sink),
                 }));
 
