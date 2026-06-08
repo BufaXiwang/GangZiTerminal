@@ -147,6 +147,50 @@ function parsePersistedBlocks(text: string, role: "user" | "assistant"): ChatBlo
   return blocks;
 }
 
+/** Convert persisted AgentMessages into merged ChatMessages.
+ * Tool result messages (user role with <tool_result>) get merged into the preceding
+ * assistant message as tool_call blocks with output filled in. */
+function mergePersistedMessages(msgs: import("../bindings").AgentMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of msgs) {
+    if (m.role !== "user" && m.role !== "assistant") continue;
+    const blocks: ChatBlock[] = m.blocks.flatMap(b => {
+      if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
+      if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
+      return [];
+    });
+    if (blocks.length === 0) continue;
+    // User messages with only tool_call blocks (tool results) → merge into last assistant msg
+    const allToolCalls = blocks.every(b => b.type === "tool_call");
+    if (m.role === "user" && allToolCalls && out.length > 0 && out[out.length - 1].role === "assistant") {
+      // Merge tool results into preceding assistant's tool_call blocks
+      const lastAssistant = out[out.length - 1];
+      for (const block of blocks) {
+        if (block.type !== "tool_call") continue;
+        // Try to find matching tool_call in assistant by id, otherwise just append
+        const existing = lastAssistant.blocks.find(
+          b => b.type === "tool_call" && b.id === block.id
+        );
+        if (existing && existing.type === "tool_call") {
+          existing.output = block.output;
+          existing.isError = block.isError;
+          existing.status = "done";
+        } else {
+          lastAssistant.blocks.push(block);
+        }
+      }
+      continue;
+    }
+    out.push({
+      id: m.messageId,
+      role: m.role as "user" | "assistant",
+      blocks,
+      timestamp: m.createdAt,
+    });
+  }
+  return out;
+}
+
 /** Truncate a string with an ellipsis if it exceeds maxLen */
 function truncate(s: string, maxLen: number): string {
   if (s.length <= maxLen) return s;
@@ -582,18 +626,7 @@ export default function AgentPage() {
     setMessages([]);
     commands.agentLoadConversation(cid).then(res => {
       if (res.status === "ok" && res.data.length > 0) {
-        const converted: ChatMessage[] = res.data
-          .filter(m => m.role === "user" || m.role === "assistant")
-          .map(m => ({
-            id: m.messageId,
-            role: m.role as "user" | "assistant",
-            blocks: m.blocks.flatMap(b => {
-              if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
-              if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
-              return [];
-            }),
-            timestamp: m.createdAt,
-          }));
+        const converted = mergePersistedMessages(res.data);
         setMessages(converted);
       }
     });
