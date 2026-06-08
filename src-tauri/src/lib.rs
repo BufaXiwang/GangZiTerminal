@@ -91,6 +91,7 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::agent::runtime_cmd::agent_upsert_strategy,
         adapters::agent::runtime_cmd::agent_run_review,
         adapters::agent::runtime_cmd::agent_list_review_reports,
+        adapters::agent::runtime_cmd::agent_list_conversations,
         adapters::agent::runtime_cmd::agent_load_conversation,
         adapters::agent::runtime_cmd::agent_load_tool_calls,
         adapters::agent::runtime_cmd::agent_read_review_report,

@@ -3744,6 +3744,20 @@ body {
   border-left-color: var(--brand);
 }
 
+/* conversation list item sub-elements */
+.agent-conv-preview {
+  font-size: 13px;
+  color: var(--fg-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-conv-time {
+  font-size: 11px;
+  color: var(--fg-faint);
+  margin-top: 2px;
+}
+
 /* sidebar unified timeline item — mode badge + kind/status + optional summary */
 .agent-timeline-item {
   white-space: normal;

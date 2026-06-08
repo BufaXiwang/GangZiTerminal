@@ -401,6 +401,20 @@ pub async fn agent_set_news_auto_analysis(
     })
 }
 
+// ---------------------------------------------------------------- 会话列表
+
+/// 列出所有用户会话（按最近活跃排序，过滤子 agent 会话）。
+#[tauri::command]
+#[specta::specta]
+pub fn agent_list_conversations(
+    infra: State<'_, crate::infrastructure::agent::AgentInfra>,
+) -> Result<Vec<crate::infrastructure::agent::messages_repo::ConversationSummary>, CommandError> {
+    infra
+        .repo
+        .list_conversations()
+        .map_err(|e| CommandError::with_message(ErrorCode::DbError, e.to_string()))
+}
+
 // ---------------------------------------------------------------- 对话 / tool_call 加载
 
 /// 加载指定对话的全部持久化消息（按 seq 排序；审计真源）。

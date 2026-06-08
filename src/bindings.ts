@@ -461,6 +461,17 @@ async agentListReviewReports(limit: number | null) : Promise<Result<ReviewReport
 }
 },
 /**
+ * 列出所有用户会话（按最近活跃排序，过滤子 agent 会话）。
+ */
+async agentListConversations() : Promise<Result<ConversationSummary[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_list_conversations") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 加载指定对话的全部持久化消息（按 seq 排序；审计真源）。
  * 
  * 加载对话消息（从最近 summary 检查点开始，不加载更早的历史）。
@@ -767,6 +778,10 @@ export type CommandError = { code: ErrorCode; message?: string | null; details?:
  */
 export type CompanyEvent = { id: string; tsCode: TsCode; eventType: CompanyEventType; announceDate?: string | null; effectiveDate?: string | null; payload: JsonValue; source: string; fetchedAt: string }
 export type CompanyEventType = "dividend" | "suspension" | "resume" | "st" | "earnings_forecast" | "unlock" | "other"
+/**
+ * 对话列表条目（前端 sidebar 用）。
+ */
+export type ConversationSummary = { conversationId: string; messageCount: number; firstAt: string; lastAt: string; preview: string }
 /**
  * Spec: quotes-module.md §2 基本面读模型
  */

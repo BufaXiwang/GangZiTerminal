@@ -21,6 +21,7 @@ import {
   type AgentRun,
   type AgentStateSnapshot,
   type AnalysisResult,
+  type ConversationSummary,
   type InvestmentStrategy,
   type ProviderChannelView,
   type ReviewReportRef,
@@ -67,6 +68,18 @@ function fmtTime(iso: string): string {
       hour: "2-digit", minute: "2-digit", second: "2-digit",
       hour12: false,
     });
+  } catch { return iso; }
+}
+
+/** Format ISO timestamp to shorter sidebar format */
+function fmtTimeShort(iso: string): string {
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+      return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+    }
+    return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
   } catch { return iso; }
 }
 
@@ -484,8 +497,49 @@ export default function AgentPage() {
   const [detailView, setDetailView] = useState<DetailView>(null);
   const [strategyModalOpen, setStrategyModalOpen] = useState(false);
   const [strategyHistory, setStrategyHistory] = useState<StrategyHistoryEntry[] | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const currentRunId = useRef<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Load conversation list from backend.
+  const loadConversations = useCallback(async () => {
+    const res = await commands.agentListConversations();
+    if (res.status === "ok") setConversations(res.data);
+  }, []);
+
+  // Create a new conversation.
+  const newConversation = useCallback(() => {
+    const id = crypto.randomUUID();
+    localStorage.setItem("agent_conversation_id", id);
+    conversationId.current = id;
+    setMessages([]);
+    void loadConversations();
+  }, [loadConversations]);
+
+  // Switch to an existing conversation.
+  const switchConversation = useCallback((cid: string) => {
+    localStorage.setItem("agent_conversation_id", cid);
+    conversationId.current = cid;
+    setMessages([]);
+    commands.agentLoadConversation(cid).then(res => {
+      if (res.status === "ok" && res.data.length > 0) {
+        const converted: ChatMessage[] = res.data
+          .filter(m => m.role === "user" || m.role === "assistant")
+          .map(m => ({
+            id: m.messageId,
+            role: m.role as "user" | "assistant",
+            blocks: m.blocks
+              .filter(b => b.type === "text" || b.type === "thinking")
+              .map(b => {
+                if (b.type === "thinking") return { type: "thinking" as const, text: b.text, collapsed: true };
+                return { type: "text" as const, text: (b as { text: string }).text };
+              }),
+            timestamp: m.createdAt,
+          }));
+        setMessages(converted);
+      }
+    });
+  }, []);
 
   const refreshState = useCallback(async () => {
     const res = await commands.agentFetchState({
@@ -553,7 +607,8 @@ export default function AgentPage() {
 
   useEffect(() => {
     void refreshState();
-  }, [refreshState]);
+    void loadConversations();
+  }, [refreshState, loadConversations]);
 
   // Conversation persistence: load persisted messages on mount.
   useEffect(() => {
@@ -603,8 +658,10 @@ export default function AgentPage() {
   refreshStateRef.current = refreshState;
 
   useEffect(() => {
+    let stale = false;
     const uns: Array<() => void> = [];
     void listen<Record<string, unknown>>("agent-event", (e) => {
+      if (stale) return;
       const env = e.payload as Record<string, unknown>;
       const p = (env?.payload ?? env) as Record<string, unknown>;
       const type = p?.type as string | undefined;
@@ -722,7 +779,7 @@ export default function AgentPage() {
           console.warn(`资讯分析队列丢弃 ${p.count} 条（超时未分析）`);
       },
     ).then((u) => uns.push(u));
-    return () => uns.forEach((u) => u());
+    return () => { stale = true; uns.forEach((u) => u()); };
   }, []); // stable refs via useRef — no re-subscription needed
 
   const cancelCurrent = useCallback(async () => {
@@ -802,7 +859,8 @@ export default function AgentPage() {
     });
     setSending(false);
     void refreshState();
-  }, [input, sending, refreshState]);
+    void loadConversations();
+  }, [input, sending, refreshState, loadConversations]);
 
   const runningCount = useMemo(
     () =>
@@ -887,16 +945,26 @@ export default function AgentPage() {
       }
     >
       <div className="agent-page">
-        {/* Left sidebar */}
         {/* Left sidebar: conversations */}
         <aside className="agent-sidebar">
           <div className="agent-sidebar-section">
             <div className="agent-sidebar-section-header">
               <h3>对话</h3>
+              <button className="agent-link-btn" onClick={newConversation}>+ 新对话</button>
             </div>
-            <div className="agent-sidebar-item active">
-              当前对话
-            </div>
+            {conversations.map(conv => (
+              <div
+                key={conv.conversationId}
+                className={`agent-sidebar-item${conv.conversationId === conversationId.current ? " active" : ""}`}
+                onClick={() => switchConversation(conv.conversationId)}
+              >
+                <div className="agent-conv-preview">{conv.preview || "新对话"}</div>
+                <div className="agent-conv-time">{fmtTimeShort(conv.lastAt)}</div>
+              </div>
+            ))}
+            {conversations.length === 0 && (
+              <div className="agent-empty">暂无对话历史</div>
+            )}
           </div>
         </aside>
 

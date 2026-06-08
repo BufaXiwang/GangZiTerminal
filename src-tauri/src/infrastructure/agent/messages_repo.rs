@@ -9,7 +9,19 @@ use crate::domain::shared::ErrorCode;
 use crate::infrastructure::db::AppDb;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+
+/// 对话列表条目（前端 sidebar 用）。
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub message_count: u32,
+    pub first_at: String,
+    pub last_at: String,
+    pub preview: String,
+}
 
 /// Agent BC 持久化 repo。
 #[derive(Clone)]
@@ -123,6 +135,63 @@ impl AgentMessagesRepo {
             Some(i) => Ok(all[i..].to_vec()),
             None => Ok(all),
         }
+    }
+
+    /// 列出所有用户会话（按最近活跃排序），用于前端 sidebar 展示。
+    ///
+    /// 过滤掉 `fork:` 前缀的子 agent 会话（spec §3.5/§3.6）。
+    pub fn list_conversations(&self) -> Result<Vec<ConversationSummary>, RepoError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT conversation_id, COUNT(*) as cnt,
+                        MIN(created_at) as first_at,
+                        MAX(created_at) as last_at
+                 FROM agent_messages
+                 WHERE conversation_id IS NOT NULL
+                   AND role IN ('user', 'assistant')
+                   AND conversation_id NOT LIKE 'fork:%'
+                 GROUP BY conversation_id
+                 ORDER BY last_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ConversationSummary {
+                        conversation_id: row.get(0)?,
+                        message_count: row.get(1)?,
+                        first_at: row.get(2)?,
+                        last_at: row.get(3)?,
+                        preview: String::new(),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut result = rows;
+            for conv in &mut result {
+                if let Ok(Some(preview)) = c
+                    .query_row(
+                        "SELECT blocks_json FROM agent_messages
+                         WHERE conversation_id = ?1 AND role = 'user'
+                         ORDER BY created_at ASC LIMIT 1",
+                        [&conv.conversation_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map(|o| o.flatten())
+                {
+                    if let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&preview) {
+                        conv.preview = blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .next()
+                            .unwrap_or("")
+                            .chars()
+                            .take(50)
+                            .collect();
+                    }
+                }
+            }
+            Ok(result)
+        })
     }
 
     pub fn load_messages_by_run(&self, run_id: &str) -> Result<Vec<AgentMessage>, RepoError> {
