@@ -1849,6 +1849,9 @@ impl QuotesService {
         scope: RefreshDataScope,
         periods: Vec<KlinePeriod>,
     ) -> Result<RefreshDataResult, ResponseError> {
+        let today_cn = Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive();
         let ts_codes = self.resolve_data_scope(&scope)?;
         let periods = if periods.is_empty() {
             vec![KlinePeriod::Day]
@@ -1879,6 +1882,7 @@ impl QuotesService {
                             .filter_map(
                                 crate::infrastructure::quotes::tdx::manager::map_daily_bar,
                             )
+                            .filter(|p| p.date.as_naive() != today_cn)
                             .collect();
                         if pts.is_empty() {
                             failed += 1;
@@ -1950,9 +1954,14 @@ impl QuotesService {
             .map_err(|e| {
                 ResponseError::with_message(ErrorCode::ProviderUnavailable, e.to_string())
             })?;
+        // 过滤当日 bar（TDX 盘中返回的当日 bar volume/amount 可能与历史不同尺度，不入库）。
+        let today = Utc::now()
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive();
         let pts: Vec<KlinePoint> = bars
             .iter()
             .filter_map(crate::infrastructure::quotes::tdx::manager::map_daily_bar)
+            .filter(|p| p.date.as_naive() != today)
             .collect();
         let added = pts.len() as u32;
         if !pts.is_empty() {
@@ -2006,6 +2015,9 @@ impl QuotesService {
             periods
         };
         let now = Utc::now();
+        let today_cn = now
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+            .date_naive();
         let mut total: u32 = 0;
         let mut success: u32 = 0;
         let mut failed: u32 = 0;
@@ -2054,6 +2066,7 @@ impl QuotesService {
                             .filter_map(
                                 crate::infrastructure::quotes::tdx::manager::map_daily_bar,
                             )
+                            .filter(|p| p.date.as_naive() != today_cn)
                             .collect();
                         if !pts.is_empty() {
                             got_bars = Some(pts);
