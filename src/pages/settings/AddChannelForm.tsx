@@ -137,7 +137,7 @@ export function AddChannelForm({ presets, onSaved }: AddChannelFormProps) {
     );
     setDiscovering(false);
     if (res.status === "ok") {
-      const sorted = [...res.data].sort((a, b) => a.id.localeCompare(b.id));
+      const sorted = [...res.data].sort((a, b) => b.id.localeCompare(a.id));
       setDiscovered(sorted);
       setManualMode(false);
       // 默认全选发现到的模型，方便一键保存。

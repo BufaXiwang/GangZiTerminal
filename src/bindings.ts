@@ -488,6 +488,17 @@ async agentLoadToolCalls(runId: string) : Promise<Result<ToolCall[], CommandErro
 }
 },
 /**
+ * 读取复盘报告文件内容（Markdown）。
+ */
+async agentReadReviewReport(path: string) : Promise<Result<string, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("agent_read_review_report", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 取消一个在跑的 run（dialogue/news/review 等）。
  */
 async agentCancelRun(input: CancelRunInput) : Promise<Result<CancelRunResult, CommandError>> {

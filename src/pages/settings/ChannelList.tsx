@@ -79,11 +79,11 @@ interface GroupEditFormProps {
   group: ChannelGroup;
   onCancel: () => void;
   onSaved: () => void;
+  onRemoveModel: (channelId: string) => void;
 }
 
-/** 编辑渠道连接信息：provider / wireFormat / host / apiKey。
- *  保存时批量更新 group 下所有 channel。model 字段不可编辑。 */
-export function GroupEditForm({ group, onCancel, onSaved }: GroupEditFormProps) {
+/** 编辑渠道连接信息 + 管理模型列表。 */
+export function GroupEditForm({ group, onCancel, onSaved, onRemoveModel }: GroupEditFormProps) {
   const [provider, setProvider] = useState(group.provider);
   const [wireFormat, setWireFormat] = useState<WireFormat>(group.wireFormat);
   const [baseUrl, setBaseUrl] = useState(group.baseUrl ?? "");
@@ -161,11 +161,39 @@ export function GroupEditForm({ group, onCancel, onSaved }: GroupEditFormProps) 
             className="settings-input"
             type="password"
             autoComplete="off"
-            placeholder="留空保留原 key"
+            placeholder={group.apiKeySet ? "••••••••（留空保留原 key）" : "输入 API Key"}
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
         </label>
+      </div>
+
+      {/* 模型列表 */}
+      <div className="settings-edit-models">
+        <span className="settings-field-label">模型（{group.channels.length} 个）</span>
+        <div className="settings-edit-model-list">
+          {group.channels.map((ch) => (
+            <div key={ch.channelId} className="settings-edit-model-row">
+              <span className="settings-edit-model-name">{ch.model}</span>
+              {ch.isActive ? (
+                <span className="settings-edit-model-active">使用中</span>
+              ) : (
+                <button
+                  type="button"
+                  className="settings-edit-model-del"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onRemoveModel(ch.channelId);
+                  }}
+                  title="删除模型"
+                >
+                  <X size={13} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
 
       {error && (
@@ -255,7 +283,7 @@ export function DiscoverMorePanel({
         );
     setDiscovering(false);
     if (res.status === "ok") {
-      const sorted = [...res.data].sort((a, b) => a.id.localeCompare(b.id));
+      const sorted = [...res.data].sort((a, b) => b.id.localeCompare(a.id));
       setDiscovered(sorted);
       const fresh = sorted.filter((m) => !existingModels.has(m.id));
       setSelected(new Set(fresh.map((m) => m.id)));
@@ -306,12 +334,15 @@ export function DiscoverMorePanel({
     discovered?.filter((m) => existingModels.has(m.id)) ?? [];
 
   const handleManualAdd = useCallback(async () => {
-    const models = manualInput
-      .split(/[\n,]/)
-      .map((s) => s.trim())
-      .filter((s) => s && !existingModels.has(s));
+    const all = manualInput.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
+    if (all.length === 0) {
+      setError("请输入至少一个模型名");
+      return;
+    }
+    const alreadyAdded = all.filter((s) => existingModels.has(s));
+    const models = all.filter((s) => !existingModels.has(s));
     if (models.length === 0) {
-      setError("请输入至少一个新模型名");
+      setError(`${alreadyAdded.join("、")} 已添加`);
       return;
     }
 

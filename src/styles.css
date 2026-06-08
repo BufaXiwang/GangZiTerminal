@@ -3323,6 +3323,47 @@ body {
   flex-direction: column;
   gap: 12px;
 }
+.settings-edit-models {
+  margin-top: 4px;
+}
+.settings-edit-model-list {
+  margin-top: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+.settings-edit-model-row {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 13px;
+}
+.settings-edit-model-row:last-child {
+  border-bottom: none;
+}
+.settings-edit-model-name {
+  flex: 1;
+  font-family: var(--font-mono);
+}
+.settings-edit-model-active {
+  font-size: 11px;
+  color: var(--brand);
+  background: var(--brand-soft);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+}
+.settings-edit-model-del {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-faint);
+  padding: 2px;
+  border-radius: var(--radius-sm);
+}
+.settings-edit-model-del:hover {
+  color: var(--chart-up);
+  background: var(--bg-soft);
+}
 
 .settings-field-toggle {
   flex-direction: row;
@@ -3659,25 +3700,7 @@ body {
 .agent-sidebar-strategy:hover {
   background: var(--bg-soft);
 }
-.agent-sidebar-model {
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border-soft);
-}
-.agent-sidebar-model select {
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  color: var(--fg-default);
-  font-size: 12px;
-  font-family: var(--font-mono);
-  cursor: pointer;
-}
-.agent-sidebar-model select:focus {
-  outline: none;
-  border-color: var(--brand);
-}
+/* Model selector moved to .agent-chat-header (center column) */
 .agent-sidebar-section {
   border-bottom: 1px solid var(--border-soft);
 }
@@ -3722,11 +3745,6 @@ body {
   align-items: center;
   gap: 6px;
 }
-.agent-timeline-mode {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--fg-strong);
-}
 .agent-timeline-kind {
   font-size: 11px;
   font-weight: 600;
@@ -3740,16 +3758,6 @@ body {
 .agent-timeline-kind.kind-no_action {
   background: var(--bg-soft);
   color: var(--fg-muted);
-}
-.agent-timeline-status {
-  font-size: 11px;
-  color: var(--fg-muted);
-}
-.agent-timeline-status.status-running {
-  color: var(--brand);
-}
-.agent-timeline-status.status-failed {
-  color: var(--state-warn);
 }
 .agent-timeline-summary {
   margin-top: 3px;
@@ -3769,6 +3777,28 @@ body {
   flex-direction: column;
   min-width: 0;
   background: var(--bg-app);
+}
+
+/* Chat header — model selector */
+.agent-chat-header {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+}
+.agent-chat-header select {
+  padding: 4px 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--fg-default);
+  cursor: pointer;
+}
+.agent-chat-header select:focus {
+  outline: none;
+  border-color: var(--brand);
 }
 
 /* Chat area */
@@ -4042,8 +4072,41 @@ body {
   background: var(--brand-soft);
 }
 .detail-code-link:hover {
-  text-decoration: underline;
   background: var(--border-default);
+}
+.detail-code-pct {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  margin-left: 4px;
+}
+.detail-code-pct.up { color: var(--chart-up); }
+.detail-code-pct.down { color: var(--chart-down); }
+.detail-code-pct.flat { color: var(--fg-muted); }
+
+/* Analysis detail — related news list */
+.detail-news-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.detail-news-item {
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.detail-news-item:last-child { border-bottom: none; }
+.detail-news-source {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--fg-faint);
+  background: var(--bg-soft);
+  padding: 1px 4px;
+  border-radius: 2px;
+  margin-right: 6px;
+}
+.detail-news-title {
+  color: var(--fg-default);
 }
 
 /* Strategy modal */

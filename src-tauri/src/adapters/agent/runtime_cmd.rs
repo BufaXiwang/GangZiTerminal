@@ -434,6 +434,14 @@ pub fn agent_load_tool_calls(
         .map_err(|e| CommandError::with_message(ErrorCode::DbError, e.to_string()))
 }
 
+/// 读取复盘报告文件内容（Markdown）。
+#[tauri::command]
+#[specta::specta]
+pub fn agent_read_review_report(path: String) -> Result<String, CommandError> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| CommandError::with_message(ErrorCode::NotFound, format!("读取报告失败: {e}")))
+}
+
 /// 写一个策略新版本（用户在对话中确认后调；版本化 + 乐观并发）。
 #[tauri::command]
 #[specta::specta]

@@ -13,6 +13,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Link, useLocation } from "react-router-dom";
 import { Bot, ChevronDown, ChevronRight, Loader, Send, User, X, Zap } from "lucide-react";
 import { PageShell } from "../components/PageShell";
+import { KlineModal } from "../components/KlineModal";
 import { ROUTES } from "../lib/router";
 import { renderMarkdown } from "../lib/simpleMarkdown";
 import {
@@ -69,38 +70,29 @@ type DetailView =
   | { type: "report"; name: string; path: string }
   | null;
 
-const MODE_LABEL: Record<string, string> = {
-  dialogue: "对话",
-  news: "资讯",
-  account_trigger: "账户触发",
-  review: "复盘",
-};
-const STATUS_LABEL: Record<string, string> = {
-  running: "运行中",
-  completed: "完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
-
 /* ---------- inline sub-components ---------- */
 
 function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[] }) {
-  const [codeNames, setCodeNames] = useState<Map<string, string>>(new Map());
+  const [codeInfo, setCodeInfo] = useState<Map<string, { name: string; pct?: number }>>(new Map());
+  const [klineCode, setKlineCode] = useState<{ tsCode: string; name?: string } | null>(null);
+  const [newsItems, setNewsItems] = useState<Array<{id: string; title: string; source?: string}>>([]);
 
   useEffect(() => {
     if (!data.relatedCodes?.length) return;
-    // Fetch instrument names via fetchData (supports tsCodes filter).
     commands.fetchData({
       tsCodes: data.relatedCodes,
-      include: { quote: false },
+      include: { quote: true },
       limit: null,
     }).then(res => {
       if (res.status === "ok") {
-        const map = new Map<string, string>();
+        const map = new Map<string, { name: string; pct?: number }>();
         for (const item of res.data.items) {
-          if (item.name) map.set(item.tsCode, item.name);
+          map.set(item.tsCode, {
+            name: item.name ?? item.tsCode,
+            pct: item.quote?.changePercent ?? undefined,
+          });
         }
-        setCodeNames(map);
+        setCodeInfo(map);
       }
     });
   }, [data.relatedCodes]);
@@ -119,6 +111,33 @@ function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[]
     return null;
   }, [relatedRun]);
 
+  // Fetch actual news items when newsIds are available.
+  useEffect(() => {
+    if (!newsIds?.length) {
+      setNewsItems([]);
+      return;
+    }
+    commands.fetchNews({
+      ids: newsIds,
+      limit: newsIds.length,
+      query: null,
+      sources: null,
+      publishedFrom: null,
+      publishedTo: null,
+      includeArticle: null,
+      offset: null,
+      order: null,
+    }).then(res => {
+      if (res.status === "ok") {
+        setNewsItems(res.data.items.map(n => ({
+          id: n.id,
+          title: n.title ?? n.id,
+          source: n.source,
+        })));
+      }
+    });
+  }, [newsIds]);
+
   return (
     <div className="agent-analysis-detail">
       <div className="detail-field">
@@ -135,27 +154,53 @@ function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[]
         <div className="detail-field">
           <span className="detail-label">相关标的</span>
           <div className="detail-codes">
-            {data.relatedCodes.map((code: string) => (
-              <Link key={code} to={ROUTES.market} className="detail-code-link">
-                {codeNames.get(code) ? `${codeNames.get(code)} ${code}` : code}
-              </Link>
-            ))}
+            {data.relatedCodes.map((code: string) => {
+              const info = codeInfo.get(code);
+              const pct = info?.pct;
+              const pctClass = pct != null ? (pct > 0 ? "up" : pct < 0 ? "down" : "flat") : "";
+              return (
+                <button
+                  key={code}
+                  type="button"
+                  className="detail-code-link"
+                  onClick={() => setKlineCode({ tsCode: code, name: info?.name })}
+                >
+                  <span>{info?.name ?? ""} {code}</span>
+                  {pct != null && (
+                    <span className={`detail-code-pct ${pctClass}`}>
+                      {pct > 0 ? "+" : ""}{pct.toFixed(2)}%
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       )}
+      <KlineModal
+        open={!!klineCode}
+        tsCode={klineCode?.tsCode ?? null}
+        name={klineCode?.name}
+        onClose={() => setKlineCode(null)}
+      />
       {data.tradeIds?.length > 0 && (
         <div className="detail-field">
           <span className="detail-label">关联交易</span>
           <span className="tabular">{data.tradeIds.join(", ")}</span>
         </div>
       )}
-      {/* Related news: show if trigger is news_batch */}
-      {newsIds && newsIds.length > 0 && (
+      {/* Related news: show titles fetched from backend */}
+      {newsItems.length > 0 && (
         <div className="detail-field">
-          <span className="detail-label">相关新闻</span>
-          <span className="muted" style={{ fontSize: 12 }}>
-            {newsIds.length} 条资讯触发（暂未支持跳转详情）
-          </span>
+          <span className="detail-label">触发新闻（{newsItems.length} 条）</span>
+          <div className="detail-news-list">
+            {newsItems.map(n => (
+              <div key={n.id} className="detail-news-item">
+                {n.source && <span className="detail-news-source">{n.source}</span>}
+                <span className="detail-news-title">{n.title}</span>
+              </div>
+            ))}
+          </div>
         </div>
       )}
       <div className="detail-field">
@@ -167,21 +212,38 @@ function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[]
 }
 
 function ReportDetail({ name, path }: { name: string; path: string }) {
+  const [content, setContent] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    commands.agentReadReviewReport(path).then((res) => {
+      if (res.status === "ok") {
+        setContent(res.data);
+      } else {
+        setLoadError(res.error.message ?? "读取失败");
+      }
+    });
+  }, [path]);
+
+  if (loadError) {
+    return (
+      <div className="agent-report-detail">
+        <p className="muted">{name} — {loadError}</p>
+      </div>
+    );
+  }
+  if (content === null) {
+    return (
+      <div className="agent-report-detail">
+        <p className="muted">加载中…</p>
+      </div>
+    );
+  }
+  // Strip the run_id line from report markdown before rendering.
+  const cleaned = content.replace(/^-\s*run_id:.*$/m, "").trim();
   return (
     <div className="agent-report-detail">
-      <div className="detail-field">
-        <span className="detail-label">文件名</span>
-        <span>{name}</span>
-      </div>
-      <div className="detail-field">
-        <span className="detail-label">路径</span>
-        <span className="tabular" style={{ fontSize: 12, wordBreak: "break-all" }}>{path}</span>
-      </div>
-      <div className="detail-field">
-        <span className="detail-label muted" style={{ fontStyle: "italic", marginTop: 12 }}>
-          复盘报告已落盘为 Markdown 文件，可在文件系统中查看完整内容。
-        </span>
-      </div>
+      <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(cleaned) }} />
     </div>
   );
 }
@@ -711,15 +773,16 @@ export default function AgentPage() {
     [state],
   );
 
-  // Build a unified timeline merging runs with analysis results (by runId).
-  const timeline = useMemo(() => {
-    const runs = state?.recentRuns ?? [];
+  // Sidebar shows only successful analysis results (no dialogue/failed runs).
+  // Use recentResults directly; attach the parent run for trigger info.
+  const analysisItems = useMemo(() => {
     const results = state?.recentResults ?? [];
-    const resultsByRun = new Map(results.map(r => [r.runId, r]));
+    const runs = state?.recentRuns ?? [];
+    const runMap = new Map(runs.map(r => [r.runId, r]));
 
-    return runs.map(run => ({
-      run,
-      analysis: resultsByRun.get(run.runId) ?? null,
+    return results.map(result => ({
+      result,
+      run: runMap.get(result.runId) ?? null,
     }));
   }, [state]);
 
@@ -798,22 +861,6 @@ export default function AgentPage() {
             <span className="agent-link-btn">查看</span>
           </div>
 
-          {/* Model selector */}
-          {channels.length > 0 && (
-            <div className="agent-sidebar-model">
-              <select
-                value={activeChannel?.channelId ?? ""}
-                onChange={(e) => void switchModel(e.target.value)}
-              >
-                {channels.map(ch => (
-                  <option key={ch.channelId} value={ch.channelId}>
-                    {ch.model} ({ch.provider})
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
           {/* Review reports */}
           <div className="agent-sidebar-section">
             <div className="agent-sidebar-section-header">
@@ -842,10 +889,10 @@ export default function AgentPage() {
             )}
           </div>
 
-          {/* Unified run timeline (merges runs + analysis results) */}
+          {/* Analysis results only (no dialogue/failed runs) */}
           <div className="agent-sidebar-section">
             <div className="agent-sidebar-section-header">
-              <h3>运行记录</h3>
+              <h3>资讯分析</h3>
               <button
                 className="agent-link-btn"
                 disabled={togglingNewsAuto}
@@ -855,38 +902,43 @@ export default function AgentPage() {
                 {newsAuto ? "自动分析：开" : "自动分析：关"}
               </button>
             </div>
-            {timeline.map(({ run, analysis }) => (
+            {analysisItems.map(({ result }) => (
               <div
-                key={run.runId}
-                className={`agent-sidebar-item agent-timeline-item${analysis && detailView?.type === "analysis" && (detailView as { type: "analysis"; data: AnalysisResult }).data.resultId === analysis.resultId ? " active" : ""}`}
-                onClick={() => analysis && toggleDetail({ type: "analysis", data: analysis })}
-                style={{ cursor: analysis ? "pointer" : "default" }}
+                key={result.resultId}
+                className={`agent-sidebar-item agent-timeline-item${detailView?.type === "analysis" && (detailView as { type: "analysis"; data: AnalysisResult }).data.resultId === result.resultId ? " active" : ""}`}
+                onClick={() => toggleDetail({ type: "analysis", data: result })}
               >
                 <div className="agent-timeline-top">
-                  <span className="agent-timeline-mode">{MODE_LABEL[run.mode] ?? run.mode}</span>
-                  {analysis ? (
-                    <span className={`agent-timeline-kind kind-${analysis.kind}`}>
-                      {analysis.kind === "action" ? "操作" : "观望"}
-                    </span>
-                  ) : (
-                    <span className={`agent-timeline-status status-${run.status}`}>
-                      {STATUS_LABEL[run.status] ?? run.status}
-                    </span>
-                  )}
+                  <span className={`agent-timeline-kind kind-${result.kind}`}>
+                    {result.kind === "action" ? "操作" : "观望"}
+                  </span>
                 </div>
-                {analysis && (
-                  <div className="agent-timeline-summary">{analysis.summary}</div>
-                )}
+                <div className="agent-timeline-summary">{result.summary}</div>
               </div>
             ))}
-            {timeline.length === 0 && (
-              <div className="agent-empty">暂无运行记录</div>
+            {analysisItems.length === 0 && (
+              <div className="agent-empty">暂无分析结果</div>
             )}
           </div>
         </aside>
 
         {/* Center area */}
         <section className="agent-center">
+          {/* Model selector in chat header */}
+          {channels.length > 0 && (
+            <div className="agent-chat-header">
+              <select
+                value={activeChannel?.channelId ?? ""}
+                onChange={(e) => void switchModel(e.target.value)}
+              >
+                {channels.map(ch => (
+                  <option key={ch.channelId} value={ch.channelId}>
+                    {ch.model} ({ch.provider})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           {detailView ? (
             <div className="agent-detail">
               <div className="agent-detail-header">

@@ -293,6 +293,11 @@ export default function SettingsPage() {
                 setEditingGroupKey(null);
                 handleSaved();
               }}
+              onRemoveModel={(channelId) => {
+                void handleRemove(channelId).then(() => {
+                  void loadChannels();
+                });
+              }}
             />
           </div>
         </div>
