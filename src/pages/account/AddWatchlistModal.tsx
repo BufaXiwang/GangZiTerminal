@@ -128,7 +128,7 @@ export function AddWatchlistModal({ open, onClose, onDone }: AddWatchlistModalPr
     if (ok) {
       onDone();
     } else {
-      setError("添加失败，请稍后重试");
+      setError(`添加 ${selectedItem.tsCode} 失败（标的可能尚未加载完成，稍后重试）`);
     }
   }, [selectedItem, addToStore, onDone]);
 

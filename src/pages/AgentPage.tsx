@@ -580,6 +580,12 @@ export default function AgentPage() {
   );
 
   // 流式 events → rich blocks；run 终态 / 分析产出 → 刷新总览。
+  // Refs to break closure dependency — avoids re-subscribing on every render.
+  const updateCurrentMessageRef = useRef(updateCurrentMessage);
+  updateCurrentMessageRef.current = updateCurrentMessage;
+  const refreshStateRef = useRef(refreshState);
+  refreshStateRef.current = refreshState;
+
   useEffect(() => {
     const uns: Array<() => void> = [];
     void listen<Record<string, unknown>>("agent-event", (e) => {
@@ -590,7 +596,7 @@ export default function AgentPage() {
       switch (type) {
         case "text_delta": {
           const delta = p.delta as string;
-          updateCurrentMessage((blocks) => {
+          updateCurrentMessageRef.current((blocks) => {
             const lastBlock = blocks[blocks.length - 1];
             if (lastBlock?.type === "text") {
               blocks[blocks.length - 1] = { ...lastBlock, text: lastBlock.text + delta };
@@ -603,7 +609,7 @@ export default function AgentPage() {
         }
         case "thinking_delta": {
           const delta = p.delta as string;
-          updateCurrentMessage((blocks) => {
+          updateCurrentMessageRef.current((blocks) => {
             const lastBlock = blocks[blocks.length - 1];
             if (lastBlock?.type === "thinking") {
               blocks[blocks.length - 1] = { ...lastBlock, text: lastBlock.text + delta };
@@ -618,7 +624,7 @@ export default function AgentPage() {
           const toolCallId = p.toolCallId as string;
           const name = p.name as string;
           const inputSummary = JSON.stringify(p.inputSummary ?? {});
-          updateCurrentMessage((blocks) => {
+          updateCurrentMessageRef.current((blocks) => {
             blocks.push({
               type: "tool_call",
               id: toolCallId,
@@ -635,7 +641,7 @@ export default function AgentPage() {
           const outputSummary = JSON.stringify(p.outputSummary ?? {});
           const isError = p.isError as boolean;
           const durationMs = p.durationMs as number;
-          updateCurrentMessage((blocks) => {
+          updateCurrentMessageRef.current((blocks) => {
             return blocks.map((b) => {
               if (b.type === "tool_call" && b.id === toolCallId) {
                 return {
@@ -652,7 +658,7 @@ export default function AgentPage() {
           break;
         }
         case "usage": {
-          updateCurrentMessage((blocks) => {
+          updateCurrentMessageRef.current((blocks) => {
             blocks.push({
               type: "usage",
               input: (p.inputTokens as number) ?? 0,
@@ -685,9 +691,9 @@ export default function AgentPage() {
     }).then((u) => uns.push(u));
     void listen("agent-run-finished", () => {
       currentRunId.current = null;
-      void refreshState();
+      void refreshStateRef.current();
     }).then((u) => uns.push(u));
-    void listen("agent-analysis-result", () => void refreshState()).then((u) =>
+    void listen("agent-analysis-result", () => void refreshStateRef.current()).then((u) =>
       uns.push(u),
     );
     // news age-out 丢弃计数（spec §5/§7）：提示用户丢了多少。
@@ -701,7 +707,7 @@ export default function AgentPage() {
       },
     ).then((u) => uns.push(u));
     return () => uns.forEach((u) => u());
-  }, [refreshState, updateCurrentMessage]);
+  }, []); // stable refs via useRef — no re-subscription needed
 
   const cancelCurrent = useCallback(async () => {
     const id = currentRunId.current;
