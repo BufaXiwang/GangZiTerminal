@@ -61,8 +61,17 @@ export function NewsDateNav({
 
   const days = useMemo(() => {
     const today = todayKey;
+    // Extend range to cover earliest date with data
+    let totalDays = daysBack;
+    const dataKeys = Object.keys(countsByDate).filter(k => countsByDate[k] > 0).sort();
+    if (dataKeys.length > 0) {
+      const earliest = dataKeys[0];
+      const diffMs = new Date(today).getTime() - new Date(earliest).getTime();
+      const diffDays = Math.ceil(diffMs / 86_400_000) + 1;
+      if (diffDays > totalDays) totalDays = diffDays;
+    }
     const out: { key: string; label: string; weekday: string; isToday: boolean }[] = [];
-    for (let i = 0; i < daysBack; i++) {
+    for (let i = 0; i < totalDays; i++) {
       const key = shiftDateKey(today, -i);
       out.push({
         key,
@@ -72,7 +81,7 @@ export function NewsDateNav({
       });
     }
     return out;
-  }, [daysBack, todayKey]);
+  }, [daysBack, todayKey, countsByDate]);
 
   const activeStopRef = useRef<HTMLButtonElement | null>(null);
 

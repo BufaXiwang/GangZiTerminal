@@ -142,8 +142,16 @@ export default function NewsPage() {
     setDateCounts(m);
   }, []);
 
-  // === 默认初始加载（mount / filter 变化）：最新一页 ===
+  // === 默认初始加载（mount / filter 变化 / refreshTick）：最新一页 ===
+  // 用户锚定日期后（activeDate != null），refreshTick 变化只刷 dateCounts，不替换窗口内容。
   useEffect(() => {
+    if (activeDate && refreshTick > 0) {
+      // 用户在看历史日期，只更新 dateCounts 不覆盖窗口
+      void fetchWindow({ order: "desc" }).then((res) => {
+        if (res.status === "ok") applyDateCounts(res.data.dateCounts);
+      });
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
