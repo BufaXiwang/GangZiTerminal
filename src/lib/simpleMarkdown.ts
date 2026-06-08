@@ -1,47 +1,76 @@
 /**
  * Lightweight markdown-to-HTML for strategy text and analysis summaries.
- * Supports: headings (# ~ ####), bullet lists (- / *), numbered lists,
- * bold (**), inline code (`), and paragraphs. No external dependencies.
+ * Supports: headings, bullet/numbered lists, tables, blockquotes,
+ * bold, inline code, and paragraphs. No external dependencies.
  */
 export function renderMarkdown(src: string): string {
   const lines = src.split("\n");
   const out: string[] = [];
   let inList: "ul" | "ol" | null = null;
+  let inTable = false;
+  let inBlockquote = false;
 
   const closeList = () => {
-    if (inList) {
-      out.push(inList === "ul" ? "</ul>" : "</ol>");
-      inList = null;
-    }
+    if (inList) { out.push(inList === "ul" ? "</ul>" : "</ol>"); inList = null; }
   };
+  const closeTable = () => {
+    if (inTable) { out.push("</tbody></table>"); inTable = false; }
+  };
+  const closeBlockquote = () => {
+    if (inBlockquote) { out.push("</blockquote>"); inBlockquote = false; }
+  };
+  const closeAll = () => { closeList(); closeTable(); closeBlockquote(); };
 
-  for (const raw of lines) {
-    const line = raw.trimEnd();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trimEnd();
 
-    // blank line → close list + paragraph break
-    if (!line.trim()) {
-      closeList();
-      out.push("");
+    // blank line
+    if (!line.trim()) { closeAll(); out.push(""); continue; }
+
+    // blockquote
+    const bqMatch = line.match(/^>\s?(.*)/);
+    if (bqMatch) {
+      closeList(); closeTable();
+      if (!inBlockquote) { out.push("<blockquote>"); inBlockquote = true; }
+      out.push(`<p>${inlineFormat(bqMatch[1])}</p>`);
       continue;
     }
+    if (inBlockquote && !bqMatch) closeBlockquote();
 
     // headings
     const hMatch = line.match(/^(#{1,4})\s+(.+)/);
     if (hMatch) {
-      closeList();
+      closeAll();
       const level = hMatch[1].length;
       out.push(`<h${level + 1}>${inlineFormat(hMatch[2])}</h${level + 1}>`);
       continue;
     }
 
+    // table row
+    if (line.includes("|") && line.trim().startsWith("|")) {
+      closeList(); closeBlockquote();
+      const cells = line.split("|").slice(1, -1).map(c => c.trim());
+      // separator row (|---|---|)
+      if (cells.every(c => /^[-:]+$/.test(c))) continue;
+      if (!inTable) {
+        out.push('<table><thead><tr>');
+        cells.forEach(c => out.push(`<th>${inlineFormat(c)}</th>`));
+        out.push('</tr></thead><tbody>');
+        inTable = true;
+      } else {
+        out.push('<tr>');
+        cells.forEach(c => out.push(`<td>${inlineFormat(c)}</td>`));
+        out.push('</tr>');
+      }
+      continue;
+    }
+    if (inTable) closeTable();
+
     // unordered list
     const ulMatch = line.match(/^\s*[-*]\s+(.+)/);
     if (ulMatch) {
-      if (inList !== "ul") {
-        closeList();
-        out.push("<ul>");
-        inList = "ul";
-      }
+      closeTable(); closeBlockquote();
+      if (inList !== "ul") { closeList(); out.push("<ul>"); inList = "ul"; }
       out.push(`<li>${inlineFormat(ulMatch[1])}</li>`);
       continue;
     }
@@ -49,21 +78,17 @@ export function renderMarkdown(src: string): string {
     // ordered list
     const olMatch = line.match(/^\s*\d+[.)]\s+(.+)/);
     if (olMatch) {
-      if (inList !== "ol") {
-        closeList();
-        out.push("<ol>");
-        inList = "ol";
-      }
+      closeTable(); closeBlockquote();
+      if (inList !== "ol") { closeList(); out.push("<ol>"); inList = "ol"; }
       out.push(`<li>${inlineFormat(olMatch[1])}</li>`);
       continue;
     }
 
-    // plain paragraph line
-    closeList();
+    // plain paragraph
+    closeAll();
     out.push(`<p>${inlineFormat(line)}</p>`);
   }
-  closeList();
-
+  closeAll();
   return out.join("\n");
 }
 

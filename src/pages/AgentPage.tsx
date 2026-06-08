@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Link, useLocation } from "react-router-dom";
-import { Bot, ChevronDown, ChevronRight, Loader, Send, User, X, Zap } from "lucide-react";
+import { Bot, ChevronDown, ChevronRight, ImagePlus, Loader, Send, User, X, Zap } from "lucide-react";
 import { PageShell } from "../components/PageShell";
 import { KlineModal } from "../components/KlineModal";
 import { ROUTES } from "../lib/router";
@@ -57,6 +57,17 @@ interface ChatMessage {
 function fmtTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
+}
+
+/** Format ISO timestamp to local timezone */
+function fmtTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString("zh-CN", {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false,
+    });
+  } catch { return iso; }
 }
 
 /** Truncate a string with an ellipsis if it exceeds maxLen */
@@ -105,8 +116,8 @@ function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[]
   const newsIds = useMemo(() => {
     if (!relatedRun) return null;
     const trigger = relatedRun.trigger as Record<string, unknown>;
-    if (trigger?.kind === "news_batch" && Array.isArray(trigger.news_ids)) {
-      return trigger.news_ids as string[];
+    if (trigger?.kind === "news_batch" && Array.isArray(trigger.newsIds)) {
+      return trigger.newsIds as string[];
     }
     return null;
   }, [relatedRun]);
@@ -205,7 +216,7 @@ function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[]
       )}
       <div className="detail-field">
         <span className="detail-label">时间</span>
-        <span>{data.createdAt}</span>
+        <span>{fmtTime(data.createdAt)}</span>
       </div>
     </div>
   );
@@ -445,6 +456,8 @@ export default function AgentPage() {
   );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [pendingImages, setPendingImages] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [sending, setSending] = useState(false);
   const [state, setState] = useState<AgentStateSnapshot | null>(null);
   const [strategy, setStrategy] = useState<InvestmentStrategy | null>(null);
@@ -705,7 +718,7 @@ export default function AgentPage() {
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    if ((!text && pendingImages.length === 0) || sending) return;
     setInput("");
     setSending(true);
     // Switch back to chat when sending a new message
@@ -725,9 +738,11 @@ export default function AgentPage() {
     };
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
+    const imagesToSend = pendingImages.length > 0 ? pendingImages : null;
+    setPendingImages([]);
     const res = await commands.agentSendMessage({
       content: text,
-      images: null,
+      images: imagesToSend,
       conversationId: conversationId.current,
     });
     setMessages((prev) => {
@@ -912,6 +927,7 @@ export default function AgentPage() {
                   <span className={`agent-timeline-kind kind-${result.kind}`}>
                     {result.kind === "action" ? "操作" : "观望"}
                   </span>
+                  <span className="agent-timeline-time">{fmtTime(result.createdAt)}</span>
                 </div>
                 <div className="agent-timeline-summary">{result.summary}</div>
               </div>
@@ -924,21 +940,6 @@ export default function AgentPage() {
 
         {/* Center area */}
         <section className="agent-center">
-          {/* Model selector in chat header */}
-          {channels.length > 0 && (
-            <div className="agent-chat-header">
-              <select
-                value={activeChannel?.channelId ?? ""}
-                onChange={(e) => void switchModel(e.target.value)}
-              >
-                {channels.map(ch => (
-                  <option key={ch.channelId} value={ch.channelId}>
-                    {ch.model} ({ch.provider})
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
           {detailView ? (
             <div className="agent-detail">
               <div className="agent-detail-header">
@@ -1017,37 +1018,88 @@ export default function AgentPage() {
               </Link>
             ) : (
               <>
-                <textarea
-                  className="agent-input"
-                  value={input}
-                  placeholder="输入消息，Enter 发送（Shift+Enter 换行）"
-                  rows={2}
-                  disabled={sending}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      void send();
-                    }
-                  }}
-                />
-                {sending ? (
-                  <button
-                    className="agent-send-btn agent-stop-btn"
-                    onClick={() => void cancelCurrent()}
-                    title="停止当前 run"
-                  >
-                    ■
-                  </button>
-                ) : (
-                  <button
-                    className="agent-send-btn"
-                    disabled={!input.trim()}
-                    onClick={() => void send()}
-                  >
-                    <Send size={16} />
-                  </button>
+                {pendingImages.length > 0 && (
+                  <div className="agent-image-preview">
+                    {pendingImages.map((src, i) => (
+                      <div key={i} className="agent-image-thumb">
+                        <img src={src} alt="" />
+                        <button
+                          className="agent-image-remove"
+                          onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
+                <div className="agent-input-wrap">
+                  <textarea
+                    className="agent-input"
+                    value={input}
+                    placeholder={sending ? "运行中… Ctrl+C 停止" : "输入消息，Ctrl+Enter 发送"}
+                    rows={3}
+                    disabled={sending}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault();
+                        void send();
+                      }
+                      if (e.key === "c" && e.ctrlKey && sending) {
+                        void cancelCurrent();
+                      }
+                    }}
+                  />
+                  <div className="agent-input-bar">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".png,.jpg,.jpeg,.gif,.webp,.bmp,.svg"
+                      multiple
+                      hidden
+                      onChange={(e) => {
+                        const files = e.target.files;
+                        if (!files) return;
+                        Array.from(files).filter((f) => f.type.startsWith("image/")).forEach((f) => {
+                          const reader = new FileReader();
+                          reader.onload = () => {
+                            if (typeof reader.result === "string") {
+                              setPendingImages((prev) => [...prev, reader.result as string]);
+                            }
+                          };
+                          reader.readAsDataURL(f);
+                        });
+                        e.target.value = "";
+                      }}
+                    />
+                    {channels.length > 0 && (
+                      <select
+                        className="agent-model-select"
+                        value={activeChannel?.channelId ?? ""}
+                        onChange={(e) => void switchModel(e.target.value)}
+                        disabled={sending}
+                      >
+                        {channels.map(ch => (
+                          <option key={ch.channelId} value={ch.channelId}>
+                            {ch.model} ({ch.provider})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <button
+                      className="agent-bar-btn"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={sending}
+                      title="上传图片"
+                    >
+                      <ImagePlus size={15} />
+                    </button>
+                    <span className="agent-input-hint">
+                      {sending ? "运行中…" : "Ctrl+Enter 发送"}
+                    </span>
+                  </div>
+                </div>
               </>
             )}
           </div>

@@ -237,8 +237,10 @@ impl RuntimeServices {
         RealtimeSection::new(
             "定论要求",
             "分析完本批 news 形成判断后，**必须**调用一次 record_analysis 声明结论：kind=action（已下单/改自选）\
-             或 no_action（观望）；summary 写结论 + 理由（含「为什么现在进还来得及 / 已 price-in」判断）；\
-             relatedCodes 填相关标的。大多数 news 应为 no_action。",
+             或 no_action（观望）；summary 用 **Markdown 格式**书写，包含：\n\
+             1. **结论**（一句话：action/no_action + 核心判断）\n\
+             2. **理由**（分点列出，含「为什么现在进还来得及 / 已 price-in / 情绪周期阶段」判断）\n\
+             3. relatedCodes 填相关标的代码。大多数 news 应为 no_action。",
         )
     }
 }

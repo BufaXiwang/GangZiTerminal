@@ -175,12 +175,22 @@ pub fn agent_add_channel(
     input: AddChannelInput,
 ) -> Result<(), CommandError> {
     let channel_id = format!("ch_{}", uuid::Uuid::new_v4());
+    // If apiKey is empty, inherit from an existing sibling channel (same provider+host).
+    let api_key = if input.api_key.is_empty() {
+        infra.channels_repo.list().map_err(map_repo_err)?
+            .iter()
+            .find(|c| c.provider == input.provider && c.base_url == input.base_url)
+            .map(|c| c.api_key.clone())
+            .unwrap_or_default()
+    } else {
+        input.api_key
+    };
     let channel = ProviderChannel {
         channel_id: channel_id.clone(),
         provider: input.provider,
         wire_format: input.wire_format,
         base_url: input.base_url,
-        api_key: input.api_key,
+        api_key,
         model: input.model,
         stream: true,
         enabled: true,
