@@ -181,6 +181,7 @@ export default function NewsPage() {
         );
       }
       setLastUpdated(new Date());
+      setActiveDate(null);
       setLoading(false);
     });
     return () => {

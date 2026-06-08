@@ -1678,16 +1678,10 @@ body {
   overflow-y: hidden;
   padding: 6px 4px 10px;
   flex: 0 0 auto;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
-
 .news-date-timeline::-webkit-scrollbar {
-  height: 6px;
-}
-
-.news-date-timeline::-webkit-scrollbar-thumb {
-  background: var(--border-default);
-  border-radius: 3px;
+  display: none;
 }
 
 /* 贯穿的水平线：垂直定位到 dot 中心。 */

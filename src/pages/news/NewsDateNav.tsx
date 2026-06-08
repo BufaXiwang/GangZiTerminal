@@ -94,8 +94,23 @@ export function NewsDateNav({
     });
   }, [activeDate]);
 
+  // Convert vertical mousewheel to horizontal scroll (no shift needed)
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = timelineRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        el.scrollLeft += e.deltaY;
+      }
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   return (
-    <div className="news-date-timeline" role="tablist">
+    <div className="news-date-timeline" role="tablist" ref={timelineRef}>
       <div className="news-date-timeline-line" aria-hidden="true" />
       {days.map((d) => {
         const count = countsByDate[d.key] ?? 0;
