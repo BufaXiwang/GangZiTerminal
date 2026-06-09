@@ -21,7 +21,9 @@ pub use context::{
     CompactTier, ContextBundle, ContextContent, ContextPart, ContextPartKind,
     ContextWindowLimits,
 };
-pub use events::{AgentEvent, AgentStopReason, CompactedTier, UsageBreakdown};
+pub use events::{
+    AgentEvent, AgentStopReason, CompactedTier, SubAgentActivityKind, UsageBreakdown,
+};
 pub use loop_request::{
     AgentRunRequest, CompactionConfig, RetryConfig, RunSummary, TokenEstimate,
 };

@@ -285,6 +285,7 @@ async fn run_turn_traced(
                     t.event_seq.push("Done");
                 }
                 AgentEvent::Error { .. } => t.event_seq.push("Error"),
+                AgentEvent::SubAgentActivity { .. } => t.event_seq.push("SubAgentActivity"),
             }
         }
         t

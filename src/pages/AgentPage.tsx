@@ -43,7 +43,15 @@ type ChatBlock =
       durationMs?: number;
       status: "running" | "done";
     }
-  | { type: "usage"; input: number; output: number; cacheRead?: number };
+  | { type: "usage"; input: number; output: number; cacheRead?: number }
+  | {
+      // 子 agent 实时活动（fork 子 run 跑时让用户看到它在干嘛；仅展示，不进 LLM 上下文）。
+      type: "subagent";
+      agentId: string;
+      tools: Array<{ name: string; done: boolean }>;
+      text: string;
+      done: boolean;
+    };
 
 interface ChatMessage {
   id: string;
@@ -454,9 +462,60 @@ function ChatBlockView({ block }: { block: ChatBlock }) {
       );
     case "usage":
       return <UsageBlockView input={block.input} output={block.output} cacheRead={block.cacheRead} />;
+    case "subagent":
+      return (
+        <SubAgentBlockView agentId={block.agentId} tools={block.tools} text={block.text} done={block.done} />
+      );
     default:
       return null;
   }
+}
+
+// 子 agent 实时活动嵌套面板（fork 子 run 阻塞跑时，用户看到它在调什么工具 / 输出什么）。
+function SubAgentBlockView({
+  tools,
+  text,
+  done,
+}: {
+  agentId: string;
+  tools: Array<{ name: string; done: boolean }>;
+  text: string;
+  done: boolean;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  return (
+    <div
+      style={{
+        border: "1px solid var(--border, #1e293b)",
+        borderLeft: "2px solid #a78bfa",
+        borderRadius: 8,
+        padding: "6px 10px",
+        margin: "6px 0",
+        background: "var(--bg-raised, rgba(167,139,250,0.05))",
+        fontSize: 12,
+      }}
+    >
+      <div
+        style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer", color: "#a78bfa" }}
+        onClick={() => setCollapsed((v) => !v)}
+      >
+        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+        <span>🤖 子 agent {done ? "· 已完成" : "· 调研中…"}</span>
+      </div>
+      {!collapsed && (
+        <div style={{ marginLeft: 18, marginTop: 4 }}>
+          {tools.map((t, i) => (
+            <div key={i} style={{ color: t.done ? "var(--text-dim,#94a3b8)" : "#fbbf24", fontFamily: "ui-monospace, monospace" }}>
+              {t.done ? "■" : "▸"} {t.name}
+            </div>
+          ))}
+          {text && (
+            <div style={{ color: "#cbd5e1", marginTop: 4, whiteSpace: "pre-wrap" }}>{text}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // todo_write 的 live checklist。从 output（执行后回显）或 input（执行中预览）解析 {items}。
@@ -877,6 +936,39 @@ export default function AgentPage() {
               }
               return b;
             });
+          });
+          break;
+        }
+        case "sub_agent_activity": {
+          // 子 agent 实时活动 → 嵌套面板（按 agentId 分组）。仅展示，不进 LLM 上下文。
+          const agentId = p.agentId as string;
+          const kind = p.kind as string;
+          const txt = (p.text as string) ?? "";
+          updateCurrentMessageRef.current((blocks) => {
+            let idx = blocks.findIndex((b) => b.type === "subagent" && b.agentId === agentId);
+            if (idx < 0) {
+              blocks.push({ type: "subagent", agentId, tools: [], text: "", done: false });
+              idx = blocks.length - 1;
+            }
+            const b = blocks[idx];
+            if (b.type !== "subagent") return blocks;
+            if (kind === "tool_start") {
+              blocks[idx] = { ...b, tools: [...b.tools, { name: txt, done: false }] };
+            } else if (kind === "tool_end") {
+              const tools = b.tools.slice();
+              for (let i = tools.length - 1; i >= 0; i--) {
+                if (!tools[i].done && txt.startsWith(tools[i].name)) {
+                  tools[i] = { ...tools[i], done: true };
+                  break;
+                }
+              }
+              blocks[idx] = { ...b, tools };
+            } else if (kind === "text") {
+              blocks[idx] = { ...b, text: b.text + txt };
+            } else if (kind === "done") {
+              blocks[idx] = { ...b, done: true, text: b.text || txt };
+            }
+            return blocks;
           });
           break;
         }

@@ -496,6 +496,7 @@ Runtime builds AgentRunRequest
   - **继承**：默认 `channel` / `model` / `effort` / 工具集都**继承父**（本项目不做 per-子 model 覆盖）；可传 `tools` 子集**收紧**（如只读工具）。**但子工具集一律剔除全部 spawn-class 工具**——除内置 `run_subagent` / `run_skill` 外，未来 Runtime 若注入 fork 类领域工具同理；剔除**由 `ToolSpec.isSpawn` 标记驱动、不靠 name 白名单**，确保任何新增 fork 类工具都被覆盖。只有顶层 agent 能 spawn（见「不变量」）。`create_skill`（写文件、不递归）`isSpawn=false`，保留。
   - **审计**：子 run 全量消息照常落 `agent_messages`（自己的 `conversation_id` + `parent_run_id`），可单独 replay。
 - 父对话侧：fork 表现为一次 **tool 调用**（`run_subagent` / `run_skill`，§5 工具），其 `<tool_result>` = 子 run 的结果文本。
+- **前端可见性（不污染上下文）**：子 run 的中间过程**不进父 LLM 上下文**（父只在 fork 完成拿末轮结论），但**会作为 `AgentEvent::SubAgentActivity` 转发给前端**——让用户在子 agent（阻塞）跑时实时看到它在调什么工具 / 输出什么（对齐 Claude Code sidechain 视图）。机制：发起 run 的入口把本 run 的 `event_tx`（= 前端通道）注入 `ForkRuntime.parent_event_tx`；`run_forked_agent` 的事件聚合处把子事件打 `{parentRunId, agentId, kind}` 标签转发。`kind ∈ started/tool_start/tool_end/text/done`。这是**纯前端展示通道**，与「只回末轮文本」的上下文卫生互不影响。
 
 ### 两种模式（对齐 CC）
 

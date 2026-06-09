@@ -138,6 +138,36 @@ pub enum AgentEvent {
         code: ErrorCode,
         message: String,
     },
+    /// 子 agent 实时活动转发给**前端**（fork 子 run 跑时让用户看到它在干嘛）。
+    /// 仅前端展示，**不进父 agent 的 LLM 上下文**（父只在 fork 完成时拿末轮结论）。
+    /// Spec: agent-infra-module.md §3.5（fork 子 agent / 前端可见性）。
+    SubAgentActivity {
+        /// 父 run id（前端据此路由到当前主 run 的视图）。
+        #[serde(rename = "runId")]
+        run_id: String,
+        /// 子 agent id（同一主 run 下多个子 agent 用它分组）。
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        kind: SubAgentActivityKind,
+        /// tool 名 / 文本增量 / 结论预览（按 kind 解释）。
+        text: String,
+    },
+}
+
+/// `SubAgentActivity.kind`：子 agent 活动类型。
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentActivityKind {
+    /// 子 agent 启动（text=任务描述预览）。
+    Started,
+    /// 子 agent 调起一个工具（text=工具名）。
+    ToolStart,
+    /// 子 agent 工具返回（text=工具名，失败带 ✗）。
+    ToolEnd,
+    /// 子 agent 输出文本增量（text=delta）。
+    Text,
+    /// 子 agent 完成（text=末轮结论预览）。
+    Done,
 }
 
 impl AgentEvent {
@@ -151,7 +181,8 @@ impl AgentEvent {
             | AgentEvent::Compacted { run_id, .. }
             | AgentEvent::Usage { run_id, .. }
             | AgentEvent::Done { run_id, .. }
-            | AgentEvent::Error { run_id, .. } => run_id,
+            | AgentEvent::Error { run_id, .. }
+            | AgentEvent::SubAgentActivity { run_id, .. } => run_id,
         }
     }
 }

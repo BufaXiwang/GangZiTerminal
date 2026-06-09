@@ -37,7 +37,7 @@
 use crate::domain::agent::{
     AgentEvent, AgentMessage, AgentMessageBlock, AgentMessageRole, AgentRunRequest,
     AgentStopReason, CompactionConfig, ContextBundle, ProviderChannel, RetryConfig, SideEffect,
-    ToolSpec,
+    SubAgentActivityKind, ToolSpec,
 };
 use crate::domain::shared::ErrorCode;
 use crate::infrastructure::agent::http_provider::HttpProvider;
@@ -611,10 +611,43 @@ pub async fn run_forked_agent(
     // `break`）。`TextDelta` 不带 turn 标记，故用 `ToolStart` 作 turn 边界信号：**每遇到一个 `ToolStart`
     // 就清空文本累加器**——于是任何带工具调用的 turn 的铺垫文本都被丢弃，loop 结束时累加器里只剩末轮
     // （不再发起工具调用、给出最终答案那轮）的文本。`tool_uses` 仍累计全程（进度统计不变）。
+    // 前端可见性（spec §3.5）：把子 run 的活动 tagged 转发给前端（父 event_tx = 前端通道），
+    // 让用户在子 agent 阻塞跑时看到它在搜什么 / 调什么工具 / 输出什么。**仅前端展示**——
+    // 子的完整事件不进父 LLM 上下文（父只在 fork 完成拿末轮结论），故上下文卫生不变。
+    let fwd_tx = rt.parent_event_tx.clone();
+    let parent_run = rt.parent_run_id.clone();
+    let sub_id = agent_id.to_string();
     let collector = async {
+        let send_activity = |kind: SubAgentActivityKind, text: String| {
+            let tx = fwd_tx.clone();
+            let (run_id, agent_id) = (parent_run.clone(), sub_id.clone());
+            async move {
+                if let Some(tx) = tx {
+                    let _ = tx
+                        .send(AgentEvent::SubAgentActivity { run_id, agent_id, kind, text })
+                        .await;
+                }
+            }
+        };
+        send_activity(SubAgentActivityKind::Started, String::new()).await;
+
         let mut text = String::new();
         let mut tool_uses: u32 = 0;
         while let Some(ev) = child_rx.recv().await {
+            // 转发 tagged 活动给前端（不影响下方「只回末轮文本」聚合）。
+            match &ev {
+                AgentEvent::TextDelta { delta, .. } => {
+                    send_activity(SubAgentActivityKind::Text, delta.clone()).await
+                }
+                AgentEvent::ToolStart { name, .. } => {
+                    send_activity(SubAgentActivityKind::ToolStart, name.clone()).await
+                }
+                AgentEvent::ToolEnd { name, is_error, .. } => {
+                    let t = if *is_error { format!("{name} ✗") } else { name.clone() };
+                    send_activity(SubAgentActivityKind::ToolEnd, t).await
+                }
+                _ => {}
+            }
             match ev {
                 AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
                 AgentEvent::ToolStart { .. } => {
@@ -625,6 +658,9 @@ pub async fn run_forked_agent(
                 _ => {}
             }
         }
+        // 完成：回传末轮结论预览（前端把子 agent 面板标完成 + 显示结论摘要）。
+        let preview: String = text.chars().take(200).collect();
+        send_activity(SubAgentActivityKind::Done, preview).await;
         (text, tool_uses)
     };
 
@@ -1239,6 +1275,36 @@ mod tests {
         let (st, _pr, result) = handle.tasks.snapshot("sub_1").unwrap();
         assert_eq!(st, SubAgentStatus::Completed);
         assert!(result.unwrap().contains("子 agent 的结论"));
+    }
+
+    // ---- 前端可见性：子 run 活动经 parent_event_tx 转发为 SubAgentActivity ----
+    #[tokio::test]
+    async fn fork_forwards_subagent_activity_to_parent_event_tx() {
+        let handle = base_handle(fixed_factory("子 agent 结论：建议关注 600519"), None);
+        handle.tasks.register("sub_act", "parent-run", "", "analyze", None);
+        let (ptx, mut prx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+        // 顶层 rt（is_subagent=false）+ 注入父 event_tx = 前端通道。
+        let rt = ForkRuntime::new(channel(), "parent-run").with_event_tx(Some(ptx));
+        let out = run_forked_agent(&handle, &rt, "sub_act", "去调研", None, None)
+            .await
+            .unwrap();
+        assert!(out.contains("结论"));
+
+        let mut kinds = Vec::new();
+        let mut saw_text = false;
+        while let Ok(ev) = prx.try_recv() {
+            if let AgentEvent::SubAgentActivity { run_id, agent_id, kind, text } = ev {
+                assert_eq!(run_id, "parent-run", "活动须挂父 run_id（前端按它路由）");
+                assert_eq!(agent_id, "sub_act");
+                if matches!(kind, SubAgentActivityKind::Text) && !text.is_empty() {
+                    saw_text = true;
+                }
+                kinds.push(kind);
+            }
+        }
+        assert!(kinds.contains(&SubAgentActivityKind::Started), "须转发 Started");
+        assert!(kinds.contains(&SubAgentActivityKind::Done), "须转发 Done");
+        assert!(saw_text, "须转发子 agent 文本活动（前端展示它在输出什么）");
     }
 
     // ---- isolation: child uses a brand-new fork conversation_id (parent linkage encoded) ----

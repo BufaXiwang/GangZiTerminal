@@ -164,15 +164,11 @@ pub async fn execute_run(
     let active = strategy.active()?;
     let ctx = build_context(&run.run_id, run.mode, active.as_ref(), realtime);
 
-    // 2.5) ForkRuntime：sub-agent tool 在 dispatch 时读取真实 channel / is_subagent / parent_run_id。
-    let fork_rt = ForkRuntime::new(channel.clone(), &run.run_id);
-    let fork_ctx = Some(fork_rt.into_ext());
-
     // 3) AgentRunRequest。
     let request = AgentRunRequest {
         run_id: run.run_id.clone(),
         trigger: trigger_label(&trigger).to_string(),
-        channel,
+        channel: channel.clone(),
         max_turns,
         input,
         conversation_id,
@@ -191,6 +187,11 @@ pub async fn execute_run(
 
     // 4) 并发排空事件流（转发前端 + token 预算护栏：累计输出 token 超预算 → 取消，loop 在轮边界停）。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
+
+    // 2.5) ForkRuntime：sub-agent tool 在 dispatch 时读取真实 channel / is_subagent / parent_run_id。
+    // 注入本 run 的 event_tx（= 前端通道）→ fork 子 run 跑时把活动 SubAgentActivity 转发前端（可见性）。
+    let fork_rt = ForkRuntime::new(channel, &run.run_id).with_event_tx(Some(tx.clone()));
+    let fork_ctx = Some(fork_rt.into_ext());
     let budget_cancel = cancel.clone();
     let drainer = tokio::spawn(async move {
         let mut output_total: u32 = 0;
