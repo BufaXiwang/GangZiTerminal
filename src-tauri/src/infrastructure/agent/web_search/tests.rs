@@ -73,6 +73,7 @@ fn config_build_counts_enabled_providers() {
     let cfg = WebSearchConfig {
         enable_duckduckgo: true,
         jina_key: Some("jk".into()),
+        brave_key: None,
         bocha_key: Some("k".into()),
         tavily_key: None, // 空/None 不启用
     };
@@ -130,12 +131,14 @@ async fn web_search_live_free_providers() {
         .build()
         .unwrap();
     let jina = std::env::var("TEST_WEB_JINA_KEY").ok();
+    let brave = std::env::var("TEST_WEB_BRAVE_KEY").ok();
     let bocha = std::env::var("TEST_WEB_BOCHA_KEY").ok();
     let tavily = std::env::var("TEST_WEB_TAVILY_KEY").ok();
-    let has_keyed = [&jina, &bocha, &tavily].iter().any(|k| k.is_some());
+    let has_keyed = [&jina, &brave, &bocha, &tavily].iter().any(|k| k.is_some());
     let cfg = WebSearchConfig {
         enable_duckduckgo: true, // best-effort（IP 相关，沙箱里大概率被反爬挡）
         jina_key: jina,
+        brave_key: brave,
         bocha_key: bocha,
         tavily_key: tavily,
     };

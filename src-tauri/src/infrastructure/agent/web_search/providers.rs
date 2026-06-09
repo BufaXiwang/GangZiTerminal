@@ -219,6 +219,79 @@ impl WebSearchProvider for Jina {
     }
 }
 
+// ───────────────────────────── Brave Search（免费额度 2000/月，需 key，最稳的免费源）
+
+pub struct Brave {
+    client: reqwest::Client,
+    key: String,
+}
+
+impl Brave {
+    pub fn new(client: reqwest::Client, key: String) -> Self {
+        Self { client, key }
+    }
+}
+
+#[async_trait::async_trait]
+impl WebSearchProvider for Brave {
+    fn name(&self) -> &str {
+        "brave"
+    }
+
+    async fn search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<Vec<WebSearchResult>, WebSearchError> {
+        let count = max_results.clamp(1, 20).to_string();
+        let resp = self
+            .client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .query(&[("q", query), ("count", count.as_str())])
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &self.key)
+            .send()
+            .await
+            .map_err(http_err)?;
+        if resp.status() == 401 || resp.status() == 403 {
+            return Err(WebSearchError::Auth(format!("brave {}", resp.status())));
+        }
+        if !resp.status().is_success() {
+            return Err(WebSearchError::Http(format!("brave status {}", resp.status())));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(http_err)?;
+        let arr = v
+            .pointer("/web/results")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| WebSearchError::Parse("brave: no web.results[]".into()))?;
+        Ok(arr
+            .iter()
+            .take(max_results)
+            .filter_map(|item| {
+                let url = item.get("url").and_then(|x| x.as_str())?.to_string();
+                let title = item
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let snippet = item
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .chars()
+                    .take(400)
+                    .collect();
+                Some(WebSearchResult {
+                    title,
+                    url,
+                    snippet,
+                    source: "brave".into(),
+                })
+            })
+            .collect())
+    }
+}
+
 // ───────────────────────────── 博查 Bocha（中文最佳，需 key）
 
 pub struct Bocha {

@@ -145,6 +145,8 @@ pub struct WebSearchConfig {
     pub enable_duckduckgo: bool,
     /// Jina 现已强制需要 key（s.jina.ai 401 AuthenticationRequired）。
     pub jina_key: Option<String>,
+    /// Brave Search：免费额度 2000/月、稳定 JSON API —— 最推荐的免费源。
+    pub brave_key: Option<String>,
     pub bocha_key: Option<String>,
     pub tavily_key: Option<String>,
 }
@@ -158,6 +160,9 @@ impl WebSearchConfig {
         }
         if let Some(k) = self.jina_key.clone().filter(|k| !k.is_empty()) {
             ps.push(Box::new(providers::Jina::new(client.clone(), k)));
+        }
+        if let Some(k) = self.brave_key.clone().filter(|k| !k.is_empty()) {
+            ps.push(Box::new(providers::Brave::new(client.clone(), k)));
         }
         if let Some(k) = self.bocha_key.clone().filter(|k| !k.is_empty()) {
             ps.push(Box::new(providers::Bocha::new(client.clone(), k)));
