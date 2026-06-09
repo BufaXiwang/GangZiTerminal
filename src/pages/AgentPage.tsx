@@ -837,10 +837,15 @@ export default function AgentPage() {
             const next = [...prev];
             const last = next[next.length - 1];
             if (last?.role === "assistant") {
-              next[next.length - 1] = { ...last, streaming: false };
+              const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+              const finalBlocks = hasText
+                ? last.blocks
+                : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
+              next[next.length - 1] = { ...last, streaming: false, blocks: finalBlocks };
             }
             return next;
           });
+          setSending(false);
           break;
         }
         default:
@@ -914,12 +919,12 @@ export default function AgentPage() {
       images: imagesToSend,
       conversationId: conversationId.current,
     });
-    setMessages((prev) => {
-      const next = [...prev];
-      const last = next[next.length - 1];
-      if (last && last.role === "assistant") {
-        if (res.status === "error") {
-          // If no text blocks were streamed, add an error text block
+    if (res.status === "error") {
+      // Error: command failed before or without emitting a `done` event.
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last && last.role === "assistant") {
           const hasText = last.blocks.some((b) => b.type === "text" && b.text);
           const errorBlocks = hasText
             ? last.blocks
@@ -933,24 +938,33 @@ export default function AgentPage() {
             error: true,
             blocks: errorBlocks,
           };
-        } else {
-          const hasText = last.blocks.some((b) => b.type === "text" && b.text);
-          const doneBlocks = hasText
-            ? last.blocks
-            : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
-          next[next.length - 1] = {
-            ...last,
-            streaming: false,
-            blocks: doneBlocks,
-          };
         }
-      }
-      return next;
-    });
-    setSending(false);
+        return next;
+      });
+      setSending(false);
+    } else {
+      // Success path: `done` event finalizes the message (same channel as text_delta,
+      // so it runs AFTER all deltas). Safety fallback if `done` event is lost:
+      setTimeout(() => {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant" && last.streaming) {
+            const next = [...prev];
+            const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+            const finalBlocks = hasText
+              ? last.blocks
+              : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
+            next[next.length - 1] = { ...last, streaming: false, blocks: finalBlocks };
+            return next;
+          }
+          return prev;
+        });
+        setSending(false);
+      }, 3000);
+    }
     void refreshState();
     void loadConversations();
-  }, [input, sending, refreshState, loadConversations]);
+  }, [input, sending, pendingImages, refreshState, loadConversations]);
 
   const runningCount = useMemo(
     () =>

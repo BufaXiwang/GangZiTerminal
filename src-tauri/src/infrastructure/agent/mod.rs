@@ -52,6 +52,12 @@ mod judge_tools_tests;
 #[cfg(test)]
 mod judge_stress_tests;
 
+/// 端到端多轮对话调用链 live 测试：真实 provider 跑 N 轮，抓全 AgentEvent 链，断言每轮非空文本
+/// （Anthropic「无文本输出」后端回归守卫）+ 跨轮 tool 链 + 持久化续接。全部 `#[ignore]`。
+/// Spec: agent-infra-module.md §3 + agent-runtime-module.md §6。
+#[cfg(test)]
+mod e2e_dialogue_tests;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
