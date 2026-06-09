@@ -438,6 +438,10 @@ function ChatBlockView({ block }: { block: ChatBlock }) {
     case "thinking":
       return <ThinkingBlockView text={block.text} defaultCollapsed={block.collapsed} />;
     case "tool_call":
+      // todo_write 渲染成 live checklist（从 output/input 的 {items} 派生，复用 ToolEnd 信道）。
+      if (block.name === "todo_write") {
+        return <TodoBlockView input={block.input} output={block.output} />;
+      }
       return (
         <ToolCallBlockView
           name={block.name}
@@ -453,6 +457,53 @@ function ChatBlockView({ block }: { block: ChatBlock }) {
     default:
       return null;
   }
+}
+
+// todo_write 的 live checklist。从 output（执行后回显）或 input（执行中预览）解析 {items}。
+function TodoBlockView({ input, output }: { input: string; output?: string }) {
+  let items: Array<{ content: string; status: string }> = [];
+  try {
+    const src = output && output !== "{}" ? output : input;
+    const parsed = JSON.parse(src);
+    if (Array.isArray(parsed?.items)) items = parsed.items;
+  } catch {
+    /* malformed → 不渲染 */
+  }
+  if (items.length === 0) return null;
+  const done = items.filter((i) => i.status === "completed").length;
+  const mark = (s: string) => (s === "completed" ? "✔" : s === "in_progress" ? "▸" : "○");
+  const color = (s: string) =>
+    s === "completed" ? "#34d399" : s === "in_progress" ? "#fbbf24" : "#94a3b8";
+  return (
+    <div
+      style={{
+        border: "1px solid var(--border, #1e293b)",
+        borderRadius: 8,
+        padding: "8px 12px",
+        margin: "6px 0",
+        background: "var(--bg-raised, rgba(255,255,255,0.02))",
+        fontSize: 13,
+      }}
+    >
+      <div style={{ color: "var(--text-dim, #94a3b8)", fontSize: 12, marginBottom: 6 }}>
+        📋 任务清单 · {done}/{items.length}
+      </div>
+      {items.map((it, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, alignItems: "baseline", padding: "1px 0" }}>
+          <span style={{ color: color(it.status), width: 14, flexShrink: 0 }}>{mark(it.status)}</span>
+          <span
+            style={{
+              color: it.status === "completed" ? "var(--text-dim, #94a3b8)" : "var(--text, #cbd5e1)",
+              textDecoration: it.status === "completed" ? "line-through" : "none",
+              fontWeight: it.status === "in_progress" ? 600 : 400,
+            }}
+          >
+            {it.content}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function TextBlockView({ text }: { text: string }) {

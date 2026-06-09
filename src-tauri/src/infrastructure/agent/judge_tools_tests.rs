@@ -1086,16 +1086,16 @@ async fn rename_regression_local_and_skill_tools_register_hermetic() {
     register_local_tools(&registry, ws.clone()).unwrap();
     register_skill_tools(&registry, skills_dir.clone()).unwrap();
 
-    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill"] {
+    for name in ["read_file", "write_file", "edit_file", "run_bash", "todo_write", "create_skill"] {
         assert!(registry.has_tool(name), "tool {name} must be registered under its canonical name");
     }
     // load_skill is removed (replaced by run_skill / fork, registered by subagent.rs).
     assert!(!registry.has_tool("load_skill"), "load_skill must no longer be registered");
-    assert_eq!(registry.list_tools().len(), 5, "expected exactly 5 registered tools (read/write/edit/bash + create_skill)");
+    assert_eq!(registry.list_tools().len(), 6, "expected exactly 6 registered tools (read/write/edit/bash/todo_write + create_skill)");
 
     // SystemPromptBuilder must render every tool section (alphabetical) + the protocol preamble.
     let prompt = build_system_prompt_with_skills(&registry.list_tools(), &[], "");
-    for name in ["read_file", "write_file", "edit_file", "run_bash", "create_skill"] {
+    for name in ["read_file", "write_file", "edit_file", "run_bash", "todo_write", "create_skill"] {
         assert!(prompt.contains(&format!("## {name}")), "prompt must contain a section for {name}");
     }
     assert!(prompt.contains("<use_tool"), "prompt must carry the <use_tool> protocol preamble");

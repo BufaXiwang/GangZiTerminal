@@ -569,11 +569,24 @@ Infra 默认注册的通用 tool：
 | `read_file` | 任意路径只读 | `{path, offset?, limit?}` → `{content, truncated}` |
 | `write_file` / `edit_file` | **仅工作区**写 / 定向改 | 越界 → `path_outside_workspace`；edit 未命中/不唯一 → `invalid_input` |
 | `run_bash` | 任意路径跑命令，cwd 默认工作区 | 危险命令 denylist → `command_rejected`；约定级沙箱 |
+| `todo_write` | 多步任务的步骤清单（agent 进度便签） | `{items:[{content,status}]}` 整表替换 → 回 `{items}`；纯便签 `SideEffect::None` |
 | `run_subagent` | fork 隔离子 agent 跑子任务 | 见 §3.5；只回结果 |
 | `create_skill` | 写 `<skills_dir>/<name>/SKILL.md` | `{name(slug), description, body}` → `{path, created}` |
 | `run_skill` | fork 子 agent 跑某 skill | `{name, args?}` → `{name, result}`；以 SKILL.md 为 prompt（§3.5）|
 
 **约定级沙箱**：write/edit 锁工作区（`<appData>/gangzi/workspace/`，路径规范化防 `..` 逃逸）；read/bash 不限路径；危险命令门禁。`run_bash` 不限路径可绕过写限制——约定级接受（强隔离需 OS sandbox，后续可选）。
+
+**`todo_write`（agent 步骤便签，对齐 Claude Code TodoWrite）**：
+```ts
+type TodoStatus = "pending" | "in_progress" | "completed";
+type TodoItem = { content: string; status: TodoStatus };
+type TodoWriteInput  = { items: TodoItem[] };   // 每次传完整清单，整表替换旧的
+type TodoWriteOutput = { items: TodoItem[] };   // 回显当前清单
+```
+- **整表替换、无服务端状态**：当前清单 = 最近一次 `todo_write` 的 `items`（agent 在自己上下文里持有 + 回显验证）。`SideEffect::None`，不入库，只靠 ToolCall 审计留痕。
+- **用途**：配合 L1「自主工作流」的「该拆就拆 / 收口前自检」——复杂多步任务开工写一份、随进度更新；单步 / 快问快答不必用（避免滥用）。
+- 校验：`items` 空 / `content` 空白 / `status` 非法 / 项数 > 50 → `invalid_input`。
+- **可见性（前端）**：UI 从 `todo_write` 的 `tool_end.outputSummary.items` 渲染 live checklist（无需独立 `AgentEvent`——复用既有 ToolEnd 信道）。
 
 **Skill 子系统**（`SkillStore`，Infra）：
 - skill = `<skills_dir>/<name>/SKILL.md`（YAML frontmatter `name`+`description` + markdown body；可选随附 `scripts/`/`references/`/`assets/`，当前只支持单 SKILL.md）。`skills_dir` = `<appData>/gangzi/skills/`，adapter 注入。

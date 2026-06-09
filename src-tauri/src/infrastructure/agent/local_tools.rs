@@ -17,7 +17,7 @@ use crate::infrastructure::agent::tool_registry::{
     FnToolHandler, RegisterError, ToolHandlerFuture, ToolHandlerOutput, ToolInvocation,
     ToolRegistry,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,6 +175,31 @@ struct RunBashInput {
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
+
+/// todo_write 的清单项状态。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// 一条 todo（agent 多步任务的步骤便签）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TodoItem {
+    content: String,
+    status: TodoStatus,
+}
+
+/// todo_write 输入：整表替换（每次传完整清单）。
+#[derive(Debug, Deserialize)]
+struct TodoWriteInput {
+    items: Vec<TodoItem>,
+}
+
+/// 一次 todo_write 最多容纳的清单项（防滥用/上下文膨胀）。
+const TODO_MAX_ITEMS: usize = 50;
 
 fn parse_input<T: for<'de> Deserialize<'de>>(inv: &ToolInvocation) -> Result<T, ToolHandlerOutput> {
     serde_json::from_value::<T>(inv.input.clone()).map_err(|e| {
@@ -391,6 +416,33 @@ async fn handle_run_bash(workspace: PathBuf, inv: ToolInvocation) -> ToolHandler
     }))
 }
 
+/// todo_write —— agent 多步任务的步骤清单（自己的进度便签）。
+///
+/// 整表替换语义（对齐 Claude Code TodoWrite）：每次传完整清单覆盖旧的；**无服务端状态**——
+/// 当前清单就是最近一次 todo_write 的 items（agent 在自己上下文里持有 + 回显验证）。
+/// 纯便签、无外部副作用（SideEffect::None）。前端从本工具 tool_end 的 outputSummary.items
+/// 渲染 live checklist。Spec: agent-infra-module.md §3.6。
+async fn handle_todo_write(inv: ToolInvocation) -> ToolHandlerOutput {
+    let input: TodoWriteInput = match parse_input(&inv) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if input.items.is_empty() {
+        return err_out(ErrorCode::InvalidInput, "items 不能为空");
+    }
+    if input.items.len() > TODO_MAX_ITEMS {
+        return err_out(
+            ErrorCode::InvalidInput,
+            format!("todo 项过多（{} > 上限 {}）", input.items.len(), TODO_MAX_ITEMS),
+        );
+    }
+    if input.items.iter().any(|it| it.content.trim().is_empty()) {
+        return err_out(ErrorCode::InvalidInput, "todo content 不能为空");
+    }
+    // 回显当前清单（替换语义；前端据此渲染）。
+    ToolHandlerOutput::ok(serde_json::json!({ "items": input.items }))
+}
+
 /// 截断到字节上限，返回 (lossy UTF-8 文本, 是否截断)。
 fn truncate_bytes(raw: &[u8]) -> (String, bool) {
     if raw.len() <= BASH_OUTPUT_MAX_BYTES {
@@ -443,12 +495,48 @@ pub fn register_local_tools(
         tool_spec_edit(),
         handler_for(workspace_dir.clone(), |ws, inv| handle_edit_file(ws, inv)),
     )?;
+    // todo_write（无工作区依赖，忽略 ws）
+    registry.register_tool(
+        tool_spec_todo(),
+        handler_for(workspace_dir.clone(), |_ws, inv| handle_todo_write(inv)),
+    )?;
     // run_bash
     registry.register_tool(
         tool_spec_bash(),
         handler_for(workspace_dir, |ws, inv| handle_run_bash(ws, inv)),
     )?;
     Ok(())
+}
+
+#[allow(non_snake_case)]
+fn tool_spec_todo() -> ToolSpec {
+    ToolSpec::new(
+        "todo_write",
+        "多步任务的步骤清单（你自己的进度便签）。整表替换：每次传完整清单覆盖旧的；\
+         开工时写一份、把当前在做的标 in_progress、做完的标 completed。\
+         复杂多步任务建议用它登记并随进度更新；单步 / 快问快答不必用。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "完整步骤清单（整表替换旧的）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "步骤描述" },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+        vec![r#"<use_tool name="todo_write">{"items":[{"content":"查 600519 实时行情","status":"in_progress"},{"content":"看基本面 PE/PB","status":"pending"},{"content":"对照投资策略给结论","status":"pending"}]}</use_tool>"#.into()],
+        READ_TIMEOUT_MS,
+        SideEffect::None,
+    )
 }
 
 use crate::domain::agent::ToolSpec;
@@ -558,6 +646,51 @@ mod tests {
             name: "x".into(),
             input,
         }
+    }
+
+    #[tokio::test]
+    async fn todo_write_echoes_items() {
+        let out = handle_todo_write(inv(serde_json::json!({
+            "items": [
+                { "content": "查行情", "status": "in_progress" },
+                { "content": "看基本面", "status": "pending" },
+                { "content": "给结论", "status": "completed" }
+            ]
+        })))
+        .await;
+        assert!(!out.is_error, "todo_write should succeed: {:?}", out.output_summary);
+        let items = out.output_summary["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["content"], "查行情");
+        assert_eq!(items[0]["status"], "in_progress");
+        assert_eq!(items[2]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn todo_write_rejects_empty_list() {
+        let out = handle_todo_write(inv(serde_json::json!({ "items": [] }))).await;
+        assert!(out.is_error);
+        assert_eq!(out.error_code, Some(ErrorCode::InvalidInput));
+    }
+
+    #[tokio::test]
+    async fn todo_write_rejects_bad_status() {
+        let out = handle_todo_write(inv(serde_json::json!({
+            "items": [{ "content": "x", "status": "doing" }]
+        })))
+        .await;
+        assert!(out.is_error, "unknown status must be rejected");
+        assert_eq!(out.error_code, Some(ErrorCode::InvalidInput));
+    }
+
+    #[tokio::test]
+    async fn todo_write_rejects_blank_content() {
+        let out = handle_todo_write(inv(serde_json::json!({
+            "items": [{ "content": "   ", "status": "pending" }]
+        })))
+        .await;
+        assert!(out.is_error);
+        assert_eq!(out.error_code, Some(ErrorCode::InvalidInput));
     }
 
     #[tokio::test]
@@ -778,7 +911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_local_tools_registers_four() {
+    async fn register_local_tools_registers_five() {
         let ws = temp_workspace("register");
         let registry = ToolRegistry::new_without_persist();
         register_local_tools(&registry, ws.clone()).unwrap();
@@ -786,7 +919,8 @@ mod tests {
         assert!(registry.has_tool("write_file"));
         assert!(registry.has_tool("edit_file"));
         assert!(registry.has_tool("run_bash"));
-        assert_eq!(registry.list_tools().len(), 4);
+        assert!(registry.has_tool("todo_write"));
+        assert_eq!(registry.list_tools().len(), 5);
         std::fs::remove_dir_all(&ws).ok();
     }
 }
