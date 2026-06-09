@@ -722,6 +722,7 @@ export default function AgentPage() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const currentRunId = useRef<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Load conversation list from backend.
   const loadConversations = useCallback(async () => {
@@ -1009,6 +1010,27 @@ export default function AgentPage() {
           }
           break;
         }
+        case "error": {
+          // provider / loop 报错 → 在气泡里显示真实错误，而不是被兜底显示成「无文本输出」。
+          const msg = (p.message as string) || (p.code as string) || "运行出错";
+          const aid = runActiveRef.current;
+          setMessages((prev) => {
+            const idx = aid ? prev.findIndex((m) => m.id === aid) : prev.length - 1;
+            if (idx < 0 || prev[idx].role !== "assistant") return prev;
+            const next = [...prev];
+            const last = next[idx];
+            next[idx] = {
+              ...last,
+              streaming: false,
+              error: true,
+              blocks: [...last.blocks, { type: "text" as const, text: `运行失败：${msg}` }],
+            };
+            return next;
+          });
+          if (aid) finishRunRef.current?.(aid);
+          else setSending(false);
+          break;
+        }
         default:
           break;
       }
@@ -1047,8 +1069,12 @@ export default function AgentPage() {
       });
   }, []);
 
+  // 只在「已经贴近底部」时才自动滚到底；用户往上滚看历史时不打扰（修复流式中无法上滚）。
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (nearBottom) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
   // 一轮 run 收尾（done 事件 / error / 兜底 timeout 调用）。按 assistantId 去重，避免重复收尾；
@@ -1294,7 +1320,7 @@ export default function AgentPage() {
               </div>
             </div>
           ) : (
-            <div className="agent-chat-scroll">
+            <div className="agent-chat-scroll" ref={chatScrollRef}>
               {messages.length === 0 && (
                 <div className="agent-empty agent-chat-hint">
                   和 Agent

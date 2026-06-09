@@ -59,10 +59,14 @@ pub fn spec_fetch_quotes() -> ToolSpec {
 pub fn spec_fetch_news() -> ToolSpec {
     ToolSpec::new(
         FETCH_NEWS,
-        "查资讯：query 关键词全文检索、sources / 时间窗过滤、ids 按 newsId 精确取回（如 buffer 批次）、\
-         includeArticle 取正文。只读。\
-         关键词检索基于 trigram，**query 尽量用 4 字及以上**（如「贵州茅台」「业绩预增」）命中率最佳；\
-         2~3 字短词（如「茅台」「业绩」）走 LIKE 兜底仍可命中但较慢、相关性排序弱。",
+        "查资讯：query 关键词检索、sources / 时间窗过滤、ids 按 newsId 精确取回、includeArticle 取正文。只读。\
+         【query 用法，务必遵守】query 只放**一个核心关键词**（最多两个），优先 4 字及以上（如「半导体」「贵州茅台」「业绩预增」）。\
+         **多词是 AND（全部都要命中），词越多越搜不到——经常返回空**。\
+         **绝对不要**把日期、股票代码、「A股/市场」之类宽泛词塞进 query。\
+         **日期范围一律用 publishedFrom / publishedTo，不要写进 query。**\
+         想要某天/某段时间的全部资讯，就**只传 publishedFrom（+publishedTo），不传 query**。\
+         例：今天的半导体资讯 → {\"query\":\"半导体\",\"publishedFrom\":\"2026-06-09T00:00:00Z\"}；\
+         今天全部资讯 → {\"publishedFrom\":\"2026-06-09T00:00:00Z\"}（无 query）。",
         serde_json::json!({
             "type": "object",
             "properties": {
