@@ -757,6 +757,11 @@ export default function AgentPage() {
   const switchConversation = useCallback((cid: string) => {
     localStorage.setItem("agent_conversation_id", cid);
     conversationId.current = cid;
+    // 重置瞬态运行状态：防止上一会话/被杀 run 残留的 sending/队列/runActive 串到新会话。
+    runActiveRef.current = null;
+    queuedRef.current = [];
+    setQueued([]);
+    setSending(false);
     setMessages([]);
     commands.agentLoadConversation(cid).then(res => {
       if (res.status === "ok" && res.data.length > 0) {
@@ -1368,8 +1373,14 @@ export default function AgentPage() {
                   </div>
                   <div className="agent-msg-body">
                     {m.role === "user" ? (
-                      // User messages: simple text
-                      <span>{m.blocks[0]?.type === "text" ? m.blocks[0].text : ""}</span>
+                      // 用户消息：拼所有文本块（不只 blocks[0]），避免奇怪状态下渲染成空气泡。
+                      <span>
+                        {m.blocks
+                          .filter((b) => b.type === "text")
+                          .map((b) => (b as { text: string }).text)
+                          .join("")
+                          .trim() || "（空消息）"}
+                      </span>
                     ) : (
                       // Assistant messages: render rich blocks
                       <>
