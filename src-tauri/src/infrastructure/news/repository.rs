@@ -989,6 +989,46 @@ mod tests {
         assert_eq!(r.items[0].id, "id-a");
     }
 
+    // 诊断：中文关键词 FTS 行为（unicode61 tokenizer 对 CJK 的真实表现）。
+    #[test]
+    fn fts_chinese_keyword_diagnostic() {
+        let db = setup();
+        let repo = NewsRepository::new(&db);
+        let mk = |id: &str, title: &str| {
+            let mut it = sample_item(id, "rss:x", None);
+            it.title = title.to_string();
+            it
+        };
+        // A: 关键词「贵州茅台」嵌在无标点的长汉字串里
+        repo.upsert_news_item(&mk("emb", "贵州茅台发布2024年业绩预增公告大幅增长")).unwrap();
+        // B: 关键词被标点分隔成独立 token
+        repo.upsert_news_item(&mk("punc", "贵州茅台：2024年业绩预增，净利润大增")).unwrap();
+        // C: 英文对照
+        repo.upsert_news_item(&mk("en", "Kweichow Moutai profit surge")).unwrap();
+
+        let q = |kw: &str| {
+            repo.list_news_items(None, None, None, Some(kw), NewsOrder::Desc, 50, 0)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|i| i.id)
+                .collect::<Vec<_>>()
+        };
+        println!("\n=== 中文 FTS 诊断（tokenize=unicode61）===");
+        for kw in ["贵州茅台", "茅台", "业绩", "业绩预增", "moutai", "profit"] {
+            println!("  query {:>10}  → {:?}", kw, q(kw));
+        }
+        println!("===========================================\n");
+
+        // 当前 unicode61 局限（CJK 不分词 → 整段汉字成单 token，子串不命中）。
+        // 这是已知 BUG：A 股最自然的「茅台」「业绩」搜不到。修 CJK 分词（bigram）后翻转下列断言。
+        assert_eq!(q("贵州茅台"), vec!["punc"], "仅标点分隔成整 token 才命中");
+        assert!(q("茅台").is_empty(), "嵌入式 2 字关键词当前不命中（unicode61 局限）");
+        assert!(q("业绩").is_empty(), "嵌入式关键词当前不命中（unicode61 局限）");
+        assert_eq!(q("moutai"), vec!["en"], "英文（空格分词）正常");
+        assert_eq!(q("profit"), vec!["en"], "英文正常");
+    }
+
     #[test]
     fn delete_news_item_and_prune_fts_keep_search_consistent() {
         let db = setup();
