@@ -3878,6 +3878,46 @@ body {
   border-color: var(--state-warn);
   color: var(--state-warn);
 }
+/* 非阻塞 pending 队列（运行中提交、待自动发送的消息） */
+.agent-msg-queued {
+  opacity: 0.7;
+}
+.agent-msg-queued .agent-msg-body {
+  border-style: dashed;
+}
+.agent-queued-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-queued-tag {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+.agent-queued-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-queued-remove {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  background: transparent;
+  border: none;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 2px;
+}
+.agent-queued-remove:hover {
+  color: var(--state-warn);
+}
 .agent-cursor {
   color: var(--brand);
   animation: agent-blink 1s step-start infinite;

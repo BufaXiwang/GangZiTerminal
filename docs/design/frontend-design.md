@@ -407,7 +407,8 @@ PageShell (minimal header)
 - 流式渲染：`listen("agent-event")` 增量 text_delta → 逐 token 追加到当前 assistant bubble
 - markdown 渲染（后续需求，当前纯文本即可）
 - 图片支持：用户可附带图片（data-URL → 后端 PayloadStore）
-- 发送：Enter 发送（Shift+Enter 换行），或点击发送按钮
+- 发送：Ctrl/⌘+Enter 发送；运行中 Ctrl+C 停止当前 run
+- **非阻塞 pending 队列**：run 进行中输入框**不锁定**；此时提交的消息不打断当前对话，而是以「排队中」气泡显示在对话区，当前 run 终态（`done` 事件）后**自动逐条发出**（对齐 Claude Code 体验）。排队消息可在发出前移除。run 收尾按 assistant 消息 id 精确定位（`runActiveRef`），保证流水线多轮不串台、不重演「晚到 text_delta 被丢弃」的 race。纯前端编排，不改 `agent_send_message` 后端契约（同会话仍串行执行）。
 
 #### 投资策略面板
 

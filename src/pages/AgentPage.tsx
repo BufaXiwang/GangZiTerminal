@@ -642,6 +642,15 @@ export default function AgentPage() {
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [sending, setSending] = useState(false);
+  // 非阻塞 pending 消息队列（CC 式）：run 进行中提交的消息排队、显示在对话区，
+  // 当前 run 结束后自动逐条发出。
+  type QueuedMsg = { id: string; text: string; images: string[] };
+  const [queued, setQueued] = useState<QueuedMsg[]>([]);
+  const queuedRef = useRef<QueuedMsg[]>([]);
+  queuedRef.current = queued;
+  const runActiveRef = useRef<string | null>(null); // 当前在跑的 assistant 消息 id（null=空闲）
+  const startRunRef = useRef<((text: string, images: string[]) => Promise<void>) | null>(null);
+  const finishRunRef = useRef<((assistantId: string) => void) | null>(null);
   const [state, setState] = useState<AgentStateSnapshot | null>(null);
   const [strategy, setStrategy] = useState<InvestmentStrategy | null>(null);
   const [reports, setReports] = useState<ReviewReportRef[]>([]);
@@ -884,19 +893,28 @@ export default function AgentPage() {
           break;
         }
         case "done": {
-          setMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            if (last?.role === "assistant") {
+          // finalize 当前 run 的 assistant 消息（按 runActiveRef 精确定位，支持 pending 队列流水线）。
+          const aid = runActiveRef.current;
+          if (aid) {
+            setMessages((prev) => {
+              const idx = prev.findIndex((m) => m.id === aid);
+              if (idx < 0 || prev[idx].role !== "assistant") return prev;
+              const next = [...prev];
+              const last = next[idx];
               const hasText = last.blocks.some((b) => b.type === "text" && b.text);
-              const finalBlocks = hasText
-                ? last.blocks
-                : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
-              next[next.length - 1] = { ...last, streaming: false, blocks: finalBlocks };
-            }
-            return next;
-          });
-          setSending(false);
+              next[idx] = {
+                ...last,
+                streaming: false,
+                blocks: hasText
+                  ? last.blocks
+                  : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }],
+              };
+              return next;
+            });
+            finishRunRef.current?.(aid); // 收尾 + 自动发下一条 pending 消息
+          } else {
+            setSending(false);
+          }
           break;
         }
         default:
@@ -941,81 +959,115 @@ export default function AgentPage() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const send = useCallback(async () => {
-    const text = input.trim();
-    if ((!text && pendingImages.length === 0) || sending) return;
-    setInput("");
-    setSending(true);
-    // Switch back to chat when sending a new message
-    setDetailView(null);
+  // 一轮 run 收尾（done 事件 / error / 兜底 timeout 调用）。按 assistantId 去重，避免重复收尾；
+  // 收尾后若队列非空，自动发下一条 pending 消息（CC 式：做完一起发，不打断当前对话）。
+  const finishRun = useCallback((assistantId: string) => {
+    if (runActiveRef.current !== assistantId) return; // 已被别处收尾
+    runActiveRef.current = null;
+    setSending(false);
+    const q = queuedRef.current;
+    if (q.length > 0) {
+      const [next, ...rest] = q;
+      setQueued(rest);
+      queuedRef.current = rest;
+      void startRunRef.current?.(next.text, next.images);
+    }
+  }, []);
 
-    const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      blocks: [{ type: "text", text }],
-      timestamp: new Date().toISOString(),
-    };
-    const assistantMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      blocks: [],
-      streaming: true,
-    };
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+  // 真正发起一轮 run。finalize 仍由 `done` 事件负责（与 text_delta 同通道、顺序在其后），
+  // 这里只在 error / done 丢失时按 assistantId 兜底，绝不在命令 resolve 时提前 finalize
+  // （那会重演「晚到 text_delta 被丢弃」的 race）。
+  const startRun = useCallback(
+    async (text: string, images: string[]) => {
+      setDetailView(null);
+      const userMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        blocks: [{ type: "text", text }],
+        timestamp: new Date().toISOString(),
+      };
+      const assistantMsg: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        blocks: [],
+        streaming: true,
+      };
+      const assistantId = assistantMsg.id;
+      runActiveRef.current = assistantId;
+      setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      setSending(true);
 
-    const imagesToSend = pendingImages.length > 0 ? pendingImages : null;
-    setPendingImages([]);
-    const res = await commands.agentSendMessage({
-      content: text,
-      images: imagesToSend,
-      conversationId: conversationId.current,
-    });
-    if (res.status === "error") {
-      // Error: command failed before or without emitting a `done` event.
-      setMessages((prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (last && last.role === "assistant") {
+      const res = await commands.agentSendMessage({
+        content: text,
+        images: images.length > 0 ? images : null,
+        conversationId: conversationId.current,
+      });
+      if (res.status === "error") {
+        setMessages((prev) => {
+          const idx = prev.findIndex((m) => m.id === assistantId);
+          if (idx < 0) return prev;
+          const next = [...prev];
+          const last = next[idx];
           const hasText = last.blocks.some((b) => b.type === "text" && b.text);
           const errorBlocks = hasText
             ? last.blocks
-            : [
-                ...last.blocks,
-                { type: "text" as const, text: `运行失败：${res.error.message ?? res.error.code}` },
-              ];
-          next[next.length - 1] = {
-            ...last,
-            streaming: false,
-            error: true,
-            blocks: errorBlocks,
-          };
-        }
-        return next;
-      });
-      setSending(false);
-    } else {
-      // Success path: `done` event finalizes the message (same channel as text_delta,
-      // so it runs AFTER all deltas). Safety fallback if `done` event is lost:
-      setTimeout(() => {
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.streaming) {
-            const next = [...prev];
-            const hasText = last.blocks.some((b) => b.type === "text" && b.text);
-            const finalBlocks = hasText
-              ? last.blocks
-              : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }];
-            next[next.length - 1] = { ...last, streaming: false, blocks: finalBlocks };
-            return next;
-          }
-          return prev;
+            : [...last.blocks, { type: "text" as const, text: `运行失败：${res.error.message ?? res.error.code}` }];
+          next[idx] = { ...last, streaming: false, error: true, blocks: errorBlocks };
+          return next;
         });
-        setSending(false);
-      }, 3000);
+        finishRun(assistantId);
+      } else {
+        // 兜底：done 事件丢失时，按 assistantId 收尾（不会误伤已开始的下一轮）。
+        setTimeout(() => {
+          setMessages((prev) => {
+            const idx = prev.findIndex((m) => m.id === assistantId);
+            if (idx < 0 || !prev[idx].streaming) return prev;
+            const next = [...prev];
+            const last = next[idx];
+            const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+            next[idx] = {
+              ...last,
+              streaming: false,
+              blocks: hasText ? last.blocks : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }],
+            };
+            return next;
+          });
+          finishRun(assistantId);
+        }, 5000);
+      }
+      void refreshState();
+      void loadConversations();
+    },
+    [refreshState, loadConversations, finishRun],
+  );
+  startRunRef.current = startRun;
+  finishRunRef.current = finishRun;
+
+  // 提交输入框：有 run 在跑 → 入队（pending，不打断当前对话）；空闲 → 立即发起。
+  const submitComposer = useCallback(() => {
+    const text = input.trim();
+    if (!text && pendingImages.length === 0) return;
+    const images = pendingImages;
+    setInput("");
+    setPendingImages([]);
+    if (runActiveRef.current !== null) {
+      setQueued((q) => {
+        const nq = [...q, { id: crypto.randomUUID(), text, images }];
+        queuedRef.current = nq;
+        return nq;
+      });
+    } else {
+      void startRun(text, images);
     }
-    void refreshState();
-    void loadConversations();
-  }, [input, sending, pendingImages, refreshState, loadConversations]);
+  }, [input, pendingImages, startRun]);
+
+  const removeQueued = useCallback((id: string) => {
+    setQueued((q) => {
+      const nq = q.filter((m) => m.id !== id);
+      queuedRef.current = nq;
+      return nq;
+    });
+  }, []);
 
   const runningCount = useMemo(
     () =>
@@ -1190,6 +1242,24 @@ export default function AgentPage() {
                   </div>
                 </div>
               ))}
+              {queued.map((q) => (
+                <div key={q.id} className="agent-msg agent-msg-user agent-msg-queued">
+                  <div className="agent-msg-avatar"><User size={16} /></div>
+                  <div className="agent-msg-body">
+                    <div className="agent-queued-row">
+                      <span className="agent-queued-tag">排队中</span>
+                      <span className="agent-queued-text">{q.text}</span>
+                      <button
+                        className="agent-queued-remove"
+                        title="移除"
+                        onClick={() => removeQueued(q.id)}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
               <div ref={chatEndRef} />
             </div>
           )}
@@ -1222,14 +1292,17 @@ export default function AgentPage() {
                   <textarea
                     className="agent-input"
                     value={input}
-                    placeholder={sending ? "运行中… Ctrl+C 停止" : "输入消息，Ctrl+Enter 发送"}
+                    placeholder={
+                      sending
+                        ? "运行中…可继续输入，Ctrl+Enter 排队，完成后自动发送（Ctrl+C 停止当前）"
+                        : "输入消息，Ctrl+Enter 发送"
+                    }
                     rows={3}
-                    disabled={sending}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
                         e.preventDefault();
-                        void send();
+                        void submitComposer();
                       }
                       if (e.key === "c" && e.ctrlKey && sending) {
                         void cancelCurrent();
@@ -1281,7 +1354,7 @@ export default function AgentPage() {
                       <ImagePlus size={15} />
                     </button>
                     <span className="agent-input-hint">
-                      {sending ? "运行中…" : "Ctrl+Enter 发送"}
+                      {sending ? "运行中… 回车排队" : "Ctrl+Enter 发送"}
                     </span>
                   </div>
                 </div>
