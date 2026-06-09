@@ -570,11 +570,25 @@ Infra 默认注册的通用 tool：
 | `write_file` / `edit_file` | **仅工作区**写 / 定向改 | 越界 → `path_outside_workspace`；edit 未命中/不唯一 → `invalid_input` |
 | `run_bash` | 任意路径跑命令，cwd 默认工作区 | 危险命令 denylist → `command_rejected`；约定级沙箱 |
 | `todo_write` | 多步任务的步骤清单（agent 进度便签） | `{items:[{content,status}]}` 整表替换 → 回 `{items}`；纯便签 `SideEffect::None` |
+| `web_search` | 联网搜索（多源并行聚合） | `{query, maxResults?}` → `{results:[{title,url,snippet,source}], providers}`；未配置任何源 → `invalid_input` |
 | `run_subagent` | fork 隔离子 agent 跑子任务 | 见 §3.5；只回结果 |
 | `create_skill` | 写 `<skills_dir>/<name>/SKILL.md` | `{name(slug), description, body}` → `{path, created}` |
 | `run_skill` | fork 子 agent 跑某 skill | `{name, args?}` → `{name, result}`；以 SKILL.md 为 prompt（§3.5）|
 
 **约定级沙箱**：write/edit 锁工作区（`<appData>/gangzi/workspace/`，路径规范化防 `..` 逃逸）；read/bash 不限路径；危险命令门禁。`run_bash` 不限路径可绕过写限制——约定级接受（强隔离需 OS sandbox，后续可选）。
+
+**`web_search`（联网搜索，多源并行聚合）**：
+```ts
+type WebSearchInput  = { query: string; maxResults?: number };           // 默认 8
+type WebSearchResult = { title: string; url: string; snippet: string; source: string }; // source=哪个源
+type WebSearchOutput = { results: WebSearchResult[]; providers: string[] }; // providers=本次参与的源
+```
+- **可插拔多源 + 并行聚合**（参考 hermes-agent `WebSearchProvider` 抽象，但 hermes 是单源 dispatch，本项目要并行聚合）：
+  - `WebSearchProvider` trait（`name` + `search(query,max)`）；每个搜索源一个实现。
+  - `MultiWebSearch` 聚合器：对所有 **已启用** 源 **并行 fan-out** → 单源失败容错（忽略，不拖垮整体）→ **按 canonical URL 去重** → 跨源交错排序 → 回带 `source` 标签的聚合列表。
+- **初始源**：DuckDuckGo（免费无 key，HTML 抓取）、Jina（免费，可选 key 提额）、博查 Bocha（需 key，中文最佳）、Tavily（需 key，免费额度）。trait 抽象使后续加 SearXNG / Brave 等只需各加一个实现。
+- **配置**：provider key / 开关由 adapter 从设置注入（key 只写不回显，同 LLM key）；一个源都没启用 → 工具返回 `invalid_input`（明确提示去配置）。`SideEffect::None`（只读外部、不写本地）。前端**不**直接发外部 HTTP——全部走 Rust（架构红线）。
+- provider 各自的 wire format（端点 / 鉴权 / 响应字段）是 infra 实现细节，不在 spec 固化（类比 TDX / news provider adapter）。
 
 **`todo_write`（agent 步骤便签，对齐 Claude Code TodoWrite）**：
 ```ts

@@ -58,6 +58,10 @@ mod judge_stress_tests;
 #[cfg(test)]
 mod e2e_dialogue_tests;
 
+/// 联网搜索 web_search：可插拔多源（DuckDuckGo/Jina/Bocha/Tavily）+ 并行去重聚合。
+/// Spec: agent-infra-module.md §3.6 web_search。
+pub mod web_search;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
