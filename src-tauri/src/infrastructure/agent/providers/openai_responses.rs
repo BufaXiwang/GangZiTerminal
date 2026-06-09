@@ -128,6 +128,12 @@ impl ProviderAdapter for OpenAIResponsesAdapter {
         if let Some(m) = self.channel.max_output_tokens {
             body["max_output_tokens"] = Value::from(m);
         }
+        // 思考过程（spec §2 supports_thinking）：gpt-5 等推理模型默认**不**回 reasoning 摘要；
+        // supports_thinking 时请求 `reasoning.summary=auto`，上游会流式回
+        // `response.reasoning_summary_text.delta` → 后端 ThinkingDelta → 前端展示思考过程。
+        if self.channel.supports_thinking {
+            body["reasoning"] = json!({ "summary": "auto" });
+        }
         // Spec §2: 不传 tools 字段、不传 server-side tool。
         Ok(body)
     }
