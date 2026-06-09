@@ -572,6 +572,7 @@ Infra 默认注册的通用 tool：
 | `run_bash` | 任意路径跑命令，cwd 默认工作区 | 危险命令 denylist → `command_rejected`；约定级沙箱 |
 | `todo_write` | 多步任务的步骤清单（agent 进度便签） | `{items:[{content,status}]}` 整表替换 → 回 `{items}`；纯便签 `SideEffect::None` |
 | `web_search` | 联网搜索（多源并行聚合） | `{query, maxResults?}` → `{results:[{title,url,snippet,source}], providers}`；未配置任何源 → `invalid_input` |
+| `web_extract` | 读网页正文（无 key） | `{urls(≤5)}` → `{results:[{url,title,content}\|{url,error}]}`；多 URL 并行 + 单条容错；当前仅 HTML |
 | `run_subagent` | fork 隔离子 agent 跑子任务 | 见 §3.5；只回结果 |
 | `create_skill` | 写 `<skills_dir>/<name>/SKILL.md` | `{name(slug), description, body}` → `{path, created}` |
 | `run_skill` | fork 子 agent 跑某 skill | `{name, args?}` → `{name, result}`；以 SKILL.md 为 prompt（§3.5）|
@@ -590,6 +591,16 @@ type WebSearchOutput = { results: WebSearchResult[]; providers: string[] }; // p
 - **初始源**：DuckDuckGo（免费无 key，HTML 抓取）、Jina（免费，可选 key 提额）、博查 Bocha（需 key，中文最佳）、Tavily（需 key，免费额度）。trait 抽象使后续加 SearXNG / Brave 等只需各加一个实现。
 - **配置**：provider key / 开关由 adapter 从设置注入（key 只写不回显，同 LLM key）；一个源都没启用 → 工具返回 `invalid_input`（明确提示去配置）。`SideEffect::None`（只读外部、不写本地）。前端**不**直接发外部 HTTP——全部走 Rust（架构红线）。
 - provider 各自的 wire format（端点 / 鉴权 / 响应字段）是 infra 实现细节，不在 spec 固化（类比 TDX / news provider adapter）。
+
+**`web_extract`（读网页正文，无 key）**：
+```ts
+type WebExtractInput  = { urls: string[] };  // ≤5
+type WebExtractResult = { url: string; title?: string; content?: string; error?: string };
+type WebExtractOutput = { results: WebExtractResult[] };
+```
+- `web_search` 只回摘要 + URL；`web_extract` 才读得到**原文**。两者 + fork 子 agent = 完整研究链（搜 → 读正文 → 综合回简报）；对基本面 / 产业链定性分析尤其关键（研报 / 年报正文）。
+- reqwest 抓 HTML → `scraper` readability-lite 抽 main content（article/main/body 内的 p/h/li 文本，去 nav/script 噪声）→ 截断（每页 ~8000 字）。多 URL 并行、单条失败回 `{url,error}` 不拖垮整体。`SideEffect::None`，前端不发外部 HTTP（走 Rust）。
+- MVP 仅 HTML；PDF（年报 / arxiv）非 HTML content-type → 回 error，后续补。
 
 **`todo_write`（agent 步骤便签，对齐 Claude Code TodoWrite）**：
 ```ts

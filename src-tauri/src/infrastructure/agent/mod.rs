@@ -62,6 +62,10 @@ mod e2e_dialogue_tests;
 /// Spec: agent-infra-module.md §3.6 web_search。
 pub mod web_search;
 
+/// 网页正文抽取 web_extract：读 URL → scraper 抽 main content（研究链：搜→读→综合）。
+/// Spec: agent-infra-module.md §3.6 web_extract。
+pub mod web_extract;
+
 pub use channels_repo::{ChannelsRepoError, ProviderChannelsRepo};
 pub use discovery::{discover_models, DiscoverError, DiscoveredModel};
 pub use http_provider::HttpProvider;
