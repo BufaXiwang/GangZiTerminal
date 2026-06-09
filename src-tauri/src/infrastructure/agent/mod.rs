@@ -168,6 +168,27 @@ pub fn bootstrap(
     if let Err(e) = register_subagent_tools(&registry, fork_handle) {
         tracing::warn!("register_subagent_tools failed: {e}");
     }
+    // web 研究工具：web_extract（无 key，读正文）+ web_search（默认 DuckDuckGo best-effort）。
+    // keyed 源（Brave/Bocha/Tavily）+ 用户 key 由设置页接线后从 settings build config（待 C）。
+    {
+        let web_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(25))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        if let Err(e) = web_extract::register_web_extract_tool(&registry, web_client.clone()) {
+            tracing::warn!("register_web_extract_tool failed: {e}");
+        }
+        let search = std::sync::Arc::new(
+            web_search::WebSearchConfig {
+                enable_duckduckgo: true,
+                ..Default::default()
+            }
+            .build(web_client),
+        );
+        if let Err(e) = web_search::register_web_search_tool(&registry, search) {
+            tracing::warn!("register_web_search_tool failed: {e}");
+        }
+    }
     AgentInfra {
         repo,
         registry,

@@ -187,6 +187,7 @@ type AgentRun = {
   - **取数后才分析**：没有工具返回数据不得给任何投资结论（保留既有纪律）。
   - **收口前自检**：给最终结论前自检「用户目标是否已被完整满足、关键数据是否齐」；缺了就继续取，而不是提前宣布完成。
   - 复杂只读深挖（如临时复盘历史决策）用 `run_subagent` fork 只读子 agent 拿回结论，不污染主线。
+  - **信息获取分层**：本地资讯 `fetch_news`、开放互联网 `web_search`（搜）+ `web_extract`（读正文）。**联网深度调研**（公司产业链 / 上下游 / 竞争格局，或多角度搜+读+综合）用 `run_subagent` fork 子 agent 去跑（子 agent 用 web_search/web_extract），只回**整理好的简报**，避免原始搜索结果污染主对话；简单查证才直接 `web_search`。
 - **L2 · 投资策略（隔离层）**：注入当前 active `InvestmentStrategy.strategy`（自然语言全文）。唯一策略来源，可整段替换、版本化。
 - **L3 · 实时上下文**：见上表；会下单的 run 必含「当日已下单意图」；review 含 scope 内决策链 + 基准。
 - **自主 run（news / account_trigger / review）注入一条 user-role 任务指令消息驱动本轮**：这三类 run 的 L1/L2/L3 全在 system prompt，若 `input` 为空则发给 messages-format provider 的 `messages` 数组为空（400）。故为每类自主 run 注入一条 user-role `AgentMessage`，内容是该 mode 的任务指令（让 agent 知道该干嘛并触发工具使用）。dialogue 本就带用户消息，不受影响。
