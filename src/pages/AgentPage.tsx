@@ -175,9 +175,10 @@ function mergePersistedMessages(msgs: import("../bindings").AgentMessage[]): Cha
       const lastAssistant = out[out.length - 1];
       for (const block of blocks) {
         if (block.type !== "tool_call") continue;
-        // Try to find matching tool_call in assistant by id, otherwise just append
+        // 历史回填：assistant 的 <use_tool> 不带 call_id（id=persisted_X），<tool_result> 带真实
+        // call_id，两者 id 不匹配。改按 **name + 顺序** 配对：填第一个同名、尚无 output 的 tool_call。
         const existing = lastAssistant.blocks.find(
-          b => b.type === "tool_call" && b.id === block.id
+          b => b.type === "tool_call" && b.name === block.name && b.output === undefined
         );
         if (existing && existing.type === "tool_call") {
           existing.output = block.output;
