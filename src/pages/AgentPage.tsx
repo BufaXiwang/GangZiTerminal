@@ -1364,7 +1364,14 @@ export default function AgentPage() {
                   对话：让它分析行情/资讯、检查持仓、复盘策略，或在你确认后下单（模拟盘）。
                 </div>
               )}
-              {messages.map((m) => (
+              {messages
+                // 不渲染「空 user 气泡」：role=user 但无任何非空文本块（孤儿/状态错乱产物）直接不显。
+                .filter(
+                  (m) =>
+                    m.role !== "user" ||
+                    m.blocks.some((b) => b.type === "text" && b.text.trim().length > 0),
+                )
+                .map((m) => (
                 <div
                   key={m.id}
                   className={`agent-msg agent-msg-${m.role}${m.error ? " agent-msg-error" : ""}`}
