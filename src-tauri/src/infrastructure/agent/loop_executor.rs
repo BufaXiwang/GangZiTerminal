@@ -477,6 +477,10 @@ pub async fn run_agent_turn_forked(
         // Spec §4: a turn whose tool_result message carries any trading_write tool result is
         // durable (never compacted). Generic signal — Infra only reads ToolSpec.sideEffect.
         let mut turn_has_trading_write = false;
+        // 同一 turn 内**相同 (name + input) 的工具调用去重**：上游模型 / relay 偶发把同一组工具
+        // 调用在一次回复里重复输出（实网见 gpt-5 一次吐 6 个 use_tool=3 组×2）。重复 dispatch 浪费
+        // token、可能重复读，且对 operate_account 是危险的重复下单。同一轮内重复的只执行一次。
+        let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for ev in outcome.tool_events.iter().cloned() {
             match ev {
@@ -484,6 +488,18 @@ pub async fn run_agent_turn_forked(
                     // Provider already emitted clean TextDelta; loop ignores any here.
                 }
                 ParserEvent::UseTool { name, input } => {
+                    // 同一 turn 内去重（name + 规范化 input）。
+                    let dedup_key = format!(
+                        "{name}\u{1}{}",
+                        serde_json::to_string(&input).unwrap_or_default()
+                    );
+                    if !seen_calls.insert(dedup_key) {
+                        tracing::warn!(
+                            target: "agent.loop", tool = %name,
+                            "duplicate tool call in same turn — skipped (model/relay 重复输出)"
+                        );
+                        continue;
+                    }
                     any_dispatch = true;
                     if registry.tool_side_effect(&name) == Some(SideEffect::TradingWrite) {
                         turn_has_trading_write = true;
