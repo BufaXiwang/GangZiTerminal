@@ -1123,6 +1123,11 @@ export default function AgentPage() {
   // （那会重演「晚到 text_delta 被丢弃」的 race）。
   const startRun = useCallback(
     async (text: string, images: string[]) => {
+      // 防空 user 气泡：空文本且无图片绝不发起 run。记栈以便定位是谁(队列 flush / 直发)传了空。
+      if (!text.trim() && images.length === 0) {
+        console.warn("[agent] startRun skipped: empty text + no images", new Error().stack);
+        return;
+      }
       setDetailView(null);
       const userMsg: ChatMessage = {
         id: crypto.randomUUID(),
