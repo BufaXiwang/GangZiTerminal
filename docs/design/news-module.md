@@ -173,7 +173,7 @@ type NewsSource = {
 - 实现自愈：启动时对账，清掉搜索读模型中指向已不存在 `NewsItem` 的孤儿行（兜底历史数据 / 外部维护脚本可能造成的不一致）。当前 FTS 实现是独立 FTS5 表（`article` 列来自 `news_articles` join，不便做 external-content + 触发器），故靠启动对账保证一致性。
 - **分词器：FTS5 `trigram`**（中英文统一、做真子串检索，**不**做 CJK 分词预处理）。语义后果：
   - **≥3 字符的 query 做子串匹配**，中英文皆可，嵌入在长串中的关键词也命中（如「贵州茅台」命中「贵州茅台发布…公告」）——这是相对 `unicode61`（整段汉字粘成单 token、子串搜不到）的关键修复。
-  - **< 3 字符的 query 无法走 trigram 索引 → 不命中**（如 2 字中文「茅台」「业绩」）。支持 2 字需 CJK bigram 预切分或 ICU tokenizer，当前权衡为不引入。
+  - **< 3 字符的 query（2 字中文如「茅台」「业绩」）trigram 索引用不了 → 走 `LIKE %词%` 兜底**：逐 token AND，跨 title / summary / article 任一命中。全表扫描（只在含短词的 query 触发）、按时间排序（无 FTS rank）。`fetch_news` 工具描述提示 agent **关键词尽量 ≥4 字**以走 trigram 主路径。
   - 切换分词器是 FTS5 虚表 schema 变更：升级需清库重建（删 `gangzi.db` 重启），不做程序内 reindex。
 
 ---

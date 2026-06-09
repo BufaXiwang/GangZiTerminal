@@ -60,11 +60,13 @@ pub fn spec_fetch_news() -> ToolSpec {
     ToolSpec::new(
         FETCH_NEWS,
         "查资讯：query 关键词全文检索、sources / 时间窗过滤、ids 按 newsId 精确取回（如 buffer 批次）、\
-         includeArticle 取正文。只读。",
+         includeArticle 取正文。只读。\
+         关键词检索基于 trigram，**query 尽量用 4 字及以上**（如「贵州茅台」「业绩预增」）命中率最佳；\
+         2~3 字短词（如「茅台」「业绩」）走 LIKE 兜底仍可命中但较慢、相关性排序弱。",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string" },
+                "query": { "type": "string", "description": "关键词；尽量 4 字及以上（trigram 子串检索），2~3 字走 LIKE 兜底" },
                 "ids": { "type": "array", "items": { "type": "string" } },
                 "sources": { "type": "array", "items": { "type": "string" } },
                 "publishedFrom": { "type": "string" },

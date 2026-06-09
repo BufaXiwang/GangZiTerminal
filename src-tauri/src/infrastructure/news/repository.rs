@@ -599,7 +599,8 @@ struct NewsFilter {
     from_table_sql: String,
     where_sql: String,
     binds: Vec<rusqlite::types::Value>,
-    has_query: bool,
+    /// true = 走 FTS trigram MATCH（可按 rank 排序）；false = 无 query 或走 LIKE 兜底（按时间排）。
+    uses_fts: bool,
 }
 
 /// 构建 news 查询的 FROM + WHERE + binds（严格 lockstep，保证 placeholder 顺序）。
@@ -616,21 +617,41 @@ fn build_news_filter(
     type ClauseBinds = (String, Vec<rusqlite::types::Value>);
     let mut where_parts: Vec<ClauseBinds> = Vec::new();
 
-    let has_query = query
-        .map(|q| !normalize_query_text(q).is_empty())
-        .unwrap_or(false);
+    let q_norm = query.map(normalize_query_text).unwrap_or_default();
+    let has_query = !q_norm.is_empty();
+    // trigram 索引要求每个 token ≥3 字符；任一短 token（如 2 字中文「茅台」）→ 退回 LIKE 兜底，
+    // 否则该 token 在 trigram 下永不命中（AND 语义会整条 query 落空）。
+    let trigram_ok = has_query && q_norm.split_whitespace().all(|t| t.chars().count() >= 3);
+    let uses_fts = trigram_ok;
 
-    let from_table_sql = if has_query {
-        let q_norm = normalize_query_text(query.unwrap());
+    let from_table_sql = if !has_query {
+        "FROM news_items ni".to_string()
+    } else if trigram_ok {
+        // FTS MATCH 必须是 WHERE 第一个 clause + 第一个 bind（历史 bug B1）。
         where_parts.push((
             "fts.news_search_fts MATCH ?".to_string(),
-            vec![rusqlite::types::Value::Text(q_norm)],
+            vec![rusqlite::types::Value::Text(q_norm.clone())],
         ));
         "FROM news_items ni
          INNER JOIN news_search_fts fts ON fts.news_id = ni.id"
             .to_string()
     } else {
-        "FROM news_items ni".to_string()
+        // LIKE 兜底（短 token）：逐 token AND，跨 title / summary / article(join) 任一命中。
+        // 全表扫描，但只在含短词的 query 上触发（spec §4：关键词尽量 ≥4 字）。
+        for tok in q_norm.split_whitespace() {
+            let like = format!("%{}%", tok);
+            where_parts.push((
+                "(ni.title LIKE ? OR ni.summary LIKE ? OR ac.content LIKE ?)".to_string(),
+                vec![
+                    rusqlite::types::Value::Text(like.clone()),
+                    rusqlite::types::Value::Text(like.clone()),
+                    rusqlite::types::Value::Text(like),
+                ],
+            ));
+        }
+        "FROM news_items ni
+         LEFT JOIN news_articles ac ON ac.url = ni.url"
+            .to_string()
     };
 
     if let Some(srcs) = sources {
@@ -672,7 +693,7 @@ fn build_news_filter(
         from_table_sql,
         where_sql,
         binds,
-        has_query,
+        uses_fts,
     })
 }
 
@@ -733,7 +754,7 @@ fn list_news_items_impl(
     //   **有 query 时 asc 也走时间升序为主序（不走 rank）**——keyset 翻页需要时间单调。
     let order_sql = match order {
         NewsOrder::Desc => {
-            if filter.has_query {
+            if filter.uses_fts {
                 "ORDER BY rank, ni.published_at DESC, ni.created_at DESC, ni.id ASC".to_string()
             } else {
                 "ORDER BY COALESCE(ni.published_at, ni.created_at) DESC, ni.created_at DESC, ni.id ASC"
@@ -989,7 +1010,7 @@ mod tests {
         assert_eq!(r.items[0].id, "id-a");
     }
 
-    // 中文关键词 FTS 行为（tokenize=trigram）：≥3 字子串命中（中英文皆可），2 字受 trigram 固有限制。
+    // 中文关键词检索：≥3 字走 trigram 子串（中英文皆可），<3 字（2 字中文）走 LIKE 兜底。
     #[test]
     fn fts_chinese_keyword_trigram() {
         let db = setup();
@@ -1017,21 +1038,20 @@ mod tests {
             ids.sort();
             ids
         };
-        println!("\n=== 中文 FTS 诊断（tokenize=trigram）===");
+        println!("\n=== 中文检索诊断（trigram + LIKE 兜底）===");
         for kw in ["贵州茅台", "茅台", "业绩", "业绩预增", "moutai", "profit"] {
             println!("  query {:>10}  → {:?}", kw, q(kw));
         }
         println!("===========================================\n");
 
-        // ≥3 字关键词：中英文都做真子串检索，嵌入式也命中（trigram 相比 unicode61 的关键提升）。
+        // ≥3 字关键词：trigram 真子串检索，中英文 + 嵌入式都命中（相比 unicode61 的关键提升）。
         assert_eq!(q("贵州茅台"), vec!["emb", "punc"], "≥3 字中文子串：嵌入式 + 标点分隔都命中");
         assert_eq!(q("业绩预增"), vec!["emb", "punc"], "≥3 字中文子串命中");
         assert_eq!(q("moutai"), vec!["en"], "英文大小写不敏感命中");
         assert_eq!(q("profit"), vec!["en"], "英文命中");
-        // trigram 固有限制：query < 3 字符无法用 trigram 索引 → 2 字中文词不命中。
-        // （要支持 2 字需 CJK bigram 预切分或 ICU tokenizer；当前权衡为不引入。）
-        assert!(q("茅台").is_empty(), "2 字中文受 trigram ≥3 限制，已知不命中");
-        assert!(q("业绩").is_empty(), "2 字中文受 trigram ≥3 限制，已知不命中");
+        // <3 字（2 字中文）：trigram 索引用不了，走 LIKE %词% 兜底 → 仍命中（全表扫描，spec §4 建议 ≥4 字）。
+        assert_eq!(q("茅台"), vec!["emb", "punc"], "2 字中文走 LIKE 兜底命中");
+        assert_eq!(q("业绩"), vec!["emb", "punc"], "2 字中文走 LIKE 兜底命中");
     }
 
     #[test]
