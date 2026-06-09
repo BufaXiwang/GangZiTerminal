@@ -440,6 +440,19 @@ function StrategyModal({
 
 /* ---------- Chat block renderers ---------- */
 
+// todo_write 是整表替换语义，只有最新一份清单有意义 → 渲染时只保留最后一个 todo_write 面板，
+// 折叠掉更早的（否则 agent 多次 todo_write 会堆叠成 N 个清单，很乱）。
+function collapseTodoBlocks(blocks: ChatBlock[]): ChatBlock[] {
+  let lastTodoIdx = -1;
+  blocks.forEach((b, i) => {
+    if (b.type === "tool_call" && b.name === "todo_write") lastTodoIdx = i;
+  });
+  if (lastTodoIdx < 0) return blocks;
+  return blocks.filter(
+    (b, i) => !(b.type === "tool_call" && b.name === "todo_write" && i !== lastTodoIdx),
+  );
+}
+
 function ChatBlockView({ block }: { block: ChatBlock }) {
   switch (block.type) {
     case "text":
@@ -995,13 +1008,20 @@ export default function AgentPage() {
               if (idx < 0 || prev[idx].role !== "assistant") return prev;
               const next = [...prev];
               const last = next[idx];
-              const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+              // 有任何可见内容（文本/工具/思考/子agent）就不贴占位；只在**真的空**时才提示。
+              const hasContent = last.blocks.some(
+                (b) =>
+                  (b.type === "text" && b.text) ||
+                  b.type === "tool_call" ||
+                  b.type === "thinking" ||
+                  b.type === "subagent",
+              );
               next[idx] = {
                 ...last,
                 streaming: false,
-                blocks: hasText
+                blocks: hasContent
                   ? last.blocks
-                  : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }],
+                  : [...last.blocks, { type: "text" as const, text: "（已完成，无输出）" }],
               };
               return next;
             });
@@ -1143,11 +1163,17 @@ export default function AgentPage() {
             if (idx < 0 || !prev[idx].streaming) return prev;
             const next = [...prev];
             const last = next[idx];
-            const hasText = last.blocks.some((b) => b.type === "text" && b.text);
+            const hasContent = last.blocks.some(
+              (b) =>
+                (b.type === "text" && b.text) ||
+                b.type === "tool_call" ||
+                b.type === "thinking" ||
+                b.type === "subagent",
+            );
             next[idx] = {
               ...last,
               streaming: false,
-              blocks: hasText ? last.blocks : [...last.blocks, { type: "text" as const, text: "（已完成，无文本输出）" }],
+              blocks: hasContent ? last.blocks : [...last.blocks, { type: "text" as const, text: "（已完成，无输出）" }],
             };
             return next;
           });
@@ -1350,7 +1376,7 @@ export default function AgentPage() {
                         {m.blocks.length === 0 && m.streaming && (
                           <span className="muted">思考中...</span>
                         )}
-                        {m.blocks.map((block, bi) => (
+                        {collapseTodoBlocks(m.blocks).map((block, bi) => (
                           <ChatBlockView key={bi} block={block} />
                         ))}
                         {m.streaming && (
