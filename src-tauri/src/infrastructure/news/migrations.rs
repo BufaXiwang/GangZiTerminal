@@ -79,7 +79,7 @@ CREATE VIRTUAL TABLE news_search_fts USING fts5(
     title,
     summary,
     article,
-    tokenize = 'unicode61'
+    tokenize = 'trigram'
 );
 "#;
 

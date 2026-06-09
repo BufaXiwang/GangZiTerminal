@@ -989,9 +989,9 @@ mod tests {
         assert_eq!(r.items[0].id, "id-a");
     }
 
-    // 诊断：中文关键词 FTS 行为（unicode61 tokenizer 对 CJK 的真实表现）。
+    // 中文关键词 FTS 行为（tokenize=trigram）：≥3 字子串命中（中英文皆可），2 字受 trigram 固有限制。
     #[test]
-    fn fts_chinese_keyword_diagnostic() {
+    fn fts_chinese_keyword_trigram() {
         let db = setup();
         let repo = NewsRepository::new(&db);
         let mk = |id: &str, title: &str| {
@@ -999,34 +999,39 @@ mod tests {
             it.title = title.to_string();
             it
         };
-        // A: 关键词「贵州茅台」嵌在无标点的长汉字串里
+        // A: 关键词嵌在无标点的长汉字串里（unicode61 下搜不到，trigram 能子串命中）
         repo.upsert_news_item(&mk("emb", "贵州茅台发布2024年业绩预增公告大幅增长")).unwrap();
-        // B: 关键词被标点分隔成独立 token
+        // B: 关键词被标点分隔
         repo.upsert_news_item(&mk("punc", "贵州茅台：2024年业绩预增，净利润大增")).unwrap();
         // C: 英文对照
         repo.upsert_news_item(&mk("en", "Kweichow Moutai profit surge")).unwrap();
 
         let q = |kw: &str| {
-            repo.list_news_items(None, None, None, Some(kw), NewsOrder::Desc, 50, 0)
+            let mut ids = repo
+                .list_news_items(None, None, None, Some(kw), NewsOrder::Desc, 50, 0)
                 .unwrap()
                 .items
                 .into_iter()
                 .map(|i| i.id)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
         };
-        println!("\n=== 中文 FTS 诊断（tokenize=unicode61）===");
+        println!("\n=== 中文 FTS 诊断（tokenize=trigram）===");
         for kw in ["贵州茅台", "茅台", "业绩", "业绩预增", "moutai", "profit"] {
             println!("  query {:>10}  → {:?}", kw, q(kw));
         }
         println!("===========================================\n");
 
-        // 当前 unicode61 局限（CJK 不分词 → 整段汉字成单 token，子串不命中）。
-        // 这是已知 BUG：A 股最自然的「茅台」「业绩」搜不到。修 CJK 分词（bigram）后翻转下列断言。
-        assert_eq!(q("贵州茅台"), vec!["punc"], "仅标点分隔成整 token 才命中");
-        assert!(q("茅台").is_empty(), "嵌入式 2 字关键词当前不命中（unicode61 局限）");
-        assert!(q("业绩").is_empty(), "嵌入式关键词当前不命中（unicode61 局限）");
-        assert_eq!(q("moutai"), vec!["en"], "英文（空格分词）正常");
-        assert_eq!(q("profit"), vec!["en"], "英文正常");
+        // ≥3 字关键词：中英文都做真子串检索，嵌入式也命中（trigram 相比 unicode61 的关键提升）。
+        assert_eq!(q("贵州茅台"), vec!["emb", "punc"], "≥3 字中文子串：嵌入式 + 标点分隔都命中");
+        assert_eq!(q("业绩预增"), vec!["emb", "punc"], "≥3 字中文子串命中");
+        assert_eq!(q("moutai"), vec!["en"], "英文大小写不敏感命中");
+        assert_eq!(q("profit"), vec!["en"], "英文命中");
+        // trigram 固有限制：query < 3 字符无法用 trigram 索引 → 2 字中文词不命中。
+        // （要支持 2 字需 CJK bigram 预切分或 ICU tokenizer；当前权衡为不引入。）
+        assert!(q("茅台").is_empty(), "2 字中文受 trigram ≥3 限制，已知不命中");
+        assert!(q("业绩").is_empty(), "2 字中文受 trigram ≥3 限制，已知不命中");
     }
 
     #[test]

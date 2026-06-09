@@ -171,6 +171,10 @@ type NewsSource = {
 - 更新 `ArticleContent` 后必须同步更新所有 `NewsItem.url == ArticleContent.url` 的搜索读模型。
 - 搜索读模型必须与 `NewsItem` 保持一致。**本阶段 News 不暴露任何删除入口**（不主动删除 `NewsItem` / `ArticleContent`，见 §读模型不变量），因此删除一致性规则（删除 `NewsItem` 时同步删其搜索行、删除 `ArticleContent` 不连带删搜索行）仅为未来维护策略预留，当前无对应触发路径。
 - 实现自愈：启动时对账，清掉搜索读模型中指向已不存在 `NewsItem` 的孤儿行（兜底历史数据 / 外部维护脚本可能造成的不一致）。当前 FTS 实现是独立 FTS5 表（`article` 列来自 `news_articles` join，不便做 external-content + 触发器），故靠启动对账保证一致性。
+- **分词器：FTS5 `trigram`**（中英文统一、做真子串检索，**不**做 CJK 分词预处理）。语义后果：
+  - **≥3 字符的 query 做子串匹配**，中英文皆可，嵌入在长串中的关键词也命中（如「贵州茅台」命中「贵州茅台发布…公告」）——这是相对 `unicode61`（整段汉字粘成单 token、子串搜不到）的关键修复。
+  - **< 3 字符的 query 无法走 trigram 索引 → 不命中**（如 2 字中文「茅台」「业绩」）。支持 2 字需 CJK bigram 预切分或 ICU tokenizer，当前权衡为不引入。
+  - 切换分词器是 FTS5 虚表 schema 变更：升级需清库重建（删 `gangzi.db` 重启），不做程序内 reindex。
 
 ---
 
