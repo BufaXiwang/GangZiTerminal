@@ -228,10 +228,21 @@ impl ToolCallParser {
             let raw_inner = std::mem::take(&mut self.content_buf);
             let trimmed = raw_inner.trim();
             let name = self.current_name.take().unwrap_or_default();
-            match serde_json::from_str::<JsonSummary>(trimmed) {
+            // 容忍模型在合法 JSON 后追加垃圾（gpt-5 长输入常见 "trailing characters"，导致
+            // run_subagent 这类长 prompt 反复 parse_error）：用流式 deserializer 取**第一个完整
+            // JSON 对象**，忽略其后多余内容。仍对真正非法的 JSON 报 parse_error。
+            let parse_result = {
+                let mut stream =
+                    serde_json::Deserializer::from_str(trimmed).into_iter::<JsonSummary>();
+                match stream.next() {
+                    Some(r) => r.map_err(|e| e.to_string()),
+                    None => Err("empty <use_tool> body".to_string()),
+                }
+            };
+            match parse_result {
                 Ok(input) => events.push(ParserEvent::UseTool { name, input }),
-                Err(e) => events.push(ParserEvent::ParseError {
-                    reason: format!("invalid JSON in <use_tool>: {}", e),
+                Err(reason) => events.push(ParserEvent::ParseError {
+                    reason: format!("invalid JSON in <use_tool>: {}", reason),
                     partial: raw_inner,
                 }),
             }
@@ -434,6 +445,24 @@ mod tests {
             }
         }
         assert!(saw_err);
+    }
+
+    // 容忍合法 JSON 后的尾部垃圾（gpt-5 长输入常见）：取第一个完整对象，不再 parse_error。
+    #[test]
+    fn t6b_trailing_chars_after_valid_json_tolerated() {
+        let mut p = ToolCallParser::new();
+        let evs = p.feed(r#"<use_tool name="run_subagent">{"prompt":"hi"} 多余的尾巴}}</use_tool>"#);
+        let mut got = None;
+        for e in evs {
+            match e {
+                ParserEvent::UseTool { name, input } => got = Some((name, input)),
+                ParserEvent::ParseError { .. } => panic!("尾部垃圾不应再 parse_error"),
+                _ => {}
+            }
+        }
+        let (name, input) = got.expect("应解析出 UseTool");
+        assert_eq!(name, "run_subagent");
+        assert_eq!(input["prompt"], "hi");
     }
 
     #[test]
