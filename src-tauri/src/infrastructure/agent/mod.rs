@@ -168,8 +168,8 @@ pub fn bootstrap(
     if let Err(e) = register_subagent_tools(&registry, fork_handle) {
         tracing::warn!("register_subagent_tools failed: {e}");
     }
-    // web 研究工具：web_extract（无 key，读正文）+ web_search（默认 DuckDuckGo best-effort）。
-    // keyed 源（Brave/Bocha/Tavily）+ 用户 key 由设置页接线后从 settings build config（待 C）。
+    // web 研究工具：web_extract（无 key，读正文）+ web_search（DuckDuckGo，免费无 key）。
+    // 需 key 的源已按用户要求移除——只留免费版本。
     {
         let web_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(25))

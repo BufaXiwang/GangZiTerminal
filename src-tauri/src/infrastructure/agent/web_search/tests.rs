@@ -1,4 +1,4 @@
-//! web_search 测试：聚合器（去重 / 交错 / 并行容错）hermetic + DuckDuckGo/Jina live。
+//! web_search 测试：聚合器（去重 / 交错 / 并行容错）hermetic + DuckDuckGo live。
 
 use super::*;
 use crate::infrastructure::agent::tool_registry::ToolRegistry;
@@ -70,20 +70,11 @@ async fn aggregator_runs_parallel_and_tolerates_provider_failure() {
 #[test]
 fn config_build_counts_enabled_providers() {
     let client = reqwest::Client::new();
-    let cfg = WebSearchConfig {
-        enable_duckduckgo: true,
-        jina_key: Some("jk".into()),
-        brave_key: None,
-        bocha_key: Some("k".into()),
-        tavily_key: None, // 空/None 不启用
-    };
-    let agg = cfg.build(client);
-    // ddg + jina + bocha = 3
-    assert_eq!(agg.provider_names().len(), 3);
-    assert!(agg.provider_names().contains(&"duckduckgo".to_string()));
-    assert!(agg.provider_names().contains(&"jina".to_string()));
-    assert!(agg.provider_names().contains(&"bocha".to_string()));
-    assert!(!agg.provider_names().contains(&"tavily".to_string()));
+    // 只剩免费的 DuckDuckGo：启用即 1 源，不启用即 0 源。
+    let on = WebSearchConfig { enable_duckduckgo: true }.build(client.clone());
+    assert_eq!(on.provider_names(), vec!["duckduckgo".to_string()]);
+    let off = WebSearchConfig { enable_duckduckgo: false }.build(client);
+    assert!(off.is_empty());
 }
 
 #[tokio::test]
@@ -121,38 +112,22 @@ async fn tool_returns_aggregated_results() {
         .contains(&serde_json::json!("a")));
 }
 
-// ───────────────────────────── live：DuckDuckGo + Jina（免费无 key）
+// ───────────────────────────── live：DuckDuckGo（免费无 key）
 
 #[tokio::test]
-#[ignore = "live: 联网真实搜索（DuckDuckGo + Jina 免费无 key；可选 TEST_WEB_BOCHA_KEY/TEST_WEB_TAVILY_KEY）"]
+#[ignore = "live: 联网真实搜索（DuckDuckGo 免费无 key；数据中心 IP 常被反爬挡，住宅 IP 通常可）"]
 async fn web_search_live_free_providers() {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap();
-    let jina = std::env::var("TEST_WEB_JINA_KEY").ok();
-    let brave = std::env::var("TEST_WEB_BRAVE_KEY").ok();
-    let bocha = std::env::var("TEST_WEB_BOCHA_KEY").ok();
-    let tavily = std::env::var("TEST_WEB_TAVILY_KEY").ok();
-    let has_keyed = [&jina, &brave, &bocha, &tavily].iter().any(|k| k.is_some());
-    let cfg = WebSearchConfig {
-        enable_duckduckgo: true, // best-effort（IP 相关，沙箱里大概率被反爬挡）
-        jina_key: jina,
-        brave_key: brave,
-        bocha_key: bocha,
-        tavily_key: tavily,
-    };
-    let agg = cfg.build(client);
+    let agg = WebSearchConfig { enable_duckduckgo: true }.build(client);
     println!("\n=== web_search live providers: {:?} ===", agg.provider_names());
     let results = agg.search("贵州茅台 2024 业绩", 5).await;
     println!("聚合 {} 条：", results.len());
     for x in &results {
         println!("  [{}] {} — {}", x.source, x.title, x.url);
     }
-    // 只在配置了 keyed 源时硬断言（无 key 时仅剩 DuckDuckGo，常被反爬挡 → 不强制）。
-    if has_keyed {
-        assert!(!results.is_empty(), "配了 keyed 源却 0 结果：检查 key / 上游 / 解析");
-    } else {
-        eprintln!("[info] 无 keyed key（仅 DuckDuckGo best-effort）；{} 条。设 TEST_WEB_*_KEY 做硬验证。", results.len());
-    }
+    // DuckDuckGo best-effort（反爬与 IP 有关）→ 不强制断言非空，仅打印观察。
+    eprintln!("[info] DuckDuckGo best-effort；{} 条。", results.len());
 }

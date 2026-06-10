@@ -38,23 +38,19 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
-    /// 来自哪个 provider（duckduckgo / jina / bocha / tavily）。
+    /// 来自哪个 provider（当前只有免费的 duckduckgo）。
     pub source: String,
 }
 
 #[derive(Debug)]
 pub enum WebSearchError {
     Http(String),
-    Parse(String),
-    Auth(String),
 }
 
 impl std::fmt::Display for WebSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WebSearchError::Http(m) => write!(f, "http: {m}"),
-            WebSearchError::Parse(m) => write!(f, "parse: {m}"),
-            WebSearchError::Auth(m) => write!(f, "auth: {m}"),
         }
     }
 }
@@ -134,21 +130,15 @@ fn interleave_dedupe(lists: Vec<Vec<WebSearchResult>>, max: usize) -> Vec<WebSea
     out
 }
 
-/// provider key / 开关配置（adapter 从设置注入；构造时按启用项 build 出聚合器）。
+/// provider 开关配置（构造时按启用项 build 出聚合器）。
 ///
-/// 现状（2026-06 实测）：**无 key 的免费源基本失效** —— DuckDuckGo html/lite 被反爬挡（HTTP 202
-/// challenge，可能与发起 IP 有关，住宅 IP 或许仍可）、Jina/SearXNG 已要 key 或封 bot。故除 DuckDuckGo
-/// （IP 相关、best-effort、聚合容错）外，其余源都需各自的（免费额度）key。
+/// 现状（2026-06）：只保留**免费、无 key** 的 DuckDuckGo。需 key 的源（Jina/Brave/Bocha/Tavily）
+/// 已按用户要求移除。DuckDuckGo 在数据中心 IP 常被反爬挡（HTTP 202 challenge），但本工具跑在
+/// 用户本机 Tauri 后端（住宅 IP），命中率更高；聚合层对失败容错（失败忽略）。
 #[derive(Debug, Clone, Default)]
 pub struct WebSearchConfig {
-    /// DuckDuckGo 无 key 抓取；可能被目标站反爬挡（取决于发起 IP）。聚合层容错（失败忽略）。
+    /// DuckDuckGo 无 key 抓取（html + lite 双端点回退）。聚合层容错。
     pub enable_duckduckgo: bool,
-    /// Jina 现已强制需要 key（s.jina.ai 401 AuthenticationRequired）。
-    pub jina_key: Option<String>,
-    /// Brave Search：免费额度 2000/月、稳定 JSON API —— 最推荐的免费源。
-    pub brave_key: Option<String>,
-    pub bocha_key: Option<String>,
-    pub tavily_key: Option<String>,
 }
 
 impl WebSearchConfig {
@@ -157,18 +147,6 @@ impl WebSearchConfig {
         let mut ps: Vec<Box<dyn WebSearchProvider>> = Vec::new();
         if self.enable_duckduckgo {
             ps.push(Box::new(providers::DuckDuckGo::new(client.clone())));
-        }
-        if let Some(k) = self.jina_key.clone().filter(|k| !k.is_empty()) {
-            ps.push(Box::new(providers::Jina::new(client.clone(), k)));
-        }
-        if let Some(k) = self.brave_key.clone().filter(|k| !k.is_empty()) {
-            ps.push(Box::new(providers::Brave::new(client.clone(), k)));
-        }
-        if let Some(k) = self.bocha_key.clone().filter(|k| !k.is_empty()) {
-            ps.push(Box::new(providers::Bocha::new(client.clone(), k)));
-        }
-        if let Some(k) = self.tavily_key.clone().filter(|k| !k.is_empty()) {
-            ps.push(Box::new(providers::Tavily::new(client.clone(), k)));
         }
         MultiWebSearch::new(ps)
     }
@@ -217,7 +195,7 @@ pub fn register_web_search_tool(
                 return ToolHandlerOutput::err(
                     json!({
                         "reason": "invalid_input",
-                        "message": "未配置任何搜索源：请在设置启用 DuckDuckGo/Jina 或填 Bocha/Tavily key"
+                        "message": "未配置任何搜索源：请在设置启用 DuckDuckGo"
                     }),
                     ErrorCode::InvalidInput,
                 );
