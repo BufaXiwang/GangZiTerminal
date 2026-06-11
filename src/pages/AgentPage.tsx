@@ -11,14 +11,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Link, useLocation } from "react-router-dom";
-import { Bot, ChevronDown, ChevronRight, ImagePlus, Loader, Send, User, X, Zap } from "lucide-react";
+import { Bot, ImagePlus, Send, User, X } from "lucide-react";
 import { PageShell } from "../components/PageShell";
-import { KlineModal } from "../components/KlineModal";
 import { ROUTES } from "../lib/router";
-import { renderMarkdown } from "../lib/simpleMarkdown";
 import {
   commands,
-  type AgentRun,
   type AgentStateSnapshot,
   type AnalysisResult,
   type ConversationSummary,
@@ -28,674 +25,17 @@ import {
   type StrategyHistoryEntry,
 } from "../bindings";
 
-/* ---------- Rich chat message model ---------- */
-
-type ChatBlock =
-  | { type: "text"; text: string }
-  | { type: "thinking"; text: string; collapsed: boolean }
-  | {
-      type: "tool_call";
-      id: string;
-      name: string;
-      input: string;
-      output?: string;
-      isError?: boolean;
-      durationMs?: number;
-      status: "running" | "done";
-    }
-  | { type: "usage"; input: number; output: number; cacheRead?: number }
-  | {
-      // 子 agent 实时活动（fork 子 run 跑时让用户看到它在干嘛；仅展示，不进 LLM 上下文）。
-      type: "subagent";
-      agentId: string;
-      tools: Array<{ name: string; done: boolean }>;
-      text: string;
-      done: boolean;
-    };
-
-interface ChatMessage {
-  id: string;
-  role: "user" | "assistant" | "system";
-  blocks: ChatBlock[];
-  streaming?: boolean;
-  error?: boolean;
-  timestamp?: string;
-}
-
-/** Format token count: 1200 → "1.2k", 500 → "500" */
-function fmtTokens(n: number): string {
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  return String(n);
-}
-
-/** Format ISO timestamp to local timezone */
-function fmtTime(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString("zh-CN", {
-      year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit", second: "2-digit",
-      hour12: false,
-    });
-  } catch { return iso; }
-}
-
-/** Format ISO timestamp to shorter sidebar format */
-function fmtTimeShort(iso: string): string {
-  try {
-    const d = new Date(iso);
-    const now = new Date();
-    if (d.toDateString() === now.toDateString()) {
-      return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
-    }
-    return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
-  } catch { return iso; }
-}
-
-/** Extract a clean one-line title from markdown summary */
-function summarizeLine(summary: string): string {
-  // Strip markdown headers/bold, take first meaningful line
-  const clean = summary
-    .replace(/^#{1,4}\s+/gm, "")
-    .replace(/\*\*/g, "")
-    .trim();
-  const firstLine = clean.split("\n").find((l) => l.trim().length > 0) ?? clean;
-  return firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
-}
-
-/** Parse persisted message text into ChatBlocks (text + tool_call from XML markers) */
-function parsePersistedBlocks(text: string, role: "user" | "assistant"): ChatBlock[] {
-  const blocks: ChatBlock[] = [];
-  // For user messages containing only tool results, parse them as tool_call blocks
-  if (role === "user") {
-    const resultRe = /<tool_(?:result|error)\s+name="([^"]*)"[^>]*call_id="([^"]*)"[^>]*>([\s\S]*?)<\/tool_(?:result|error)>/g;
-    let match;
-    while ((match = resultRe.exec(text)) !== null) {
-      const isError = match[0].startsWith("<tool_error");
-      blocks.push({
-        type: "tool_call",
-        id: match[2],
-        name: match[1],
-        input: "",
-        output: match[3].slice(0, 500),
-        isError,
-        status: "done",
-      });
-    }
-    // If we parsed tool results, skip adding raw text
-    if (blocks.length > 0) return blocks;
-  }
-  // For assistant messages, parse <use_tool> as tool calls
-  if (role === "assistant") {
-    const toolRe = /<use_tool\s+name="([^"]*)">([\s\S]*?)<\/use_tool>/g;
-    let lastIdx = 0;
-    let match;
-    while ((match = toolRe.exec(text)) !== null) {
-      const before = text.slice(lastIdx, match.index).trim();
-      if (before) blocks.push({ type: "text", text: before });
-      blocks.push({
-        type: "tool_call",
-        id: `persisted_${match.index}`,
-        name: match[1],
-        input: match[2].slice(0, 500),
-        status: "done",
-      });
-      lastIdx = match.index + match[0].length;
-    }
-    const after = text.slice(lastIdx).trim();
-    if (after) blocks.push({ type: "text", text: after });
-    if (blocks.length > 0) return blocks;
-  }
-  // Fallback: plain text
-  const cleaned = text
-    .replace(/<use_tool[\s\S]*?<\/use_tool>/g, "")
-    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
-    .replace(/<tool_error[\s\S]*?<\/tool_error>/g, "")
-    .trim();
-  if (cleaned) blocks.push({ type: "text", text: cleaned });
-  return blocks;
-}
-
-/** Convert persisted AgentMessages into merged ChatMessages.
- * Tool result messages (user role with <tool_result>) get merged into the preceding
- * assistant message as tool_call blocks with output filled in. */
-function mergePersistedMessages(msgs: import("../bindings").AgentMessage[]): ChatMessage[] {
-  const out: ChatMessage[] = [];
-  for (const m of msgs) {
-    if (m.role !== "user" && m.role !== "assistant") continue;
-    const blocks: ChatBlock[] = m.blocks.flatMap(b => {
-      if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
-      if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
-      return [];
-    });
-    if (blocks.length === 0) continue;
-    // User messages with only tool_call blocks (tool results) → merge into last assistant msg
-    const allToolCalls = blocks.every(b => b.type === "tool_call");
-    if (m.role === "user" && allToolCalls && out.length > 0 && out[out.length - 1].role === "assistant") {
-      // Merge tool results into preceding assistant's tool_call blocks
-      const lastAssistant = out[out.length - 1];
-      for (const block of blocks) {
-        if (block.type !== "tool_call") continue;
-        // 历史回填：assistant 的 <use_tool> 不带 call_id（id=persisted_X），<tool_result> 带真实
-        // call_id，两者 id 不匹配。改按 **name + 顺序** 配对：填第一个同名、尚无 output 的 tool_call。
-        const existing = lastAssistant.blocks.find(
-          b => b.type === "tool_call" && b.name === block.name && b.output === undefined
-        );
-        if (existing && existing.type === "tool_call") {
-          existing.output = block.output;
-          existing.isError = block.isError;
-          existing.status = "done";
-        } else {
-          lastAssistant.blocks.push(block);
-        }
-      }
-      continue;
-    }
-    out.push({
-      id: m.messageId,
-      role: m.role as "user" | "assistant",
-      blocks,
-      timestamp: m.createdAt,
-    });
-  }
-  return out;
-}
-
-/** Truncate a string with an ellipsis if it exceeds maxLen */
-function truncate(s: string, maxLen: number): string {
-  if (s.length <= maxLen) return s;
-  return s.slice(0, maxLen) + "...";
-}
-
-type DetailView =
-  | { type: "analysis"; data: AnalysisResult }
-  | { type: "report"; name: string; path: string }
-  | null;
-
-/* ---------- inline sub-components ---------- */
-
-function AnalysisDetail({ data, runs }: { data: AnalysisResult; runs: AgentRun[] }) {
-  const [codeInfo, setCodeInfo] = useState<Map<string, { name: string; pct?: number }>>(new Map());
-  const [klineCode, setKlineCode] = useState<{ tsCode: string; name?: string } | null>(null);
-  const [newsItems, setNewsItems] = useState<Array<{id: string; title: string; source?: string}>>([]);
-
-  useEffect(() => {
-    if (!data.relatedCodes?.length) return;
-    commands.fetchData({
-      tsCodes: data.relatedCodes,
-      include: { quote: true },
-      limit: null,
-    }).then(res => {
-      if (res.status === "ok") {
-        const map = new Map<string, { name: string; pct?: number }>();
-        for (const item of res.data.items) {
-          map.set(item.tsCode, {
-            name: item.name ?? item.tsCode,
-            pct: item.quote?.changePercent ?? undefined,
-          });
-        }
-        setCodeInfo(map);
-      }
-    });
-  }, [data.relatedCodes]);
-
-  // Find related news IDs from the run's trigger (news_batch mode).
-  const relatedRun = useMemo(
-    () => runs.find(r => r.runId === data.runId),
-    [runs, data.runId],
-  );
-  const newsIds = useMemo(() => {
-    if (!relatedRun) return null;
-    const trigger = relatedRun.trigger as Record<string, unknown>;
-    if (trigger?.kind === "news_batch" && Array.isArray(trigger.newsIds)) {
-      return trigger.newsIds as string[];
-    }
-    return null;
-  }, [relatedRun]);
-
-  // Fetch actual news items when newsIds are available.
-  useEffect(() => {
-    if (!newsIds?.length) {
-      setNewsItems([]);
-      return;
-    }
-    commands.fetchNews({
-      ids: newsIds,
-      limit: newsIds.length,
-      query: null,
-      sources: null,
-      publishedFrom: null,
-      publishedTo: null,
-      includeArticle: null,
-      offset: null,
-      order: null,
-    }).then(res => {
-      if (res.status === "ok") {
-        setNewsItems(res.data.items.map(n => ({
-          id: n.id,
-          title: n.title ?? n.id,
-          source: n.source,
-        })));
-      }
-    });
-  }, [newsIds]);
-
-  return (
-    <div className="agent-analysis-detail">
-      <div className="detail-field">
-        <span className="detail-label">判定</span>
-        <span className={`detail-kind kind-${data.kind}`}>
-          {data.kind === "action" ? "操作" : "观望"}
-        </span>
-      </div>
-      <div className="detail-field">
-        <span className="detail-label">摘要</span>
-        <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(data.summary) }} />
-      </div>
-      {data.relatedCodes?.length > 0 && (
-        <div className="detail-field">
-          <span className="detail-label">相关标的</span>
-          <div className="detail-codes">
-            {data.relatedCodes.map((code: string) => {
-              const info = codeInfo.get(code);
-              const pct = info?.pct;
-              const pctClass = pct != null ? (pct > 0 ? "up" : pct < 0 ? "down" : "flat") : "";
-              return (
-                <button
-                  key={code}
-                  type="button"
-                  className="detail-code-link"
-                  onClick={() => setKlineCode({ tsCode: code, name: info?.name })}
-                >
-                  <span>{info?.name ?? ""} {code}</span>
-                  {pct != null && (
-                    <span className={`detail-code-pct ${pctClass}`}>
-                      {pct > 0 ? "+" : ""}{pct.toFixed(2)}%
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
-      <KlineModal
-        open={!!klineCode}
-        tsCode={klineCode?.tsCode ?? null}
-        name={klineCode?.name}
-        onClose={() => setKlineCode(null)}
-      />
-      {data.tradeIds?.length > 0 && (
-        <div className="detail-field">
-          <span className="detail-label">关联交易</span>
-          <span className="tabular">{data.tradeIds.join(", ")}</span>
-        </div>
-      )}
-      {/* Related news: show titles fetched from backend */}
-      {newsItems.length > 0 && (
-        <div className="detail-field">
-          <span className="detail-label">触发新闻（{newsItems.length} 条）</span>
-          <div className="detail-news-list">
-            {newsItems.map(n => (
-              <div key={n.id} className="detail-news-item">
-                {n.source && <span className="detail-news-source">{n.source}</span>}
-                <span className="detail-news-title">{n.title}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="detail-field">
-        <span className="detail-label">时间</span>
-        <span>{fmtTime(data.createdAt)}</span>
-      </div>
-    </div>
-  );
-}
-
-function ReportDetail({ name, path }: { name: string; path: string }) {
-  const [content, setContent] = useState<string | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  useEffect(() => {
-    commands.agentReadReviewReport(path).then((res) => {
-      if (res.status === "ok") {
-        setContent(res.data);
-      } else {
-        setLoadError(res.error.message ?? "读取失败");
-      }
-    });
-  }, [path]);
-
-  if (loadError) {
-    return (
-      <div className="agent-report-detail">
-        <p className="muted">{name} — {loadError}</p>
-      </div>
-    );
-  }
-  if (content === null) {
-    return (
-      <div className="agent-report-detail">
-        <p className="muted">加载中…</p>
-      </div>
-    );
-  }
-  // Strip the run_id line from report markdown before rendering.
-  const cleaned = content.replace(/^-\s*run_id:.*$/m, "").trim();
-  return (
-    <div className="agent-report-detail">
-      <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(cleaned) }} />
-    </div>
-  );
-}
-
-function StrategyModal({
-  strategy,
-  history,
-  onClose,
-}: {
-  strategy: InvestmentStrategy | null;
-  history: StrategyHistoryEntry[] | null;
-  onClose: () => void;
-}) {
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
-
-  return (
-    <div className="agent-modal-backdrop" onClick={onClose}>
-      <div className="agent-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="agent-modal-header">
-          <h2>投资策略{strategy ? ` V${strategy.version}` : ""}</h2>
-          <span className="muted" style={{ fontSize: 12 }}>
-            通过对话修改
-          </span>
-          <button className="agent-modal-close" onClick={onClose}>
-            <X size={18} />
-          </button>
-        </div>
-        <div className="agent-modal-body">
-          <div className="md-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(strategy?.strategy ?? "（未设置策略）") }} />
-          {history && history.length > 0 && (
-            <div className="agent-strategy-history">
-              <h4 className="agent-strategy-history-title">版本历史</h4>
-              {history.map((h) => (
-                <div key={h.version} className="agent-strategy-history-item">
-                  <span className="tabular">V{h.version}</span>
-                  <span className="muted">{h.updatedAt}</span>
-                  <span className="muted">{h.reason}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ---------- Chat block renderers ---------- */
-
-// todo_write 是整表替换语义，只有最新一份清单有意义 → 渲染时只保留最后一个 todo_write 面板，
-// 折叠掉更早的（否则 agent 多次 todo_write 会堆叠成 N 个清单，很乱）。
-function collapseTodoBlocks(blocks: ChatBlock[]): ChatBlock[] {
-  let lastTodoIdx = -1;
-  blocks.forEach((b, i) => {
-    if (b.type === "tool_call" && b.name === "todo_write") lastTodoIdx = i;
-  });
-  if (lastTodoIdx < 0) return blocks;
-  return blocks.filter(
-    (b, i) => !(b.type === "tool_call" && b.name === "todo_write" && i !== lastTodoIdx),
-  );
-}
-
-function ChatBlockView({ block }: { block: ChatBlock }) {
-  switch (block.type) {
-    case "text":
-      return <TextBlockView text={block.text} />;
-    case "thinking":
-      return <ThinkingBlockView text={block.text} defaultCollapsed={block.collapsed} />;
-    case "tool_call":
-      // todo_write 渲染成 live checklist（从 output/input 的 {items} 派生，复用 ToolEnd 信道）。
-      if (block.name === "todo_write") {
-        return <TodoBlockView input={block.input} output={block.output} />;
-      }
-      return (
-        <ToolCallBlockView
-          name={block.name}
-          input={block.input}
-          output={block.output}
-          isError={block.isError}
-          durationMs={block.durationMs}
-          status={block.status}
-        />
-      );
-    case "usage":
-      return <UsageBlockView input={block.input} output={block.output} cacheRead={block.cacheRead} />;
-    case "subagent":
-      return (
-        <SubAgentBlockView agentId={block.agentId} tools={block.tools} text={block.text} done={block.done} />
-      );
-    default:
-      return null;
-  }
-}
-
-// 子 agent 实时活动嵌套面板（fork 子 run 阻塞跑时，用户看到它在调什么工具 / 输出什么）。
-function SubAgentBlockView({
-  tools,
-  text,
-  done,
-}: {
-  agentId: string;
-  tools: Array<{ name: string; done: boolean }>;
-  text: string;
-  done: boolean;
-}) {
-  const [collapsed, setCollapsed] = useState(false);
-  return (
-    <div
-      style={{
-        border: "1px solid var(--border, #1e293b)",
-        borderLeft: "2px solid #a78bfa",
-        borderRadius: 8,
-        padding: "6px 10px",
-        margin: "6px 0",
-        background: "var(--bg-raised, rgba(167,139,250,0.05))",
-        fontSize: 12,
-      }}
-    >
-      <div
-        style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer", color: "#a78bfa" }}
-        onClick={() => setCollapsed((v) => !v)}
-      >
-        {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-        <span>🤖 子 agent {done ? "· 已完成" : "· 调研中…"}</span>
-      </div>
-      {!collapsed && (
-        <div style={{ marginLeft: 18, marginTop: 4 }}>
-          {tools.map((t, i) => (
-            <div key={i} style={{ color: t.done ? "var(--text-dim,#94a3b8)" : "#fbbf24", fontFamily: "ui-monospace, monospace" }}>
-              {t.done ? "■" : "▸"} {t.name}
-            </div>
-          ))}
-          {text && (
-            <div style={{ color: "#cbd5e1", marginTop: 4, whiteSpace: "pre-wrap" }}>{text}</div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// todo_write 的 live checklist。从 output（执行后回显）或 input（执行中预览）解析 {items}。
-function TodoBlockView({ input, output }: { input: string; output?: string }) {
-  let items: Array<{ content: string; status: string }> = [];
-  try {
-    const src = output && output !== "{}" ? output : input;
-    const parsed = JSON.parse(src);
-    if (Array.isArray(parsed?.items)) items = parsed.items;
-  } catch {
-    /* malformed → 不渲染 */
-  }
-  if (items.length === 0) return null;
-  const done = items.filter((i) => i.status === "completed").length;
-  const mark = (s: string) => (s === "completed" ? "✔" : s === "in_progress" ? "▸" : "○");
-  const color = (s: string) =>
-    s === "completed" ? "#34d399" : s === "in_progress" ? "#fbbf24" : "#94a3b8";
-  return (
-    <div
-      style={{
-        border: "1px solid var(--border, #1e293b)",
-        borderRadius: 8,
-        padding: "8px 12px",
-        margin: "6px 0",
-        background: "var(--bg-raised, rgba(255,255,255,0.02))",
-        fontSize: 13,
-      }}
-    >
-      <div style={{ color: "var(--text-dim, #94a3b8)", fontSize: 12, marginBottom: 6 }}>
-        📋 任务清单 · {done}/{items.length}
-      </div>
-      {items.map((it, i) => (
-        <div key={i} style={{ display: "flex", gap: 8, alignItems: "baseline", padding: "1px 0" }}>
-          <span style={{ color: color(it.status), width: 14, flexShrink: 0 }}>{mark(it.status)}</span>
-          <span
-            style={{
-              color: it.status === "completed" ? "var(--text-dim, #94a3b8)" : "var(--text, #cbd5e1)",
-              textDecoration: it.status === "completed" ? "line-through" : "none",
-              fontWeight: it.status === "in_progress" ? 600 : 400,
-            }}
-          >
-            {it.content}
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function TextBlockView({ text }: { text: string }) {
-  const cleaned = text
-    .replace(/<use_tool[\s\S]*?<\/use_tool>/g, "")
-    .replace(/<tool_result[\s\S]*?<\/tool_result>/g, "")
-    .replace(/<tool_error[\s\S]*?<\/tool_error>/g, "")
-    .trim();
-  if (!cleaned) return null;
-  return (
-    <div
-      className="chat-block-text md-content"
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(cleaned) }}
-    />
-  );
-}
-
-function ThinkingBlockView({
-  text,
-  defaultCollapsed,
-}: {
-  text: string;
-  defaultCollapsed: boolean;
-}) {
-  const [collapsed, setCollapsed] = useState(defaultCollapsed);
-  return (
-    <div
-      className="chat-block-thinking"
-      onClick={() => setCollapsed(!collapsed)}
-    >
-      <div className="chat-block-thinking-header">
-        {collapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-        <span>思考过程</span>
-      </div>
-      {!collapsed && (
-        <div className="chat-block-thinking-text">{text}</div>
-      )}
-    </div>
-  );
-}
-
-function ToolCallBlockView({
-  name,
-  input,
-  output,
-  isError,
-  durationMs,
-  status,
-}: {
-  name: string;
-  input: string;
-  output?: string;
-  isError?: boolean;
-  durationMs?: number;
-  status: "running" | "done";
-}) {
-  const [expanded, setExpanded] = useState(false);
-  return (
-    <div className={`chat-block-tool${isError ? " is-error" : ""}`}>
-      <div
-        className="chat-block-tool-header"
-        onClick={() => setExpanded(!expanded)}
-      >
-        {status === "running" ? (
-          <Loader size={14} className="tool-spinner" />
-        ) : (
-          <Zap size={14} />
-        )}
-        <span className="tool-name">{name}</span>
-        {status === "done" && durationMs != null && (
-          <span className="tool-duration">{durationMs}ms</span>
-        )}
-        {status === "running" && (
-          <span className="tool-duration">运行中...</span>
-        )}
-        <span className="tool-expand-hint">
-          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        </span>
-      </div>
-      {expanded && (
-        <div className="chat-block-tool-body">
-          <div className="tool-io-section">
-            <span className="tool-io-label">Input</span>
-            <pre>{truncate(input, 800)}</pre>
-          </div>
-          {output != null && (
-            <div className="tool-io-section">
-              <span className={`tool-io-label${isError ? " tool-io-error" : ""}`}>
-                {isError ? "Error" : "Output"}
-              </span>
-              <pre>{truncate(output, 800)}</pre>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function UsageBlockView({
-  input,
-  output,
-  cacheRead,
-}: {
-  input: number;
-  output: number;
-  cacheRead?: number;
-}) {
-  return (
-    <div className="chat-block-usage">
-      <Zap size={10} />
-      {" "}
-      {fmtTokens(input)} input · {fmtTokens(output)} output
-      {cacheRead != null && cacheRead > 0 && (
-        <> · {fmtTokens(cacheRead)} cache</>
-      )}
-    </div>
-  );
-}
+import {
+  fmtTime,
+  fmtTimeShort,
+  mergePersistedMessages,
+  summarizeLine,
+  type ChatBlock,
+  type ChatMessage,
+  type DetailView,
+} from "./agent/chatModel";
+import { ChatBlockView, collapseTodoBlocks } from "./agent/blocks";
+import { AnalysisDetail, ReportDetail, StrategyModal } from "./agent/detail";
 
 /* ---------- main page ---------- */
 
@@ -734,7 +74,10 @@ export default function AgentPage() {
   const [strategyModalOpen, setStrategyModalOpen] = useState(false);
   const [strategyHistory, setStrategyHistory] = useState<StrategyHistoryEntry[] | null>(null);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const currentRunId = useRef<string | null>(null);
+  /// 本页对话 run 的 runId（agent-event 按它路由；后台 news/review run 的事件不写对话气泡）。
+  const dialogueRunId = useRef<string | null>(null);
+  /// 历史加载/切会话后强制滚到底（绕过「贴近底部才自动滚」的判定——首屏 scrollTop=0 永远不算贴底）。
+  const scrollToBottomPending = useRef(false);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -746,7 +89,7 @@ export default function AgentPage() {
 
   // Create a new conversation.
   const newConversation = useCallback(() => {
-    const id = crypto.randomUUID();
+    const id = globalThis.crypto?.randomUUID?.() ?? `conv_${Date.now()}`;
     localStorage.setItem("agent_conversation_id", id);
     conversationId.current = id;
     setMessages([]);
@@ -766,6 +109,7 @@ export default function AgentPage() {
     commands.agentLoadConversation(cid).then(res => {
       if (res.status === "ok" && res.data.length > 0) {
         const converted = mergePersistedMessages(res.data);
+        scrollToBottomPending.current = true;
         setMessages(converted);
       }
     });
@@ -841,24 +185,18 @@ export default function AgentPage() {
   }, [refreshState, loadConversations]);
 
   // Conversation persistence: load persisted messages on mount.
+  // 与 switchConversation 同一条转换路径（mergePersistedMessages）：tool_result user 消息
+  // 合并进前一条 assistant 的 tool_call block，首屏与切会话渲染一致。
   useEffect(() => {
     const cid = conversationId.current;
     if (!cid) return;
     commands.agentLoadConversation(cid).then(res => {
       if (res.status === "ok" && res.data.length > 0) {
-        const converted: ChatMessage[] = res.data
-          .filter(m => m.role === "user" || m.role === "assistant")
-          .map(m => ({
-            id: m.messageId,
-            role: m.role as "user" | "assistant",
-            blocks: m.blocks.flatMap(b => {
-              if (b.type === "thinking") return [{ type: "thinking" as const, text: b.text, collapsed: true }];
-              if (b.type === "text") return parsePersistedBlocks((b as {text:string}).text, m.role as "user"|"assistant");
-              return [];
-            }),
-            timestamp: m.createdAt,
-          }));
-        if (converted.length > 0) setMessages(converted);
+        const converted = mergePersistedMessages(res.data);
+        if (converted.length > 0) {
+          scrollToBottomPending.current = true;
+          setMessages(converted);
+        }
       }
     }).catch(() => { /* first conversation, no history */ });
   }, []);
@@ -885,15 +223,45 @@ export default function AgentPage() {
   updateCurrentMessageRef.current = updateCurrentMessage;
   const refreshStateRef = useRef(refreshState);
   refreshStateRef.current = refreshState;
+  const loadConversationsRef = useRef(loadConversations);
+  loadConversationsRef.current = loadConversations;
 
   useEffect(() => {
     let stale = false;
     const uns: Array<() => void> = [];
+    // listen() promise 在 unmount 后才 resolve 时立即注销，避免监听器泄漏。
+    const track = (u: () => void) => {
+      if (stale) u();
+      else uns.push(u);
+    };
     void listen<Record<string, unknown>>("agent-event", (e) => {
       if (stale) return;
       const env = e.payload as Record<string, unknown>;
       const p = (env?.payload ?? env) as Record<string, unknown>;
       const type = p?.type as string | undefined;
+      const evRunId = p?.runId as string | undefined;
+
+      // —— 按 runId 路由（关键）：后端所有 run（对话 / news 自动分析 / 复盘 / 账户触发）共用
+      // `agent-event` 通道。对话气泡只消费**本页对话 run** 的事件；后台 run 的流不写气泡，
+      // 否则会出现流污染 / 气泡被提前 finalize / 错误写错气泡。
+      // 绑定时机：loop 的 run_start 事件先于该 run 的一切 delta（同一 mpsc 顺序），
+      // trigger === "user_chat" 即本页发起的对话 run。
+      if (type === "run_start") {
+        if ((p.trigger as string) === "user_chat" && runActiveRef.current !== null) {
+          dialogueRunId.current = evRunId ?? null;
+          // run 启动时用户消息已落库 → 立刻刷新左侧会话列表（新对话即时出现，
+          // 不等 agentSendMessage 在 run 终态后才 resolve）。
+          void loadConversationsRef.current();
+        }
+        return;
+      }
+      const isDialogueEvent =
+        evRunId !== undefined && evRunId === dialogueRunId.current;
+      if (!isDialogueEvent) {
+        // 后台 run：终态时仅刷新右侧总览，不碰对话区。
+        if (type === "done" || type === "error") void refreshStateRef.current();
+        return;
+      }
 
       switch (type) {
         case "text_delta": {
@@ -973,7 +341,8 @@ export default function AgentPage() {
             const b = blocks[idx];
             if (b.type !== "subagent") return blocks;
             if (kind === "tool_start") {
-              blocks[idx] = { ...b, tools: [...b.tools, { name: txt, done: false }] };
+              // 新工具调用 = 之前的文本是非末轮铺垫 → 清空（与「只回末轮结论」语义一致，防面板爆量）。
+              blocks[idx] = { ...b, tools: [...b.tools, { name: txt, done: false }], text: "" };
             } else if (kind === "tool_end") {
               const tools = b.tools.slice();
               for (let i = tools.length - 1; i >= 0; i--) {
@@ -984,7 +353,9 @@ export default function AgentPage() {
               }
               blocks[idx] = { ...b, tools };
             } else if (kind === "text") {
-              blocks[idx] = { ...b, text: b.text + txt };
+              // 只保留尾部 ~4000 字符：长调研子任务的流式文本无上限累积会拖垮渲染。
+              const merged = b.text + txt;
+              blocks[idx] = { ...b, text: merged.length > 4000 ? merged.slice(-4000) : merged };
             } else if (kind === "done") {
               blocks[idx] = { ...b, done: true, text: b.text || txt };
             }
@@ -1005,8 +376,10 @@ export default function AgentPage() {
           break;
         }
         case "done": {
-          // finalize 当前 run 的 assistant 消息（按 runActiveRef 精确定位，支持 pending 队列流水线）。
+          // finalize 当前对话 run 的 assistant 消息（按 runActiveRef 精确定位，支持 pending 队列流水线）。
+          dialogueRunId.current = null;
           const aid = runActiveRef.current;
+          const stopReason = p.stopReason as string | undefined;
           if (aid) {
             setMessages((prev) => {
               const idx = prev.findIndex((m) => m.id === aid);
@@ -1021,13 +394,22 @@ export default function AgentPage() {
                   b.type === "thinking" ||
                   b.type === "subagent",
               );
-              next[idx] = {
-                ...last,
-                streaming: false,
-                blocks: hasContent
-                  ? last.blocks
-                  : [...last.blocks, { type: "text" as const, text: "（已完成，无输出）" }],
+              // 非正常终态必须让用户看见（否则「跑了半天没结果也不知道为什么」）。
+              const abnormal: Record<string, string> = {
+                token_budget_exceeded:
+                  "⚠️ 已达本次运行的 token 预算上限，回答被截断（任务太深可拆小步问，或在设置里调高 agent_run_token_budget）",
+                max_turns: "⚠️ 已达最大工具轮数上限，任务可能未完成（可继续追问让它接着做）",
+                context_limit: "⚠️ 上下文超出模型窗口，回答被截断（建议新开对话）",
+                cancelled: "⏹ 已停止",
               };
+              const notice = stopReason ? abnormal[stopReason] : undefined;
+              let blocks = last.blocks;
+              if (notice) {
+                blocks = [...blocks, { type: "text" as const, text: notice }];
+              } else if (!hasContent) {
+                blocks = [...blocks, { type: "text" as const, text: "（已完成，无输出）" }];
+              }
+              next[idx] = { ...last, streaming: false, blocks };
               return next;
             });
             finishRunRef.current?.(aid); // 收尾 + 自动发下一条 pending 消息
@@ -1037,42 +419,38 @@ export default function AgentPage() {
           break;
         }
         case "error": {
-          // provider / loop 报错 → 在气泡里显示真实错误，而不是被兜底显示成「无文本输出」。
+          // provider / loop 报错 → 在**本对话 run 的气泡**里显示真实错误（已按 runId 路由到这里；
+          // 不再回退「最后一条 assistant」——那会把后台 run 的错误写进别人的气泡）。
           const msg = (p.message as string) || (p.code as string) || "运行出错";
           const aid = runActiveRef.current;
+          if (!aid) break;
           setMessages((prev) => {
-            const idx = aid ? prev.findIndex((m) => m.id === aid) : prev.length - 1;
+            const idx = prev.findIndex((m) => m.id === aid);
             if (idx < 0 || prev[idx].role !== "assistant") return prev;
             const next = [...prev];
             const last = next[idx];
+            // 只标 error + 追加错误文本；finalize（streaming=false + finishRun）交给随后的
+            // done 事件（loop 的致命错误路径必发 done；非致命错误后 run 还会继续流）。
             next[idx] = {
               ...last,
-              streaming: false,
               error: true,
               blocks: [...last.blocks, { type: "text" as const, text: `运行失败：${msg}` }],
             };
             return next;
           });
-          if (aid) finishRunRef.current?.(aid);
-          else setSending(false);
           break;
         }
         default:
           break;
       }
-    }).then((u) => uns.push(u));
-    void listen<Record<string, unknown>>("agent-run-started", (e) => {
-      const p = ((e.payload as Record<string, unknown>)?.payload ??
-        e.payload) as { runId?: string };
-      if (p?.runId) currentRunId.current = p.runId;
-    }).then((u) => uns.push(u));
+    }).then(track);
+    // run 起止只刷新右侧总览；对话 run 的跟踪经 agent-event 的 run_start（trigger=user_chat）绑定，
+    // 不再用「任何 run 启动都覆盖 currentRunId」——那会让 Ctrl+C 取消错后台 run。
+    void listen("agent-run-started", () => void refreshStateRef.current()).then(track);
     void listen("agent-run-finished", () => {
-      currentRunId.current = null;
       void refreshStateRef.current();
-    }).then((u) => uns.push(u));
-    void listen("agent-analysis-result", () => void refreshStateRef.current()).then((u) =>
-      uns.push(u),
-    );
+    }).then(track);
+    void listen("agent-analysis-result", () => void refreshStateRef.current()).then(track);
     // news age-out 丢弃计数（spec §5/§7）：提示用户丢了多少。
     void listen<Record<string, unknown>>(
       "agent-news-buffer-dropped",
@@ -1082,12 +460,13 @@ export default function AgentPage() {
         if (p?.count)
           console.warn(`资讯分析队列丢弃 ${p.count} 条（超时未分析）`);
       },
-    ).then((u) => uns.push(u));
+    ).then(track);
     return () => { stale = true; uns.forEach((u) => u()); };
   }, []); // stable refs via useRef — no re-subscription needed
 
   const cancelCurrent = useCallback(async () => {
-    const id = currentRunId.current;
+    // 只取消**本页对话 run**（dialogueRunId）；绝不取消后台 news/review run。
+    const id = dialogueRunId.current;
     if (id)
       await commands.agentCancelRun({
         runId: id,
@@ -1095,10 +474,16 @@ export default function AgentPage() {
       });
   }, []);
 
-  // 只在「已经贴近底部」时才自动滚到底；用户往上滚看历史时不打扰（修复流式中无法上滚）。
+  // 历史加载/切会话 → 立即滚到底（最新消息）；流式期间只在「已经贴近底部」时自动滚，
+  // 用户往上滚看历史时不打扰（修复流式中无法上滚）。
   useEffect(() => {
     const el = chatScrollRef.current;
     if (!el) return;
+    if (scrollToBottomPending.current) {
+      scrollToBottomPending.current = false;
+      chatEndRef.current?.scrollIntoView({ behavior: "auto" });
+      return;
+    }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     if (nearBottom) chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
@@ -1130,13 +515,18 @@ export default function AgentPage() {
       }
       setDetailView(null);
       const userMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: globalThis.crypto?.randomUUID?.() ?? `msg_${Date.now()}`,
         role: "user",
-        blocks: [{ type: "text", text }],
+        blocks: [
+          ...(text ? [{ type: "text" as const, text }] : []),
+          ...(images.length > 0
+            ? [{ type: "text" as const, text: `📎 ${images.length} 张图片` }]
+            : []),
+        ],
         timestamp: new Date().toISOString(),
       };
       const assistantMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: globalThis.crypto?.randomUUID?.() ?? `as_${Date.now()}`,
         role: "assistant",
         blocks: [],
         streaming: true,
@@ -1207,7 +597,7 @@ export default function AgentPage() {
     setPendingImages([]);
     if (runActiveRef.current !== null) {
       setQueued((q) => {
-        const nq = [...q, { id: crypto.randomUUID(), text, images }];
+        const nq = [...q, { id: globalThis.crypto?.randomUUID?.() ?? `q_${Date.now()}`, text, images }];
         queuedRef.current = nq;
         return nq;
       });
@@ -1616,3 +1006,4 @@ export default function AgentPage() {
     </PageShell>
   );
 }
+

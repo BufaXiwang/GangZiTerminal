@@ -1142,7 +1142,7 @@ export type SendMessageInput = {
  */
 content: string; 
 /**
- * 多模态附件（base64/URL）；当前 loop 仅消费文本，images 接受但未透传（见模块注）。
+ * 多模态附件（data-URL `data:image/...;base64,...`）；经 PayloadStore 转 Image block 透传给 loop。
  */
 images?: string[] | null; 
 /**

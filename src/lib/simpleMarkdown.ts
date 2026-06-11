@@ -75,12 +75,13 @@ export function renderMarkdown(src: string): string {
       continue;
     }
 
-    // ordered list
-    const olMatch = line.match(/^\s*\d+[.)]\s+(.+)/);
+    // ordered list — 保留源编号（li value）：有序项之间常夹着 "-" 子弹点/空行，
+    // 会把 <ol> 切成多段导致每段都从 1 重新计数；value 属性让显示编号始终跟随源文。
+    const olMatch = line.match(/^\s*(\d+)[.)]\s+(.+)/);
     if (olMatch) {
       closeTable(); closeBlockquote();
       if (inList !== "ol") { closeList(); out.push("<ol>"); inList = "ol"; }
-      out.push(`<li>${inlineFormat(olMatch[1])}</li>`);
+      out.push(`<li value="${olMatch[1]}">${inlineFormat(olMatch[2])}</li>`);
       continue;
     }
 
