@@ -239,19 +239,36 @@ pub fn decide_tier(
     None
 }
 
-/// 启发式估算一条消息的 token 数（4 字符 / token，跨所有 text / thinking block）。
+/// 启发式估算一段文本的 token 数（CJK 感知）。
+///
+/// 纯 chars/4 对中文严重低估（真实 tokenizer 约 0.6~1 token/汉字，/4 低估 ~3-4 倍）——本产品
+/// 主语言是中文（A 股研究），低估会让压缩阈值远迟于真实超限才触发。启发式：
+/// ASCII 按 4 字符/token，非 ASCII（中文/全角等）按 ~2/3 token/字符（宁可略高估提早压缩）。
+pub fn estimate_text_tokens(text: &str) -> u32 {
+    let mut ascii = 0usize;
+    let mut non_ascii = 0usize;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    let t = ascii.div_ceil(4) + (non_ascii * 2).div_ceil(3);
+    t.min(u32::MAX as usize) as u32
+}
+
+/// 启发式估算一条消息的 token 数（CJK 感知，跨所有 text / thinking block）。
 pub fn estimate_message_tokens(msg: &AgentMessage) -> u32 {
-    let chars: usize = msg
-        .blocks
+    msg.blocks
         .iter()
         .map(|b| match b {
-            AgentMessageBlock::Text { text } => text.chars().count(),
-            AgentMessageBlock::Thinking { text, .. } => text.chars().count(),
+            AgentMessageBlock::Text { text } => estimate_text_tokens(text),
+            AgentMessageBlock::Thinking { text, .. } => estimate_text_tokens(text),
             // image dataRef 只是 URI 引用；wire 时才 base64，估算时按引用长度近似。
-            AgentMessageBlock::Image { data_ref, .. } => data_ref.chars().count(),
+            AgentMessageBlock::Image { data_ref, .. } => estimate_text_tokens(data_ref),
         })
-        .sum();
-    chars.div_ceil(4) as u32
+        .fold(0u32, u32::saturating_add)
 }
 
 /// 启发式估算一批会话消息的 token 总和。
@@ -275,12 +292,10 @@ pub fn estimate_context_tokens(
         .estimated_tokens()
         .saturating_add(estimate_messages_tokens(messages));
     // Spec §4: soft limit drives MicroClear。channel 没声明窗口大小时退化到默认软限制。
+    // 与 loop 的 `CompactionPlan::derive` 同一定义（window/2），避免两套 soft limit 判定漂移。
     let soft_limit = channel
         .context_window_tokens
-        .map(|w| {
-            // 默认软限制按窗口的 ~33% 估算(与 ContextWindowLimits::default 60k / 180k 比例一致)。
-            (w as u64).max(1) / 3
-        })
+        .map(|w| (w as u64).max(1) / 2)
         .map(|v| v.min(u32::MAX as u64) as u32)
         .unwrap_or(ContextWindowLimits::default().soft_limit_tokens);
     TokenEstimate {
@@ -351,15 +366,50 @@ fn message_is_tool_result(msg: &AgentMessage) -> bool {
     })
 }
 
-/// 把一条 tool_result 消息的 text block 替换为 `<tool_result_stub .. />`（保留 name/call_id/ref）。
-fn stub_message_in_place(msg: &mut AgentMessage) {
-    for b in msg.blocks.iter_mut() {
-        if let AgentMessageBlock::Text { text } = b {
-            if parse_tool_result_attrs(text).is_some() {
-                *text = render_stub(&ContextContent::Text(text.clone()));
-            }
+/// 把一段文本里的**每个** `<tool_result ...>...</tool_result>` wrapper 替换为对应的
+/// `<tool_result_stub .. />`（逐个保留 name/call_id/ref）。
+///
+/// 批量工具调用轮的 user message 是 N 个 wrapper 串联在同一 text block 里——必须逐个 stub，
+/// 否则只剩第一个调用的 call_id/ref，其余 N-1 个调用的痕迹从上下文消失（审计链断裂）。
+/// 已是 stub（`<tool_result_stub`）的段不动。返回 None = 文本里没有可 stub 的 wrapper。
+fn stub_wrappers_in_text(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    let mut any = false;
+    loop {
+        let Some(pos) = rest.find("<tool_result") else {
+            out.push_str(rest);
+            break;
+        };
+        let after_tag = &rest[pos + "<tool_result".len()..];
+        // 只匹配真 wrapper 开标签（`<tool_result ` 带属性）；`<tool_result_stub`/无属性形不动。
+        if !after_tag.starts_with(|c: char| c.is_whitespace()) {
+            out.push_str(&rest[..pos + "<tool_result".len()]);
+            rest = after_tag;
+            continue;
         }
+        let segment = &rest[pos..];
+        let (attrs_ok, close_end) = match (
+            parse_tool_result_attrs(segment),
+            segment.find("</tool_result>"),
+        ) {
+            (Some(_), Some(c)) => (true, c + "</tool_result>".len()),
+            _ => (false, 0),
+        };
+        if !attrs_ok {
+            // 无属性 / 未闭合 → 该段保留原样，跳过这个开标签继续向后扫。
+            out.push_str(&rest[..pos + "<tool_result".len()]);
+            rest = after_tag;
+            continue;
+        }
+        out.push_str(&rest[..pos]);
+        out.push_str(&render_stub(&ContextContent::Text(
+            segment[..close_end].to_string(),
+        )));
+        rest = &rest[pos + close_end..];
+        any = true;
     }
+    any.then_some(out)
 }
 
 /// MicroClear（messages lane）：把尾窗（最近 `keep_recent` 条）**之外**的非 durable
@@ -383,16 +433,19 @@ pub fn micro_clear_messages(
         if message_is_durable(msg, durable_message_ids) {
             continue;
         }
-        if message_is_tool_result(msg) {
-            // already a stub? parse_tool_result_attrs matches stub too (it has name/call_id/ref),
-            // but stub tag is `<tool_result_stub`. Guard: skip if already stubbed.
-            let already_stub = msg.blocks.iter().any(|b| {
-                matches!(b, AgentMessageBlock::Text { text } if text.contains("<tool_result_stub"))
-            });
-            if !already_stub {
-                stub_message_in_place(msg);
-                stubbed += 1;
+        // 逐 block 试 stub：只有实际发生了 wrapper→stub 替换才计数（已是纯 stub 的消息
+        // `stub_wrappers_in_text` 返回 None，不重复计数）。
+        let mut changed = false;
+        for b in msg.blocks.iter_mut() {
+            if let AgentMessageBlock::Text { text } = b {
+                if let Some(s) = stub_wrappers_in_text(text) {
+                    *text = s;
+                    changed = true;
+                }
             }
+        }
+        if changed {
+            stubbed += 1;
         }
     }
     stubbed
@@ -416,9 +469,9 @@ pub fn drop_oldest_round_messages(
             removed += 1;
             // remove at most one "round" worth: the assistant turn + its following tool_result.
             // After removing one assistant message, also remove a following non-durable
-            // tool_result user message if present (same logical round).
-            if i < messages.len()
-                && i < messages.len().saturating_sub(keep_recent.saturating_sub(removed as usize))
+            // tool_result user message if present (same logical round). The tail window after
+            // removal is `len - keep_recent` (keep_recent itself never shrinks).
+            if i < messages.len().saturating_sub(keep_recent)
                 && !message_is_durable(&messages[i], durable_message_ids)
                 && message_is_tool_result(&messages[i])
             {
@@ -827,6 +880,32 @@ mod tests {
         // a0 (oldest) removed; the recent tail kept.
         assert!(msgs.iter().all(|m| m.message_id != "a0"));
         assert!(msgs.iter().any(|m| m.message_id == "a2"));
+    }
+
+    #[test]
+    fn stub_wrappers_in_text_stubs_every_wrapper() {
+        // 批量调用轮：N 个 wrapper 串联在同一 text block，必须逐个 stub（保留各自 call_id/ref）。
+        let text = format!(
+            "{}\n{}",
+            r#"<tool_result name="q1" call_id="tc_1" ref="pl_1">{"a":1}</tool_result>"#,
+            r#"<tool_result name="q2" call_id="tc_2" ref="pl_2">{"b":2}</tool_result>"#
+        );
+        let out = stub_wrappers_in_text(&text).expect("must stub");
+        assert!(out.contains(r#"<tool_result_stub name="q1" call_id="tc_1" ref="pl_1" />"#), "{out}");
+        assert!(out.contains(r#"<tool_result_stub name="q2" call_id="tc_2" ref="pl_2" />"#), "{out}");
+        assert!(!out.contains("</tool_result>"), "原文已折叠: {out}");
+        // 纯 stub 文本 → None（不重复处理）。
+        assert!(stub_wrappers_in_text(&out).is_none());
+    }
+
+    #[test]
+    fn estimate_text_tokens_cjk_aware() {
+        // ASCII：~4 字符/token。
+        assert_eq!(estimate_text_tokens(&"x".repeat(400)), 100);
+        // 中文：~2/3 token/字符（400 字 ≈ 267 tokens），远高于 chars/4 的 100。
+        let zh = "股".repeat(400);
+        let t = estimate_text_tokens(&zh);
+        assert!(t >= 250 && t <= 300, "CJK 估算应 ~267，got {t}");
     }
 
     #[test]

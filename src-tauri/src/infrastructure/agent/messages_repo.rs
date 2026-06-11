@@ -82,6 +82,33 @@ impl AgentMessagesRepo {
         })
     }
 
+    /// 把一条已持久化消息标记为 durable（spec §4：trading_write 轮的 tool_result 永不压缩 / 替 stub /
+    /// 折进摘要——标记落库使该保护**跨 run 续接**仍生效）。`upsert_message` 不触碰该列
+    ///（INSERT OR REPLACE 后由 loop 在需要时重新打标）。
+    pub fn mark_durable(&self, message_id: &str) -> Result<(), RepoError> {
+        self.db.with(|c| {
+            c.execute(
+                "UPDATE agent_messages SET durable = 1 WHERE message_id = ?1",
+                params![message_id],
+            )?;
+            Ok::<_, RepoError>(())
+        })
+    }
+
+    /// 读某会话全部 durable 消息 id（loop 续接时重建 durable_message_ids，spec §4）。
+    pub fn load_durable_ids(&self, conversation_id: &str) -> Result<Vec<String>, RepoError> {
+        self.db.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT message_id FROM agent_messages
+                 WHERE conversation_id = ?1 AND durable = 1",
+            )?;
+            let rows = stmt
+                .query_map(params![conversation_id], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// 给定 conversation 的下一个 seq（max(seq)+1，无消息则 0）。
     ///
     /// Spec: agent-infra-module.md §4 多轮会话持久化（会话内单调序号）。
@@ -132,7 +159,20 @@ impl AgentMessagesRepo {
             .iter()
             .rposition(|m| m.kind == Some(MessageKind::Summary));
         match last_summary_idx {
-            Some(i) => Ok(all[i..].to_vec()),
+            Some(i) => {
+                // Spec §4：durable（trading_write）消息**永远 inline 保留**——它们不折进摘要，
+                // seq 落在 summary 之前，若只取 `summary..` 会被挤出视野（跨 run 即丢，违反不变量）。
+                // 视图 = summary 前的 durable 行（按原序）+ summary + 其后全部。
+                let durable: std::collections::HashSet<String> =
+                    self.load_durable_ids(conversation_id)?.into_iter().collect();
+                let mut view: Vec<AgentMessage> = all[..i]
+                    .iter()
+                    .filter(|m| durable.contains(&m.message_id))
+                    .cloned()
+                    .collect();
+                view.extend_from_slice(&all[i..]);
+                Ok(view)
+            }
             None => Ok(all),
         }
     }
@@ -540,5 +580,47 @@ mod tests {
         let loaded = repo.load_tool_call("tc_2").unwrap().unwrap();
         assert_eq!(loaded.error_code, Some(ErrorCode::InsufficientCash));
         assert_eq!(loaded.input_payload_ref.as_deref(), Some("pl_in"));
+    }
+
+    /// Spec §4：durable（trading_write）消息即便 seq 落在最新 summary 之前，
+    /// `load_conversation_view` 也必须把它包含进视图（跨 run 永不离开 LLM 视野）。
+    #[test]
+    fn view_includes_durable_messages_before_summary() {
+        let db = fresh_db();
+        let repo = AgentMessagesRepo::new(db);
+        let conv = "c-durable";
+        let mk = |id: &str, seq: i64, kind: Option<MessageKind>, text: &str| AgentMessage {
+            message_id: id.into(),
+            run_id: Some("r1".into()),
+            conversation_id: Some(conv.into()),
+            seq: Some(seq),
+            kind,
+            role: AgentMessageRole::User,
+            blocks: vec![AgentMessageBlock::Text { text: text.into() }],
+            created_at: Utc::now(),
+        };
+        repo.upsert_message(&mk("old", 0, None, "旧闲聊")).unwrap();
+        repo.upsert_message(&mk(
+            "trade",
+            1,
+            None,
+            r#"<tool_result name="operate_account" call_id="tc_t">{"orderId":"o1"}</tool_result>"#,
+        ))
+        .unwrap();
+        repo.mark_durable("trade").unwrap();
+        repo.upsert_message(&mk("sum", 2, Some(MessageKind::Summary), "滚动摘要"))
+            .unwrap();
+        repo.upsert_message(&mk("tail", 3, None, "最近一轮")).unwrap();
+
+        let durable = repo.load_durable_ids(conv).unwrap();
+        assert_eq!(durable, vec!["trade".to_string()]);
+
+        let view = repo.load_conversation_view(conv).unwrap();
+        let ids: Vec<&str> = view.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["trade", "sum", "tail"],
+            "视图 = summary 前的 durable 行 + summary + 其后；旧闲聊被挤出"
+        );
     }
 }

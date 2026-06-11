@@ -231,14 +231,11 @@ impl ToolCallParser {
             // 容忍模型在合法 JSON 后追加垃圾（gpt-5 长输入常见 "trailing characters"，导致
             // run_subagent 这类长 prompt 反复 parse_error）：用流式 deserializer 取**第一个完整
             // JSON 对象**，忽略其后多余内容。仍对真正非法的 JSON 报 parse_error。
-            let parse_result = {
-                let mut stream =
-                    serde_json::Deserializer::from_str(trimmed).into_iter::<JsonSummary>();
-                match stream.next() {
-                    Some(r) => r.map_err(|e| e.to_string()),
-                    None => Err("empty <use_tool> body".to_string()),
-                }
-            };
+            //
+            // 注意：StreamDeserializer 在首值后紧跟 `]` / `}` / `,` 时会在**第一个值**上就报
+            // TrailingCharacters（实网抓到 gpt-5 输出 `{...}]`）——所以失败时再用括号平衡扫描
+            // 取首个完整 {…}/[…] 前缀兜底；两条路都不行才算真 parse_error。
+            let parse_result = parse_first_json_value(trimmed);
             match parse_result {
                 Ok(input) => events.push(ParserEvent::UseTool { name, input }),
                 Err(reason) => events.push(ParserEvent::ParseError {
@@ -272,6 +269,64 @@ impl Default for ToolCallParser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 取 `<use_tool>` body 里的第一个完整 JSON 值，容忍其后的尾部垃圾（spec §2 容错条款）。
+///
+/// 两级解析：① StreamDeserializer 首值（容忍空白分隔的尾巴）；② 失败时括号平衡扫描首个
+/// `{…}` / `[…]` 前缀再 `from_str`（容忍 `{...}]` 这类 StreamDeserializer 直接报
+/// TrailingCharacters 的粘连尾巴）。都失败 → 报首次错误。
+fn parse_first_json_value(trimmed: &str) -> Result<JsonSummary, String> {
+    if trimmed.is_empty() {
+        return Err("empty <use_tool> body".to_string());
+    }
+    let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<JsonSummary>();
+    match stream.next() {
+        Some(Ok(v)) => Ok(v),
+        Some(Err(first_err)) => match balanced_json_prefix(trimmed) {
+            Some(prefix) => {
+                serde_json::from_str::<JsonSummary>(prefix).map_err(|_| first_err.to_string())
+            }
+            None => Err(first_err.to_string()),
+        },
+        None => Err("empty <use_tool> body".to_string()),
+    }
+}
+
+/// 字符串感知的括号平衡扫描：返回以 `{` / `[` 开头的首个完整平衡前缀。
+/// 引号内的括号 / 转义引号不计；非对象/数组开头或始终不平衡 → None。
+fn balanced_json_prefix(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let open = *bytes.first()?;
+    let close = match open {
+        b'{' => b'}',
+        b'[' => b']',
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        } else if b == open {
+            depth += 1;
+        } else if b == close {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return Some(&s[..=i]);
+            }
+        }
+    }
+    None
 }
 
 /// Compute the largest prefix length we can safely emit as text without risk of having started a tag.
@@ -537,5 +592,43 @@ mod tests {
             }
         }
         assert!(saw_err);
+    }
+
+    #[test]
+    fn t6c_glued_bracket_tail_after_valid_json_tolerated() {
+        // 实网回归（2026-06-10，gpt-5.4 输出 run_subagent）：合法对象后**紧贴**一个 `]`——
+        // StreamDeserializer 对 `,]}` 开头的尾巴在首值上就报 TrailingCharacters，
+        // 必须走括号平衡兜底。垃圾尾巴还包括重复 `}`、粘连文字等。
+        for tail in ["]", "}", "]]", "} ]", "garbage"] {
+            let mut p = ToolCallParser::new();
+            let body = format!(
+                r#"<use_tool name="run_subagent">{{"prompt":"调研","allowedTools":["web_search"]}}{tail}</use_tool>"#
+            );
+            let mut evs = p.feed(&body);
+            evs.extend(p.finalize());
+            let tool = evs.iter().find_map(|e| match e {
+                ParserEvent::UseTool { name, input } => Some((name.clone(), input.clone())),
+                _ => None,
+            });
+            let (name, input) = tool.unwrap_or_else(|| panic!("tail={tail:?} 应解析出 UseTool，evs={evs:?}"));
+            assert_eq!(name, "run_subagent");
+            assert_eq!(input["prompt"], "调研");
+            assert_eq!(input["allowedTools"][0], "web_search");
+        }
+    }
+
+    #[test]
+    fn balanced_json_prefix_respects_strings_and_escapes() {
+        assert_eq!(
+            balanced_json_prefix(r#"{"a":"}"}]junk"#),
+            Some(r#"{"a":"}"}"#)
+        );
+        assert_eq!(
+            balanced_json_prefix(r#"{"a":"\"}"}x"#),
+            Some(r#"{"a":"\"}"}"#)
+        );
+        assert_eq!(balanced_json_prefix(r#"[{"a":1}]]"#), Some(r#"[{"a":1}]"#));
+        assert_eq!(balanced_json_prefix("not json"), None);
+        assert_eq!(balanced_json_prefix(r#"{"never closed"#), None);
     }
 }

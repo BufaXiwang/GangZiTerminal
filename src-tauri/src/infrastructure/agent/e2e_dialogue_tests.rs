@@ -256,6 +256,7 @@ async fn run_turn_traced(
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
     let pump = tokio::spawn(async move {
@@ -480,6 +481,7 @@ async fn e2e_todo_write_multistep_live() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
 
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
@@ -556,4 +558,173 @@ async fn e2e_todo_write_multistep_live() {
     assert!(add_ran, "add 工具未跑，kv 链未完成；tool 链={:?}", tools);
 
     println!("\n========== ✅ todo_write 通过：{} 次调用，末清单 {} 项 ==========\n", todo_calls.len(), items.len());
+}
+
+// ===========================================================================
+// 测试：fork 子 agent live（run_subagent 前台 + SubAgentActivity 前端事件 + 多轮续接引用子结论）。
+// 对齐生产接线：per-run registry 注入 ForkRuntime + RunSharedState + 取消令牌（executor 同构）。
+// ===========================================================================
+
+#[tokio::test]
+#[ignore = "live: 需要 TEST_ANT_* / TEST_OAI_* / TEST_DS_* 之一"]
+async fn e2e_subagent_fork_live() {
+    use crate::infrastructure::agent::loop_executor::{run_agent_turn_forked, RunSharedState};
+    use crate::infrastructure::agent::skill_store::SkillStore;
+    use crate::infrastructure::agent::subagent::{
+        register_subagent_tools, ForkHandle, ForkRuntime, SubAgentTaskRegistry,
+    };
+    use crate::infrastructure::agent::loop_executor::ProviderStream;
+
+    let Some(LabeledChannel { label, channel }) = primary_channel() else {
+        eprintln!("[skip] e2e_subagent: 未设置任何 provider env");
+        return;
+    };
+
+    let repo = fresh_repo();
+    let state = Arc::new(KvState::default());
+    // per-run registry（生产中 = build_domain_registry_for_mode + augment）：领域 tool + fork tool。
+    let registry = Arc::new(ToolRegistry::new_without_persist());
+    register_kv_chain_tools(&registry, state.clone());
+    let skills_dir = std::env::temp_dir().join(format!("gangzi-e2e-fork-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&skills_dir).unwrap();
+    let fork_factory: crate::infrastructure::agent::subagent::ProviderFactory = {
+        let ch = channel.clone();
+        Arc::new(move |c: &ProviderChannel| {
+            let mut real = ch.clone();
+            real.model = c.model.clone();
+            HttpProvider::new(real).map(|p| Box::new(p) as Box<dyn ProviderStream>)
+        })
+    };
+    let handle = ForkHandle::new(
+        registry.clone(),
+        fork_factory,
+        Some(repo.clone()),
+        None,
+        channel.clone(),
+        SkillStore::new(skills_dir.clone()),
+        SubAgentTaskRegistry::new(),
+    );
+    register_subagent_tools(&registry, handle.clone()).unwrap();
+
+    let conv = format!("conv_fork_{}", uuid::Uuid::new_v4());
+    let shared = RunSharedState::new();
+
+    // —— 一轮跑法（生产 executor 同构：ForkRuntime 注入 registry/shared/event_tx/cancel）——
+    let run_round = |round_run_id: String, prompt: String| {
+        let channel = channel.clone();
+        let registry = registry.clone();
+        let repo = repo.clone();
+        let conv = conv.clone();
+        let shared = shared.clone();
+        async move {
+            let provider = Box::new(HttpProvider::new(channel.clone()).unwrap());
+            let request = AgentRunRequest {
+                run_id: round_run_id.clone(),
+                trigger: "user".into(),
+                channel: channel.clone(),
+                max_turns: 8,
+                input: vec![user_message(&round_run_id, &prompt)],
+                conversation_id: Some(conv.clone()),
+                compaction: None,
+                fallback_channels: vec![],
+                retry: None,
+                token_budget: None,
+            };
+            let (tx, mut rx) = mpsc::channel::<AgentEvent>(512);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let fork_rt = ForkRuntime::new(channel, &round_run_id)
+                .with_event_tx(Some(tx.clone()))
+                .with_registry(registry.clone())
+                .with_shared(shared.clone())
+                .with_cancel(cancel.clone());
+            let pump = tokio::spawn(async move {
+                let mut text = String::new();
+                let mut tools: Vec<String> = Vec::new();
+                let mut activities: Vec<(String, String)> = Vec::new(); // (kind, text)
+                while let Some(e) = rx.recv().await {
+                    match e {
+                        AgentEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                        AgentEvent::ToolEnd { name, is_error, .. } => {
+                            if !is_error {
+                                tools.push(name);
+                            }
+                        }
+                        AgentEvent::SubAgentActivity { kind, text: t, .. } => {
+                            activities.push((format!("{kind:?}"), t));
+                        }
+                        _ => {}
+                    }
+                }
+                (text, tools, activities)
+            });
+            run_agent_turn_forked(
+                request,
+                registry,
+                ContextBundle::new(&round_run_id),
+                vec![provider],
+                tx,
+                Some(repo),
+                Some(fork_rt.into_ext()),
+                Some(shared),
+                cancel,
+            )
+            .await
+            .expect("round run");
+            pump.await.unwrap()
+        }
+    };
+
+    println!("\n========== E2E 子 agent fork [{}] model={} ==========", label, channel.model);
+
+    // 第 1 轮：让主 agent fork 一个子 agent 算 17+25（子 agent 用 add 工具），父只拿结论。
+    let (text1, tools1, acts1) = run_round(
+        format!("run_fork_1_{}", uuid::Uuid::new_v4()),
+        "请用 run_subagent 工具 fork 一个子 agent：让它用 add 工具计算 17 加 25 并以一句话报告结果。\
+         拿到子 agent 的结论后，用一句中文告诉我这个和是多少。"
+            .into(),
+    )
+    .await;
+    println!("── 第 1 轮（fork）──");
+    println!("  tools : {:?}", tools1);
+    println!(
+        "  活动流: {}",
+        acts1.iter().map(|(k, t)| format!("{k}({t})")).collect::<Vec<_>>().join(" → ")
+    );
+    println!("  text  : {}", text1.trim());
+
+    assert!(tools1.iter().any(|t| t == "run_subagent"), "父未调用 run_subagent；tools={tools1:?}");
+    assert!(
+        acts1.iter().any(|(k, _)| k == "Started") && acts1.iter().any(|(k, _)| k == "Done"),
+        "SubAgentActivity 必须含 Started 与 Done（前端面板的开始/完成信号）；acts={acts1:?}"
+    );
+    assert!(
+        acts1.iter().any(|(k, t)| k == "ToolStart" && t == "add"),
+        "子 agent 应经 SubAgentActivity 暴露 add 工具调用（前端可见性）；acts={acts1:?}"
+    );
+    assert!(text1.contains("42"), "父结论应含 42（17+25）；text={text1:?}");
+
+    // 第 2 轮（同会话续接）：引用子 agent 的结论再算一步——验证父历史里留有 fork 的 tool_result。
+    let (text2, tools2, _acts2) = run_round(
+        format!("run_fork_2_{}", uuid::Uuid::new_v4()),
+        "刚才子 agent 算出的和是多少？请用 add 工具把它再加 8，并用一句话告诉我最终结果。".into(),
+    )
+    .await;
+    println!("── 第 2 轮（续接引用子结论）──");
+    println!("  tools : {:?}", tools2);
+    println!("  text  : {}", text2.trim());
+    assert!(tools2.iter().any(|t| t == "add"), "第 2 轮应在父侧调用 add；tools={tools2:?}");
+    assert!(text2.contains("50"), "最终结果应为 50（42+8）；text={text2:?}");
+
+    // 审计独立：子 run 的消息落在 fork:<parent> 前缀的独立会话里。
+    let parent_msgs = repo.load_conversation(&conv).unwrap();
+    assert!(parent_msgs.len() >= 4, "父会话应有多轮消息，got {}", parent_msgs.len());
+    assert!(
+        parent_msgs.iter().all(|m| {
+            m.blocks.iter().all(|b| !matches!(b, AgentMessageBlock::Text { text } if text.contains("【返回约定】")))
+        }),
+        "子 run 的引导 prompt 不得混进父会话（上下文卫生）"
+    );
+
+    std::fs::remove_dir_all(&skills_dir).ok();
+    println!("\n========== ✅ 子 agent fork live 通过：fork→活动流→结论回父→续接引用 ==========\n");
 }

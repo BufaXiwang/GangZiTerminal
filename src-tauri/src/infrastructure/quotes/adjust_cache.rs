@@ -2,8 +2,10 @@
 //!
 //! Spec: docs/design/quotes-module.md §2 "本地复权计算（基于 TDX xdxr）"
 //!
-//! Key = `(ts_code, period, mode, xdxr_version)`。`xdxr_version` 由调用方提供，
+//! Key = `(ts_code, period, mode, xdxr_version, limit)`。`xdxr_version` 由调用方提供，
 //! 用来在 xdxr 数据刷新后失效旧 cache（spec §2 "xdxr 事件刷新时整体失效"）。
+//! `limit` 必须入 key：同一标的不同根数的请求是不同序列——否则首次缓存的长度会被
+//! 后续任意 limit 的请求原样命中（实测 bug 2026-06-11：kline --limit 1/3/10 恒返 5 根）。
 //!
 //! 简单进程内 cache，无持久化；进程重启清空（spec 没要求持久化）。
 //!
@@ -22,6 +24,8 @@ pub struct AdjustCacheKey {
     pub adjust: Adjust,
     /// xdxr 版本号：由调用方提供（一般用 events.len() 或 SUM(fetched_at)）。
     pub xdxr_version: i64,
+    /// 请求根数（load_kline_series 的 limit）。不同 limit = 不同序列，必须区分缓存。
+    pub limit: u32,
 }
 
 #[derive(Default)]
@@ -102,6 +106,7 @@ mod tests {
             period: KlinePeriod::Day,
             adjust: Adjust::Qfq,
             xdxr_version: 1,
+            limit: 120,
         };
         assert!(c.get(&k).is_none());
         c.put(k.clone(), fake_series());
@@ -117,6 +122,7 @@ mod tests {
                 period: KlinePeriod::Day,
                 adjust: Adjust::Qfq,
                 xdxr_version: 1,
+                limit: 120,
             },
             fake_series(),
         );
@@ -126,6 +132,7 @@ mod tests {
                 period: KlinePeriod::Day,
                 adjust: Adjust::Qfq,
                 xdxr_version: 1,
+                limit: 120,
             },
             fake_series(),
         );
@@ -137,6 +144,24 @@ mod tests {
     }
 
     #[test]
+    fn limit_mismatch_misses() {
+        // 回归（2026-06-11）：limit 不入 key 时，首次缓存的长度会被任意 limit 命中
+        // （kline --limit 1/3/10 恒返首次缓存的根数）。不同 limit 必须各自成键。
+        let c = AdjustCache::new();
+        let k120 = AdjustCacheKey {
+            ts_code: "600519.SH".into(),
+            period: KlinePeriod::Day,
+            adjust: Adjust::Qfq,
+            xdxr_version: 1,
+            limit: 120,
+        };
+        c.put(k120.clone(), fake_series());
+        let k3 = AdjustCacheKey { limit: 3, ..k120.clone() };
+        assert!(c.get(&k3).is_none(), "不同 limit 不得命中同一缓存");
+        assert!(c.get(&k120).is_some());
+    }
+
+    #[test]
     fn version_mismatch_misses() {
         let c = AdjustCache::new();
         let k1 = AdjustCacheKey {
@@ -144,6 +169,7 @@ mod tests {
             period: KlinePeriod::Day,
             adjust: Adjust::Qfq,
             xdxr_version: 1,
+            limit: 120,
         };
         c.put(k1.clone(), fake_series());
         let k2 = AdjustCacheKey {

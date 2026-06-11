@@ -16,6 +16,14 @@ use rusqlite_migration::M;
 ///
 /// **append-only**：新增 migration 只能加到末尾（rusqlite_migration 按全局位置判定 user_version）。
 pub fn migrations() -> Vec<M<'static>> {
+    let mut all = migrations_base();
+    all.extend(migrations_tail());
+    all
+}
+
+/// 全局组合用的「基础段」（全局序号 6–11，**冻结不可再增**）。
+/// 新增 agent migration 一律加 `migrations_tail()`（拼在全局列表末尾，append-only）。
+pub fn migrations_base() -> Vec<M<'static>> {
     vec![
         M::up(MIGRATION_001_INITIAL),
         M::up(MIGRATION_002_CHANNEL_AUTH_ACTIVE),
@@ -25,6 +33,21 @@ pub fn migrations() -> Vec<M<'static>> {
         M::up(MIGRATION_006_REVIEW_FOLLOWUP),
     ]
 }
+
+/// 全局**尾部**追加段（在 `all_migrations()` 末尾拼接；不得插进基础段——会顶掉
+/// 后续 BC 的全局序号，使存量 DB 重跑建表 panic）。
+pub fn migrations_tail() -> Vec<M<'static>> {
+    vec![M::up(MIGRATION_TAIL_001_MESSAGE_DURABLE)]
+}
+
+// Spec: agent-infra-module.md §4 上下文管理（trading_write / durable 永不丢）
+//
+// durable 标记持久化：trading_write 轮的 tool_result user message 在落库时打标，
+// 使「永不压缩 / 替 stub / 不折进摘要」跨 run 续接仍生效（load 视图必含 durable 行 +
+// loop 续接时据此重建 durable_message_ids）。kind=summary 的 durable 性由 kind 本身表达，不用此列。
+const MIGRATION_TAIL_001_MESSAGE_DURABLE: &str = r#"
+ALTER TABLE agent_messages ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;
+"#;
 
 // Spec: agent-runtime-module.md §3（复盘报告 ④ follow-up + ② 基准对照「组合收益」）
 //
@@ -60,7 +83,6 @@ CREATE TABLE agent_daily_equity (
 //
 // agent_settings: 运行时配置 kv 真源（settings store）。所有硬编码阈值改读此表，
 // 缺失用缺省、解析非法 fail-closed（退回缺省）+ heartbeat（tracing::warn）。
-// 也持久化熔断状态（circuit_breaker_active），重启保持（熔断不自动解除）。
 const MIGRATION_005_SETTINGS: &str = r#"
 CREATE TABLE agent_settings (
     key        TEXT PRIMARY KEY,

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 
 use crate::domain::agent::runtime::{AnalysisResultKind, StrategyStatus};
 use crate::domain::shared::{ErrorCode, TsCode};
@@ -216,11 +216,29 @@ impl ToolHandler for FetchQuotesHandler {
     fn invoke(&self, inv: ToolInvocation) -> ToolHandlerFuture {
         let gw = self.gateway.clone();
         Box::pin(async move {
-            match gw.fetch(inv.input).await {
+            let mut input = inv.input;
+            normalize_fetch_quotes_input(&mut input);
+            match gw.fetch(input).await {
                 Ok(v) => ToolHandlerOutput::ok(v),
                 Err(e) => ToolHandlerOutput::err(json!({"message": e.message}), e.code),
             }
         })
+    }
+}
+
+/// LLM 友好的入参归一化（adapter 职责：把模型常见的"合理但不合 DTO"形态翻成 canonical）。
+///
+/// `include.indicators` 的 canonical 形态是 `true/false` 或 `["ma5","macd_dif",…]`；模型常传
+/// 对象形态 `{"ma":[5,10,20],"macd":true}` —— untagged enum 报错对模型不可自纠（实网 2026-06-10）。
+/// 归一化规则：对象 → `true`（取全部指标，包含模型想要的子集；多取无害、失败有害）。
+fn normalize_fetch_quotes_input(input: &mut JsonValue) {
+    if let Some(ind) = input
+        .get_mut("include")
+        .and_then(|inc| inc.get_mut("indicators"))
+    {
+        if ind.is_object() {
+            *ind = JsonValue::Bool(true);
+        }
     }
 }
 

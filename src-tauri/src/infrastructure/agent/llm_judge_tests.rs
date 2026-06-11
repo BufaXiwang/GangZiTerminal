@@ -346,6 +346,7 @@ async fn run_loop_collect(
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -519,6 +520,7 @@ async fn judge_multiturn_memory() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
@@ -547,6 +549,7 @@ async fn judge_multiturn_memory() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -663,6 +666,7 @@ user: 还有一个未决问题：招行的分批买入点位我还没想清楚�
         }),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -778,6 +782,7 @@ async fn judge_memory_through_compaction() {
         }),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -880,6 +885,7 @@ async fn judge_durable_fact_preserved() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -931,6 +937,7 @@ async fn judge_durable_fact_preserved() {
         }),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -1062,6 +1069,7 @@ async fn judge_rolling_summary_folds_prior() {
         }),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1205,6 +1213,7 @@ async fn force_one_summarize_cycle(
         compaction: Some(tight_compaction(1, Some(summarize_prompt), compact_channel)),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -1256,6 +1265,7 @@ async fn run_turn_resilient(
             compaction: Some(compaction.clone()),
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let pump = tokio::spawn(async move {
@@ -1525,6 +1535,7 @@ async fn judge_longterm_fact_survives_multiple_cycles() {
         compaction: Some(tight_compaction(1, Some(summarize_prompt), Some(judge_ch.clone()))),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -1603,6 +1614,7 @@ async fn judge_accumulated_constraints() {
             compaction: None,
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         };
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let pump = tokio::spawn(async move {
@@ -1720,6 +1732,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -1762,6 +1775,7 @@ async fn judge_durable_verbatim_vs_droppable() {
         compaction: Some(tight_compaction(1, Some(summarize_prompt), None)),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -1878,6 +1892,7 @@ async fn judge_microclear_then_answer_correct() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -1918,6 +1933,7 @@ async fn judge_microclear_then_answer_correct() {
         compaction: Some(tight_compaction(1, None, None)),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {
@@ -2092,6 +2108,7 @@ async fn judge_keep_recent_verbatim() {
         compaction: Some(tight_compaction(2, Some(summarize_prompt), Some(judge_ch.clone()))),
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -2201,6 +2218,7 @@ async fn judge_drop_degrade_preserves_durable() {
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
     let pump1 = tokio::spawn(async move {
@@ -2239,6 +2257,7 @@ async fn judge_drop_degrade_preserves_durable() {
         compaction: Some(tight_compaction(1, None, None)), // summarize_prompt = None → Drop lane
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
     let pump2 = tokio::spawn(async move {

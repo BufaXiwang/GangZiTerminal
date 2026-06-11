@@ -75,7 +75,7 @@ fn l1_mode_line(mode: AgentRunMode) -> &'static str {
             在给出你的看法之外，**必须明确询问用户是否要将其写入投资策略**（经 upsert_investment_strategy），\
             得到用户明确确认后才写；未确认一律不写、不擅自改策略。",
         AgentRunMode::News => "【当前模式：news 分析】读本批 news，判断对持仓 / 自选 / 候选标的的影响。\
-            大多数 news 应 no_action；要动手必须说明边际信息（为什么现在进还来得及），并受熔断 / 追高保护约束。\
+            大多数 news 应 no_action；要动手必须说明边际信息（为什么现在进还来得及），不追高、先判断是否已 price-in。\
             分析完本批 news 形成判断后，**必须**调用 record_analysis 声明 action / no_action + 理由\
             （含「为什么现在进还来得及 / 已 price-in」），relatedCodes 填相关标的；无论是否下单都要调一次。",
         AgentRunMode::AccountTrigger => "【当前模式：账户事件响应】止损 / 止盈命中、挂单成交 / 拒单等已发生。\

@@ -16,7 +16,9 @@ use crate::domain::agent::loop_request::AgentRunRequest;
 use crate::domain::agent::messages::AgentMessage;
 use crate::domain::agent::runtime::{AgentRun, AgentRunStatus, AgentRunTrigger};
 use crate::domain::agent::AgentStopReason;
-use crate::infrastructure::agent::loop_executor::{run_agent_turn_forked, ProviderStream};
+use crate::infrastructure::agent::loop_executor::{
+    run_agent_turn_forked, ProviderStream, RunSharedState,
+};
 use crate::infrastructure::agent::subagent::ForkRuntime;
 use tokio_util::sync::CancellationToken;
 use crate::infrastructure::agent::messages_repo::AgentMessagesRepo;
@@ -46,10 +48,12 @@ pub type CancelRegistry = std::sync::Mutex<std::collections::HashMap<String, Can
 ///
 /// 领域 registry 由 execute_run 在 create_run 之后内建（绑定真 run_id + 冻结策略版本）；Infra
 /// 工具与 fork（run_subagent）依赖运行期上下文，由 bootstrap 通过本 hook 在同一 registry 上补注册。
+/// 带 `AgentRunMode`：review run 只读（spec §3 mode 表）——bootstrap 据此过滤写类 / spawn 类 Infra 工具。
 ///
 /// 取 `&Arc<ToolRegistry>`：Infra 的 `register_local_tools` / fork 注册需要 Arc（handler 可能回持
 /// registry 引用）。
-pub type RegistryAugment = Arc<dyn Fn(&Arc<ToolRegistry>) + Send + Sync>;
+pub type RegistryAugment =
+    Arc<dyn Fn(&Arc<ToolRegistry>, crate::domain::agent::runtime::AgentRunMode) + Send + Sync>;
 
 /// 一次 run 的执行入参（providers 由调用方按 channel 备好；registry 由 execute_run 内建）。
 pub struct ExecuteRunParams {
@@ -75,7 +79,8 @@ pub struct ExecuteRunParams {
     pub event_sink: Option<AgentEventSink>,
     /// 取消令牌表（execute_run 登记本 run 的 token，cancel_agent_run 据此取消）；可 None。
     pub cancel_registry: Option<Arc<CancelRegistry>>,
-    /// 输出 token 预算护栏（spec §11）：累计输出 token 超此值 → 取消本 run（在轮边界停）。None = 不限。
+    /// run token 预算护栏（spec §8/§11）：传给 Infra loop（`AgentRunRequest.tokenBudget`），
+    /// 累计 input+output+子 run 回灌超此值 → `done(stop_reason=token_budget_exceeded)`。None = 不限。
     pub token_budget: Option<u32>,
     /// run 创建后、LLM turn 跑之前回调（拿到真 run_id）。news drain 用它 `mark_in_batch`
     /// 做 in-flight 保护 + 标 runId（spec §5）。可 None。
@@ -92,11 +97,15 @@ fn trigger_label(t: &AgentRunTrigger) -> &'static str {
 }
 
 /// stop_reason → run 终态。
+///
+/// `MaxTurns` **不**映射 Completed：跑满轮数说明任务很可能没真正收口（news 没 record_analysis /
+/// account_trigger 没处置完），按 Completed 会让调用方误把 trigger 标 handled / news 标 analyzed。
+/// 落 Failed + 明确 error 串，调用方按可恢复策略处理（重试 / 回 pending）。
 fn status_for(stop: AgentStopReason) -> (AgentRunStatus, Option<String>) {
     match stop {
-        AgentStopReason::Completed
-        | AgentStopReason::MaxTurns
-        | AgentStopReason::ProviderStop => (AgentRunStatus::Completed, None),
+        AgentStopReason::Completed | AgentStopReason::ProviderStop => {
+            (AgentRunStatus::Completed, None)
+        }
         AgentStopReason::Cancelled => (AgentRunStatus::Cancelled, None),
         other => (
             AgentRunStatus::Failed,
@@ -157,14 +166,15 @@ pub async fn execute_run(
         run.strategy_version,
     );
     if let Some(augment) = augment_registry.as_ref() {
-        augment(&registry);
+        augment(&registry, run.mode);
     }
 
     // 2) build_context —— L1 角色 + L2 策略（冻结版本对应的 active）+ L3 实时。
     let active = strategy.active()?;
     let ctx = build_context(&run.run_id, run.mode, active.as_ref(), realtime);
 
-    // 3) AgentRunRequest。
+    // 3) AgentRunRequest（token 预算执行在 Infra：spec §8——loop 在 turn 边界比对累计
+    //    input+output+子 run 回灌，超限 → done(stop_reason=token_budget_exceeded)，不再借道 cancel）。
     let request = AgentRunRequest {
         run_id: run.run_id.clone(),
         trigger: trigger_label(&trigger).to_string(),
@@ -175,6 +185,7 @@ pub async fn execute_run(
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: token_budget.map(|t| crate::domain::agent::TokenBudget { run_tokens: t }),
     };
 
     // 3.5) 登记取消令牌（cancel_agent_run 据 run_id 取消）。
@@ -185,37 +196,43 @@ pub async fn execute_run(
         }
     }
 
-    // 4) 并发排空事件流（转发前端 + token 预算护栏：累计输出 token 超预算 → 取消，loop 在轮边界停）。
+    // 4) 并发排空事件流（转发前端）。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(64);
 
-    // 2.5) ForkRuntime：sub-agent tool 在 dispatch 时读取真实 channel / is_subagent / parent_run_id。
-    // 注入本 run 的 event_tx（= 前端通道）→ fork 子 run 跑时把活动 SubAgentActivity 转发前端（可见性）。
-    let fork_rt = ForkRuntime::new(channel, &run.run_id).with_event_tx(Some(tx.clone()));
+    // 2.5) ForkRuntime：sub-agent tool 在 dispatch 时读取真实上下文（spec §3.5）：
+    // - event_tx（= 前端通道）→ fork 子 run 的活动 SubAgentActivity 转发前端（可见性）。
+    // - registry → 子 agent 默认继承**本 run** 的 per-run 工具集（含领域工具）。
+    // - shared → 子 usage 回灌父预算 + 后台完成通知注入父下一轮。
+    // - cancel → 取消父 run 时传播给跑着的子 run。
+    let shared = RunSharedState::new();
+    let fork_rt = ForkRuntime::new(channel, &run.run_id)
+        .with_event_tx(Some(tx.clone()))
+        .with_registry(registry.clone())
+        .with_shared(shared.clone())
+        .with_cancel(cancel.clone())
+        .with_max_turns(max_turns);
     let fork_ctx = Some(fork_rt.into_ext());
-    let budget_cancel = cancel.clone();
     let drainer = tokio::spawn(async move {
-        let mut output_total: u32 = 0;
         while let Some(ev) = rx.recv().await {
-            if let (Some(budget), AgentEvent::Usage { output_tokens, .. }) = (token_budget, &ev) {
-                output_total = output_total.saturating_add(*output_tokens);
-                if output_total >= budget {
-                    tracing::warn!(
-                        target: "runtime.token_budget",
-                        output_total, budget,
-                        "输出 token 超预算 → 取消 run"
-                    );
-                    budget_cancel.cancel();
-                }
-            }
             if let Some(sink) = event_sink.as_ref() {
                 sink(ev);
             }
         }
     });
 
-    let summary = run_agent_turn_forked(request, registry, ctx, providers, tx, repo, fork_ctx, cancel)
-        .await
-        .map_err(|e| ExecError::Loop(e.to_string()));
+    let summary = run_agent_turn_forked(
+        request,
+        registry,
+        ctx,
+        providers,
+        tx,
+        repo,
+        fork_ctx,
+        Some(shared),
+        cancel,
+    )
+    .await
+    .map_err(|e| ExecError::Loop(e.to_string()));
 
     let _ = drainer.await; // tx 已随 run_agent_turn 返回 drop → drainer 自然结束
 

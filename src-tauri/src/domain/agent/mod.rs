@@ -25,7 +25,7 @@ pub use events::{
     AgentEvent, AgentStopReason, CompactedTier, SubAgentActivityKind, UsageBreakdown,
 };
 pub use loop_request::{
-    AgentRunRequest, CompactionConfig, RetryConfig, RunSummary, TokenEstimate,
+    AgentRunRequest, CompactionConfig, RetryConfig, RunSummary, TokenBudget, TokenEstimate,
 };
 pub use messages::{
     AgentMessage, AgentMessageBlock, AgentMessageRole, JsonSummary, MessageKind,

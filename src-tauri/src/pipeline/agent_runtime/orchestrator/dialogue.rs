@@ -64,6 +64,12 @@ impl RuntimeServices {
                 tracing::warn!(target: "runtime.dialogue", images=images.len(), "images received but no PayloadStore (test env), skipped");
             }
         }
+        // 图片-only 消息：去掉空文本 block（部分 provider 拒绝空 text block），只留 image。
+        if msg.blocks.len() > 1 {
+            msg.blocks.retain(|b| {
+                !matches!(b, AgentMessageBlock::Text { text } if text.trim().is_empty())
+            });
+        }
         let input = vec![msg];
 
         let params = ExecuteRunParams {

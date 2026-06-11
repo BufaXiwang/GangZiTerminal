@@ -22,6 +22,8 @@ pub enum AgentStopReason {
     ProviderStop,
     ToolError,
     ContextLimit,
+    /// 累计 token（含 fork 子 run 回灌）超过 `request.tokenBudget`（spec §2/§5）。
+    TokenBudgetExceeded,
     Error,
 }
 

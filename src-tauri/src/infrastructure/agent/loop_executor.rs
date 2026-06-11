@@ -37,10 +37,52 @@ use crate::infrastructure::agent::tool_registry::{DispatchError, DispatchExt, To
 use crate::infrastructure::agent::system_prompt::build_system_prompt;
 use chrono::Utc;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tokio::sync::mpsc::{self, Sender};
 use uuid::Uuid;
+
+/// 一个 run 的「父子共享状态」（spec §3.5 token 回灌 + 后台 `<task-notification>` 注入）。
+///
+/// 由发起 run 的入口（executor）创建，同时交给：① 本 run 的 loop（`run_agent_turn_forked` 的
+/// `shared` 参数——turn 边界读取）；② `ForkRuntime`（fork handler / 后台子任务写入）。
+/// - `extra_tokens`：fork 子 run 的 usage 回灌（父预算检查把它计入累计）。
+/// - `notifications`：后台子 run 终态时 push `<task-notification>` 文本；父 loop 在下一个 turn
+///   边界 drain 并作为 user message 注入（**不**经前端 event 通道——那是展示通道，不进 LLM 上下文）。
+#[derive(Clone, Default)]
+pub struct RunSharedState {
+    pub extra_tokens: Arc<AtomicU64>,
+    pub notifications: Arc<Mutex<Vec<String>>>,
+}
+
+impl RunSharedState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// fork 子 run usage 回灌（spec §3.5）。
+    pub fn add_tokens(&self, tokens: u64) {
+        self.extra_tokens.fetch_add(tokens, Ordering::Relaxed);
+    }
+    pub fn extra_tokens(&self) -> u64 {
+        self.extra_tokens.load(Ordering::Relaxed)
+    }
+    /// 后台子 run 完成通知入队（父 loop 下一 turn 边界注入）。
+    pub fn push_notification(&self, text: String) {
+        self.notifications
+            .lock()
+            .expect("RunSharedState notifications poisoned")
+            .push(text);
+    }
+    fn drain_notifications(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .notifications
+                .lock()
+                .expect("RunSharedState notifications poisoned"),
+        )
+    }
+}
 
 /// 默认尾窗：最近 N 轮永不摘要 / micro-clear（spec §4 keepRecentTurns 缺省）。
 const DEFAULT_KEEP_RECENT_TURNS: u32 = 3;
@@ -259,6 +301,7 @@ pub async fn run_agent_turn(
         event_tx,
         repo,
         None,
+        None,
         CancellationToken::new(),
     )
     .await
@@ -276,7 +319,7 @@ pub async fn run_agent_turn_cancellable(
     cancel: CancellationToken,
 ) -> Result<RunSummary, LoopError> {
     run_agent_turn_forked(
-        request, registry, context, providers, event_tx, repo, None, cancel,
+        request, registry, context, providers, event_tx, repo, None, None, cancel,
     )
     .await
 }
@@ -298,6 +341,7 @@ pub async fn run_agent_turn_forked(
     event_tx: Sender<AgentEvent>,
     repo: Option<AgentMessagesRepo>,
     fork_ctx: Option<DispatchExt>,
+    shared: Option<RunSharedState>,
     cancel: CancellationToken,
 ) -> Result<RunSummary, LoopError> {
     let run_id = request.run_id.clone();
@@ -357,6 +401,13 @@ pub async fn run_agent_turn_forked(
         .filter(|m| m.kind == Some(MessageKind::Summary))
         .map(|m| m.message_id.clone())
         .collect();
+    // Spec §4：trading_write durable 标记已落库（mark_durable）——续接时从 repo 重建，
+    // 让「永不压缩 / 不折进摘要」跨 run 仍然生效（不只在本 run 内存里成立）。
+    if let (Some(conv), Some(r)) = (&conversation_id, &repo) {
+        if let Ok(ids) = r.load_durable_ids(conv) {
+            durable_message_ids.extend(ids);
+        }
+    }
 
     let mut turn: u32 = 0;
     let mut reactive_retry_used = false;
@@ -371,13 +422,42 @@ pub async fn run_agent_turn_forked(
             stop_reason = AgentStopReason::MaxTurns;
             break;
         }
+        // Spec §2/§5 token 预算：累计（各 turn input+output + fork 子 run 回灌）≥ budget → 停。
+        if let Some(budget) = request.token_budget {
+            let consumed = u64::from(usage_input)
+                .saturating_add(u64::from(usage_output))
+                .saturating_add(shared.as_ref().map(|s| s.extra_tokens()).unwrap_or(0));
+            if consumed >= u64::from(budget.run_tokens) && consumed > 0 {
+                tracing::warn!(
+                    run_id, consumed, budget = budget.run_tokens,
+                    "token budget exceeded — stopping run"
+                );
+                stop_reason = AgentStopReason::TokenBudgetExceeded;
+                break;
+            }
+        }
+        // Spec §3.5：后台子 run 的完成通知注入下一轮（user message，进 LLM 上下文）。
+        if let Some(s) = shared.as_ref() {
+            let notes = s.drain_notifications();
+            if !notes.is_empty() {
+                let note_msg = build_message(
+                    AgentMessageRole::User,
+                    notes.join("\n"),
+                    &run_id,
+                    &conversation_id,
+                    repo.as_ref(),
+                );
+                persist_message(repo.as_ref(), &note_msg, &event_tx, &run_id).await;
+                messages.push(note_msg);
+            }
+        }
         turn += 1;
 
         // ---- Spec §4: proactive per-turn compaction BEFORE provider.next_turn ----
         // estimate(messages + context) → if > soft_limit: MicroClear; if still > summarize
         // threshold: Summarize (when summarize_prompt present) else Drop-oldest. Generic signals
         // only: ContextPart.droppable + durable_message_ids.
-        let new_durable = proactive_compact(
+        let (new_durable, hard_exceeded) = proactive_compact(
             &mut messages,
             &mut context,
             &durable_message_ids,
@@ -389,20 +469,43 @@ pub async fn run_agent_turn_forked(
         )
         .await?;
         durable_message_ids.extend(new_durable);
+        if hard_exceeded {
+            // Spec §4 触发表：尽力压缩后仍超过 hard_limit → fail closed（stop_reason=context_limit）。
+            send_event(
+                &event_tx,
+                AgentEvent::Error {
+                    run_id: run_id.clone(),
+                    code: ErrorCode::ProviderContextTooLong,
+                    message: "estimated context exceeds hard limit after compaction".into(),
+                },
+            )
+            .await?;
+            stop_reason = AgentStopReason::ContextLimit;
+            break;
+        }
 
         // ---- provider call: transient backoff retry + channel fallback (§4), then the
         // orthogonal context-too-long reactive-retry path below. ----
-        let outcome = match resilient_next_turn(
-            &mut providers,
-            &mut active_provider_idx,
-            &retry_plan,
-            &messages,
-            &context,
-            &event_tx,
-            &run_id,
-        )
-        .await
-        {
+        // Spec §3：取消必须在 provider stream 进行中也生效——用 select 让 cancel 直接中断本次
+        // provider 调用（drop future = abort 底层请求），不是等整 turn 流完才在边界发现。
+        let outcome_res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            r = resilient_next_turn(
+                &mut providers,
+                &mut active_provider_idx,
+                &retry_plan,
+                &messages,
+                &context,
+                &event_tx,
+                &run_id,
+            ) => Some(r),
+        };
+        let Some(outcome_res) = outcome_res else {
+            stop_reason = AgentStopReason::Cancelled;
+            break;
+        };
+        let outcome = match outcome_res {
             Ok(out) => out,
             Err(LoopError::ProviderContextTooLong) => {
                 if reactive_retry_used {
@@ -427,12 +530,19 @@ pub async fn run_agent_turn_forked(
                     crate::domain::agent::ContextWindowLimits::default(),
                 );
                 context = new_ctx;
+                // Spec §4 ReactiveRetry：「直接 Drop 最老一轮 API round（含 chat history +
+                // tool_results），保证下一次发送一定更短」——token 大头几乎总在 messages-lane，
+                // 只压 systemParts 重发大概率原样再被拒。stub 旧 tool_result + drop 最老一轮。
+                let keep = plan.keep_recent_turns as usize;
+                let stubbed = micro_clear_messages(&mut messages, &durable_message_ids, keep);
+                let dropped_rounds =
+                    drop_oldest_round_messages(&mut messages, &durable_message_ids, keep);
                 send_event(
                     &event_tx,
                     AgentEvent::Compacted {
                         run_id: run_id.clone(),
                         tier: crate::domain::agent::CompactedTier::ReactiveRetry,
-                        dropped_messages: dropped,
+                        dropped_messages: dropped + stubbed + dropped_rounds,
                         estimated_tokens_saved: None,
                     },
                 )
@@ -527,7 +637,7 @@ pub async fn run_agent_turn_forked(
                         )
                         .await;
 
-                    let (out_summary, is_error, duration_ms, used_call_id, err_code) =
+                    let (out_summary, is_error, duration_ms, used_call_id, err_code, payload_ref) =
                         match dispatch_res {
                             Ok(r) => (
                                 r.output_summary,
@@ -535,20 +645,21 @@ pub async fn run_agent_turn_forked(
                                 r.duration_ms,
                                 r.tool_call_id,
                                 r.error_code,
+                                r.output_payload_ref,
                             ),
                             Err(DispatchError::NotRegistered(_)) => {
                                 let summary = serde_json::json!({
                                     "message": format!("tool '{}' not registered", name),
                                 });
-                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput))
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput), None)
                             }
                             Err(DispatchError::InvalidInput(msg)) => {
                                 let summary = serde_json::json!({"message": msg});
-                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput))
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::InvalidInput), None)
                             }
                             Err(e) => {
                                 let summary = serde_json::json!({"message": e.to_string()});
-                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::ParseError))
+                                (summary, true, 0u64, call_id.clone(), Some(ErrorCode::ParseError), None)
                             }
                         };
 
@@ -577,9 +688,14 @@ pub async fn run_agent_turn_forked(
                             name, used_call_id, code_str, payload_str
                         ));
                     } else {
+                        // >8KB 的 output 走了 PayloadStore：wrapper 带 ref 属性，使压缩替 stub 时
+                        // `<tool_result_stub name/call_id/ref>` 三属性齐全，replay 能拉回原文（spec §2/§4）。
+                        let ref_attr = payload_ref
+                            .map(|r| format!(r#" ref="{r}""#))
+                            .unwrap_or_default();
                         tool_results_for_next_turn.push(format!(
-                            r#"<tool_result name="{}" call_id="{}">{}</tool_result>"#,
-                            name, used_call_id, payload_str
+                            r#"<tool_result name="{}" call_id="{}"{}>{}</tool_result>"#,
+                            name, used_call_id, ref_attr, payload_str
                         ));
                     }
                 }
@@ -637,6 +753,14 @@ pub async fn run_agent_turn_forked(
             durable_message_ids.insert(user_msg.message_id.clone());
         }
         persist_message(repo.as_ref(), &user_msg, &event_tx, &run_id).await;
+        // durable 标记落库（跨 run 续接仍受保护，spec §4）；失败不致命（本 run 内存集合仍生效）。
+        if turn_has_trading_write && user_msg.conversation_id.is_some() {
+            if let Some(r) = repo.as_ref() {
+                if let Err(e) = r.mark_durable(&user_msg.message_id) {
+                    tracing::warn!(run_id, error = %e, "mark_durable failed");
+                }
+            }
+        }
         messages.push(user_msg);
         // Continue to next turn.
     }
@@ -718,9 +842,11 @@ async fn persist_message(
 /// Spec §4 主动压缩（每轮发请求前）：estimate(messages + context) →
 /// - `> soft_limit`：MicroClear（context 易腐 part 替 stub + messages 非 durable 旧 tool_result 替 stub）
 /// - 仍 `> summarize_threshold`：有 `summarize_prompt` → Summarize（模型调用）；否则 Drop 最旧一轮
+/// - 尽力压缩后仍 `> hard_limit`：先持续 Drop 最旧轮直到无可丢；仍超 → 返回 `hard_exceeded=true`，
+///   caller fail closed（`stop_reason=context_limit`，spec §4 触发表）。
 ///
 /// 只认通用信号：`ContextPart.droppable` + `durable_message_ids`。trading_write / summary 永不动。
-/// 返回本次新增的 durable message_ids（如 Summarize 产出的 summary 检查点），caller 并入集合。
+/// 返回 (本次新增的 durable message_ids, hard_exceeded)。
 #[allow(clippy::too_many_arguments)]
 async fn proactive_compact(
     messages: &mut Vec<AgentMessage>,
@@ -731,11 +857,11 @@ async fn proactive_compact(
     repo: Option<&AgentMessagesRepo>,
     event_tx: &Sender<AgentEvent>,
     run_id: &str,
-) -> Result<HashSet<String>, LoopError> {
+) -> Result<(HashSet<String>, bool), LoopError> {
     let mut new_durable: HashSet<String> = HashSet::new();
     let est = estimate_context_tokens(messages, context, channel);
     if est.total_tokens <= plan.soft_limit {
-        return Ok(new_durable);
+        return Ok((new_durable, false));
     }
 
     // ---- Tier 1: MicroClear ----
@@ -763,7 +889,7 @@ async fn proactive_compact(
     }
 
     if after_micro <= plan.summarize_threshold {
-        return Ok(new_durable);
+        return Ok((new_durable, false));
     }
 
     // ---- Tier 2: Summarize (if prompt provided) else Drop oldest round ----
@@ -838,7 +964,41 @@ async fn proactive_compact(
             .await?;
         }
     }
-    Ok(new_durable)
+
+    // ---- Hard limit（spec §4 触发表最后一档）----
+    // Summarize/Drop 一次只处理一轮；仍超 hard → 应急持续 Drop 最旧轮（durable / 尾窗仍受保护），
+    // 直到回到 hard 以下或无可丢。无可丢仍超 → hard_exceeded，caller fail closed。
+    let mut emergency_dropped = 0u32;
+    loop {
+        let est = estimate_context_tokens(messages, context, channel).total_tokens;
+        if est <= plan.hard_limit {
+            break;
+        }
+        let d = drop_oldest_round_messages(
+            messages,
+            durable_message_ids,
+            plan.keep_recent_turns as usize,
+        );
+        if d == 0 {
+            break;
+        }
+        emergency_dropped += d;
+    }
+    if emergency_dropped > 0 {
+        send_event(
+            event_tx,
+            AgentEvent::Compacted {
+                run_id: run_id.to_string(),
+                tier: CompactedTier::Drop,
+                dropped_messages: emergency_dropped,
+                estimated_tokens_saved: None,
+            },
+        )
+        .await?;
+    }
+    let hard_exceeded =
+        estimate_context_tokens(messages, context, channel).total_tokens > plan.hard_limit;
+    Ok((new_durable, hard_exceeded))
 }
 
 fn plan_limits(plan: &CompactionPlan) -> crate::domain::agent::ContextWindowLimits {
@@ -1213,6 +1373,7 @@ mod tests {
             compaction: None,
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         }
     }
 
@@ -2077,6 +2238,7 @@ mod tests {
                 compaction: None,
                 fallback_channels: vec![],
                 retry: None,
+                token_budget: None,
             };
             let registry = Arc::new(ToolRegistry::new_without_persist());
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
@@ -2176,6 +2338,7 @@ mod tests {
                 compaction: None,
                 fallback_channels: vec![],
                 retry: None,
+                token_budget: None,
             };
             let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
             let pump = tokio::spawn(async move {
@@ -2307,6 +2470,7 @@ mod tests {
             compaction: None,
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         };
         let (tx1, mut rx1) = mpsc::channel::<AgentEvent>(256);
         let pump1 = tokio::spawn(async move { while rx1.recv().await.is_some() {} });
@@ -2353,6 +2517,7 @@ mod tests {
             }),
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         };
         let (tx2, mut rx2) = mpsc::channel::<AgentEvent>(256);
         let pump2 = tokio::spawn(async move {
@@ -2407,5 +2572,216 @@ mod tests {
             .unwrap_or_default();
         assert!(!summary_text.trim().is_empty(), "summary model call must produce text");
         println!("[multiturn-summarize-live] summary = {:?}", summary_text);
+    }
+
+    // ---- token 预算（spec §2/§5：累计 input+output+子回灌 ≥ budget → token_budget_exceeded）----
+
+    #[tokio::test]
+    async fn loop_stops_with_token_budget_exceeded() {
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("echo"), echo_handler()).unwrap();
+        // 每 turn 都发起一次工具调用（loop 会继续）；usage 每 turn 100+100。
+        let turn = || {
+            Ok(scripted_outcome(
+                r#"<use_tool name="echo">{"a":1}</use_tool>"#,
+                100,
+                100,
+                AgentStopReason::ProviderStop,
+            ))
+        };
+        let provider = Box::new(ScriptedProvider {
+            script: vec![turn(), turn(), turn(), turn(), turn()],
+            index: 0,
+        });
+        let mut request = req();
+        request.max_turns = 50;
+        // 预算 300：turn1 后累计 200 < 300 继续；turn2 后 400 ≥ 300 → 第 3 个 turn 边界停。
+        request.token_budget = Some(crate::domain::agent::TokenBudget { run_tokens: 300 });
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let drain = tokio::spawn(async move {
+            let mut last_done = None;
+            while let Some(e) = rx.recv().await {
+                if let AgentEvent::Done { stop_reason, .. } = &e {
+                    last_done = Some(*stop_reason);
+                }
+            }
+            last_done
+        });
+        let summary = run_agent_turn(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            vec![provider],
+            tx,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.stop_reason, AgentStopReason::TokenBudgetExceeded);
+        assert_eq!(summary.turns, 2, "应在第 3 个 turn 边界停（已跑 2 turn）");
+        let done = drain.await.unwrap();
+        assert_eq!(done, Some(AgentStopReason::TokenBudgetExceeded));
+    }
+
+    #[tokio::test]
+    async fn loop_budget_counts_child_feedback_tokens() {
+        // 子 run usage 回灌（RunSharedState.extra_tokens）计入预算累计。
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("echo"), echo_handler()).unwrap();
+        let turn = || {
+            Ok(scripted_outcome(
+                r#"<use_tool name="echo">{"a":1}</use_tool>"#,
+                10,
+                10,
+                AgentStopReason::ProviderStop,
+            ))
+        };
+        let provider = Box::new(ScriptedProvider {
+            script: vec![turn(), turn(), turn()],
+            index: 0,
+        });
+        let mut request = req();
+        request.max_turns = 50;
+        request.token_budget = Some(crate::domain::agent::TokenBudget { run_tokens: 1000 });
+        let shared = RunSharedState::new();
+        // 模拟一个子 run 已烧掉 5000 tokens（回灌）。
+        shared.add_tokens(5000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let summary = run_agent_turn_forked(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            vec![provider],
+            tx,
+            None,
+            None,
+            Some(shared),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let _ = drain.await;
+        assert_eq!(summary.stop_reason, AgentStopReason::TokenBudgetExceeded);
+        // 回灌（5000）在 run 起跑前已超预算（1000）→ 第 1 个 turn 边界即停，一轮都不跑。
+        assert_eq!(summary.turns, 0, "回灌已超预算 → 不再起任何 turn");
+    }
+
+    // ---- 后台子 run 完成通知注入父下一轮（spec §3.5）----
+
+    #[tokio::test]
+    async fn loop_injects_pending_notifications_as_user_message() {
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        registry.register_tool(spec("echo"), echo_handler()).unwrap();
+        let provider = Box::new(ScriptedProvider {
+            script: vec![
+                Ok(scripted_outcome(
+                    r#"<use_tool name="echo">{"a":1}</use_tool>"#,
+                    5,
+                    5,
+                    AgentStopReason::ProviderStop,
+                )),
+                Ok(scripted_outcome("done", 5, 5, AgentStopReason::Completed)),
+            ],
+            index: 0,
+        });
+        let shared = RunSharedState::new();
+        shared.push_notification(
+            r#"<task-notification agent_id="sub_x"><status>completed</status><result>子结论</result></task-notification>"#
+                .into(),
+        );
+        // 用 db-backed repo 验证通知被持久化为 user message。
+        use crate::infrastructure::agent::migrations::migrations as agent_migrations;
+        use crate::infrastructure::db::{run_migrations, AppDb};
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, agent_migrations()).unwrap());
+        let repo = AgentMessagesRepo::new(db);
+        let mut request = req();
+        request.conversation_id = Some("conv-notify".into());
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let summary = run_agent_turn_forked(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            vec![provider],
+            tx,
+            Some(repo.clone()),
+            None,
+            Some(shared.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let _ = drain.await;
+        assert_eq!(summary.stop_reason, AgentStopReason::Completed);
+        // 通知已被 drain（队列空）且作为 user message 落库。
+        let all = repo.load_conversation("conv-notify").unwrap();
+        let has_note = all.iter().any(|m| {
+            m.role == AgentMessageRole::User
+                && m.blocks.iter().any(|b| {
+                    matches!(b, AgentMessageBlock::Text { text } if text.contains("<task-notification"))
+                })
+        });
+        assert!(has_note, "通知必须注入为 user message 并落库");
+    }
+
+    // ---- durable 跨 run（spec §4：trading_write 标记落库 + 续接重建）----
+
+    #[tokio::test]
+    async fn trading_write_durable_marked_in_db_and_reloaded() {
+        use crate::infrastructure::agent::migrations::migrations as agent_migrations;
+        use crate::infrastructure::db::{run_migrations, AppDb};
+        let db = AppDb::open_in_memory().unwrap();
+        db.with(|c| run_migrations(c, agent_migrations()).unwrap());
+        let repo = AgentMessagesRepo::new(db);
+
+        let registry = Arc::new(ToolRegistry::new_without_persist());
+        let trading_spec = ToolSpec::new(
+            "operate",
+            "trading write",
+            json!({"type":"object"}),
+            vec![r#"<use_tool name="operate">{}</use_tool>"#.into()],
+            5000,
+            SideEffect::TradingWrite,
+        );
+        registry.register_tool(trading_spec, echo_handler()).unwrap();
+
+        let provider = Box::new(ScriptedProvider {
+            script: vec![
+                Ok(scripted_outcome(
+                    r#"<use_tool name="operate">{"action":"open"}</use_tool>"#,
+                    5,
+                    5,
+                    AgentStopReason::ProviderStop,
+                )),
+                Ok(scripted_outcome("已开仓", 5, 5, AgentStopReason::Completed)),
+            ],
+            index: 0,
+        });
+        let mut request = req();
+        request.conversation_id = Some("conv-durable".into());
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        run_agent_turn(
+            request,
+            registry,
+            ContextBundle::new("r1"),
+            vec![provider],
+            tx,
+            Some(repo.clone()),
+        )
+        .await
+        .unwrap();
+        let _ = drain.await;
+
+        // trading_write 轮的 tool_result user message 已打 durable 标。
+        let durable = repo.load_durable_ids("conv-durable").unwrap();
+        assert_eq!(durable.len(), 1, "恰好 trading_write 那条 tool_result 被打标");
+        let all = repo.load_conversation("conv-durable").unwrap();
+        let marked = all.iter().find(|m| m.message_id == durable[0]).unwrap();
+        assert!(marked.blocks.iter().any(|b| {
+            matches!(b, AgentMessageBlock::Text { text } if text.contains(r#"<tool_result name="operate""#))
+        }));
     }
 }

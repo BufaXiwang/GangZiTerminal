@@ -37,6 +37,7 @@ use rusqlite_migration::{Migrations, M};
 /// | 11   | Agent     | 006 review_suggestions + daily_equity（deprecated） |
 /// | 12   | Account   | tail-001 account_day_equity（日初权益基线 + 高水位） |
 /// | 13   | Account   | tail-002 account_archive（账户重置归档摘要） |
+/// | 14   | Agent     | tail-001 agent_messages 增 durable 列（trading_write 跨 run 保护） |
 pub fn all_migrations() -> Vec<M<'static>> {
     use crate::infrastructure::account::migrations as account_mig;
     use crate::infrastructure::agent::migrations as agent_mig;
@@ -44,12 +45,13 @@ pub fn all_migrations() -> Vec<M<'static>> {
     use crate::infrastructure::quotes::migrations as quotes_mig;
 
     let mut all = Vec::new();
-    // Spec: architecture.md — 全局拼接顺序 news → account → quotes → agent → account_tail
+    // Spec: architecture.md — 全局拼接顺序 news → account → quotes → agent_base → tails
     all.extend(news_mig::migrations());      // [0]       News 001
     all.extend(account_mig::migrations());   // [1..3]    Account 001–003
     all.extend(quotes_mig::migrations());    // [4..5]    Quotes 001–002
-    all.extend(agent_mig::migrations());     // [6..11]   Agent 001–006
+    all.extend(agent_mig::migrations_base()); // [6..11]  Agent 001–006（冻结段）
     all.extend(account_mig::migrations_tail()); // [12..13]  Account tail-001–002
+    all.extend(agent_mig::migrations_tail()); // [14]     Agent tail-001 durable
     all
 }
 

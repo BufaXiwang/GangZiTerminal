@@ -68,6 +68,19 @@ pub struct AgentRunRequest {
     /// 瞬时错误退避重试策略（spec §4）；缺省内置 3 次 / 500ms / 8000ms。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryConfig>,
+    /// 本 run 的 token 预算（spec §5 `tokenBudget`，Runtime 从 settings 传入）；缺省无上限。
+    /// 累计 = 各 turn input+output 之和 + fork 子 run 回灌的 usage；超限 → loop 在 turn 边界停，
+    /// emit `done(stop_reason=token_budget_exceeded)`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<TokenBudget>,
+}
+
+/// 本 run 的 token 预算（spec §5 `TokenBudget`）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBudget {
+    /// 本 run 累计 token 上限（含 fork 子 run 回灌的 usage）。
+    pub run_tokens: u32,
 }
 
 /// 瞬时错误退避重试配置（spec §4 / §5 `RetryConfig`）。
@@ -166,6 +179,7 @@ mod tests {
             compaction: None,
             fallback_channels: vec![],
             retry: None,
+            token_budget: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: AgentRunRequest = serde_json::from_str(&j).unwrap();

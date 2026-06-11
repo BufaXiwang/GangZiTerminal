@@ -48,7 +48,7 @@ fn map_orchestration(e: OrchestrationError) -> CommandError {
 pub struct SendMessageInput {
     /// 用户消息文本（spec `content`）。
     pub content: String,
-    /// 多模态附件（base64/URL）；当前 loop 仅消费文本，images 接受但未透传（见模块注）。
+    /// 多模态附件（data-URL `data:image/...;base64,...`）；经 PayloadStore 转 Image block 透传给 loop。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
     /// 续接的对话线程 id（spec §9 补充）；不传则后端新开匿名线程。
@@ -71,13 +71,14 @@ pub async fn agent_send_message(
     services: State<'_, Arc<RuntimeServices>>,
     input: SendMessageInput,
 ) -> Result<SendMessageResult, CommandError> {
-    if input.content.trim().is_empty() {
+    // 图片-only 消息合法（spec §9：content 与 images 至少其一非空）；只拦「全空」。
+    let images = input.images.unwrap_or_default();
+    if input.content.trim().is_empty() && images.is_empty() {
         return Err(CommandError::with_message(ErrorCode::InvalidInput, "消息不能为空"));
     }
     let conversation_id = input
         .conversation_id
         .unwrap_or_else(|| format!("conv_{}", uuid::Uuid::new_v4()));
-    let images = input.images.unwrap_or_default();
     let res = services
         .run_dialogue_detailed(conversation_id, input.content, images)
         .await

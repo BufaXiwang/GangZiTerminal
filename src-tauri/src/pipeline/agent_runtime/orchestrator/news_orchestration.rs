@@ -186,14 +186,27 @@ impl RuntimeServices {
                 }
             }
             Ok(run) => {
-                // run 落到非 Completed 终态（failed/cancelled）→ 视为可恢复，本批回 pending 重试（spec §5）。
+                // run 落到非 Completed 终态：
+                // - Cancelled = 用户主动取消 → **不重试**（回 pending 等于违背取消意图），本批 dropped。
+                // - TokenBudgetExceeded → **不重试**（同一批重跑必然再超限 → 无限烧钱循环），本批 dropped。
+                // - 其余 failed（provider 抖动 / max_turns 等）→ 可恢复，回 pending 下窗重试（spec §5）。
+                let unrecoverable = run.status == AgentRunStatus::Cancelled
+                    || run
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("TokenBudgetExceeded"));
                 tracing::warn!(
                     target: "runtime.sched.news",
-                    run_id = %run.run_id, status = ?run.status,
-                    "news run 非 Completed 终态 → 本批回 pending"
+                    run_id = %run.run_id, status = ?run.status, error = ?run.error, unrecoverable,
+                    "news run 非 Completed 终态"
                 );
-                if let Err(e) = self.news_buffer.revert_to_pending(&batch) {
-                    tracing::warn!(target: "runtime.sched.news", error = %e, "revert_to_pending failed");
+                let res = if unrecoverable {
+                    self.news_buffer.mark_dropped(&batch)
+                } else {
+                    self.news_buffer.revert_to_pending(&batch)
+                };
+                if let Err(e) = res {
+                    tracing::warn!(target: "runtime.sched.news", error = %e, "post-terminal disposition failed");
                 }
                 None
             }

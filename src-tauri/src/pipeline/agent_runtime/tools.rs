@@ -31,7 +31,9 @@ pub fn spec_fetch_quotes() -> ToolSpec {
     ToolSpec::new(
         FETCH_QUOTES,
         "获取行情快照 / K线 / 指标 / 基本面（tsCodes 路径，→ Quotes fetch_data），或市场扫描（scan 路径，\
-         → Quotes scan_market）。tsCodes 与 scan 二选一。只读、不触发远端刷新。",
+         → Quotes scan_market）。tsCodes 与 scan 二选一。只读、不触发远端刷新。\
+         indicators 只接受 true（全部指标）或指标名数组（如 [\"ma5\",\"macd_dif\",\"rsi6\"]），\
+         **不要传对象**（如 {\"ma\":[5,10]}）。",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -41,15 +43,23 @@ pub fn spec_fetch_quotes() -> ToolSpec {
                     "type": "object",
                     "properties": {
                         "quote": { "type": "boolean" },
-                        "klines": { "type": "array", "items": { "type": "string" } },
-                        "indicators": {},
+                        "klines": { "type": "array", "items": { "type": "string" }, "description": "如 [\"day\"]" },
+                        "indicators": {
+                            "description": "true=全部指标；或指标名数组，可选值：ma5/ma10/ma20/ma60/ema12/ema26/\
+                                            macd_dif/macd_dea/macd_hist/rsi6/rsi12/rsi24/kdj_k/kdj_d/kdj_j/\
+                                            boll_upper/boll_mid/boll_lower/volume_ma5/volume_ma10。\
+                                            （不要传对象；误传对象会被当作 true 处理）"
+                        },
                         "profile": { "type": "boolean" },
                         "dailyBasic": { "type": "boolean" }
                     }
                 }
             }
         }),
-        vec![r#"<use_tool name="fetch_quotes">{"tsCodes":["600519.SH"],"include":{"quote":true}}</use_tool>"#.into()],
+        vec![
+            r#"<use_tool name="fetch_quotes">{"tsCodes":["600519.SH"],"include":{"quote":true}}</use_tool>"#.into(),
+            r#"<use_tool name="fetch_quotes">{"tsCodes":["600406.SH"],"include":{"quote":true,"klines":["day"],"indicators":["ma5","ma20","macd_dif","rsi6"],"dailyBasic":true}}</use_tool>"#.into(),
+        ],
         READ_TIMEOUT_MS,
         SideEffect::None,
     )
@@ -119,7 +129,7 @@ pub fn spec_operate_account() -> ToolSpec {
     ToolSpec::new(
         OPERATE_ACCOUNT,
         "对模拟账户下单 / 撤单 / 开仓 / 调仓 / 平仓 / 调整保护。accountInput 为 Account canonical 动作；\
-         reason 说明本次理由。受风控闸门（熔断 / 追高 / 当日额度）+ 账户 fail-closed 约束。",
+         reason 说明本次理由。受账户级风控（AccountRiskPolicy，fail-closed）约束。",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -157,7 +167,9 @@ pub fn spec_record_analysis() -> ToolSpec {
         RECORD_ANALYSIS,
         "对本批 news 形成判断后声明结论：kind 为 action（下单/改自选）或 no_action（观望）；\
          summary 写结论 + 理由（含「为什么现在进还来得及/已 price-in」判断）；relatedCodes 为相关标的（可空）。\
-         大多数 news 应为 no_action。形成判断后**必须**调用一次。",
+         **summary 第一行必须是一行主题标题**（≤30 字，概括本批新闻主题 + 判断要点，\
+         如「中东冲突升级+AI算力利好——映射已 price-in，观望」），不要以「结论」「no_action」开头；\
+         正文从第二行起。大多数 news 应为 no_action。形成判断后**必须**调用一次。",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -167,7 +179,7 @@ pub fn spec_record_analysis() -> ToolSpec {
             },
             "required": ["kind", "summary"]
         }),
-        vec![r#"<use_tool name="record_analysis">{"kind":"no_action","summary":"利好已被 price-in，现价追高风险大，观望","relatedCodes":["600519.SH"]}</use_tool>"#.into()],
+        vec![r#"<use_tool name="record_analysis">{"kind":"no_action","summary":"白酒提价利好——已被 price-in，观望\n\n结论：现价追高风险大，不出手。理由：……","relatedCodes":["600519.SH"]}</use_tool>"#.into()],
         WRITE_TIMEOUT_MS,
         SideEffect::NonTradingWrite,
     )

@@ -24,6 +24,9 @@ use crate::pipeline::account::service::AccountService;
 use crate::pipeline::news::service::NewsService;
 use crate::pipeline::quotes::service::QuotesService;
 
+use crate::domain::agent::runtime::AgentRunMode;
+use crate::domain::agent::SideEffect;
+
 use super::executor::{AgentEventSink, RegistryAugment};
 use super::gateway_impls::{AccountGatewayImpl, NewsGatewayImpl, QuotesGatewayImpl};
 use super::news_buffer::{NewsBufferConfig, NewsBufferService};
@@ -104,20 +107,33 @@ pub fn build_runtime_services(b: RuntimeBootstrap) -> RuntimeServices {
         Ok(vec![Box::new(p) as Box<dyn ProviderStream>])
     });
 
-    // Infra 工具（本地 file/bash + fork run_subagent/run_skill + create_skill）注入 per-run registry：
+    // Infra 工具（本地 file/bash + fork run_subagent/run_skill + create_skill 等）注入 per-run registry：
     // 从 Infra 全局 registry 复制所有非领域工具到 per-run registry（spec §4 / agent-infra §3.6）。
+    // **review run 只读**（spec §3 mode 表：review = fetch_* + record_review_suggestion）：
+    // 只复制无副作用的只读 Infra 工具（SideEffect::None 且非 spawn 且非 run_bash——bash 可写盘，
+    // 约定级沙箱挡不住），write_file / edit_file / create_skill / run_subagent / run_skill 都不给。
     let infra_reg = b.infra_registry;
-    let augment: Option<RegistryAugment> = Some(Arc::new(move |per_run: &Arc<ToolRegistry>| {
-        for spec in infra_reg.list_tools() {
-            // 领域工具已由 build_domain_registry_for_mode 注册；只复制 Infra 侧工具。
-            if per_run.has_tool(&spec.name) {
-                continue; // 已注册（领域工具），跳过
+    let augment: Option<RegistryAugment> = Some(Arc::new(
+        move |per_run: &Arc<ToolRegistry>, mode: AgentRunMode| {
+            let review_readonly = mode == AgentRunMode::Review;
+            for spec in infra_reg.list_tools() {
+                // 领域工具已由 build_domain_registry_for_mode 注册；只复制 Infra 侧工具。
+                if per_run.has_tool(&spec.name) {
+                    continue; // 已注册（领域工具），跳过
+                }
+                if review_readonly
+                    && (spec.side_effect != SideEffect::None
+                        || spec.is_spawn
+                        || spec.name == "run_bash")
+                {
+                    continue;
+                }
+                if let Some(handler) = infra_reg.clone_handler(&spec.name) {
+                    let _ = per_run.register_tool(spec, handler);
+                }
             }
-            if let Some(handler) = infra_reg.clone_handler(&spec.name) {
-                let _ = per_run.register_tool(spec, handler);
-            }
-        }
-    }));
+        },
+    ));
 
     RuntimeServices::new(RuntimeServicesConfig {
         runs,

@@ -2242,6 +2242,7 @@ impl QuotesService {
             period,
             adjust,
             xdxr_version,
+            limit,
         };
         if let Some(cached) = self.adjust_cache.get(&key) {
             return Ok(Some(cached));

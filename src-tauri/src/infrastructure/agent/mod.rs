@@ -58,7 +58,7 @@ mod judge_stress_tests;
 #[cfg(test)]
 mod e2e_dialogue_tests;
 
-/// 联网搜索 web_search：可插拔多源（DuckDuckGo/Jina/Bocha/Tavily）+ 并行去重聚合。
+/// 联网搜索 web_search：可插拔多源（搜狗 + DuckDuckGo，免费无 key）+ 并行去重聚合。
 /// Spec: agent-infra-module.md §3.6 web_search。
 pub mod web_search;
 
@@ -168,7 +168,7 @@ pub fn bootstrap(
     if let Err(e) = register_subagent_tools(&registry, fork_handle) {
         tracing::warn!("register_subagent_tools failed: {e}");
     }
-    // web 研究工具：web_extract（无 key，读正文）+ web_search（DuckDuckGo，免费无 key）。
+    // web 研究工具：web_extract（无 key，读正文）+ web_search（搜狗 + DuckDuckGo，免费无 key）。
     // 需 key 的源已按用户要求移除——只留免费版本。
     {
         let web_client = reqwest::Client::builder()
@@ -181,7 +181,7 @@ pub fn bootstrap(
         let search = std::sync::Arc::new(
             web_search::WebSearchConfig {
                 enable_duckduckgo: true,
-                ..Default::default()
+                enable_sogou: true,
             }
             .build(web_client),
         );

@@ -57,7 +57,9 @@ pub const DEFAULT_ACCOUNT_TRIGGER_EVAL_BATCH_SIZE: u32 = 200;
 pub const DEFAULT_EOD_REVIEW_TIME: &str = "15:30 Asia/Shanghai";
 pub const DEFAULT_REVIEW_MIN_SAMPLE_TRADES: u32 = 30;
 pub const DEFAULT_AGENT_RUN_MAX_TURNS: u32 = 40;
-pub const DEFAULT_AGENT_RUN_TOKEN_BUDGET: u32 = 200_000;
+// 预算口径 = 累计 input+output（真实成本，input 每轮全量重计）+ fork 子 run 回灌。
+// 长对话历史 ~30k 时 200k 只够 5-6 轮（实网 2026-06-10：深挖任务第 5 轮被掐、没产出结论）→ 提到 1M。
+pub const DEFAULT_AGENT_RUN_TOKEN_BUDGET: u32 = 1_000_000;
 pub const DEFAULT_AGENT_DAILY_TOKEN_BUDGET: u64 = 5_000_000;
 
 /// Runtime settings facade。包一份 repo；每个 getter 解析对应 key。
@@ -175,7 +177,7 @@ impl RuntimeSettings {
     }
 
 
-    // ---- setter（供前端开关 / 熔断状态写入）-------------------------------
+    // ---- setter（供前端开关写入）-------------------------------
 
     /// 写任意 key（字符串值）。
     pub fn set(&self, key: &str, value: &str) -> rusqlite::Result<()> {

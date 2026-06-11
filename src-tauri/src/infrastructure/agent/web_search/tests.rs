@@ -70,10 +70,12 @@ async fn aggregator_runs_parallel_and_tolerates_provider_failure() {
 #[test]
 fn config_build_counts_enabled_providers() {
     let client = reqwest::Client::new();
-    // 只剩免费的 DuckDuckGo：启用即 1 源，不启用即 0 源。
-    let on = WebSearchConfig { enable_duckduckgo: true }.build(client.clone());
-    assert_eq!(on.provider_names(), vec!["duckduckgo".to_string()]);
-    let off = WebSearchConfig { enable_duckduckgo: false }.build(client);
+    // 免费双源：sogou 排前（中文主力），duckduckgo 其次。
+    let both = WebSearchConfig { enable_duckduckgo: true, enable_sogou: true }.build(client.clone());
+    assert_eq!(both.provider_names(), vec!["sogou".to_string(), "duckduckgo".to_string()]);
+    let ddg_only = WebSearchConfig { enable_duckduckgo: true, enable_sogou: false }.build(client.clone());
+    assert_eq!(ddg_only.provider_names(), vec!["duckduckgo".to_string()]);
+    let off = WebSearchConfig { enable_duckduckgo: false, enable_sogou: false }.build(client);
     assert!(off.is_empty());
 }
 
@@ -121,7 +123,7 @@ async fn web_search_live_free_providers() {
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .unwrap();
-    let agg = WebSearchConfig { enable_duckduckgo: true }.build(client);
+    let agg = WebSearchConfig { enable_duckduckgo: true, enable_sogou: true }.build(client);
     println!("\n=== web_search live providers: {:?} ===", agg.provider_names());
     let results = agg.search("贵州茅台 2024 业绩", 5).await;
     println!("聚合 {} 条：", results.len());

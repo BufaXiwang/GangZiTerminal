@@ -411,6 +411,7 @@ async fn run_turn(
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {
@@ -459,6 +460,7 @@ async fn run_loop_collect(
         compaction: None,
         fallback_channels: vec![],
         retry: None,
+        token_budget: None,
     };
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let pump = tokio::spawn(async move {

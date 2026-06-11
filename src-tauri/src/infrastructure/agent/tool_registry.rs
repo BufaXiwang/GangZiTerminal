@@ -340,20 +340,33 @@ impl ToolRegistry {
         input: JsonSummary,
         ext: Option<DispatchExt>,
     ) -> Result<ToolCallResult, DispatchError> {
-        let (handler, spec, validator) = {
+        let looked_up = {
             let g = self.tools.read().expect("RwLock poisoned");
-            let entry = g
-                .get(tool_name)
-                .ok_or_else(|| DispatchError::NotRegistered(tool_name.into()))?;
-            (
-                entry.handler.clone(),
-                entry.spec.clone(),
-                entry.input_validator.clone(),
-            )
+            g.get(tool_name).map(|entry| {
+                (
+                    entry.handler.clone(),
+                    entry.spec.clone(),
+                    entry.input_validator.clone(),
+                )
+            })
+        };
+        let Some((handler, spec, validator)) = looked_up else {
+            // Spec §2 不变量「所有 tool 调用都必须记录 ToolCall」：未注册也落一条 is_error 审计行，
+            // 让 tool_end 事件里的 toolCallId 在 agent_tool_calls 中可查（一一对应）。
+            self.record_rejected_call(
+                run_id,
+                &tool_call_id,
+                tool_name,
+                &input,
+                format!("tool '{tool_name}' not registered"),
+            );
+            return Err(DispatchError::NotRegistered(tool_name.into()));
         };
 
         if let Some(v) = validator {
             if let Some(msg) = v(&input) {
+                // 同上：inputSchema 校验失败也必须有 ToolCall 审计行（spec §2）。
+                self.record_rejected_call(run_id, &tool_call_id, tool_name, &input, msg.clone());
                 return Err(DispatchError::InvalidInput(msg));
             }
         }
@@ -435,6 +448,40 @@ impl ToolRegistry {
             error_code: output.error_code,
             duration_ms,
         })
+    }
+
+    /// 落一条「协议层被拒」的 ToolCall 审计行（未注册 / inputSchema 校验失败；spec §2 不变量
+    /// 「所有 tool 调用都必须记录 ToolCall」）。失败只 warn——审计写失败不阻断回传 tool_error。
+    fn record_rejected_call(
+        &self,
+        run_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        input: &JsonSummary,
+        message: String,
+    ) {
+        let Some(repo) = &self.repo else { return };
+        let now: OccurredAt = Utc::now();
+        let (input_summary, input_payload_ref) = self
+            .split_payload(PayloadKind::ToolInput, input)
+            .unwrap_or_else(|_| (input.clone(), None));
+        let call = ToolCall {
+            tool_call_id: tool_call_id.to_string(),
+            run_id: run_id.to_string(),
+            name: tool_name.to_string(),
+            input_summary,
+            input_payload_ref,
+            output_summary: Some(serde_json::json!({ "message": message })),
+            output_payload_ref: None,
+            is_error: true,
+            error_code: Some(ErrorCode::InvalidInput),
+            started_at: now,
+            ended_at: Some(now),
+            duration_ms: Some(0),
+        };
+        if let Err(e) = repo.upsert_tool_call(&call) {
+            tracing::warn!(run_id, tool = tool_name, error = %e, "record_rejected_call failed");
+        }
     }
 
     /// 按 spec §2 PayloadStore 阈值规则切分 summary / payload_ref。

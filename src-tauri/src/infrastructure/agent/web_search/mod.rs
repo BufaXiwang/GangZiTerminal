@@ -38,7 +38,7 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: String,
-    /// 来自哪个 provider（当前只有免费的 duckduckgo）。
+    /// 来自哪个 provider（sogou / duckduckgo）。
     pub source: String,
 }
 
@@ -132,19 +132,25 @@ fn interleave_dedupe(lists: Vec<Vec<WebSearchResult>>, max: usize) -> Vec<WebSea
 
 /// provider 开关配置（构造时按启用项 build 出聚合器）。
 ///
-/// 现状（2026-06）：只保留**免费、无 key** 的 DuckDuckGo。需 key 的源（Jina/Brave/Bocha/Tavily）
-/// 已按用户要求移除。DuckDuckGo 在数据中心 IP 常被反爬挡（HTTP 202 challenge），但本工具跑在
-/// 用户本机 Tauri 后端（住宅 IP），命中率更高；聚合层对失败容错（失败忽略）。
+/// 现状（2026-06）：**免费、无 key** 的双源——搜狗（中文 / A 股财经主力）+ DuckDuckGo（国际内容）。
+/// 需 key 的源（Jina/Brave/Bocha/Tavily）已按用户要求移除；百度无头抓取弹验证码、Bing 中国版有
+/// 地名前缀实体回退 bug（「宁德时代」→宁德市），均不可用（2026-06-11 实测）。
+/// 两源并行 fan-out、失败互不拖垮（聚合层容错）。
 #[derive(Debug, Clone, Default)]
 pub struct WebSearchConfig {
     /// DuckDuckGo 无 key 抓取（html + lite 双端点回退）。聚合层容错。
     pub enable_duckduckgo: bool,
+    /// 搜狗（sogou.com）无 key 抓取。中文财经内容主力源（跳转链接并行解包）。
+    pub enable_sogou: bool,
 }
 
 impl WebSearchConfig {
     /// 按启用项构造聚合器（共享一个 reqwest client）。
     pub fn build(&self, client: reqwest::Client) -> MultiWebSearch {
         let mut ps: Vec<Box<dyn WebSearchProvider>> = Vec::new();
+        if self.enable_sogou {
+            ps.push(Box::new(providers::Sogou::new(client.clone())));
+        }
         if self.enable_duckduckgo {
             ps.push(Box::new(providers::DuckDuckGo::new(client.clone())));
         }
@@ -195,7 +201,7 @@ pub fn register_web_search_tool(
                 return ToolHandlerOutput::err(
                     json!({
                         "reason": "invalid_input",
-                        "message": "未配置任何搜索源：请在设置启用 DuckDuckGo"
+                        "message": "未配置任何搜索源：请启用搜狗 / DuckDuckGo"
                     }),
                     ErrorCode::InvalidInput,
                 );
