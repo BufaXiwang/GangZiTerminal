@@ -551,6 +551,27 @@ pub fn run() {
             // （spawn_account_eval_tick_scheduler，spec agent-runtime §6/§8）——
             // 旧的 Account BC 60s 纯兜底 eval scheduler 已退役。
 
+            // -- CLI 本地只读端点（spec: docs/design/cli-module.md §2）
+            // 127.0.0.1 随机端口 + <appData>/cli.port 发现；复用三个 Gateway（与 Agent 读 tool 同源）。
+            {
+                let cli_gateways = adapters::cli::CliGateways::new(
+                    Arc::clone(&quotes_service),
+                    Arc::clone(&news_service),
+                    Arc::clone(&account_service),
+                );
+                let portfile = app
+                    .handle()
+                    .path()
+                    .app_data_dir()
+                    .map(|d| d.join("cli.port"))
+                    .unwrap_or_else(|_| std::env::temp_dir().join("gangzi-cli.port"));
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = adapters::cli::serve(cli_gateways, portfile).await {
+                        tracing::warn!(target: "cli.endpoint", error = %e, "CLI endpoint exited");
+                    }
+                });
+            }
+
             // -- Quotes Scheduler（multi-tick）— 同样需要 runtime context 包装
             let quotes_handle: QuotesSchedulerHandle =
                 tauri::async_runtime::block_on(async {
@@ -762,12 +783,12 @@ mod specta_export_tests {
         use crate::infrastructure::quotes::migrations as quotes_mig;
         let db = AppDb::open_in_memory().unwrap();
         db.with(|conn| {
-            // ① 旧版本：news → account → quotes → agent（无 tail）。
+            // ① 旧版本：news → account → quotes → agent 基础段（无任何 tail）。
             let mut old = Vec::new();
             old.extend(news_mig::migrations());
             old.extend(account_mig::migrations());
             old.extend(quotes_mig::migrations());
-            old.extend(agent_mig::migrations());
+            old.extend(agent_mig::migrations_base());
             let old_len = old.len();
             run_migrations(conn, old).expect("old migration set applies");
             let uv_before: i64 = conn

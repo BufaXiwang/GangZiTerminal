@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod agent;
+pub mod cli;
 pub mod error;
 pub mod news;
 pub mod ping;

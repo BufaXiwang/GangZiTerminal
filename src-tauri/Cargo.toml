@@ -4,10 +4,17 @@ version = "0.1.0"
 description = "A 股研究 + 模拟交易学习终端"
 authors = ["local"]
 edition = "2021"
+# 两个 bin（app 主程序 + gangzi CLI）；`cargo run` 默认跑 app。
+default-run = "gangzi-terminal"
 
 [lib]
 name = "gangzi_terminal"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+# gangzi —— 只读查询 CLI（spec: docs/design/cli-module.md）。瘦客户端：连运行中 app 的本地端点。
+[[bin]]
+name = "gangzi"
+path = "src/bin/gangzi.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
