@@ -8,7 +8,7 @@
 
 > 🟢 **两处设计决策**：
 > 1. **证据不单独持久化**——靠 `run_id → ToolCall 审计`（Infra 已记每次 `fetch_*` 的完整 in/out）按需重建。约束：复盘报告引用的 run 的 payload **不被 GC 清理**（pin），见 §8。
-> 2. **策略保持纯自然语言**——`InvestmentStrategy` 当前只有一段自然语言 `strategy`，**不做结构化硬约束**；后续如需可再加字段（如仓位/止损/集中度限额）。本阶段硬约束分两处兜底：账户级（`AccountRiskPolicy`，Account fail-closed）+ 编排级（熔断/追高，阈值取 Runtime settings）。
+> 2. **策略保持纯自然语言**——`InvestmentStrategy` 当前只有一段自然语言 `strategy`，**不做结构化硬约束**；后续如需可再加字段（如仓位/止损/集中度限额）。本阶段硬约束只有**账户级**（`AccountRiskPolicy`，Account fail-closed）一道机器闸门；**不做编排级风控闸门**（熔断/追高/额度拦截）——模拟账户，亏损本身就是学习闭环的反馈信号，风险偏好由自然语言策略供 LLM 自律。
 >
 > 🔗 **跨 BC 协同（实现前需对齐 Account spec）**：本版恢复 `account-triggered` 实时消费（§6），与 [account-module.md](account-module.md) 的 `AccountTrigger` / `mark_trigger_handled` 契约一致；另需 Account 的 `operate_account` 接受 `clientOrderId` 幂等键去重（§3 AgentTrade 崩溃恢复）。
 
@@ -32,13 +32,13 @@ Agent 自己决策 → 自己 operate_account 下单 → 自己复盘
 ```text
 News / Quotes / Account 只表达「发生了什么」（事实 + 事件 + 只读 facade）
 Agent Infra          负责「把一次 LLM loop 稳定跑完」（消息 / 工具 / 压缩 / fork / skill）
-Agent Runtime        负责「何时唤起谁、注入哪些工具与策略、风控编排、把结果变成可复盘的决策链」
+Agent Runtime        负责「何时唤起谁、注入哪些工具与策略、把结果变成可复盘的决策链」
 ```
 
 契约强度：
 
-- `AgentRun`、trigger 集、`InvestmentStrategy`、`AnalysisResult`、`AgentTrade`、review 只读 sub-agent、风控编排、闭环关联键 `run_id` 是 `Spec-as-source`。
-- buffer 阈值（M / N / 4h）、熔断/追高阈值、各调度 cadence、退避参数、settings 缺省、文件组织是 `Spec-anchored`。
+- `AgentRun`、trigger 集、`InvestmentStrategy`、`AnalysisResult`、`AgentTrade`、review 只读 sub-agent、闭环关联键 `run_id` 是 `Spec-as-source`。
+- buffer 阈值（M / N / 4h）、各调度 cadence、退避参数、settings 缺省、文件组织是 `Spec-anchored`。
 - 策略结构化硬约束、自动策略晋升、自动调参、回测引擎、多 agent 协作**不在本阶段**。
 
 ---
@@ -50,11 +50,11 @@ Agent Runtime 负责：
 - 启动并管理后台 loop（news buffer 消费、收盘复盘定时、账户 trigger 路由、行情/账户维护调度）。
 - 监听应用内事件（`news-refreshed`、`account-triggered`），路由成 `AgentRun`；账户重建由自驱 quote tick 触发（§6），不消费 universe `market-quotes-refreshed`。
 - 为每类 run 选择 **mode**、注入 allowed tools、构造实时上下文、注入当前 active `InvestmentStrategy`。
-- **风控编排**：熔断（连亏 / 单日回撤）触发后暂停自动下单；追高保护；当日下单额度控制；下单前防自我打架。
+- **防自我打架信息注入**：会下单 run 的 L3 强制注入「当日已下单意图 + 活跃挂单 + 持仓 + 剩余可下单额度」——信息层提示，无强拦截（机器闸门只有 Account fail-closed）。
 - 调用 Agent Infra 跑 canonical loop。
 - 记录 `AnalysisResult`、`AgentTrade`；复盘产物（review sub-agent）写成 workspace 文件。
 - 维护 news 待分析 buffer、`orderId → runId` 反查索引、in-flight lock、事件消费幂等、heartbeat、启动恢复。
-- 向前端 emit 运行状态、分析结果、run 起止、熔断状态。
+- 向前端 emit 运行状态、分析结果、run 起止。
 
 Agent Runtime 不负责：
 
@@ -66,7 +66,7 @@ Agent Runtime 不负责：
 
 - Runtime 位于 `pipeline/`，可调用各 BC 公开 use case / facade，但**不属于任一 BC**。
 - Quotes / News / Account **不知道 Runtime 存在**；任一层不得 import Agent 代码。
-- 风控**两层**：① 账户级硬约束（`AccountRiskPolicy`：单票 / 总仓 / 单笔 / 日新单等，Account fail-closed 兜底，是最终闸门）；② 编排级（熔断 / 追高 / 当日额度 / 防自我打架，Runtime 在下单前拦截，阈值取 Runtime settings）。自然语言策略表达风险偏好供 LLM 自律，不承载机器校验。
+- 风控**只有一层机器闸门**：账户级硬约束（`AccountRiskPolicy`：单票 / 总仓 / 单笔 / 日新单等，Account fail-closed 兜底）。**Runtime 不设编排级风控闸门**（无熔断 / 追高 / 额度拦截）——模拟账户，策略好坏由复盘闭环反馈。自然语言策略表达风险偏好供 LLM 自律，不承载机器校验；Runtime 只做防自我打架的**信息注入**（L3，§6）。
 
 ---
 
@@ -78,15 +78,13 @@ Agent Runtime 不负责：
 └────────┬───────────────┬───────────────────┬────────────────────┘
          └───────────────┴─────────┬─────────┘
                                    ▼
-        ┌─ 风控闸门：熔断中？→ 自动下单降级为 no_action/建议 ─┐
-                                   ▼
          AgentRun(run_id, mode, strategyVersion 冻结)
          注入 = L1 角色 + L2 策略(自然语言) + L3 实时上下文(含当日已下单意图)
                                    │
       ┌────────────────────────────┼─────────────────────────────┐
       │(news)                      │(dialogue/news/account_trigger)│
       ▼                            ▼                               │
- AnalysisResult            风控预校验 → operate_account             │
+ AnalysisResult            operate_account                          │
  {action|no_action}        (clientOrderId 幂等) → AgentTrade        │
  →右侧列表                  {runId,strategyVersion,reason,result}    │
                                    │                                │
@@ -160,21 +158,22 @@ type AgentRun = {
 - `runId` 是事件、工具调用、模型 turn、AnalysisResult、AgentTrade 的关联键。
 - **策略版本冻结**：run 创建时把 active `version` 写入 `AgentRun.strategyVersion`，全程不变（注入 L2、AgentTrade 盖戳都用它），不因并发 `upsert_investment_strategy` 中途改变 → 保证确定性 + 归因正确。
 - `account_trigger` run 经 `orderId → runId` 索引把响应关联到原始建仓 run（写 `causationRunId`）；查不到记 `mapping_missing`。
+- **stop_reason → status 映射**：`completed`/`provider_stop` → `completed`；`cancelled` → `cancelled`；**`max_turns` → `failed`**（跑满轮数 ≈ 任务未收口，不得让调用方据 Completed 误标 trigger handled / news analyzed）；其余（`token_budget_exceeded`/`context_limit`/`error`…）→ `failed` + error 记 stop_reason。
 - `review` run 可由**收盘调度**起（顶层 run，`trigger=eod_review`），也可被对话/news run **fork**（`parentRunId` 指向父 run）；两种都**只读、不下单**。
 - 单次 run 用单个 provider channel / model；失败也落 `status`+`error`；无需唤起时不创建 run，只在事件消费记录标 `ignored`。
 
-### mode 与工具（review 只读；其余可下单，受风控闸门）
+### mode 与工具（review 只读；其余可下单）
 
 | mode | 起因 | 上下文（L3） | 领域工具 | operate_account |
 |---|---|---|---|---|
 | **dialogue** | 用户消息 | 独立连续对话线程 + 策略 + 账户/行情按需 + 当日已下单意图 | 全部读 + `update_watchlist` + `operate_account` + `upsert_investment_strategy` + `run_subagent` | ✓ |
-| **news** | buffer M/N（§5） | 隔离单次：本批 news + 策略 + 账户/行情 + 当日已下单意图 | `fetch_news/quotes/account` + `update_watchlist` + `operate_account` + `record_analysis` + `run_subagent` | ✓（受熔断+追高） |
+| **news** | buffer M/N（§5） | 隔离单次：本批 news + 策略 + 账户/行情 + 当日已下单意图 | `fetch_news/quotes/account` + `update_watchlist` + `operate_account` + `record_analysis` + `run_subagent` | ✓ |
 | **account_trigger** | `account-triggered`（实时） | 隔离单次：本 trigger + 原始建仓 run 摘要 + 账户/行情 + 当日意图 | `fetch_account/quotes/news` + `operate_account` | ✓ |
 | **review** | 收盘调度 / 手动触发 | 隔离单次：scope 内决策链(AnalysisResults+AgentTrades) + 账户结果 + 组合 vs 基准超额(Runtime 算) + 上次建议 follow-up(Runtime 对账) + 策略 | `fetch_account/quotes/news` + `record_review_suggestion`（只读，不下单；结论文本回 + 报告由 Runtime 落盘） | **✗ 永不下单** |
 
 - **review 永不 `operate_account`**——它是**只读复盘**：读决策链 + 账户结果 + 基准，产出结论。收盘 review 由 Runtime 把结论确定性落盘成报告（不依赖 agent 写文件），避免"按当天结果做事后补救"污染归因。
 - **复盘两条路径**：① **顶层 review-mode run**（收盘调度 / 手动 `run_review` 命令触发），跑只读 review agent 并由 Runtime 写当日报告；② **对话/news 中临时复盘**——直接用 `run_subagent` fork 一个隔离子 agent、`allowedTools` 收紧为只读 `fetch_*`，拿回结论文本辅助判断（不另设 `run_review` 工具：run_subagent 已覆盖，只读由 allowedTools 保证）。
-- 其余三 mode 都能 `operate_account`，但受**熔断闸门**（熔断中 news/account_trigger 自动下单降级为 no_action/建议）。
+- 其余三 mode 都能 `operate_account`；唯一机器闸门是 Account 级 `AccountRiskPolicy` fail-closed（Runtime 不拦截）。
 - 会下单的 run（dialogue/news/account_trigger）的 L3 **强制注入**「当日已下 AgentTrades + 活跃挂单 + 持仓 + 剩余可下单额度」（防自我打架，§6）。
 - 工具集是 mode 固定属性；领域**写**只走结构化工具，绝不经 `run_bash`；本地工具 / fork / skill 机制见 [agent-infra-module.md](agent-infra-module.md)（fork 无嵌套：子 agent 内剔除全部 spawn 类工具 `{run_subagent, run_skill}`，Infra 按 spawn-class 标记剔除，见 agent-infra §3.5）。
 
@@ -208,7 +207,7 @@ type InvestmentStrategy = {
 规则：
 
 - `strategy` 是**自然语言**（本阶段不结构化），注入 L2 给所有 mode 共用。**后续若需机器可校验的硬约束，可在此 type 上加结构化字段（如仓位/止损/集中度限额）**——届时回写本 spec。
-- 当前硬风控由两处兜底（不靠策略结构化）：账户级 `AccountRiskPolicy`（Account fail-closed）+ 编排级熔断/追高（Runtime settings 阈值，§6）。
+- 当前硬风控由账户级 `AccountRiskPolicy`（Account fail-closed）兜底（不靠策略结构化）；无编排级闸门。
 - **单点写、用户确认**：策略只能在**对话 mode**、用户明确确认后经 `upsert_investment_strategy` 写新版本。news / account_trigger / review run **不写策略**；复盘只给建议。
 - 对话中用户强调新偏好/约束 → Agent **确认是否写进策略文本** → 确认才 version+1。
 - 每次更新 `version+1`，旧版本保留可追溯；历史版本可经 `fetch_investment_strategy({includeHistory:true})` 读出（前端展示历史版本，见 §9）。
@@ -232,9 +231,10 @@ type AnalysisResult = {
 规则：
 
 - **产生机制**：由 news run 的 agent 经 `record_analysis` 工具声明 `kind/summary/relatedCodes`；`tradeIds` 由 Runtime 按 `run_id` 关联本 run 的 `AgentTrades`；Runtime 持久化并 emit `agent-analysis-result`。
+- **summary 首行 = 主题标题**（≤30 字，概括本批新闻主题 + 判断要点；不以「结论」「no_action」开头）——前端列表用首行做条目标题；正文（结论 + 理由）从第二行起。
 - news mode 分析完一批 news 后 emit；右侧列表按 `createdAt` 倒序。
 - `no_action` 也要 emit；**大多数 news 应是 no_action**。
-- action 类 `summary` 必须说明「为什么现在进还来得及」（边际信息），否则倾向降级 no_action（追高保护，§6）。
+- action 类 `summary` 必须说明「为什么现在进还来得及」（边际信息），否则倾向降级 no_action（price-in 判断纪律，L1）。
 - 证据不另存，按 `run_id` 拉 `fetch_news` ToolCall。
 
 ### `AgentTrade`（每次 operate_account 的审计戳）
@@ -311,7 +311,6 @@ type ReviewSuggestion = {
 - 工具结果必带时间戳；过期事实不得作为下单依据。
 - 策略只在对话 mode 经用户确认更新；其余 mode 不写策略。
 - news mode 形成判断必 emit `AnalysisResult`（含 `no_action`）；同一 news 不重复分析。
-- 熔断激活时，自动下单 mode（news/account_trigger）不实际下单，只 no_action/建议。
 - `account-triggered` 必须被实时幂等消费；`mark_trigger_handled` 只在 run 终态后调用。
 
 ---
@@ -376,7 +375,7 @@ type RecordReviewSuggestionToolOutput = { suggestionId: string };  // Runtime �
 
 规则：
 
-- `operate_account` handler 流程：① 风控闸门（熔断中→拒绝并提示降级）→ ② 编排级预校验（追高 / 当日额度）→ ③ **生成 `clientOrderId` 并写入 `accountInput.clientOrderId`**，落 `AgentTrade{submitting, clientOrderId}` → ④ 调 Account（`accountInput` 已含 clientOrderId，Account 按它幂等去重 + fail-closed 账户级硬约束）→ ⑤ 填 result 转 `settled`，写 `orderId→runId` 索引 → ⑥ 回 `tradeId`。按账户**全局串行**。`clientOrderId` 由 Runtime 单点生成，模型不提供。
+- `operate_account` handler 流程：① **生成 `clientOrderId` 并写入 `accountInput.clientOrderId`**，落 `AgentTrade{submitting, clientOrderId}` → ② 调 Account（`accountInput` 已含 clientOrderId，Account 按它幂等去重 + fail-closed 账户级硬约束——唯一机器闸门）→ ③ 填 result 转 `settled`，写 `orderId→runId` 索引 → ④ 回 `tradeId`。按账户**全局串行**。`clientOrderId` 由 Runtime 单点生成，模型不提供。Runtime 不做下单前风控拦截。
 - 临时复盘子 agent（对话/news 经 `run_subagent` fork）：上下文隔离，`allowedTools` 收紧为只读 `fetch_*`（**无 operate_account / write_file**，只读由 allowedTools 保证）；子 agent 内剔除全部 spawn 类工具 `{run_subagent, run_skill}`（Infra 按 spawn-class 标记剔除，见 agent-infra §3.5，无嵌套）；只把最终结论文本回给父 run。收盘 review 走顶层 review-mode run（见 §6），由 Runtime 落盘报告。
 - `record_analysis` 只在 **news mode** 暴露，per-run 绑定 `run_id`：handler 解析 `{kind, summary, relatedCodes}` → 经 `record_analysis_result` 持久化 + emit `agent-analysis-result`；`tradeIds` 由 Runtime 按 `run_id` 关联本 run 已记的 `AgentTrades`（handler 查 `list_trades_by_run`），模型不提供。`kind` 非法 → `InvalidInput` 业务拒绝。
 - `upsert_investment_strategy` 只在对话 mode 暴露，要求"用户已确认"。
@@ -410,6 +409,7 @@ type NewsBufferItem = {
 - **默认关闭**；buffer durable。生产者：`news-refreshed` 后 push `newIds∪updatedIds∪articleUpdatedNewsIds`（去重），纯 failed/warnings 变化不入队。
 - 触发：`pending ≥ news_agent_batch_size(M=50)` 立即；否则每 `news_agent_max_wait_secs(N=600)` 兜底。
 - 消费：取 publishedAt 最新 ≤M 条 → `AgentRun(mode=news)`，标 `in_batch`+`runId`；成功 `analyzed`，可恢复失败回 `pending`，不可恢复 `dropped`。**newest-first 排序锚点 = `publishedAt` 降序；`publishedAt` 缺失的条目排到末尾，以 `enteredAt` 降序兜底。**
+- **不可恢复终态**（本批直接 `dropped`，不回 pending）：run 被用户取消（重试违背取消意图）、run 超 token 预算（同批重跑必然再超限 → 烧钱循环）。其余 failed（provider 抖动 / max_turns）回 pending 重试。
 - **age-out**：超 4h 仍 pending → `dropped`，**emit 计数**（`agent-news-buffer-dropped` / heartbeat）。**4h 窗口锚点 = `enteredAt`（入队时间，滚动 4h）**。高负载下"最新优先"会饿死中段新闻，这是**有意接受的有损降级**，但必须让用户看见丢了多少。
 - news run 可 `fetch_news({query})` 关键词深挖。in-flight：`agent.news_batch` lock；启动恢复 `in_batch` 失效回 `pending`。
 
@@ -426,7 +426,7 @@ type NewsBufferItem = {
 ```text
 send_agent_message → AgentRun(mode=dialogue) → 注入 L1+L2+会话历史+当日意图
   → run_agent_turn → 流式返回
-  → 交易：风控预校验 → operate_account → AgentTrade
+  → 交易：operate_account → AgentTrade
   → 改策略：与用户确认 → upsert_investment_strategy
   → 用户说"review 一下" → run_subagent(allowedTools=只读 fetch_*) → fork 只读复盘子 agent → 返回结论
 ```
@@ -437,7 +437,7 @@ send_agent_message → AgentRun(mode=dialogue) → 注入 L1+L2+会话历史+当
 news-refreshed → buffer(§5) → M/N 触发 → AgentRun(mode=news)
   → 注入本批 news+账户/行情+当日意图
   → 形成判断 → 调 record_analysis(kind/summary/relatedCodes) → emit AnalysisResult（action/no_action）
-  → action 下单（受熔断+追高+账户 fail-closed）→ operate_account → AgentTrade
+  → action 下单（账户 fail-closed 兜底）→ operate_account → AgentTrade
   → 需要时 run_subagent(只读 fetch_*) 临时复盘历史决策辅助判断
 ```
 
@@ -469,14 +469,12 @@ Account emits account-triggered
 - `eod_review_time`（CN ≥15:30）触发收盘 review；按交易日加锁（一日一次）；可经 `run_review` 命令手动起。
 - 对话/news 中的**临时复盘**不走顶层 run，而是 `run_subagent`（allowedTools 收紧为只读 `fetch_*`）拿回结论文本——只读由 allowedTools 保证，不另设 `run_review` 工具。
 
-### 风控编排（Runtime 级，跨 mode；阈值取 settings）
+### 风控（无编排级闸门；机器闸门只有 Account fail-closed）
 
-> 账户级硬约束由 Account fail-closed 兜底；本节是 Runtime 编排级控制。
+> **设计决策（2026-06-10）**：不做编排级风控闸门（熔断 / 追高 / 当日额度强拦截）——模拟账户，亏损是学习闭环的反馈信号，策略好坏由复盘闭环评判。账户级硬约束（`AccountRiskPolicy`，含日新单上限等）由 Account fail-closed 兜底，是唯一机器闸门。
 
-- **熔断**：当日「连续亏损笔数」「组合当日回撤」是账户财务事实，由 **Account 只读 facade `consecutive_losses(now)` / `daily_drawdown(now)`** 提供（Account 是单一所有者，含当日权益高水位持久化、重启安全；见 account-module.md「账户财务事实只读 facade」）。Runtime 周期调这两个 facade 取值，与 `circuit_breaker_max_consecutive_losses` / `circuit_breaker_max_daily_drawdown`（**阈值取 Runtime settings**）比较做熔断判定——**Runtime 只做「取阈值 + 比较 + 激活闸门 + emit」的编排，不再自己从账户快照扒 positions 算连亏 / 维护回撤高水位**。任一超阈值 → **熔断激活**：news / account_trigger 的自动 `operate_account` 降级为 no_action/建议（dialogue 仍可在用户明确指令下交易）。熔断 emit 可观测；**需用户在对话中确认（`set_circuit_breaker`）才解除**。
-- **防自我打架**：会下单的 run 的 L3 **强制注入**「当日已下 AgentTrades + 活跃挂单 + 当前持仓 + 剩余可下单额度」，避免 fresh run 重复建仓 / 自我对打。
-- **追高保护**：news 触发的**开仓**，标的当日涨幅超 `chasing_guard_pct`（缺省 +5%）或临近涨停 → 默认降级 no_action / 仅加自选；要追须 dialogue 用户确认。
-- **当日额度**：当日新开仓达账户 `maxDailyNewOrders` → 自动 mode 不再开新仓（可平/调仓）。
+- **防自我打架（信息注入，非拦截）**：会下单的 run 的 L3 **强制注入**「当日已下 AgentTrades + 活跃挂单 + 当前持仓 + 剩余可下单额度」，避免 fresh run 重复建仓 / 自我对打。剩余额度是**提示信息**（来自账户 `maxDailyNewOrders` 与当日已下单数），真正的拒单由 Account 执行。
+- 追高 / price-in 判断是 L1 纪律（自然语言），由模型自律；不做机器拦截。
 
 ### 行情 / 账户维护调度
 
@@ -509,7 +507,6 @@ quote tick   → codes = Account.subscribed_codes() ∪ Quotes.core_indexes()
 | `market-quotes-refresh-progress` | `MarketQuotesRefreshProgressPayload` | Quotes | UI + Runtime(headless) | universe scope 两段刷新进度 |
 | `agent-analysis-result` | `{resultId,runId,kind}` | Runtime | UI | news 分析结果产出 |
 | `agent-news-buffer-dropped` | `{count, windowSecs, occurredAt}` | Runtime | UI | news age-out 丢弃计数（§5） |
-| `agent-circuit-breaker` | `{active,reason}` | Runtime | UI | 熔断激活/解除 |
 
 规则：事件只表达事实；producer 不知 consumer；consumer 幂等；envelope 含 `eventId`+`occurredAt`，可带 `correlationId`/`causationId`；跨 BC 路由事件须 durable consumption record。
 
@@ -559,18 +556,16 @@ type EventConsumption = {
 |---|---|---|
 | `news_auto_analysis_enabled` | news 自动分析开关 | false |
 | `news_agent_batch_size`(M) / `news_agent_max_wait_secs`(N) / `news_buffer_window_secs` | news buffer 阈值 | 50 / 600 / 14400 |
-| `chasing_guard_pct` | 追高保护：当日涨幅超此值降级 | 5% |
-| `circuit_breaker_max_consecutive_losses` | 熔断：连续亏损笔数 | 5 |
-| `circuit_breaker_max_daily_drawdown` | 熔断：单日组合回撤比例 | 5% |
 | `account_trigger_eval_interval_secs` / `account_trigger_eval_batch_size` | trigger 评估兜底 | 10 / 200 |
 | `eod_review_time` | 收盘复盘触发时间 | `15:30 Asia/Shanghai` |
 | `review_min_sample_trades` | 复盘可下绩效结论的最小交易笔数 | 30 |
-| `agent_run_max_turns` / `agent_run_token_budget` / `agent_daily_token_budget` | run/日 token 护栏 | 40 / 200000 / 5000000 |
+| `agent_run_max_turns` / `agent_run_token_budget` / `agent_daily_token_budget` | run/日 token 护栏（run 预算口径 = 累计 input+output + 子 run 回灌） | 40 / 1000000 / 5000000 |
 | `quotes_*_refresh_time` / `news_article_warm_*` | 维护 cadence | 见旧值 |
 | `context_soft/summarize/hard_limit_tokens` / `agent_context_compact_channel_id` / `_model` | Infra 压缩 | 48000/64000/96000 / unset |
 
 - settings 是运行时配置，不属于 `InvestmentStrategy`，模型不能隐式改；缺失用缺省，非法 fail-closed+heartbeat。
 - **token 预算执行机制在 Infra**：超预算停 turn（`run_agent_turn` 的 `tokenBudget` 入参 + `token_budget_exceeded` stop_reason）、fork 子 run（含 review）usage 回灌父 run 累加，均由 Infra 执行（见 agent-infra）；Runtime 只配置 `agent_run_token_budget` / `agent_daily_token_budget` 等 settings 值并传入 Infra。
+- ⚠️ **`agent_daily_token_budget`（日预算）当前未接执行**（需跨 run 的当日用量累计持久化）；run 级预算已生效。后续接：Runtime 在发起 run 前查当日累计，超限拒起自动 run（dialogue 仍放行 + 提示）。
 
 ---
 
@@ -584,7 +579,7 @@ type CancelAgentRunRequest = { runId: string; reason?: string };
 type CancelAgentRunResponse = { accepted: boolean; runId: string; status: "cancelled" | "completed" | "failed" | "not_found" };
 
 type FetchAgentStateRequest = {
-  include?: { messages?: boolean; runs?: boolean; analysisResults?: boolean; trades?: boolean; strategy?: boolean; toolCalls?: boolean; circuitBreaker?: boolean };
+  include?: { messages?: boolean; runs?: boolean; analysisResults?: boolean; trades?: boolean; strategy?: boolean; toolCalls?: boolean };
   limit?: number; offset?: number;
 };
 
@@ -601,15 +596,13 @@ type UpsertInvestmentStrategyRequest = {
 };
 
 type ListReviewReportsRequest = { limit?: number };          // 读 <workspace>/reviews/
-type SetCircuitBreakerRequest = { resume: boolean; reason: string };  // 对话确认解除熔断
 ```
 
 规则：
 
 - `cancel_agent_run` 可取消 `queued` 或尚未提交当前 tool call 的 `running` run（含后台 news/account_trigger/review）；已提交 Account 的 `operate_account` 不可撤（撤单走新 `operate_account(cancel_order)`）。
 - `upsert_investment_strategy`（command）= 用户显式确认改策略的唯一入口；`baseVersion` 乐观并发，冲突 `version_conflict`。
-- 熔断解除须 `set_circuit_breaker(resume=true)`（对话确认），不自动解除。
-- 前端：中间 chat + 右侧 AnalysisResult 列表 + 左侧复盘报告文件列表 + 投资策略面板（自然语言+版本）+ 熔断状态条。
+- 前端：中间 chat + 右侧 AnalysisResult 列表 + 左侧复盘报告文件列表 + 投资策略面板（自然语言+版本）。
 
 ### 内部 Runtime API
 
@@ -622,7 +615,6 @@ run_eod_review(trade_date) -> ReviewRunResult;         // 顶层 review run；Ru
 // 临时复盘无独立 API：对话/news 经 Infra run_subagent(allowedTools=只读) fork，结论文本回父 run
 build_run_context(mode, trigger) -> RunContext;        // L1+L2+L3（含当日意图），只读 facade
 register_tools_for_mode(mode) -> ToolSpec[];
-check_risk_gate(mode, account_input) -> RiskGateDecision;  // 熔断 + 追高 + 当日额度
 record_analysis_result(run_id, result) -> ResultId;
 record_agent_trade(run_id, client_order_id, account_input, reason) -> TradeId;  // submitting
 settle_agent_trade(trade_id, account_result) -> ();
@@ -639,8 +631,7 @@ pipeline/agent_runtime/
   runs.rs          AgentRun / mode / 生命周期 / 策略版本冻结
   context.rs       L1+L2+L3 组装（含当日意图注入）
   tools.rs         mode -> ToolRegistry + 领域 tool handler（含 record_analysis 仅 news mode；无 run_review；临时复盘用 Infra run_subagent）
-  risk.rs          熔断 / 追高 / 当日额度 / 防自我打架（阈值取 settings）
-  records.rs       AnalysisResult（record_analysis_result 持久化+emit）/ AgentTrade(submitting→settled) / orderId→runId 索引 / ReviewSuggestion 登记（日初权益 / 连亏 / 回撤已下沉 Account facade，不在此）
+  records.rs       AnalysisResult（record_analysis_result 持久化+emit）/ AgentTrade(submitting→settled) / orderId→runId 索引 / ReviewSuggestion 登记（日初权益已下沉 Account facade，不在此）
   strategy.rs      InvestmentStrategy 读写 / 版本（自然语言）
   news_buffer.rs   §5 buffer 生产/消费/age-out(+计数)
   triggers.rs      account-triggered 消费 / dedupe / mark_handled / 归因
@@ -659,7 +650,7 @@ pipeline/agent_runtime/
 - **review run 永不 `operate_account`**；顶层 review run 由收盘调度 / 手动 `run_review` 命令起，Runtime 捕获结论确定性落盘报告；对话/news 的临时复盘经 `run_subagent`（allowedTools 收紧只读 `fetch_*`）拿回结论文本（不另设 `run_review` fork 工具，只读由 allowedTools 保证）。
 - run 创建时冻结 `strategyVersion`，全程不变。
 - 每次 `operate_account` 必写 `AgentTrade`（`submitting`→`settled`）带 `clientOrderId`；崩溃后用 `clientOrderId` 确定性对账，无"猜失败"盲区。
-- 自动下单受风控闸门：熔断（连亏/回撤，阈值取 settings）中 news/account_trigger 不实际下单；追高保护降级；当日额度耗尽不再开新仓；账户级硬约束由 Account fail-closed 兜底。
+- 自动下单无编排级风控闸门（设计决策，§6）；账户级硬约束由 Account fail-closed 兜底，是唯一机器闸门。
 - 会下单的 run 的 L3 强制注入「当日已下 AgentTrades + 活跃挂单 + 持仓 + 剩余额度」（防自我打架）。
 - 策略**纯自然语言**，只在对话 mode 经用户确认更新；其余 mode 不写策略。
 - news mode 形成判断必 emit `AnalysisResult`（含 `no_action`）；age-out 丢弃 emit 计数，不静默。

@@ -130,6 +130,9 @@ LLM 输出：
   {"price": "1820.5", "freshness": {"status": "fresh", "ageMs": 1200}, ...}
   </tool_result>
 
+  output > 8KB（已写 PayloadStore）时 wrapper 额外带 ref 属性（压缩替 stub 时三属性齐全可 replay）：
+  <tool_result name="fetch_quote" call_id="tc_abc123" ref="pl_xyz">...</tool_result>
+
 失败时回传：
   <tool_error name="fetch_quote" call_id="tc_abc123" code="quote_missing">
   {"message": "no snapshot for 600519.SH"}
@@ -140,10 +143,11 @@ LLM 输出：
 
 - 标签名一律小写：`use_tool` / `tool_result` / `tool_error` / `tool_result_stub`。
 - `name` 属性必填，值是 `ToolRegistry` 中注册的 tool name。
-- `<use_tool>` 内容必须是合法 JSON（即 `ToolSpec.inputSchema` 校验的 input）。
+- `<use_tool>` 内容必须是合法 JSON（即 `ToolSpec.inputSchema` 校验的 input）。**容错**：内容以一个完整 JSON 值开头、其后跟尾部垃圾（模型偶发的重复 token / 散字符）时，取首个完整 JSON 值、忽略其后内容（救长输入的 `run_subagent` 等调用；完全不是 JSON 才算 `parse_error`）。
 - `<tool_result>` 内容是 JSON；`<tool_error>` 内容是 JSON 且必须带 `code` 属性（取 `ErrorCode` 封闭集合）。
 - `call_id` 由 Infra 在 parser 检测到 `<use_tool>` 闭合时生成（`tc_<uuid>`），写入回传标签，供模型在后续推理中显式引用某次结果。
 - LLM 输出单 turn 内可以有多个 `<use_tool>`；Infra 按出现顺序串行 dispatch（不并行），逐个回传 `<tool_result>`（支持批量工具调用）。
+- **同 turn 去重**：同一 turn 内出现 `(name, input)` 完全相同的重复 `<use_tool>`（模型 / relay 重复输出所致），只 dispatch 首个；后续重复**不执行、不回传**（防重复副作用）。模型确需重复执行同一调用应分 turn 发起。
 - **工具调用是本轮文本的逻辑终点（best practice，对齐 native tool-calling 语义）**：
   - 首个 `<use_tool>` **之前**的文本（preamble / 推理）实时 emit 为 `text_delta`。
   - 首个 `<use_tool>` **之后**的文本是模型在「无工具结果」下的推测续写（hallucination）——**不 emit、不作权威输出**（native 协议里模型在工具调用处即 `stop_reason=tool_use` 结束本轮；文本协议下模型可能继续吐字，按此规则丢弃）。
@@ -329,7 +333,10 @@ type AgentEvent =
   | { type: "compacted"; runId: string; tier: "micro_clear" | "summarize" | "drop" | "reactive_retry"; droppedMessages: number; estimatedTokensSaved?: number }
   | { type: "usage"; runId: string; inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
   | { type: "done"; runId: string; stopReason: AgentStopReason; turns: number }
-  | { type: "error"; runId: string; code: ErrorCode; message: string };
+  | { type: "error"; runId: string; code: ErrorCode; message: string }
+  // 子 run 实时活动转发（仅前端展示，不进父 LLM 上下文；详见 §3.5「前端可见性」）
+  | { type: "sub_agent_activity"; runId: string; agentId: string;
+      kind: "started" | "tool_start" | "tool_end" | "text" | "done"; text: string };
 ```
 
 规则：
@@ -532,9 +539,12 @@ type SubAgentTask = {
 
 **管理 API（Infra 提供给父 agent / Runtime）**：
 - `run_subagent` / `run_skill`（前台或后台，§3.6 工具）—— spawn。
-- `subagent_output(agentId)` —— 读后台任务的中间进度 / 已产出。
-- `stop_subagent(agentId)` —— abort 一个运行中的子 run。
-- 完成通知：Infra 在子 run 终态时 emit `AgentEvent`（`<task-notification>`），父 loop 收到后注入下一轮。
+- `subagent_output(agentId)` —— 读后台任务的中间进度 / 已产出（注册为顶层工具，§3.6）。
+- `stop_subagent(agentId)` —— abort 一个运行中的子 run（注册为顶层工具，§3.6；前台 / 后台任务都可停）。
+- 完成通知：子 run 终态时把 `<task-notification>`（status + usage + result 预览）push 进父 run 的
+  **共享通知队列**（`RunSharedState.notifications`）；父 loop 在下一个 turn 边界 drain 并作为
+  user message 注入（进 LLM 上下文 + 落库）。**不**经前端 event 通道——那是展示通道（`SubAgentActivity`）。
+  父 run 已结束时通知丢弃（warn）。
 
 ### 不变量
 
@@ -552,10 +562,22 @@ type SubAgentTask = {
 
 机制 + 任务注册表 + 前台/后台/并行 + `run_subagent`/`run_skill`（替换 inline `load_skill`）+ `stop_subagent`/`subagent_output` 均已实现 + hermetic 测试（ScriptedProvider，无网络）。依赖注入分两层：`ForkHandle` 只持**静态依赖**（ProviderFactory + registry + repo + SkillStore + 任务注册表 + 占位默认配置）；**运行时上下文**（channel / is_subagent / parentRunId / 父 event_tx）由 `ForkRuntime` 在**发起 run 时注入**——经 `DispatchExt`（对 registry 不透明的 `Arc<dyn Any>`）透传给 `run_agent_turn_forked`，fork handler 在 **dispatch 时** downcast 回 `ForkRuntime` 读取。**不允许嵌套（对齐 CC `isInForkChild` 布尔，无深度计数）**：构造子 run registry（`child_registry`）时**无论 `allowedTools` 是否给定，都剔除全部 spawn-class 工具（按 `ToolSpec.isSpawn` 标记，覆盖 `run_subagent`/`run_skill`（及未来任何 isSpawn 工具））**——子 agent 的 system prompt 里根本没有这些工具，从根上没法再 fork（首选机制，对齐 CC）。另设兜底布尔守卫：`ForkRuntime` 顶层 run = `is_subagent=false`，`ForkRuntime::child()` 把派生的子运行时置 `is_subagent=true`；`spawn_or_run` 在发起 fork 前预检发起方 `is_subagent`，`run_forked_agent` 再对发起方 `is_subagent` 兜底一次——`is_subagent == true` 即拒（防 spawn 工具未被正确剔除）。hermetic 测试 `subagent_has_no_fork_tools_no_nesting` 覆盖「子 registry 无 spawn 工具 + 子尝试 `<use_tool name="run_subagent">` 被当未注册 tool 拒、不产生第二层子 run」，`subagent_flag_refuses_nested_fork` 覆盖布尔守卫。以下几点**当前为务实折中 / 待补**：
 
-- **`parentRunId` 关联**：暂编码在子 `conversation_id`（`fork:<parentRunId>:<uuid>`）+ 内存 `SubAgentTask`，**未加 DB 列**（加列 = migration + domain 改动）。要按父 replay 审计再加列。
-- **`<task-notification>`**：暂以 `AgentEvent::TextDelta` 文本信封发（不新增 event 变体，保协议不变）；后续可加专用变体。
-- **token 预算**：spec 已定义 `run_agent_turn` 的 `tokenBudget` 入参 + `token_budget_exceeded` stop_reason + 子 usage 回灌父累加（见 §6 `run_agent_turn` / `AgentStopReason`）。**执行实现是 Infra 自己的增量（不绑 Phase 3）**——loop 已按 turn 累计 usage（`SubAgentTask.progress.tokens`），只需在 turn 边界加一道预算检查 + 超限 emit stop_reason 即可，可随时独立落地；当前代码尚未接预算检查，子继承父 compaction/window。
-- **生产接线**：fork 上下文已改为 **run 时注入**（`ForkRuntime` → `DispatchExt`），**不再静态捕获、也不需要 registry replace**。`bootstrap` 的 `ForkHandle` 仅装静态依赖 + 占位默认配置；Phase 3 接线只需触发入口（Tauri command / scheduler / Runtime）在发起 run 时构造 `ForkRuntime`（真实 channel / parentRunId / 父 event_tx）传给 `run_agent_turn_forked`。即：**fork 机制已就绪 + 单测通过（含 `is_subagent` 布尔守卫拒绝嵌套的回归）；生产联动随 Phase 3 的 run 触发接入。**
+**2026-06-10 管理面补齐**（生产接线已全量打通，executor 在发起 run 时构造 `ForkRuntime` 注入
+channel / per-run registry / `RunSharedState` / cancel token / event_tx）：
+
+- **工具集继承父 = 父 run 的 per-run registry**（`ForkRuntime.registry` 注入；含 Runtime 领域工具），
+  不再是 bootstrap 全局 registry；`allowedTools` 含未注册名 → `invalid_input` 拒绝（不静默忽略）。
+- **token 预算已实现**：`AgentRunRequest.tokenBudget` + loop turn 边界检查（累计 = 各 turn
+  input+output + 子 run 回灌 `RunSharedState.extra_tokens`）→ 超限 `done(stop_reason=token_budget_exceeded)`；
+  子 usage 经 collector 的 `Usage` 事件实时回灌 + `update_progress` 运行中可读。
+- **`<task-notification>` 注入父下一轮**：经 `RunSharedState.notifications` 队列（见上「管理 API」），
+  不再借道 `TextDelta` 污染前端流。
+- **取消传播**：父 run 的 CancellationToken 经 `ForkRuntime.cancel` 传给子 loop（turn 边界 +
+  provider stream 中响应）；`stop_subagent` 经 JoinHandle abort（前台 / 后台任务都有句柄——fork
+  执行 spawn-detached，dispatch 超时 drop handler future 不会再砍掉终态记账）。
+- **`subagent_output` / `stop_subagent` 已注册为顶层工具**（§3.6；spawn-class 标记 → 子 agent 不可见）。
+- **`parentRunId` 关联**：仍编码在子 `conversation_id`（`fork:<parentRunId>:<uuid>`），并回写
+  `SubAgentTask.conversation_id`（注册表可定位子 run 的 agent_messages 做 replay）。**未加 DB 列**。
 
 ---
 
@@ -574,6 +596,8 @@ Infra 默认注册的通用 tool：
 | `web_search` | 联网搜索（多源并行聚合） | `{query, maxResults?}` → `{results:[{title,url,snippet,source}], providers}`；未配置任何源 → `invalid_input` |
 | `web_extract` | 读网页正文（无 key） | `{urls(≤5)}` → `{results:[{url,title,content}\|{url,error}]}`；多 URL 并行 + 单条容错；当前仅 HTML |
 | `run_subagent` | fork 隔离子 agent 跑子任务 | 见 §3.5；只回结果 |
+| `subagent_output` | 读后台子任务状态 / 进度 / 产出 | `{agentId}` → `{status, progress, result?}`；spawn-class（仅顶层） |
+| `stop_subagent` | 停止运行中的子任务 | `{agentId}` → `{stopped}`；spawn-class（仅顶层） |
 | `create_skill` | 写 `<skills_dir>/<name>/SKILL.md` | `{name(slug), description, body}` → `{path, created}` |
 | `run_skill` | fork 子 agent 跑某 skill | `{name, args?}` → `{name, result}`；以 SKILL.md 为 prompt（§3.5）|
 
@@ -588,7 +612,7 @@ type WebSearchOutput = { results: WebSearchResult[]; providers: string[] }; // p
 - **可插拔多源 + 并行聚合**（参考 hermes-agent `WebSearchProvider` 抽象，但 hermes 是单源 dispatch，本项目要并行聚合）：
   - `WebSearchProvider` trait（`name` + `search(query,max)`）；每个搜索源一个实现。
   - `MultiWebSearch` 聚合器：对所有 **已启用** 源 **并行 fan-out** → 单源失败容错（忽略，不拖垮整体）→ **按 canonical URL 去重** → 跨源交错排序 → 回带 `source` 标签的聚合列表。
-- **初始源**：DuckDuckGo（免费无 key，HTML 抓取）、Jina（免费，可选 key 提额）、博查 Bocha（需 key，中文最佳）、Tavily（需 key，免费额度）。trait 抽象使后续加 SearXNG / Brave 等只需各加一个实现。
+- **当前源（只用免费无 key，用户决策 2026-06）**：**搜狗**（中文 / A 股财经主力——实测「宁德时代 2025 一季报」直接命中东财 / 腾讯 / 新浪财经；`/link` 跳转包装由 provider 并行轻量解包，~300B/条）+ DuckDuckGo（国际内容，html+lite 双端点）。不可用源（2026-06-11 实测）：百度（无头抓取弹验证码）、Bing 中国版（无 cookie SERP 有地名前缀实体回退 bug：「宁德时代」→宁德市、「贵州茅台」→贵州省，对财经查询主动误导）。需 key 的源（Jina / Brave / 博查 / Tavily）已移除；trait 抽象使将来加回只需各加一个实现。
 - **配置**：provider key / 开关由 adapter 从设置注入（key 只写不回显，同 LLM key）；一个源都没启用 → 工具返回 `invalid_input`（明确提示去配置）。`SideEffect::None`（只读外部、不写本地）。前端**不**直接发外部 HTTP——全部走 Rust（架构红线）。
 - provider 各自的 wire format（端点 / 鉴权 / 响应字段）是 infra 实现细节，不在 spec 固化（类比 TDX / news provider adapter）。
 
@@ -657,9 +681,9 @@ type RunSkillToolOutput = { name: string; result: string };   // 只回子 run �
 ```ts
 // run_subagent —— fork 隔离子 agent 跑子任务（isSpawn=true）
 type RunSubagentToolInput = {
-  description: string;        // 一句话任务描述（进子 agent 任务注册表）
-  prompt: string;            // 子 agent 的任务 prompt
-  tools?: ToolName[];        // 可选：收紧子工具集（默认继承父；spawn-class 一律剔除）
+  prompt: string;            // 子 agent 的任务 prompt（必填）
+  description?: string;      // 一句话任务描述（进子 agent 任务注册表）；缺省取 prompt 首行
+  allowedTools?: ToolName[]; // 可选：收紧子工具集（默认继承父 run 的工具集；spawn-class 一律剔除）
   runInBackground?: boolean; // true=异步后台跑，立即返回 agentId；缺省 false=前台阻塞
 };
 type RunSubagentToolOutput = {
@@ -683,7 +707,7 @@ type InfraToolName =
 
 - spawn-class（`isSpawn=true`，子 agent 内被剔除）：`run_subagent` / `run_skill`。（Runtime 当前不注入 fork 类领域工具；临时复盘复用 `run_subagent` 收紧只读，见 agent-runtime §3。`isSpawn` 机制对未来任何新增 fork 类工具仍自动生效。）
 - Runtime 新增领域 tool 必须先扩展 [agent-runtime-module.md §4](agent-runtime-module.md#4-工具) 或对应模块 spec，再通过 `ToolRegistry` 注册；Infra 不在本文件重复列举 Runtime tool。
-- `allowedTools` / `RunSubagentToolInput.tools` 中出现未注册 tool name 时，按 `invalid_input` 拒绝；已注册 tool 的归属由注册方 spec 负责。
+- `RunSubagentToolInput.allowedTools` 中出现未注册（= 父 run registry 中不存在的）tool name 时，按 `invalid_input` 拒绝；已注册 tool 的归属由注册方 spec 负责。「继承父」指**父 run 的 per-run registry**（含 Runtime 注入的领域工具），不是 Infra bootstrap 全局 registry。
 
 ---
 
@@ -710,6 +734,10 @@ type InfraToolName =
 - `Chat Context` 只用于需要对话续接的 run；非交互后台 run 默认由 Runtime 提供 `Realtime Packet` 和 `Review / Memory`，不要求恢复完整聊天历史。
 - 可清理内容（`droppable=true` / 非 trading_write 的 tool 结果）：替 stub / 丢弃，LLM 仍可通过 `<use_tool>` 重新拉取。例：行情 / K 线 / 新闻全文 / 旧账户读快照。
 - 不可清理内容（`droppable=false` / `trading_write` 结果 / `kind=summary` 检查点）：永远 inline 保留。例：order_id / 成交价 / Account event ID。**Drop 一整轮时只清该轮的可清理部分，不可清理项保留**。
+- **durable 标记持久化（跨 run 生效）**：trading_write 轮的 tool_result user message 在落库时打
+  `durable` 标（`agent_messages.durable` 列）；`load_conversation_view` 的视图 = **summary 之前的
+  durable 行 + 最新 summary + 其后全部**，loop 续接时从 repo 重建 durable 集合——保证「永不丢 /
+  不替 stub / 不折进摘要」不只在单 run 内存里成立。
 
 ### 上下文压缩策略
 

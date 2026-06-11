@@ -54,6 +54,19 @@ CLI 不负责：
 - **为什么必须瘦客户端、不冷起独立进程**：独立进程会①重新冷连 TDX（秒级握手、绕开暖缓存）②和 GUI app **抢同一个单写 SQLite**（锁冲突 / 脏读风险）③看不到 app 的实时缓存 / 订阅集。瘦客户端把这些都交给唯一的 app 实例，单一真源、零冲突。
 - app 未运行 → 端点连不上 → CLI 报 `app_not_running` 并非零退出（不 fallback 去开 DB / 连 provider）。
 
+### 实现注记（2026-06-11 已落地）
+
+- **端点形态**：`127.0.0.1:0` 随机端口（只绑本机），端口写 `<appData>/cli.port`；CLI 经
+  `$GANGZI_CLI_PORT`（显式覆盖）或 portfile 发现。app 退出后 portfile 残留无害（连不上即
+  `app_not_running`）。手写最小 HTTP/1.1（仅 `POST /v1/{quotes,news,account}` + `GET /v1/health`，
+  `Connection: close`），零新依赖。
+- **同源复用**：三条路由直接挂 agent_runtime 的 `QuotesGateway/NewsGateway/AccountGateway::fetch`
+  ——与 Agent 读 tool（fetch_quotes/fetch_news/fetch_account）**同一实现**，§1「与 GUI 一致」与
+  验收「与 Agent 读 tool 同源」按构造满足。写方法（operate/update_watchlist）无路由，CLI 层不可达。
+- **代码位置**：app 侧 `adapters/cli/`（mod=端点+dispatch、args=参数解析、render=table 渲染，
+  均 hermetic 测试）；CLI 二进制 `src-tauri/src/bin/gangzi.rs`（std TcpStream，进程内无业务 I/O）。
+- **退出码**：0 成功 · 1 app 侧业务错误（透传 ErrorCode）· 2 参数非法 · 3 `app_not_running`。
+
 ---
 
 ## 3. 命令集（全部只读）
