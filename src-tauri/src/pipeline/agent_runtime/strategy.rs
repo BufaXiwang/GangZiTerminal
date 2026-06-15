@@ -20,7 +20,7 @@ pub const BASELINE_STRATEGY_ID: &str = "baseline_a_share";
 /// 内置 baseline 策略文本（龙头战法：情绪周期 / 龙头选股 / 仓位管理 / 止损止盈纪律）。
 const BASELINE_STRATEGY_TEXT: &str = r#"# 龙头战法 — A 股模拟交易默认策略
 
-> 100 万 CNY 模拟账户，超短线风格，以情绪周期为框架、以辨识度龙头为唯一标的。
+> 模拟账户（初始资金以账户实际为准，仓位均按比例管理），超短线风格，以情绪周期为框架、以辨识度龙头为唯一标的。
 
 ## 一、核心理念
 
