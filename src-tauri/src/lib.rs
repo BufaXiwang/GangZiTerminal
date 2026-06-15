@@ -59,6 +59,8 @@ fn build_specta_builder() -> Builder<tauri::Wry> {
         adapters::quotes::cmd::scan_market,
         adapters::quotes::cmd::fetch_market_breadth,
         adapters::quotes::cmd::fetch_industry_heatmap,
+        adapters::quotes::cmd::set_tushare_token,
+        adapters::quotes::cmd::tushare_token_status,
         adapters::quotes::cmd::ensure_chart_data,
         adapters::quotes::cmd::extend_chart_history,
         adapters::quotes::cmd::fetch_kline_page,
@@ -227,8 +229,11 @@ pub fn run() {
             app.manage(news_handle);
 
             // -- Quotes BC bootstrap
+            // TuShare token：优先读设置页持久化的 <appData>/tushare.token，回退环境变量。
+            let tushare_token = adapters::quotes::cmd::read_persisted_tushare_token(app.handle())
+                .or_else(|| std::env::var("TUSHARE_TOKEN").ok().filter(|s| !s.is_empty()));
             let quotes_service = Arc::new(
-                QuotesService::new(db.clone(), QuotesConfig::default())
+                QuotesService::new(db.clone(), QuotesConfig { tushare_token })
                     .expect("failed to build QuotesService"),
             );
             app.manage(Arc::clone(&quotes_service));
@@ -438,17 +443,19 @@ pub fn run() {
                     db.clone(),
                     std::sync::Arc::clone(quotes_service.cache()),
                 ));
+            // 模拟账户初始资金（单一真源，config 与 init 用同一个值）。
+            let initial_cash = Money(Decimal::from(20_000));
             let account_service = Arc::new(AccountService::new(
                 db.clone(),
                 account_gateway,
                 AccountServiceConfig {
-                    initial_cash: Money(Decimal::from(1_000_000)),
+                    initial_cash,
                     ..AccountServiceConfig::default()
                 },
             ));
             // 初始化账户（幂等）
             if let Err(code) = account_service
-                .initialize_account_if_needed(Money(Decimal::from(1_000_000)))
+                .initialize_account_if_needed(initial_cash)
             {
                 tracing::error!(
                     target: "account.bootstrap",

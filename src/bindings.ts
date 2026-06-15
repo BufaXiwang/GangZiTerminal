@@ -111,6 +111,28 @@ async fetchIndustryHeatmap(topN: number | null) : Promise<Result<IndustryHeatmap
 }
 },
 /**
+ * 写入 / 清除 TuShare token（空字符串 = 删除配置）。重启后生效。
+ */
+async setTushareToken(token: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_tushare_token", { token }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * TuShare token 是否已配置（文件非空 或 环境变量 TUSHARE_TOKEN 非空）。不回明文（写-only）。
+ */
+async tushareTokenStatus() : Promise<Result<boolean, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tushare_token_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * 前端 on-demand 拉数据：用户选中标的 + 切到某 chart period 时，如果 DB 空就触发后端拉一份。
  * 
  * 按 period 字符串分派：

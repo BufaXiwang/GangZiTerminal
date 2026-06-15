@@ -286,3 +286,55 @@ pub async fn ensure_chart_data(
     }
     Ok(())
 }
+
+// ───────────────────────── TuShare token 配置（设置页）─────────────────────────
+//
+// token 持久化在 `<appData>/tushare.token`（单文件，与 cli.port 同款，免迁移）。
+// 启动时 lib.rs 调 `read_persisted_tushare_token` 读入 → QuotesConfig.tushare_token
+// （文件缺失时回退环境变量 TUSHARE_TOKEN）。token 在 QuotesService 构造时烤进 client，
+// 故**设置后需重启生效**（设置页会提示）。写-only：状态只回「是否已配置」，不回明文。
+
+/// `<appData>/tushare.token` 路径（解析不到 appData → None）。
+fn tushare_token_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    app.path().app_data_dir().ok().map(|d| d.join("tushare.token"))
+}
+
+/// 启动期读取已持久化的 TuShare token（trim、空视为无）。lib.rs 在构造 QuotesService 前调用。
+pub fn read_persisted_tushare_token(app: &tauri::AppHandle) -> Option<String> {
+    let p = tushare_token_path(app)?;
+    std::fs::read_to_string(p)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 写入 / 清除 TuShare token（空字符串 = 删除配置）。重启后生效。
+#[tauri::command]
+#[specta::specta]
+pub fn set_tushare_token(app: tauri::AppHandle, token: String) -> Result<(), CommandError> {
+    let path = tushare_token_path(&app)
+        .ok_or_else(|| CommandError::with_message(ErrorCode::DbError, "无法定位 appData 目录"))?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        // 清除：删文件（不存在也算成功）。
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CommandError::with_message(ErrorCode::DbError, format!("创建目录失败: {e}")))?;
+    }
+    std::fs::write(&path, trimmed)
+        .map_err(|e| CommandError::with_message(ErrorCode::DbError, format!("写入 token 失败: {e}")))?;
+    Ok(())
+}
+
+/// TuShare token 是否已配置（文件非空 或 环境变量 TUSHARE_TOKEN 非空）。不回明文（写-only）。
+#[tauri::command]
+#[specta::specta]
+pub fn tushare_token_status(app: tauri::AppHandle) -> Result<bool, CommandError> {
+    let from_file = read_persisted_tushare_token(&app).is_some();
+    let from_env = std::env::var("TUSHARE_TOKEN").ok().filter(|s| !s.is_empty()).is_some();
+    Ok(from_file || from_env)
+}

@@ -52,6 +52,31 @@ export default function SettingsPage() {
   // 发现更多模型 modal
   const [discoverGroupKey, setDiscoverGroupKey] = useState<string | null>(null);
 
+  // TuShare token 配置（数据源）
+  const [tushareConfigured, setTushareConfigured] = useState<boolean>(false);
+  const [tushareInput, setTushareInput] = useState("");
+  const [tushareSaving, setTushareSaving] = useState(false);
+  const [tushareSaved, setTushareSaved] = useState(false);
+
+  const refreshTushareStatus = useCallback(async () => {
+    const res = await commands.tushareTokenStatus();
+    if (res.status === "ok") setTushareConfigured(res.data);
+  }, []);
+
+  const saveTushareToken = useCallback(async () => {
+    setTushareSaving(true);
+    const res = await commands.setTushareToken(tushareInput.trim());
+    setTushareSaving(false);
+    if (res.status === "ok") {
+      setTushareInput("");
+      setTushareSaved(true);
+      void refreshTushareStatus();
+      setTimeout(() => setTushareSaved(false), 4000);
+    } else {
+      setError(formatError(res.error));
+    }
+  }, [tushareInput, refreshTushareStatus]);
+
   const loadChannels = useCallback(async () => {
     const res = await commands.agentListChannels();
     if (res.status === "ok") {
@@ -77,6 +102,7 @@ export default function SettingsPage() {
       else setError(formatError(chRes.error));
       setLoading(false);
     });
+    void refreshTushareStatus();
     return () => {
       cancelled = true;
     };
@@ -262,6 +288,57 @@ export default function SettingsPage() {
           {!hasChannels && !addOpen && (
             <p className="muted settings-empty-hint">
               连接 LLM 服务商以启用 Agent。
+            </p>
+          )}
+        </section>
+
+        {/* --- 数据源：TuShare token --- */}
+        <section className="settings-block">
+          <div className="settings-block-header">
+            <h2 className="settings-block-title">数据源 · TuShare</h2>
+            <span className={tushareConfigured ? "muted" : "muted"} style={{ fontSize: 13 }}>
+              {tushareConfigured ? "✅ 已配置" : "未配置"}
+            </span>
+          </div>
+          <p className="muted" style={{ fontSize: 13, marginBottom: 10 }}>
+            TuShare Pro token 用于补全行业 / 上市日期 / 基本面等数据（缺失时仅跳过该部分，行情仍可用）。
+            token 只写不回显；<b>保存后需重启应用生效</b>。
+          </p>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", maxWidth: 560 }}>
+            <input
+              type="password"
+              className="input"
+              placeholder={tushareConfigured ? "已配置（留空不变；输入以覆盖）" : "粘贴 TuShare Pro token"}
+              value={tushareInput}
+              onChange={(e) => setTushareInput(e.target.value)}
+              style={{ flex: 1 }}
+            />
+            <button
+              type="button"
+              className="btn"
+              disabled={tushareSaving || tushareInput.trim().length === 0}
+              onClick={() => void saveTushareToken()}
+            >
+              {tushareSaving ? "保存中…" : "保存"}
+            </button>
+            {tushareConfigured && (
+              <button
+                type="button"
+                className="btn ghost"
+                disabled={tushareSaving}
+                onClick={() => {
+                  setTushareInput("");
+                  void commands.setTushareToken("").then(() => refreshTushareStatus());
+                }}
+                title="清除已配置的 token"
+              >
+                清除
+              </button>
+            )}
+          </div>
+          {tushareSaved && (
+            <p className="muted" style={{ fontSize: 13, marginTop: 8, color: "#22c55e" }}>
+              已保存 · 重启应用后生效
             </p>
           )}
         </section>
