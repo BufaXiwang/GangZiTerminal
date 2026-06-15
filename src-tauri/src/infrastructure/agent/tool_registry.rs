@@ -450,9 +450,11 @@ impl ToolRegistry {
         })
     }
 
-    /// 落一条「协议层被拒」的 ToolCall 审计行（未注册 / inputSchema 校验失败；spec §2 不变量
-    /// 「所有 tool 调用都必须记录 ToolCall」）。失败只 warn——审计写失败不阻断回传 tool_error。
-    fn record_rejected_call(
+    /// 落一条「协议层被拒」的 ToolCall 审计行（未注册 / inputSchema 校验失败 / parse_error；
+    /// spec §2 不变量「所有 tool 调用都必须记录 ToolCall」+「每条 <tool_error> 的 call_id 与
+    /// agent_tool_calls 行一一对应」）。失败只 warn——审计写失败不阻断回传 tool_error。
+    /// `pub(crate)`：loop_executor 的 ParseError 分支也走它(parse 失败时没有真 tool 名，传合成名)。
+    pub(crate) fn record_rejected_call(
         &self,
         run_id: &str,
         tool_call_id: &str,

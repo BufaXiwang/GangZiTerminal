@@ -23,7 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// 单次 read_file / run_bash 捕获的字节上限（超出截断，truncated=true）。
-const READ_MAX_BYTES: usize = 256 * 1024; // 256KB
+const READ_MAX_BYTES: usize = 256 * 1024; // 256KB（最终回给 agent 的内容上限）
+// 有界扫描上界：读文件时最多读这么多进内存（远高于 READ_MAX_BYTES，给按行 offset/limit 留余量），
+// 防 agent 读 GB 级文件直接 OOM。超过即标记 truncated。
+const READ_SCAN_MAX_BYTES: usize = 4 * 1024 * 1024; // 4MB
 const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024; // 64KB / 流
 
 /// 各 tool 默认 timeout（ToolSpec.timeout_ms）。
@@ -253,10 +256,24 @@ async fn handle_read_file(workspace: PathBuf, inv: ToolInvocation) -> ToolHandle
         return err_out(ErrorCode::InvalidInput, "path is a directory");
     }
 
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(e) => return err_out(ErrorCode::InvalidInput, format!("read failed: {e}")),
+    // OOM 防护：read 路径不限工作区，agent 可能读到 GB 级文件。最终只回 ≤256KB（READ_MAX_BYTES），
+    // 但 offset/limit 是**按行**选取，需要先读进足够覆盖窗口的字节。封顶在一个远高于最终上限的
+    // 扫描上界（READ_SCAN_MAX_BYTES），用 take() 有界读——绝不把整个大文件读进内存。
+    let bytes = {
+        use tokio::io::AsyncReadExt;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => return err_out(ErrorCode::InvalidInput, format!("read failed: {e}")),
+        };
+        let mut buf = Vec::new();
+        // +1 字节让我们能判断是否「超过扫描上界被截断」。
+        let mut limited = file.take(READ_SCAN_MAX_BYTES as u64 + 1);
+        if let Err(e) = limited.read_to_end(&mut buf).await {
+            return err_out(ErrorCode::InvalidInput, format!("read failed: {e}"));
+        }
+        buf
     };
+    let scan_truncated = bytes.len() > READ_SCAN_MAX_BYTES;
 
     // 二进制 / 非 UTF-8 优雅处理：尝试 lossless UTF-8；失败 → invalid_input（非文本）。
     let text = match String::from_utf8(bytes) {
@@ -293,7 +310,7 @@ async fn handle_read_file(workspace: PathBuf, inv: ToolInvocation) -> ToolHandle
     } else {
         (content, false)
     };
-    truncated = truncated || byte_truncated;
+    truncated = truncated || byte_truncated || scan_truncated;
 
     ToolHandlerOutput::ok(serde_json::json!({
         "content": content,
@@ -865,6 +882,21 @@ mod tests {
         let big = "a".repeat(READ_MAX_BYTES + 5000);
         handle_write_file(ws.clone(), inv(serde_json::json!({ "path": "big.txt", "content": big }))).await;
         let target = ws.join("big.txt");
+        let out = handle_read_file(ws.clone(), inv(serde_json::json!({ "path": target.to_str().unwrap() }))).await;
+        assert!(!out.is_error);
+        assert_eq!(out.output_summary["truncated"], true);
+        assert!(out.output_summary["content"].as_str().unwrap().len() <= READ_MAX_BYTES);
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn read_bounds_scan_to_avoid_oom() {
+        // OOM 防护回归：写一个超过扫描上界(4MB)的文件，read 必须有界读 + 标 truncated，
+        // 最终内容仍 ≤ READ_MAX_BYTES（不把整文件读进内存）。
+        let ws = temp_workspace("read-scan-cap");
+        let huge = "x".repeat(READ_SCAN_MAX_BYTES + 100_000);
+        handle_write_file(ws.clone(), inv(serde_json::json!({ "path": "huge.txt", "content": huge }))).await;
+        let target = ws.join("huge.txt");
         let out = handle_read_file(ws.clone(), inv(serde_json::json!({ "path": target.to_str().unwrap() }))).await;
         assert!(!out.is_error);
         assert_eq!(out.output_summary["truncated"], true);

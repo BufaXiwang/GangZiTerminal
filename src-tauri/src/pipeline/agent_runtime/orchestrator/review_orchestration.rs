@@ -215,9 +215,9 @@ impl RuntimeServices {
     }
 
     pub(super) fn collect_followup(&self, trade_date: &TradeDate) -> String {
-        let Some(prev_naive) = trade_date.as_naive().pred_opt() else {
-            return "（无上一交易日，跳过 follow-up）".into();
-        };
+        // 上一**交易日**（非自然日）：否则周一会去看周日、节后第一天会看假期，必然取不到建议（spec §3 ④）。
+        let prev_naive =
+            crate::domain::quotes::trade_calendar::previous_trading_day(trade_date.as_naive());
         let prev_td = TradeDate::from_naive(prev_naive);
         let suggestions = self
             .deps

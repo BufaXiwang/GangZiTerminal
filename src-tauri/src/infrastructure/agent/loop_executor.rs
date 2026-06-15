@@ -708,6 +708,15 @@ pub async fn run_agent_turn_forked(
                     let payload = serde_json::json!({"message": reason});
                     let payload_str =
                         serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
+                    // Spec §2: 该 <tool_error> 的 call_id 必须在 agent_tool_calls 有对应行
+                    // （与 NotRegistered/InvalidInput 一致）。parse 失败没有真 tool 名 → 合成名 _parser。
+                    registry.record_rejected_call(
+                        &run_id,
+                        &call_id,
+                        "_parser",
+                        &serde_json::json!({ "reason": reason }),
+                        reason.clone(),
+                    );
                     tool_results_for_next_turn.push(format!(
                         r#"<tool_error name="_parser" call_id="{}" code="parse_error">{}</tool_error>"#,
                         call_id, payload_str
