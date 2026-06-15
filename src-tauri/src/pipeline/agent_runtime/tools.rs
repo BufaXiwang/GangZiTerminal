@@ -129,16 +129,24 @@ pub fn spec_operate_account() -> ToolSpec {
     ToolSpec::new(
         OPERATE_ACCOUNT,
         "对模拟账户下单 / 撤单 / 开仓 / 调仓 / 平仓 / 调整保护。accountInput 为 Account canonical 动作；\
-         reason 说明本次理由。受账户级风控（AccountRiskPolicy，fail-closed）约束。",
+         reason 说明本次理由。受账户级风控（AccountRiskPolicy，fail-closed）约束。\
+         **市价单**：orderType=\"market\"，盘中按现价撮合。\
+         **限价挂单**：orderType=\"limit\" + limitPrice，单子留存为 pending，行情满足价格条件时（含次日开盘）自动成交——\
+         **收盘后想布局明天就用限价单挂上**，不必等开盘。quantity 是股数（A 股 100 股 = 1 手，须 100 的整数倍）。\
+         可选 stopLoss / takeProfit 设保护价。",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "accountInput": { "type": "object", "description": "OperateAccountInput（Account canonical 动作）" },
+                "accountInput": { "type": "object", "description": "OperateAccountInput；action ∈ place_order/open_position/scale_position/close_position/cancel_order/adjust_protection。\
+                    open_position 字段：tsCode, quantity(100整数倍), orderType(market|limit), limitPrice(限价时必填), stopLoss?, takeProfit?, reason" },
                 "reason": { "type": "string" }
             },
             "required": ["accountInput", "reason"]
         }),
-        vec![r#"<use_tool name="operate_account">{"accountInput":{"action":"open_position","tsCode":"600519.SH","quantity":100,"reason":"news 利好"},"reason":"news 利好开仓"}</use_tool>"#.into()],
+        vec![
+            r#"<use_tool name="operate_account">{"accountInput":{"action":"open_position","tsCode":"600519.SH","quantity":100,"orderType":"market","reason":"盘中追入"},"reason":"突破建仓"}</use_tool>"#.into(),
+            r#"<use_tool name="operate_account">{"accountInput":{"action":"open_position","tsCode":"300308.SZ","quantity":100,"orderType":"limit","limitPrice":"45.50","stopLoss":"41.00","reason":"低吸挂单等开盘"},"reason":"收盘后挂限价单布局明天"}</use_tool>"#.into(),
+        ],
         WRITE_TIMEOUT_MS,
         SideEffect::TradingWrite,
     )
